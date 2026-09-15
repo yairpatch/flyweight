@@ -410,6 +410,52 @@ typedef struct FlyweightV2VisionResize {
 } FlyweightV2VisionResize;
 
 FLYWEIGHT_V2_API int flyweight_v2_model_attach_vision(FlyweightV2Model* model, const char* path);
+
+/* Diffusion image generation (Z-Image-Turbo): a Qwen3 text encoder, the
+   single-stream DiT and the KL autoencoder, each opened as a model from its
+   diffusers directory. The tower borrows the three models, which must
+   outlive it. Sizes are pixels; latents are [16][height/8][width/8] f32;
+   images come back as interleaved RGB bytes, height*width*3. */
+typedef struct FlyweightV2Diffusion FlyweightV2Diffusion;
+/* Where the encoder's and DiT's weights live: on the device, pinned in host
+   memory and streamed a layer at a time (a few hundred MiB of device memory
+   instead of the whole model, at some seconds per image), or decided from
+   the card: host when the weights would take more than half of it. */
+#define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_DEVICE 0u
+#define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_HOST 1u
+#define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO 2u
+typedef struct FlyweightV2DiffusionInfo {
+    uint32_t host_weights;
+    uint32_t max_width, max_height;
+    uint64_t device_bytes;   /* resident weights + workspace + staging */
+    uint64_t host_bytes;     /* pinned host memory, zero when resident */
+} FlyweightV2DiffusionInfo;
+/* Called after the text encoder (step 0) and after every denoising step; a
+   non-zero return cancels the generation. */
+typedef int (*FlyweightV2DiffusionProgress)(void* user_data, uint32_t step, uint32_t steps);
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* transformer,
+                                                   FlyweightV2Model* vae, int32_t device, uint32_t max_width,
+                                                   uint32_t max_height, uint32_t max_prompt_tokens,
+                                                   uint32_t weights, FlyweightV2Diffusion** out);
+FLYWEIGHT_V2_API void flyweight_v2_diffusion_destroy(FlyweightV2Diffusion* tower);
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_info(const FlyweightV2Diffusion* tower, FlyweightV2DiffusionInfo* out);
+/* hidden_states[-2] of the encoder for `count` tokens: count * hidden f32. */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_encode_text(FlyweightV2Diffusion* tower, const uint32_t* tokens,
+                                                        uint64_t count, float* output, uint64_t capacity);
+/* One transformer forward at normalized time `time` (0 = pure noise ... 1). */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_transformer_step(FlyweightV2Diffusion* tower, const float* latents,
+                                                             uint32_t latent_h, uint32_t latent_w,
+                                                             const float* caption, uint64_t caption_tokens,
+                                                             float time, float* velocity);
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_decode_latents(FlyweightV2Diffusion* tower, const float* latents,
+                                                           uint32_t latent_h, uint32_t latent_w, uint8_t* rgb);
+/* The whole pipeline. `initial_latents` may be null (drawn from `seed`). */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* tower, const uint32_t* tokens,
+                                                     uint64_t count, uint32_t width, uint32_t height,
+                                                     uint32_t steps, float shift, uint64_t seed,
+                                                     const float* initial_latents,
+                                                     FlyweightV2DiffusionProgress progress, void* user_data,
+                                                     uint8_t* rgb);
 FLYWEIGHT_V2_API int flyweight_v2_vision_info(const FlyweightV2Model* model, FlyweightV2VisionInfo* out);
 FLYWEIGHT_V2_API int flyweight_v2_vision_resize(const FlyweightV2Model* model, uint32_t width, uint32_t height, uint32_t min_tokens, uint32_t max_tokens, FlyweightV2VisionResize* out);
 /* Replace only the embedded Qwen MTP block with tensors from a compatible

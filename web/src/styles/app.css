@@ -432,6 +432,13 @@ kbd {
 .shell--rail.shell--panel {
   grid-template-columns: 60px minmax(0, 1fr) 420px;
 }
+/* The image studio shows a gallery, so it takes a wider column. */
+.shell--panel-wide {
+  grid-template-columns: 280px minmax(0, 1fr) min(720px, 55vw);
+}
+.shell--rail.shell--panel-wide {
+  grid-template-columns: 60px minmax(0, 1fr) min(720px, 55vw);
+}
 
 .main {
   display: flex;
@@ -2126,4 +2133,56 @@ kbd {
 .attachment__action:disabled {
   cursor: default;
   opacity: 0.5;
+}
+
+/* ---- Image studio ---------------------------------------------------- */
+.images {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.images__controls {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.images__controls input[type="number"],
+.images__controls input[type="text"] {
+  width: 84px;
+}
+.images__empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.images__gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+.images__item {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.images__item img {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.images__item figcaption {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.images__item figcaption > span:first-child {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.images__item .button {
+  align-self: flex-start;
 }

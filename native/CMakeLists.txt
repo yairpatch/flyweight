@@ -47,11 +47,13 @@ add_custom_command(
         ${FLYWEIGHT_CPU_KERNEL_TABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_qwen_kernels.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_native_kernels.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_diffusion_kernels.hpp
         --preprocessor "${CMAKE_CXX_COMPILER}"
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_cpu_kernels.py
         ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_qwen_kernels.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_native_kernels.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/flyweight_v2_diffusion_kernels.hpp
     COMMENT "Generating host kernel corpus for the CPU backend"
     VERBATIM
 )

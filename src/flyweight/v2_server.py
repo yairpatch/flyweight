@@ -30,6 +30,7 @@ from .server import (
     _parse_tool_calls,
     _split_reasoning_content,
 )
+from .images import ImageGenerator
 from .vision import (
     IMAGE_PAD_TOKEN, IMAGE_PLACEHOLDER, ImageError, ImageInput, ImagePreprocessor,
     PreparedImage, expand_image_pads, image_token_offsets,
@@ -2724,6 +2725,9 @@ class NativeV2InferenceService(InferenceService):
         mmproj_path: Path | str | None = None,
         image_max_tokens: int = 1024,
         image_urls: str = "allow",
+        image_model_path: Path | str | None = None,
+        image_max_size: int = 1024,
+        image_weights: str = "auto",
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
@@ -2771,6 +2775,19 @@ class NativeV2InferenceService(InferenceService):
             model_path, mtp_model=mtp_model_path, mmproj=mmproj_path)
         self.image_max_tokens = int(image_max_tokens)
         self.image_urls = image_urls
+        # The image model loads before the chat runtime plans its memory, so
+        # the expert cache auto-fit sees the VRAM the tower took.
+        self.images: ImageGenerator | None = None
+        if image_model_path is not None:
+            try:
+                self.images = ImageGenerator(
+                    image_model_path, device=device,
+                    max_width=int(image_max_size), max_height=int(image_max_size),
+                    weights=image_weights,
+                )
+            except BaseException:
+                self.v2_model.close()
+                raise
         # BailingMoE3 runs on its own runtime rather than the Qwen one: 24 of
         # its 24 layers use attention the Qwen path does not implement. It is a
         # narrower runtime -- one sequence, no prefix cache, no expert paging --
@@ -2946,6 +2963,10 @@ class NativeV2InferenceService(InferenceService):
         generator_close = getattr(self.generator, "close", None)
         if callable(generator_close):
             generator_close()
+        images = getattr(self, "images", None)
+        if images is not None:
+            images.close()
+            self.images = None
         bailing = getattr(self, "bailing_runtime", None)
         if bailing is not None:
             bailing.close()
@@ -2983,8 +3004,19 @@ class NativeV2InferenceService(InferenceService):
             "mtp_drafts": self.mtp_drafts,
             "gpu_cache_mib": self.gpu_cache_mib,
             "vision": self._vision_health(),
+            "images": self._images_health(),
         }
         return value
+
+    def _images_health(self) -> dict[str, object] | None:
+        images = getattr(self, "images", None)
+        return images.describe() if images is not None else None
+
+    def images_generations(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        images = getattr(self, "images", None)
+        if images is None:
+            return super().images_generations(payload)
+        return images.generate(payload)
 
     def _vision_health(self) -> dict[str, object] | None:
         tokenizer = getattr(self.generator, "tokenizer", None)

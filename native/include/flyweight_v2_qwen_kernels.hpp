@@ -2767,10 +2767,19 @@ void name(                                                                     \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
     const int input_size, const int output_size,                               \
-    const int rows, const int scale_stride                                     \
+    const int rows_total, const int scale_stride                               \
 ) {                                                                            \
     const int row_base = blockIdx.x * FLYWEIGHT_MMQ_ROWS;                        \
     if (row_base >= output_size) return;                                       \
+    /* grid.y batches tokens in tiles: a launch may carry every row of a     */\
+    /* GEMM instead of one tile, which fills the GPU on the diffusion tower's */\
+    /* 4096-row batches. With grid.y == 1 this is exactly the old kernel.    */\
+    const int token_base = blockIdx.y * FLYWEIGHT_MMQ_TOKENS;                    \
+    if (token_base >= rows_total) return;                                      \
+    const int rows = min(FLYWEIGHT_MMQ_TOKENS, rows_total - token_base);         \
+    vectors += (long long)token_base * input_size;                             \
+    vector_scales += (long long)token_base * scale_stride;                     \
+    outputs += (long long)token_base * output_size;                            \
     const int blocks_per_row = input_size >> 8;                                \
     const int groups_per_row = blocks_per_row << 3;                            \
     /* Staged in 16-byte units -- one k16 half of one (row, group), which is */\
@@ -3104,10 +3113,16 @@ extern "C" __global__ void name(                                               \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
     const int input_size, const int output_size,                               \
-    const int rows, const int scale_stride                                     \
+    const int rows_total, const int scale_stride                               \
 ) {                                                                            \
     const int row_base = blockIdx.x * FLYWEIGHT_MMQ_MIN_ROWS;                        \
     if (row_base >= output_size) return;                                       \
+    const int token_base = blockIdx.y * FLYWEIGHT_MMQ_MIN_TOKENS;                \
+    if (token_base >= rows_total) return;                                      \
+    const int rows = min(FLYWEIGHT_MMQ_MIN_TOKENS, rows_total - token_base);     \
+    vectors += (long long)token_base * input_size;                             \
+    vector_scales += (long long)token_base * scale_stride;                     \
+    outputs += (long long)token_base * output_size;                            \
     const int blocks_per_row = input_size >> 8;                                \
     const int groups_per_row = blocks_per_row << 3;                            \
     __shared__ int w_words[FLYWEIGHT_MMQ_MIN_ROWS][FLYWEIGHT_MMQ_GROUPS][9];           \

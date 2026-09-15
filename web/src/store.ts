@@ -29,7 +29,7 @@ import type {
   ToolDefinition,
 } from "./types";
 
-export type Panel = "settings" | "tools" | "runtime" | "tokenizer" | "playground" | "inspector" | null;
+export type Panel = "settings" | "tools" | "runtime" | "tokenizer" | "playground" | "inspector" | "images" | null;
 export type ThemePreference = "system" | "light" | "dark";
 export type RuntimeStatus = "connecting" | "online" | "busy" | "offline" | "locked";
 

@@ -172,6 +172,9 @@ inline Policy policy_for_weights(Target weights) {
 inline Target target_for(const HfTensor& tensor, const Policy& policy) {
     // 1-D: norms, dt_bias, A_log, the router bias.
     if (tensor.shape.size() < 2) return policy.small;
+    // A single-row matrix is a vector that happens to be stored 2-D (the DiT's
+    // pad tokens are [1][dim]); nothing multiplies by it.
+    if (tensor.shape.size() == 2 && tensor.shape[1] == 1) return policy.small;
 
     // The embedding table and the head each take their own target.
     const Target wanted = tensor.name == "token_embd.weight" ? policy.embedding

@@ -160,6 +160,7 @@ export interface HealthPayload {
   execution?: Record<string, unknown> & {
     backend?: string;
     vision?: Record<string, unknown> | null;
+    images?: Record<string, unknown> | null;
   };
 }
 

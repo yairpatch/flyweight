@@ -108,6 +108,22 @@ struct ModelConfig {
     std::uint32_t draft_block_size=0;
     // Per-layer SwiGLU clamp bounds, routed experts and shared expert.
     std::vector<float> swiglu_clamp_exp, swiglu_clamp_shexp;
+    // Diffusion components loaded from a diffusers directory (Z-Image's
+    // `ZImageTransformer2DModel`, the FLUX `AutoencoderKL`). Zero on every
+    // language model. The DiT reuses hidden_size / layer_count / heads /
+    // intermediate_size / rms_norm_epsilon / rope_freq_base for its blocks and
+    // rope_sections for the per-axis rotary widths (axes_dims); what has no
+    // language-model analogue is spelled out here.
+    std::uint32_t refiner_layer_count=0;      // n_refiner_layers
+    std::uint32_t patch_size=0, in_channels=0; // latent patch side, latent channels
+    std::uint32_t caption_dim=0;              // cap_feat_dim: the text encoder's width
+    float time_scale=0.0f;                    // t_scale
+    std::uint32_t rope_axis_lengths[3]={0,0,0}; // axes_lens
+    // AutoencoderKL decoder geometry.
+    std::uint32_t latent_channels=0, vae_layers_per_block=0, vae_norm_groups=0;
+    std::uint32_t vae_block_channels[4]={0,0,0,0};
+    bool vae_mid_attention=false;
+    float latent_scale=0.0f, latent_shift=0.0f; // scaling_factor, shift_factor
     // GGUF tokenizer terminator ids; max means the key was absent.
     std::uint32_t eos_token_id=0xffffffffu;
     std::uint32_t eot_token_id=0xffffffffu;

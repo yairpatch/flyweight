@@ -81,7 +81,7 @@ export function App() {
   }, []);
 
   return (
-    <div className={`shell${sidebarOpen ? "" : " shell--rail"}${panel ? " shell--panel" : ""}`}>
+    <div className={`shell${sidebarOpen ? "" : " shell--rail"}${panel ? " shell--panel" : ""}${panel === "images" ? " shell--panel-wide" : ""}`}>
       <Sidebar />
       <div className="scrim" onClick={() => useStore.getState().toggleSidebar(false)} aria-hidden="true" />
       <main className="main" aria-busy={!ready}>

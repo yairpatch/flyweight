@@ -18,6 +18,7 @@
 #include "flyweight_v2_qwen_kernels.hpp"
 #include "flyweight_v2_native_kernels.hpp"
 #include "flyweight_v2_deepseek4_kernels.hpp"
+#include "flyweight_v2_diffusion_kernels.hpp"
 #include "flyweight_v2_bailing.hpp"
 #include "flyweight_v2_hf_quantize.hpp"
 #include "flyweight_v2_hf_cache.hpp"
@@ -7975,6 +7976,14 @@ std::string hf_imatrix_path(const std::string& directory,
 // change, so the arena is written to a sidecar on the way out and mapped on the
 // way back in. A hit skips the shard mappings entirely -- the 15.8 GB of bf16
 // is never opened, let alone read.
+// A tokenizer file beside the checkpoint, or in the `tokenizer/` sibling a
+// diffusers pipeline keeps it in (`text_encoder/` holds only the weights).
+static std::string hf_tokenizer_file(const std::string& directory,const char* name){
+    auto text=read_text_file(directory+"/"+name);
+    if(text.empty())text=read_text_file(directory+"/../tokenizer/"+name);
+    return text;
+}
+
 void load_hf(const char* path, FlyweightV2Model& m) {
     namespace hf = flyweight::v2::hf;
     m.path=path;
@@ -8005,14 +8014,14 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     // name; config.json carries no equivalent of general.name.
     const auto slash=directory.find_last_of('/');
     m.name=slash==std::string::npos?directory:directory.substr(slash+1);
-    m.chat_template=read_text_file(directory+"/chat_template.jinja");
+    m.chat_template=hf_tokenizer_file(directory,"chat_template.jinja");
     // Checkpoints published before chat_template.jinja existed keep the
     // template in tokenizer_config.json -- one string, or a list of named
     // templates of which "default" is the conversational one. Reading only
     // the file left those checkpoints on the runtime's generic fallback
     // markup, silently.
     if(m.chat_template.empty()){
-        if(const auto text=read_text_file(directory+"/tokenizer_config.json");
+        if(const auto text=hf_tokenizer_file(directory,"tokenizer_config.json");
            !text.empty()){
             const auto parsed=flyweight::v2::json::parse(text);
             const auto& configured=parsed["chat_template"];
@@ -8037,31 +8046,48 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     }
     phase("config.json");
 
-    // tokenizer.json is ~12 MB of JSON on this checkpoint, most of it the
-    // 157k-entry vocabulary, and it is parsed once at open.
-    const auto tokenizer_text=read_text_file(directory+"/tokenizer.json");
-    if(tokenizer_text.empty())
-        throw std::runtime_error("cannot read tokenizer.json");
-    phase("tokenizer.json read");
-    auto tokenizer=hf::tokenizer_from_json(
-        flyweight::v2::json::parse(tokenizer_text),m.config.vocabulary_size);
-    phase("tokenizer.json parse");
-    if(tokenizer.pre.empty())
-        throw std::runtime_error(
-            "tokenizer.json uses a pre-tokenizer pattern this runtime has not "
-            "transcribed; refusing to tokenize with the wrong splitter");
-    m.vocabulary=std::move(tokenizer.vocabulary);
-    m.merges=std::move(tokenizer.merges);
-    m.token_types=std::move(tokenizer.token_types);
-    m.tokenizer_pre=std::move(tokenizer.pre);
-    build_tokenizer_tables(m);
-    phase("tokenizer tables");
+    // A diffusion component (the DiT, the VAE) has no vocabulary; only a
+    // language model carries a tokenizer to read.
+    const bool diffusion=hf::is_diffusion_architecture(m.architecture);
+    if(!diffusion){
+        // tokenizer.json is ~12 MB of JSON on this checkpoint, most of it the
+        // 157k-entry vocabulary, and it is parsed once at open.
+        const auto tokenizer_text=hf_tokenizer_file(directory,"tokenizer.json");
+        if(tokenizer_text.empty())
+            throw std::runtime_error("cannot read tokenizer.json");
+        phase("tokenizer.json read");
+        auto tokenizer=hf::tokenizer_from_json(
+            flyweight::v2::json::parse(tokenizer_text),m.config.vocabulary_size);
+        phase("tokenizer.json parse");
+        if(tokenizer.pre.empty())
+            throw std::runtime_error(
+                "tokenizer.json uses a pre-tokenizer pattern this runtime has not "
+                "transcribed; refusing to tokenize with the wrong splitter");
+        m.vocabulary=std::move(tokenizer.vocabulary);
+        m.merges=std::move(tokenizer.merges);
+        m.token_types=std::move(tokenizer.token_types);
+        m.tokenizer_pre=std::move(tokenizer.pre);
+        build_tokenizer_tables(m);
+        phase("tokenizer tables");
+    }
 
     const auto files=hf_shard_files(directory);
 
     hf::Policy policy;
+    // The DiT is read whole on every denoising step, so it packs at Q8_0 by
+    // default: the loss of a K-quant shows in the picture and the size is
+    // not what decides whether an image model fits. The VAE decoder is 50M
+    // parameters of convolutions and stays f32 outright, as diffusers runs it
+    // (force_upcast).
+    if(m.architecture=="zimage-dit")policy=hf::policy_for_weights(hf::Target::Q8_0);
+    // The plain-Qwen3 text encoder conditions the DiT with its hidden state,
+    // and Q8_0 halves that state's error against Q6_K (0.9% vs 2.1% rms on
+    // Z-Image's encoder) for 1.1 GB more, which lives in host memory anyway
+    // once the tower streams its weights.
+    if(m.architecture=="qwen3")policy=hf::policy_for_weights(hf::Target::Q8_0);
+    if(m.architecture=="autoencoder-kl")policy=hf::policy_for_weights(hf::Target::F32);
     if(const char* requested=std::getenv("FLYWEIGHT_HF_QUANT");
-       requested&&!hf_policy_for(requested,policy))
+       requested&&m.architecture!="autoencoder-kl"&&!hf_policy_for(requested,policy))
         throw std::runtime_error("FLYWEIGHT_HF_QUANT must be one of "
             "IQ2_XS, Q2_K, IQ3_XXS, Q3_K, IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, "
             "F32");
@@ -14416,6 +14442,9 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     const bool k2horizon=m->config.architecture=="k2-horizon";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
+    if(m->config.architecture=="qwen3"&&m->format_name=="safetensors")throw std::runtime_error(
+        "a plain Qwen3 safetensors checkpoint is loaded as a diffusion text encoder only; "
+        "the Qwen decode runtime does not run it (its attention has no query gate)");
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
@@ -14912,6 +14941,18 @@ static bool qwen_mmq_wide(){
     }();
     return enabled&&!flyweight_backend_is_cpu();
 }
+// The one corpus every Qwen-family runtime and the diffusion tower compile:
+// identical text means the driver's module cache hands them the same module,
+// so a chat model and an image model in one process do not evict each other's
+// kernels.
+static std::string qwen_cuda_corpus(){
+    return (qwen_mmq_wide()
+             ?std::string("#define FLYWEIGHT_MMQ_ROW_WARPS 4\n"
+                          "#define FLYWEIGHT_MMQ_ROW_FRAGS 2\n")
+             :std::string())+
+        std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source+
+        flyweight::v2::diffusion_cuda_source;
+}
 int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     // Before anything reads weights in bulk: the hashed n-gram table is not
@@ -14941,12 +14982,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
     if(const char*cuda_home=std::getenv("CUDA_HOME")){option_storage.push_back(std::string("-I")+cuda_home+"/include");option_storage.push_back(std::string("-I")+cuda_home+"/include/cccl");}
     std::vector<const char*>compile_options;for(const auto&option:option_storage)compile_options.push_back(option.c_str());
     std::array<char,16384>compile_log{};
-    const std::string cuda_source=
-        (qwen_mmq_wide()
-             ?std::string("#define FLYWEIGHT_MMQ_ROW_WARPS 4\n"
-                          "#define FLYWEIGHT_MMQ_ROW_FRAGS 2\n")
-             :std::string())+
-        std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source;
+    const std::string cuda_source=qwen_cuda_corpus();
     if(flyweight_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
     runtime->cuda_ready=true;
     if(flyweight_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
@@ -18954,6 +18990,7 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
 
 #include "v2_mtp_verifier.inc"
 #include "v2_vision.inc"
+#include "v2_diffusion.inc"
 
 // Layer-synchronous chunked prefill. Attention stays a per-row pass with the
 // decode kernels -- a row's attention at layer L needs only earlier rows' KV

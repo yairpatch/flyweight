@@ -149,6 +149,138 @@ inline bool is_qwen3_5(const std::string& model_type,
            architecture == "Qwen3_5ForCausalLM";
 }
 
+// Plain Qwen3 (`Qwen3ForCausalLM`): dense, every layer full attention with
+// q/k norms, no query gate. Loaded here as the text encoder of Z-Image, whose
+// conditioning is one of this model's hidden states; the Qwen decode runtime
+// does not run it (see flyweight_v2_qwen_runtime_create).
+inline bool is_qwen3(const std::string& model_type,
+                     const std::string& architecture) {
+    return model_type == "qwen3" || architecture == "Qwen3ForCausalLM";
+}
+
+inline ModelConfig config_from_qwen3(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "qwen3";
+    out.hidden_size = static_cast<std::uint32_t>(config["hidden_size"].as_uint());
+    out.layer_count =
+        static_cast<std::uint32_t>(config["num_hidden_layers"].as_uint());
+    out.attention_heads =
+        static_cast<std::uint32_t>(config["num_attention_heads"].as_uint());
+    out.attention_kv_heads =
+        static_cast<std::uint32_t>(config["num_key_value_heads"].as_uint());
+    out.context_length =
+        static_cast<std::uint32_t>(config["max_position_embeddings"].as_uint());
+    out.vocabulary_size = static_cast<std::uint32_t>(config["vocab_size"].as_uint());
+    out.intermediate_size =
+        static_cast<std::uint32_t>(config["intermediate_size"].as_uint());
+    out.dense_intermediate_size = out.intermediate_size;
+    out.rms_norm_epsilon =
+        static_cast<float>(config["rms_norm_eps"].as_double(1e-6));
+    out.attention_head_dim = static_cast<std::uint32_t>(config["head_dim"].as_uint(
+        out.attention_heads ? out.hidden_size / out.attention_heads : 0));
+    out.key_length = out.attention_head_dim;
+    out.value_length = out.attention_head_dim;
+    out.rotary_dimension = out.attention_head_dim;
+    out.rope_freq_base = static_cast<float>(config["rope_theta"].as_double(1.0e6));
+    if (config.contains("eos_token_id"))
+        out.eos_token_id =
+            static_cast<std::uint32_t>(config["eos_token_id"].as_uint());
+    if (config.contains("bos_token_id"))
+        out.bos_token_id =
+            static_cast<std::uint32_t>(config["bos_token_id"].as_uint());
+    return out;
+}
+
+// Diffusers components carry `_class_name` instead of `model_type`, and no
+// tokenizer. Two are recognised: Z-Image's single-stream DiT and the FLUX
+// 16-channel KL autoencoder it renders through.
+inline bool is_zimage_transformer(const json::Value& config) {
+    return config["_class_name"].as_string() == "ZImageTransformer2DModel";
+}
+
+inline bool is_autoencoder_kl(const json::Value& config) {
+    return config["_class_name"].as_string() == "AutoencoderKL";
+}
+
+// True for the diffusion components, which have no vocabulary and whose open
+// must not look for tokenizer.json.
+inline bool is_diffusion_architecture(const std::string& architecture) {
+    return architecture == "zimage-dit" || architecture == "autoencoder-kl";
+}
+
+inline ModelConfig config_from_zimage_transformer(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "zimage-dit";
+    out.hidden_size = static_cast<std::uint32_t>(config["dim"].as_uint());
+    out.layer_count = static_cast<std::uint32_t>(config["n_layers"].as_uint());
+    out.refiner_layer_count =
+        static_cast<std::uint32_t>(config["n_refiner_layers"].as_uint());
+    out.attention_heads = static_cast<std::uint32_t>(config["n_heads"].as_uint());
+    out.attention_kv_heads =
+        static_cast<std::uint32_t>(config["n_kv_heads"].as_uint(out.attention_heads));
+    if (!out.hidden_size || !out.attention_heads || !out.layer_count)
+        throw std::runtime_error("ZImageTransformer2DModel config is incomplete");
+    out.attention_head_dim = out.hidden_size / out.attention_heads;
+    out.key_length = out.value_length = out.attention_head_dim;
+    // FeedForward(dim, int(dim / 3 * 8)) in the reference.
+    out.intermediate_size =
+        static_cast<std::uint32_t>(out.hidden_size / 3 * 8);
+    out.dense_intermediate_size = out.intermediate_size;
+    out.rms_norm_epsilon = static_cast<float>(config["norm_eps"].as_double(1e-5));
+    out.rope_freq_base = static_cast<float>(config["rope_theta"].as_double(256.0));
+    out.time_scale = static_cast<float>(config["t_scale"].as_double(1000.0));
+    out.caption_dim = static_cast<std::uint32_t>(config["cap_feat_dim"].as_uint());
+    out.in_channels = static_cast<std::uint32_t>(config["in_channels"].as_uint(16));
+    out.patch_size =
+        static_cast<std::uint32_t>(config["all_patch_size"][0].as_uint(2));
+    const auto& dims = config["axes_dims"];
+    const auto& lens = config["axes_lens"];
+    if (dims.size() != 3 || lens.size() != 3)
+        throw std::runtime_error("ZImageTransformer2DModel rope must have three axes");
+    std::uint32_t total = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        out.rope_sections[axis] = static_cast<std::uint32_t>(dims[axis].as_uint());
+        out.rope_axis_lengths[axis] = static_cast<std::uint32_t>(lens[axis].as_uint());
+        total += out.rope_sections[axis];
+    }
+    if (total != out.attention_head_dim)
+        throw std::runtime_error("ZImageTransformer2DModel axes_dims do not sum to head_dim");
+    if (!config["qk_norm"].as_bool(true))
+        throw std::runtime_error("ZImageTransformer2DModel without qk_norm is not supported");
+    // The three attention projections are stacked into one [3*dim][dim]
+    // matrix at load (see translate_zimage); build_tensors counts the pieces
+    // as experts, so this is the stack depth, not a router.
+    out.expert_count = 3;
+    return out;
+}
+
+inline ModelConfig config_from_autoencoder_kl(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "autoencoder-kl";
+    out.latent_channels =
+        static_cast<std::uint32_t>(config["latent_channels"].as_uint(16));
+    out.in_channels = static_cast<std::uint32_t>(config["out_channels"].as_uint(3));
+    out.vae_layers_per_block =
+        static_cast<std::uint32_t>(config["layers_per_block"].as_uint(2));
+    out.vae_norm_groups =
+        static_cast<std::uint32_t>(config["norm_num_groups"].as_uint(32));
+    out.vae_mid_attention = config["mid_block_add_attention"].as_bool(true);
+    out.latent_scale = static_cast<float>(config["scaling_factor"].as_double(1.0));
+    out.latent_shift = static_cast<float>(config["shift_factor"].as_double(0.0));
+    const auto& channels = config["block_out_channels"];
+    if (channels.size() != 4)
+        throw std::runtime_error("AutoencoderKL must have four resolution levels");
+    for (std::size_t level = 0; level < 4; ++level)
+        out.vae_block_channels[level] =
+            static_cast<std::uint32_t>(channels[level].as_uint());
+    if (config["use_post_quant_conv"].as_bool(false))
+        throw std::runtime_error("AutoencoderKL with post_quant_conv is not supported");
+    for (std::size_t level = 0; level < 4; ++level)
+        if (config["up_block_types"][level].as_string() != "UpDecoderBlock2D")
+            throw std::runtime_error("AutoencoderKL decoder block type is not UpDecoderBlock2D");
+    return out;
+}
+
 // Everything the decoder needs comes out of `text_config`; the SSM widths do
 // not, because the layer plan reads those off the tensor shapes instead (see
 // qwen_forward_rows, which derives channels, value_heads and the conv kernel
@@ -265,8 +397,12 @@ inline ModelConfig config_from_json(const json::Value& config) {
     const auto model_type = config["model_type"].as_string();
     const auto architecture = config["architectures"][0].as_string();
 
+    if (is_zimage_transformer(config)) return config_from_zimage_transformer(config);
+    if (is_autoencoder_kl(config)) return config_from_autoencoder_kl(config);
     if (is_qwen3_5(model_type, architecture))
         return config_from_qwen3_5(config);
+    if (is_qwen3(model_type, architecture))
+        return config_from_qwen3(config);
 
     ModelConfig out;
     if (!is_bailing_hybrid(model_type, architecture))
@@ -600,11 +736,78 @@ inline ParsedName translate_qwen3_5(const std::string& name,
     return parsed;
 }
 
+// Plain Qwen3: the same block tensors as a Qwen3.5 full-attention layer under
+// `model.layers.` rather than `model.language_model.layers.`, no MTP block, and
+// the embedding may double as the head (tie_word_embeddings).
+inline ParsedName translate_qwen3(const std::string& name) {
+    ParsedName parsed;
+    static const std::map<std::string, std::string> globals = {
+        {"model.embed_tokens.weight", "token_embd.weight"},
+        {"model.norm.weight", "output_norm.weight"},
+        {"lm_head.weight", "output.weight"},
+    };
+    if (const auto found = globals.find(name); found != globals.end()) {
+        parsed.matched = true;
+        parsed.gguf = found->second;
+        return parsed;
+    }
+    std::uint32_t index = 0;
+    std::string rest;
+    if (!split_indexed(name, "model.layers.", index, rest)) return parsed;
+    const auto& layers = qwen3_5_layer_names();
+    const auto found = layers.find(rest);
+    if (found == layers.end()) return parsed;
+    parsed.matched = true;
+    parsed.layer = index;
+    parsed.gguf = "blk." + std::to_string(index) + "." + found->second;
+    return parsed;
+}
+
+// Z-Image DiT. Names pass through as diffusers spells them, with one change:
+// each block's `attention.to_q/to_k/to_v` are stacked into a single
+// `attention.qkv.weight` of shape [3*dim][dim] (q rows, then k, then v), so the
+// projection is one GEMM and lands in the fused layout the attention kernel
+// reads. The stack rides build_tensors' expert path with q/k/v as pieces 0/1/2.
+inline ParsedName translate_zimage(const std::string& name) {
+    ParsedName parsed;
+    parsed.matched = true;
+    parsed.gguf = name;
+    static const char* const pieces[] = {"to_q", "to_k", "to_v"};
+    for (std::uint32_t piece = 0; piece < 3; ++piece) {
+        const std::string suffix = std::string(".attention.") + pieces[piece] + ".weight";
+        if (name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            parsed.is_expert = true;
+            parsed.expert = piece;
+            parsed.gguf = name.substr(0, name.size() - suffix.size()) +
+                          ".attention.qkv.weight";
+            return parsed;
+        }
+    }
+    return parsed;
+}
+
+// AutoencoderKL: only the decoder half is executed, so the encoder and the
+// quant convs are recognised and dropped; everything else keeps its name.
+inline ParsedName translate_autoencoder_kl(const std::string& name) {
+    ParsedName parsed;
+    parsed.matched = true;
+    if (name.rfind("encoder.", 0) == 0 || name.rfind("quant_conv.", 0) == 0) {
+        parsed.skip = true;
+        return parsed;
+    }
+    parsed.gguf = name;
+    return parsed;
+}
+
 // Splits `model.layers.<N>.<rest>` and translates. `full_attention` decides the
 // two ambiguous g_proj cases.
 inline ParsedName translate(const std::string& name,
                             const ModelConfig& config) {
     if (config.architecture == "qwen35") return translate_qwen3_5(name, config);
+    if (config.architecture == "qwen3") return translate_qwen3(name);
+    if (config.architecture == "zimage-dit") return translate_zimage(name);
+    if (config.architecture == "autoencoder-kl") return translate_autoencoder_kl(name);
     const auto& linear_layer = config.sliding_window_pattern;
     ParsedName parsed;
     const auto& globals = global_names();
