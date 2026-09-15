@@ -92,7 +92,7 @@ class ImageGenerator:
         max_width: int = 1024,
         max_height: int = 1024,
         weights: str = "auto",
-        precision: str = "fast",
+        precision: str = "balanced",
         model_name: str | None = None,
     ) -> None:
         root = Path(snapshot)
@@ -140,7 +140,7 @@ class ImageGenerator:
             "max_size": f"{self.max_width}x{self.max_height}",
             "default_steps": DEFAULT_STEPS,
             "weights": "host" if info["host_weights"] else "device",
-            "precision": "exact" if info["exact"] else "fast",
+            "precision": "exact" if info["exact"] else "balanced" if info["balanced"] else "fast",
             "device_mib": int(info["device_bytes"]) // (1024 * 1024),
             "host_mib": int(info["host_bytes"]) // (1024 * 1024),
             "busy": self.busy,

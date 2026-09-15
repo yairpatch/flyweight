@@ -2728,7 +2728,7 @@ class NativeV2InferenceService(InferenceService):
         image_model_path: Path | str | None = None,
         image_max_size: int = 1024,
         image_weights: str = "auto",
-        image_precision: str = "fast",
+        image_precision: str = "balanced",
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,

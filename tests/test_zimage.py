@@ -123,6 +123,14 @@ class ZImageLoaderTests(unittest.TestCase):
             self.assertEqual(rgb, tower.generate(tokens, 64, 48, steps=2, seed=3))
         finally:
             tower.close()
+        # Balanced precision: the bf16 GEMM over the stored Q8_0 weights.
+        tower = V2Diffusion(encoder, transformer, vae, max_width=64, max_height=48,
+                            max_prompt_tokens=64, weights="device", precision="balanced")
+        try:
+            self.assertTrue(tower.info["balanced"])
+            self.assertEqual(len(tower.generate(tokens, 64, 48, steps=2, seed=3)), 64 * 48 * 3)
+        finally:
+            tower.close()
         # Exact precision takes the f32 paths end to end.
         tower = V2Diffusion(encoder, transformer, vae, max_width=64, max_height=48,
                             max_prompt_tokens=64, weights="device", precision="exact")

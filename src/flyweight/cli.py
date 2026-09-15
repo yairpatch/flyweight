@@ -545,10 +545,11 @@ def _add_runtime_options(
              "they would take more than half the card",
     )
     add(
-        placement, "--image-precision", choices=("fast", "exact"), default="fast",
-        help="fast: Q8 activations and bf16 tensor-core attention and "
-             "convolutions; exact: f32 activations everywhere but the stored "
-             "weights, several times slower and closer to the reference",
+        placement, "--image-precision", choices=("fast", "balanced", "exact"), default="balanced",
+        help="fast: Q8 activations on int8 tensor cores; balanced: bf16 "
+             "activations over the Q8_0 weights on bf16 tensor cores (the "
+             "reference's own numerics); exact: f32 activations everywhere "
+             "but the stored weights, several times slower",
     )
 
     add(
@@ -1626,7 +1627,7 @@ def _serve(args: argparse.Namespace) -> int:
         image_model_path=getattr(args, "image_model", None),
         image_max_size=getattr(args, "image_max_size", 1024),
         image_weights=getattr(args, "image_weights", "auto"),
-        image_precision=getattr(args, "image_precision", "fast"),
+        image_precision=getattr(args, "image_precision", "balanced"),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,

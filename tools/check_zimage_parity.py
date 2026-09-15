@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--stages", default="text,step,decode,generate")
     parser.add_argument("--max-size", type=int, default=0)
     parser.add_argument("--weights", default="device", choices=("device", "host", "auto"))
-    parser.add_argument("--precision", default="fast", choices=("fast", "exact"))
+    parser.add_argument("--precision", default="fast", choices=("fast", "balanced", "exact"))
     args = parser.parse_args()
     ref = np.load(args.ref)
     size = ref["image"].shape[0]

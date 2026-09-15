@@ -499,6 +499,7 @@ class _DiffusionInfo(ctypes.Structure):
     _fields_ = [
         ("host_weights", ctypes.c_uint32),
         ("exact", ctypes.c_uint32),
+        ("balanced", ctypes.c_uint32),
         ("max_width", ctypes.c_uint32),
         ("max_height", ctypes.c_uint32),
         ("device_bytes", ctypes.c_uint64),
@@ -510,7 +511,8 @@ class _DiffusionInfo(ctypes.Structure):
 DIFFUSION_WEIGHTS = {"device": 0, "host": 1, "auto": 2}
 # OR-ed into the weights flag: exact f32 activations instead of the Q8/bf16 paths.
 DIFFUSION_EXACT = 8
-DIFFUSION_PRECISION = {"fast": 0, "exact": DIFFUSION_EXACT}
+DIFFUSION_BALANCED = 16
+DIFFUSION_PRECISION = {"fast": 0, "balanced": DIFFUSION_BALANCED, "exact": DIFFUSION_EXACT}
 
 
 class _QwenTaskEvent(ctypes.Structure):
@@ -3449,8 +3451,10 @@ class V2Diffusion:
     hundred MiB of device memory, so a chat model can share the card), or
     ``"auto"`` (host when they would take more than half the card).
     ``precision`` is ``"fast"`` (Q8 activations, bf16 attention and
-    convolutions on tensor cores) or ``"exact"`` (f32 everywhere but the
-    stored weights; several times slower).
+    convolutions on tensor cores), ``"balanced"`` (bf16 activations into a
+    tensor-core GEMM over the stored Q8_0 weights, bf16 attention and
+    convolutions) or ``"exact"`` (f32 everywhere but the stored weights;
+    several times slower).
     """
 
     def __init__(
@@ -3495,6 +3499,7 @@ class V2Diffusion:
         return {
             "host_weights": bool(value.host_weights),
             "exact": bool(value.exact),
+            "balanced": bool(value.balanced),
             "max_width": int(value.max_width),
             "max_height": int(value.max_height),
             "device_bytes": int(value.device_bytes),

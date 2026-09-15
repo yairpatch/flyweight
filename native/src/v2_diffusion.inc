@@ -104,6 +104,10 @@ struct FlyweightV2Diffusion {
     // quantization), f32 attention and f32 convolutions. Several times
     // slower; the weights stay quantized as loaded.
     bool exact = false;
+    // Balanced mode: Q8_0 weights dequantized to bf16 inside a tensor-core
+    // GEMM with bf16 activations (diffusers' numerics), bf16 attention and
+    // convolutions. Between fast and exact in both cost and error.
+    bool balanced = false;
 
     // Text encoder.
     const Tensor* token_embedding = nullptr;
@@ -543,9 +547,10 @@ struct DiffArena {
     }
 };
 
-// Bytes the Q8 activation staging needs for `rows` of `width`.
+// Bytes the Q8 activation staging needs for `rows` of `width`; the bf16
+// staging of balanced mode reuses the same allocation at twice the bytes.
 std::uint64_t diff_q8_bytes(std::uint64_t rows, int width) {
-    return diff_align(rows * width) + diff_align(rows * (width / 32) * 4);
+    return diff_align(rows * width * 2) + diff_align(rows * (width / 32) * 4);
 }
 
 std::uint64_t diff_transformer_workspace(const FlyweightV2Diffusion& d, std::uint64_t rows) {
@@ -745,7 +750,19 @@ struct DiffLaunch {
         }
         const auto* format = flyweight::v2::qwen_format(m.type);
         if (!format) throw std::runtime_error("diffusion GEMM: no kernels for weight type " + std::to_string(m.type));
-        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact;
+        if (d.balanced && m.type == 8 && (in & 63) == 0 && q8 && d.flash_attention) {
+            // q8 doubles as the bf16 activation staging: it is sized for
+            // rows * width * 2 bytes when balanced (see the workspaces).
+            long long elements = static_cast<long long>(rows) * in;
+            void* pack_arguments[] = {&input, &q8, &elements};
+            run("diff_pack_rows_bf16", grid_for(static_cast<std::uint64_t>(elements)), 1, 256, pack_arguments);
+            void* arguments[] = {const_cast<std::uint64_t*>(&m.device), &q8, &output, &in, &out, &count};
+            run("diff_q8_bf16_gemm", static_cast<std::uint32_t>((out + 63) / 64),
+                static_cast<std::uint32_t>((rows + 127) / 128), 256, arguments);
+            if (m.bias) add_bias(output, m.bias, out, rows);
+            return;
+        }
+        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact && !d.balanced;
         if (mmq) {
             int scale_stride = (in / 32) * 2;
             {
@@ -873,7 +890,7 @@ void diff_encode_text(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std:
     const std::uint64_t d_k16 = arena.take(count * kv_width * 2);
     const std::uint64_t d_v16 = arena.take(count * kv_width * 2);
     const int q8_width = std::max(d.encoder_intermediate, hidden);
-    const std::uint64_t d_q8 = arena.take(count * q8_width);
+    const std::uint64_t d_q8 = arena.take(count * q8_width * 2);
     const std::uint64_t d_q8_scales = arena.take(count * (q8_width / 32) * 4);
 
     // Token embeddings gathered on the host: the table is quantized and a
@@ -964,7 +981,7 @@ DiffTransformerBuffers diff_transformer_buffers(FlyweightV2Diffusion& d, DiffAre
     b.t_mid = arena.take(kDiffTimeMlpWidth * f);
     b.t_emb = arena.take(kDiffAdalnWidth * f);
     const int q8_width = std::max(d.intermediate, d.dim);
-    b.q8 = arena.take(rows * q8_width);
+    b.q8 = arena.take(rows * q8_width * 2);
     b.q8_scales = arena.take(rows * (q8_width / 32) * 4);
     return b;
 }
@@ -1557,7 +1574,8 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
                                   uint32_t max_height, uint32_t max_prompt_tokens, uint32_t weights,
                                   FlyweightV2Diffusion** out) { return guarded([&]{
     const bool exact = (weights & FLYWEIGHT_V2_DIFFUSION_EXACT) != 0;
-    weights &= ~FLYWEIGHT_V2_DIFFUSION_EXACT;
+    const bool balanced = (weights & FLYWEIGHT_V2_DIFFUSION_BALANCED) != 0 && !exact;
+    weights &= ~(FLYWEIGHT_V2_DIFFUSION_EXACT | FLYWEIGHT_V2_DIFFUSION_BALANCED);
     if (weights > FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO)
         throw std::runtime_error("invalid diffusion weights placement");
     if (!encoder || !transformer || !vae || !out) throw std::runtime_error("invalid diffusion create arguments");
@@ -1580,6 +1598,7 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
     d->max_height = max_height;
     d->max_prompt_tokens = max_prompt_tokens;
     d->exact = exact;
+    d->balanced = balanced;
     if (flyweight_gpu_init(device) != 0) throw std::runtime_error("failed to initialize native CUDA runtime");
     {
         std::vector<std::string> option_storage;
@@ -1671,6 +1690,7 @@ int flyweight_v2_diffusion_info(const FlyweightV2Diffusion* d, FlyweightV2Diffus
     if (!d || !out) throw std::runtime_error("invalid diffusion info arguments");
     out->host_weights = d->host_weights ? 1u : 0u;
     out->exact = d->exact ? 1u : 0u;
+    out->balanced = d->balanced ? 1u : 0u;
     out->device_bytes = d->weight_bytes + d->workspace_bytes + 2 * (d->host_weights ? d->staging_bytes : 0);
     out->host_bytes = d->host_bytes;
     out->max_width = d->max_width;

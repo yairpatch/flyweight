@@ -513,12 +513,14 @@ the DiT's own work and costs well under a second per image. `auto` (the default)
 picks `host` when the weights would take more than half the card, which
 is what lets a 12 GB card serve Qwen3.6-35B and Z-Image together. The
 image model loads before the chat runtime plans its memory either way.
-`--image-precision exact` swaps the Q8-activation GEMMs, the bf16
-attention and the bf16 convolutions for their f32 paths: the DiT step
-lands 3.3% RMS from an f32 reference instead of 6.6% (diffusers' own
-bf16 run is at 5.1%), at four times the render time, about 2.5 minutes
-per 1024x1024 image on the laptop card. The stored weights stay Q8_0
-either way. `--image-max-size` fixes the largest side (the workspace is
+`--image-precision` picks the arithmetic. `balanced` (the default) runs
+bf16 activations through a tensor-core GEMM that dequantizes the stored
+Q8_0 weights in place, with bf16 attention and convolutions: the DiT
+step lands 3.7% RMS from an f32 reference, inside diffusers' own bf16
+run at 5.1%, at no cost over `fast`. `fast` quantizes activations to
+int8 for the MMQ kernels instead (6.6%). `exact` keeps f32 activations
+everywhere (3.3%) at about eight times the render time. The stored
+weights stay Q8_0 in every mode. `--image-max-size` fixes the largest side (the workspace is
 reserved for it at startup) and sizes must be multiples of 16; larger
 sides work with a larger reservation, 1536x1536 taking about 45 s and
 2.9 GB of VRAM. Outputs are base64 PNG

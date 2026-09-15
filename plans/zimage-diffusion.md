@@ -90,6 +90,16 @@ times when syncing).
   ~1.65 s: MMQ ~1 s (47 TFLOP at ~45 TOPS), attention 0.15 s, the rest
   elementwise. 512x512: 3.5 s.
 
+## Balanced precision (2026-09-15)
+
+`diff_q8_bf16_gemm`: a 128x64-tile bf16 mma GEMM that stages Q8_0 blocks as
+bf16 (28 TFLOPS on 3840->11520 at 4160 rows, 16 on 10240->3840) with the
+activations packed to bf16 by `diff_pack_rows_bf16`. Step error vs f32 at
+1024: fast 6.6%, balanced 3.7%, exact 3.3%, diffusers bf16 5.1%; balanced
+costs the same wall time as fast, so it is the default. Remaining error in
+balanced is the Q8_0 weights plus bf16 rounding of activations; exact
+removes the latter for 8x the time.
+
 ## Precision switch (2026-09-15)
 
 `--image-precision exact` (`FLYWEIGHT_V2_DIFFUSION_EXACT` in the create
