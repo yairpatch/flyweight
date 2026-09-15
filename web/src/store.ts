@@ -89,7 +89,7 @@ const IMAGE_SETTINGS_KEY = "flyweight.images.settings.v1";
 
 const DEFAULT_IMAGE_SETTINGS: ImageSettings = { aspect: "1:1", size: 1024, steps: 8, seed: null };
 const VIDEO_SETTINGS_KEY = "flyweight.videos.settings.v1";
-const DEFAULT_VIDEO_SETTINGS: VideoSettings = { aspect: "16:9", size: 640, frames: 124, steps: 8, seed: null };
+const DEFAULT_VIDEO_SETTINGS: VideoSettings = { aspect: "16:9", size: 640, frames: 124, steps: 50, seed: null };
 
 /** Pixel size of a clip: the long side on the chosen aspect, shrunk into the server's canvas, multiples of 32. */
 export function videoDimensions(settings: VideoSettings, maxWidth: number, maxHeight: number): { width: number; height: number } {

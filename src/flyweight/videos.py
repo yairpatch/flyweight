@@ -34,7 +34,7 @@ from .server import APIError
 from .v2 import V2Diffusion, V2Model
 
 FPS = 24
-DEFAULT_STEPS = 8
+DEFAULT_STEPS = 50
 DEFAULT_SHIFT = 12.0
 DEFAULT_AUDIO_SHIFT = 3.0
 DEFAULT_FRAMES = 124
@@ -351,6 +351,8 @@ class VideoGenerator:
                     ratio = np.float32(sigmas[step + 1] / sigmas[step])
                     sample[...] = ratio * sample + (np.float32(1.0) - ratio) * denoised
                 report(step + 1, "denoise")
+            # Kept for the parity tools: the final latents of the last clip.
+            self.last_latents = (video.copy(), (latent_t, latent_h, latent_w))
             rgb, decoded = self.tower.h3_decode(video.ravel(), latent_t, latent_h, latent_w)
             pixels = np.frombuffer(rgb, dtype=np.uint8).reshape(decoded, height, width, 3)[:frames]
             clip = encode_mp4(pixels, width, height)

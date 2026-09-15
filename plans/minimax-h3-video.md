@@ -14,7 +14,9 @@ as fp16 safetensors) with the configs and tokenizer from
   linear per block, per-modality modulation rows) and the ViT VAE decoder
   (36 layers, per-head interleaved `to_qkv` reordered at load, register and
   zero tokens, rope over `(2(i+0.5)/n - 1) * 2pi`, diffusers' `_decode`
-  chunk/blend/pad-cut).
+  chunk/blend/pad-cut, and the same 256-pixel spatial tiles with 64-pixel
+  linearly blended overlaps). Without the tiles the decode drifts from 0.7% to
+  27% RMS as the width grows past 16 latents and every frame shows a grid.
 - The sequence is `[text | audio | video]`; audio rows are channel-major, two
   channels of 32-wide latents, 40 per second. Text rows inherit the video
   timestep.

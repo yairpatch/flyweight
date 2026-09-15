@@ -501,6 +501,9 @@ void h3_attach_vae(FlyweightV2Diffusion& d) {
     h3_upload_vae(d, *d.h3);
 }
 
+constexpr int kH3VaeTilePixels = 256;
+constexpr int kH3VaeTileOverlapPixels = 64;
+
 std::uint64_t h3_workspace_for(const FlyweightV2Diffusion& d, std::uint32_t text, std::uint32_t width,
                                std::uint32_t height, std::uint32_t frames) {
     const auto& h3 = *d.h3;
@@ -508,7 +511,10 @@ std::uint64_t h3_workspace_for(const FlyweightV2Diffusion& d, std::uint32_t text
     if (h3.has_vae) {
         const int chunk = (h3.vae_clip_length + h3.vae_temporal - 1) / h3.vae_temporal;
         const int token_overlap = (-h3.vae_token_drop % chunk + chunk) % chunk;
-        const std::uint64_t voxels = static_cast<std::uint64_t>(chunk + token_overlap) * (height / h3.vae_spatial) * (width / h3.vae_spatial);
+        // The decoder runs in tiles of at most kH3VaeTilePixels a side.
+        const std::uint64_t tile_h = std::min<std::uint64_t>(height, kH3VaeTilePixels) / h3.vae_spatial;
+        const std::uint64_t tile_w = std::min<std::uint64_t>(width, kH3VaeTilePixels) / h3.vae_spatial;
+        const std::uint64_t voxels = static_cast<std::uint64_t>(chunk + token_overlap) * tile_h * tile_w;
         vae_bytes = h3_vae_workspace_bytes(h3, voxels + h3.vae_registers + 1, voxels);
     }
     int aligned = static_cast<int>(frames);
@@ -730,6 +736,92 @@ void h3_vae_decode_clip(FlyweightV2Diffusion& d, FlyweightV2H3& h3, const float*
             }
 }
 
+// diffusers decodes in 256-pixel spatial tiles overlapping by at least 64
+// (`use_tiling` is on by default and the pipeline keeps it): the ViT decoder
+// was run that way, and attending over a whole wider frame drifts visibly.
+
+// diffusers' `_split_tiles`: the fewest `tile`-wide tiles whose union covers
+// `length` with every overlap at least `min_overlap`; the slack goes round
+// robin onto the overlaps in whole `ratio` steps so boundaries stay
+// latent-aligned. One tile when `tile >= length`.
+void h3_vae_split_tiles(int length, int tile, int min_overlap, int ratio, std::vector<int>& starts,
+                        std::vector<int>& overlaps) {
+    starts.clear();
+    overlaps.clear();
+    starts.push_back(0);
+    if (tile >= length) return;
+    int num = (length + tile - 1) / tile;
+    while (tile * num - min_overlap * (num - 1) - length < 0) ++num;
+    overlaps.assign(num - 1, min_overlap);
+    const int remaining = tile * num - min_overlap * (num - 1) - length;
+    for (int i = 0; i < remaining / ratio; ++i) overlaps[i % (num - 1)] += ratio;
+    for (int i = 0; i < num - 1; ++i) starts.push_back(starts.back() + tile - overlaps[i]);
+}
+
+// One clip through the spatial tiling and diffusers' `_stitch_tiles`: every
+// tile is decoded raw, then blended linearly with the raw tile above and the
+// raw tile to its left over the overlaps and cropped by its own overlaps.
+void h3_vae_decode_clip_tiled(FlyweightV2Diffusion& d, FlyweightV2H3& h3, const float* z, int frames, int latent_h,
+                              int latent_w, float* pixels) {
+    const int ps = h3.vae_spatial, pt = h3.vae_temporal, channels = h3.vae_latent_channels;
+    const int tile_latents = kH3VaeTilePixels / ps;
+    if (latent_h <= tile_latents && latent_w <= tile_latents) {
+        h3_vae_decode_clip(d, h3, z, frames, latent_h, latent_w, pixels);
+        return;
+    }
+    std::vector<int> starts_y, overlaps_y, starts_x, overlaps_x;
+    h3_vae_split_tiles(latent_h * ps, kH3VaeTilePixels, kH3VaeTileOverlapPixels, ps, starts_y, overlaps_y);
+    h3_vae_split_tiles(latent_w * ps, kH3VaeTilePixels, kH3VaeTileOverlapPixels, ps, starts_x, overlaps_x);
+    const int ty = std::min(latent_h, tile_latents), tx = std::min(latent_w, tile_latents);   // tile size in latents
+    const int th = ty * ps, tw = tx * ps, out_t = frames * pt;
+    const int out_h = latent_h * ps, out_w = latent_w * ps;
+    const std::uint64_t tile_values = static_cast<std::uint64_t>(3) * out_t * th * tw;
+    const std::size_t rows = starts_y.size(), cols = starts_x.size();
+    std::vector<std::vector<float>> tiles(rows * cols);
+    std::vector<float> tile_latents_buffer(static_cast<std::uint64_t>(channels) * frames * ty * tx);
+    for (std::size_t i = 0; i < rows; ++i)
+        for (std::size_t j = 0; j < cols; ++j) {
+            const int y0 = starts_y[i] / ps, x0 = starts_x[j] / ps;
+            for (int c = 0; c < channels; ++c)
+                for (int t = 0; t < frames; ++t)
+                    for (int y = 0; y < ty; ++y)
+                        std::memcpy(tile_latents_buffer.data() + ((static_cast<std::uint64_t>(c) * frames + t) * ty + y) * tx,
+                                    z + ((static_cast<std::uint64_t>(c) * frames + t) * latent_h + y0 + y) * latent_w + x0,
+                                    static_cast<std::size_t>(tx) * sizeof(float));
+            tiles[i * cols + j].assign(tile_values, 0.0f);
+            h3_vae_decode_clip(d, h3, tile_latents_buffer.data(), frames, ty, tx, tiles[i * cols + j].data());
+        }
+    auto at = [&](const std::vector<float>& tile, int c, int t, int y, int x) {
+        return tile[((static_cast<std::uint64_t>(c) * out_t + t) * th + y) * tw + x];
+    };
+    for (std::size_t i = 0; i < rows; ++i)
+        for (std::size_t j = 0; j < cols; ++j) {
+            const std::vector<float>& tile = tiles[i * cols + j];
+            const std::vector<float>* above = i > 0 ? &tiles[(i - 1) * cols + j] : nullptr;
+            const std::vector<float>* left = j > 0 ? &tiles[i * cols + j - 1] : nullptr;
+            const int oy = i > 0 ? overlaps_y[i - 1] : 0, ox = j > 0 ? overlaps_x[j - 1] : 0;
+            const int keep_h = th - (i + 1 < rows ? overlaps_y[i] : 0);
+            const int keep_w = tw - (j + 1 < cols ? overlaps_x[j] : 0);
+            for (int c = 0; c < 3; ++c)
+                for (int t = 0; t < out_t; ++t)
+                    for (int y = 0; y < keep_h; ++y) {
+                        float* out = pixels + ((static_cast<std::uint64_t>(c) * out_t + t) * out_h + starts_y[i] + y) * out_w + starts_x[j];
+                        for (int x = 0; x < keep_w; ++x) {
+                            float value = at(tile, c, t, y, x);
+                            if (above && y < oy) {
+                                const float w = static_cast<float>(y) / oy;
+                                value = at(*above, c, t, th - oy + y, x) * (1.0f - w) + value * w;
+                            }
+                            if (left && x < ox) {
+                                const float w = static_cast<float>(x) / ox;
+                                value = at(*left, c, t, y, tw - ox + x) * (1.0f - w) + value * w;
+                            }
+                            out[x] = value;
+                        }
+                    }
+        }
+}
+
 // The whole latent video, chunked as diffusers' `_decode`: every clip holds
 // tokens_chunk_size + overlap latent frames, each decoded clip drops its first
 // `pre_padding` frames, and consecutive clips cross-fade over `frame_overlap`.
@@ -786,7 +878,7 @@ int h3_vae_decode(FlyweightV2Diffusion& d, FlyweightV2H3& h3, const float* laten
         const int clip_frames = count * temporal;
         clip_pixels.assign(static_cast<std::uint64_t>(clip_frames) * frame_values, 0.0f);
         // The decoder writes [3][F][H][W]; keep that and index frames through channels.
-        h3_vae_decode_clip(d, h3, clip_latents.data(), count, latent_h, latent_w, clip_pixels.data());
+        h3_vae_decode_clip_tiled(d, h3, clip_latents.data(), count, latent_h, latent_w, clip_pixels.data());
         auto clip_frame = [&](int t, int c) { return clip_pixels.data() + (static_cast<std::uint64_t>(c) * clip_frames + t) * out_h * out_w; };
         // Segment j = 0: this chunk's frames; j = 1: the overlap tail for the next.
         for (int j = 0; j < (h3.vae_token_drop > 0 ? 2 : 1); ++j) {

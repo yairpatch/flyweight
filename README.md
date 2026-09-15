@@ -590,7 +590,11 @@ them until the user saves custom settings.
 beside the chat model and serves text-to-video at `/v1/videos/generations`
 (`prompt`, `size` in multiples of 32, `frames`, `steps`, `seed`, `shift`;
 the clip comes back as base64 MP4 in `data[0].b64_json`) and in the chat
-UI's **Video studio**. The model directory holds the
+UI's **Video studio**. The model card recommends a 768-pixel short edge
+and its prompts are the structured `integrated_multimodal_description` /
+`overall_soundscape` / `non_diegetic_music` text of the release's
+prompting guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md` in the
+snapshot); short plain prompts and small canvases render noticeably worse. The model directory holds the
 [unsloth GGUFs](https://huggingface.co/unsloth/MiniMax-H3-GGUF) next to
 the release's configs:
 
@@ -620,7 +624,9 @@ DiT (50 blocks, 3-axis rope over text, audio and video rows, a pruned
 adaLN table) steps the video and audio latents down two rectified-flow
 schedules (shift 12 and 3) with the model's data-ward velocity; the ViT
 decoder turns the video latents into frames in the same overlapping chunks
-as diffusers. The audio rows take part in every step because the video
+as diffusers, and in the same 256-pixel spatial tiles: the ViT decoder is
+meant to be run that way, and decoding a whole wider frame at once leaves a
+visible grid. The audio rows take part in every step because the video
 attends to them, but the audio VAE is not ported yet, so clips are silent.
 The VAE is quantized to Q8_0 on first open and cached beside it. Frames
 snap up to the `17n + 5` the VAE decodes, at 24 fps; the released model is
@@ -631,8 +637,10 @@ Weights stream from pinned host memory by default (`--video-weights`): the
 encoder and DiT are 31 GB together, so the tower holds about 1.1 GB of VRAM
 at 640x384 and the chat model keeps the card. The whole run is compute on
 the DiT: a step at 640x384 and 124 frames takes 16 s on an RTX 5070 Ti
-laptop, so an eight-step clip is about two minutes; the decode is a
-second. `--video-max-size` and `--video-max-frames` size the workspace
+laptop. The model is guidance-distilled but not step-distilled, and the
+reference runs 50 steps (the default here too), so a clip at that size is
+about 13 minutes; `steps` trades quality for time. The decode is a few
+seconds. `--video-max-size` and `--video-max-frames` size the workspace
 (default 640x384 and 124 frames); a larger canvas costs attention time
 quadratically. Against the torch reference on the same GGUF weights the
 encoder matches to 0.02% RMS, the DiT step to a cosine of 0.9999, and the

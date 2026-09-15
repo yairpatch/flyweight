@@ -268,6 +268,44 @@ def vae(args: argparse.Namespace) -> None:
         out = out.view(F, Hh, Ww, 3, pt, ps, ps).permute(3, 0, 4, 1, 5, 2, 6).reshape(3, F * pt, Hh * ps, Ww * ps)
         return out
 
+    # diffusers' spatial tiling (`use_tiling` defaults on): 256-pixel tiles, >= 64 overlap, latent-aligned.
+    def split_tiles(length, tile=256, min_overlap=64, ratio=16):
+        if tile >= length:
+            return [0], [length], []
+        num = math.ceil(length / tile)
+        while tile * num - min_overlap * (num - 1) - length < 0:
+            num += 1
+        overlaps = [min_overlap] * (num - 1)
+        for i in range((tile * num - sum(overlaps) - length) // ratio):
+            overlaps[i % (num - 1)] += ratio
+        starts = [0]
+        for i in range(num - 1):
+            starts.append(starts[-1] + tile - overlaps[i])
+        return starts, [tile] * num, overlaps
+
+    def blend(a, b, extent, dim):
+        extent = min(a.shape[dim], b.shape[dim], extent)
+        weights_ = torch.arange(extent).float() / extent
+        shape = [1] * a.ndim; shape[dim] = extent
+        head = a.narrow(dim, a.shape[dim] - extent, extent) * (1 - weights_.view(shape)) + b.narrow(dim, 0, extent) * weights_.view(shape)
+        return head if extent == b.shape[dim] else torch.cat([head, b.narrow(dim, extent, b.shape[dim] - extent)], dim)
+
+    def decode_clip_tiled(clip):
+        C, F, Hh, Ww = clip.shape
+        ys, ylens, yov = split_tiles(Hh * 16); xs, xlens, xov = split_tiles(Ww * 16)
+        tiles = [[decode_clip(clip[:, :, y // 16: (y + yl) // 16, x // 16: (x + xl) // 16]) for x, xl in zip(xs, xlens)] for y, yl in zip(ys, ylens)]
+        rows = []
+        for i, row in enumerate(tiles):
+            out_row = []
+            for j, tile in enumerate(row):
+                if i > 0: tile = blend(tiles[i - 1][j], tile, yov[i - 1], -2)
+                if j > 0: tile = blend(row[j - 1], tile, xov[j - 1], -1)
+                if i < len(tiles) - 1: tile = tile[..., : tile.shape[-2] - yov[i], :]
+                if j < len(row) - 1: tile = tile[..., : tile.shape[-1] - xov[j]]
+                out_row.append(tile)
+            rows.append(torch.cat(out_row, -1))
+        return torch.cat(rows, -2)
+
     # _decode chunking
     clip_length, token_drop, temporal = 17, 3, 4
     tokens_chunk = math.ceil(clip_length / temporal); token_overlap = (-token_drop) % tokens_chunk
@@ -282,7 +320,7 @@ def vae(args: argparse.Namespace) -> None:
     started = time.time()
     for i in range(num_chunks):
         start = i * tokens_chunk
-        clip = decode_clip(z[:, start: start + tokens_chunk + token_overlap])
+        clip = decode_clip_tiled(z[:, start: start + tokens_chunk + token_overlap])
         print(f"clip {i} decoded, {time.time() - started:.0f}s", flush=True)
         for j in range(int(token_drop > 0) + 1):
             fs = j * chunk_frames
