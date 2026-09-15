@@ -28,7 +28,13 @@ interface GenerationResponse {
   data: Array<{ b64_json: string; seed: number; seconds: number }>;
 }
 
-const SIDES = [256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024];
+/** Side lengths offered up to the server's limit: every 64 px from 256, the limit itself included. */
+function sidesUpTo(limit: number): number[] {
+  const sides: number[] = [];
+  for (let side = 256; side <= limit; side += 64) sides.push(side);
+  if (sides[sides.length - 1] !== limit && limit % 16 === 0) sides.push(limit);
+  return sides;
+}
 
 function maxSide(info: ImagesInfo | null): number {
   const text = info?.max_size ?? "512x512";
@@ -43,8 +49,8 @@ export function ImagesPanel() {
   const info = (health?.execution?.images as ImagesInfo | null | undefined) ?? null;
   const limit = maxSide(info);
   const [prompt, setPrompt] = useState("");
-  const [width, setWidth] = useState(Math.min(512, limit));
-  const [height, setHeight] = useState(Math.min(512, limit));
+  const [width, setWidth] = useState(Math.min(1024, limit));
+  const [height, setHeight] = useState(Math.min(1024, limit));
   const [steps, setSteps] = useState(info?.default_steps ?? 8);
   const [seed, setSeed] = useState("");
   const [running, setRunning] = useState(false);
@@ -106,7 +112,7 @@ export function ImagesPanel() {
     }
   };
 
-  const sides = SIDES.filter((side) => side <= limit);
+  const sides = sidesUpTo(limit);
 
   return (
     <div className="images">
