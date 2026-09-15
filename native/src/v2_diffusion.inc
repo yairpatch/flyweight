@@ -754,10 +754,10 @@ struct DiffLaunch {
             // q8 doubles as the bf16 activation staging: it is sized for
             // rows * width * 2 bytes when balanced (see the workspaces).
             long long elements = static_cast<long long>(rows) * in;
-            void* pack_arguments[] = {&input, &q8, &elements};
+            void* pack_arguments[] = {&input, &q8, &in, &elements};
             run("diff_pack_rows_bf16", grid_for(static_cast<std::uint64_t>(elements)), 1, 256, pack_arguments);
             void* arguments[] = {const_cast<std::uint64_t*>(&m.device), &q8, &output, &in, &out, &count};
-            run("diff_q8_bf16_gemm", static_cast<std::uint32_t>((out + 63) / 64),
+            run("diff_q8_bf16_gemm", static_cast<std::uint32_t>((out + 127) / 128),
                 static_cast<std::uint32_t>((rows + 127) / 128), 256, arguments);
             if (m.bias) add_bias(output, m.bias, out, rows);
             return;

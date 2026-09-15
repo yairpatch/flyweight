@@ -288,6 +288,13 @@ void diff_attention_rows(
 // f32 rows -> head-major bf16 planes [heads][rows][128], the queries
 // pre-scaled by `q_scale` (the softmax scale times log2 e, so the softmax
 // runs on exp2). Round-to-nearest-even by hand: the corpus is also host C++.
+// Slot of channel j (0..15) within its block: lane pair p = (j % 8) / 2
+// holds channels {2p, 2p+1, 2p+8, 2p+9} of an m16n8k16 k-step, so those
+// four go adjacent.
+__device__ __forceinline__ int diff_channel_slot(int j) {
+    return ((j & 7) >> 1) * 4 + (j >> 3) * 2 + (j & 1);
+}
+
 __device__ __forceinline__ unsigned short diff_f32_to_bf16(float value) {
     unsigned int bits = __float_as_uint(value);
     if ((bits & 0x7f800000u) == 0x7f800000u) return (unsigned short)(bits >> 16);
@@ -470,31 +477,35 @@ R"FLYWEIGHT_CUDA(
 // blocks of 32: f16 scale then 32 int8), dequantized to bf16 as each block is
 // staged. The weights keep their stored precision and only the activations
 // round to bf16 -- diffusers' own numerics -- where the MMQ path also rounds
-// activations to int8. 128x64 tile per 256-thread block (4x2 warps of
-// 32x32), K walked two Q8 blocks (64) at a time through shared memory, the
+// activations to int8. 128x128 tile per 256-thread block (4x2 warps of
+// 32x64), K walked two Q8 blocks (64) at a time through shared memory, the
 // next slab fetched into registers while the current one is multiplied.
-// Grid: (ceil(out/64), ceil(rows/128)). input_size must be a multiple of 64.
+// Both tiles keep every 16-wide k block in fragment slot order (see
+// diff_channel_slot), so a fragment's two k pairs are one 64-bit load; the
+// activations arrive that way from diff_pack_rows_bf16.
+// Grid: (ceil(out/128), ceil(rows/128)). input_size must be a multiple of 64.
 extern "C" __global__ __launch_bounds__(256)
 void diff_q8_bf16_gemm(const unsigned char* packed, const unsigned short* input, float* output,
                        const int input_size, const int output_size, const int rows) {
     __shared__ uint4 a4[128][9];   // [128 rows][72 halves]
-    __shared__ uint4 b4[64][9];    // [64 cols][72 halves]
+    __shared__ uint4 b4[128][9];   // [128 cols][72 halves]
     unsigned short (*a_tile)[72] = (unsigned short (*)[72])a4;
     unsigned short (*b_tile)[72] = (unsigned short (*)[72])b4;
-    const int row_base = blockIdx.y * 128, col_base = blockIdx.x * 64;
+    const int row_base = blockIdx.y * 128, col_base = blockIdx.x * 128;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int quad = lane >> 2, pair = lane & 3;
-    const int wm = warp >> 1, wn = warp & 1;
+    const int wm = warp >> 1, wn = warp & 1;   // 4 x 2 warps: 32 rows x 64 cols each
     const int blocks_per_row = input_size >> 5;
-    float acc[2][4][4];
-    for (int m = 0; m < 2; ++m) for (int n = 0; n < 4; ++n) for (int i = 0; i < 4; ++i) acc[m][n][i] = 0.0f;
+    float acc[2][8][4];
+    for (int m = 0; m < 2; ++m) for (int n = 0; n < 8; ++n) for (int i = 0; i < 4; ++i) acc[m][n][i] = 0.0f;
 
-    // Each thread stages 4 uint4 of A (128 rows x 64 halves = 1024 uint4) and
-    // one Q8 block of B (64 cols x 2 blocks = 128 blocks; 256 threads take
-    // half a block each: 16 values).
+    // Per slab of 64 k: A is 128 rows x 64 halves = 1024 uint4, 4 per thread;
+    // B is 128 cols x 2 Q8 blocks = 256 blocks, one half-block (16 values)
+    // per thread, dequantized into slot order.
     uint4 a_next[4];
     unsigned short b_next[16];
-    auto fetch = [&](int slab) {
+    unsigned short b_next2[16];
+    auto fetch_all = [&](int slab) {
         for (int i = 0; i < 4; ++i) {
             const int index = threadIdx.x + i * 256;
             const int r = index >> 3, c = (index & 7) * 8;
@@ -503,59 +514,66 @@ void diff_q8_bf16_gemm(const unsigned char* packed, const unsigned short* input,
                 ? *(const uint4*)(input + (long long)row * input_size + slab * 64 + c)
                 : make_uint4(0u, 0u, 0u, 0u);
         }
-        const int col = threadIdx.x >> 2, part = threadIdx.x & 3;   // part: block (0/1) x half (0/1)
-        const int n = col_base + col;
-        if (n < output_size) {
-            const unsigned char* block = packed + ((long long)n * blocks_per_row + slab * 2 + (part >> 1)) * 34;
-            unsigned short scale_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-            __half scale_half;
-            memcpy(&scale_half, &scale_bits, sizeof(scale_half));
-            const float scale = __half2float(scale_half);
-            const signed char* q = (const signed char*)(block + 2 + (part & 1) * 16);
-            for (int j = 0; j < 16; ++j) b_next[j] = diff_f32_to_bf16(scale * (float)q[j]);
-        } else {
-            for (int j = 0; j < 16; ++j) b_next[j] = 0;
+        for (int i = 0; i < 2; ++i) {
+            const int index = threadIdx.x + i * 256;
+            const int col = index >> 2, part = index & 3;
+            const int n = col_base + col;
+            unsigned short* target = i == 0 ? b_next : b_next2;
+            if (n < output_size) {
+                const unsigned char* block = packed + ((long long)n * blocks_per_row + slab * 2 + (part >> 1)) * 34;
+                unsigned short scale_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
+                __half scale_half;
+                memcpy(&scale_half, &scale_bits, sizeof(scale_half));
+                const float scale = __half2float(scale_half);
+                const signed char* q = (const signed char*)(block + 2 + (part & 1) * 16);
+                for (int j = 0; j < 16; ++j) target[diff_channel_slot(j)] = diff_f32_to_bf16(scale * (float)q[j]);
+            } else {
+                for (int j = 0; j < 16; ++j) target[j] = 0;
+            }
         }
     };
-    auto store = [&]() {
+    auto store_all = [&]() {
         for (int i = 0; i < 4; ++i) {
             const int index = threadIdx.x + i * 256;
             a4[index >> 3][index & 7] = a_next[i];
         }
-        const int col = threadIdx.x >> 2, part = threadIdx.x & 3;
-        uint4* target = &b4[col][part * 2];
-        target[0] = *(const uint4*)&b_next[0];
-        target[1] = *(const uint4*)&b_next[8];
+        for (int i = 0; i < 2; ++i) {
+            const int index = threadIdx.x + i * 256;
+            const int col = index >> 2, part = index & 3;
+            const unsigned short* source = i == 0 ? b_next : b_next2;
+            uint4* target = &b4[col][part * 2];
+            target[0] = *(const uint4*)&source[0];
+            target[1] = *(const uint4*)&source[8];
+        }
     };
 
     const int slabs = input_size >> 6;
-    fetch(0);
+    fetch_all(0);
     for (int slab = 0; slab < slabs; ++slab) {
-        store();
+        store_all();
         __syncthreads();
-        if (slab + 1 < slabs) fetch(slab + 1);
+        if (slab + 1 < slabs) fetch_all(slab + 1);
         for (int ks = 0; ks < 4; ++ks) {
             unsigned int a[2][4];
             for (int m = 0; m < 2; ++m) {
-                const int r = wm * 32 + m * 16 + quad, k = ks * 16 + pair * 2;
-                a[m][0] = *(const unsigned int*)&a_tile[r][k];
-                a[m][1] = *(const unsigned int*)&a_tile[r + 8][k];
-                a[m][2] = *(const unsigned int*)&a_tile[r][k + 8];
-                a[m][3] = *(const unsigned int*)&a_tile[r + 8][k + 8];
+                const int r = wm * 32 + m * 16 + quad, k = ks * 16 + pair * 4;
+                const uint2 low = *(const uint2*)&a_tile[r][k];
+                const uint2 high = *(const uint2*)&a_tile[r + 8][k];
+                a[m][0] = low.x;  a[m][2] = low.y;
+                a[m][1] = high.x; a[m][3] = high.y;
             }
-            for (int n = 0; n < 4; ++n) {
-                const int c = wn * 32 + n * 8 + quad, k = ks * 16 + pair * 2;
-                unsigned int b[2];
-                b[0] = *(const unsigned int*)&b_tile[c][k];
-                b[1] = *(const unsigned int*)&b_tile[c][k + 8];
+            for (int n = 0; n < 8; ++n) {
+                const int c = wn * 64 + n * 8 + quad, k = ks * 16 + pair * 4;
+                const uint2 bits = *(const uint2*)&b_tile[c][k];
+                unsigned int b[2] = {bits.x, bits.y};
                 for (int m = 0; m < 2; ++m) kv_mma_m16n8k16(acc[m][n], a[m], b, (const __nv_bfloat16*)0);
             }
         }
         __syncthreads();
     }
     for (int m = 0; m < 2; ++m)
-        for (int n = 0; n < 4; ++n) {
-            const int col = col_base + wn * 32 + n * 8 + pair * 2;
+        for (int n = 0; n < 8; ++n) {
+            const int col = col_base + wn * 64 + n * 8 + pair * 2;
             if (col >= output_size) continue;
             const int row0 = row_base + wm * 32 + m * 16 + quad, row1 = row0 + 8;
             if (row0 < rows) *(float2*)(output + (long long)row0 * output_size + col) = make_float2(acc[m][n][0], acc[m][n][1]);
@@ -563,12 +581,17 @@ void diff_q8_bf16_gemm(const unsigned char* packed, const unsigned short* input,
         }
 }
 
-// f32 rows -> bf16 rows, the GEMM above's activation input.
+// f32 rows -> bf16 rows in fragment slot order within each block of 16
+// columns, the GEMM above's activation input. `width` must be a multiple
+// of 16.
 extern "C" __global__
-void diff_pack_rows_bf16(const float* input, unsigned short* output, const long long elements) {
+void diff_pack_rows_bf16(const float* input, unsigned short* output, const int width, const long long elements) {
     for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         index < elements; index += (long long)blockDim.x * gridDim.x)
-        output[index] = diff_f32_to_bf16(input[index]);
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int column = (int)(index % width);
+        const long long row = index / width;
+        output[row * width + (column & ~15) + diff_channel_slot(column & 15)] = diff_f32_to_bf16(input[index]);
+    }
 }
 
 // Row softmax in place over [rows][width] (the autoencoder's mid-block
@@ -711,12 +734,6 @@ void diff_conv2d(const float* input, const float* weight, const float* bias,
 // out_channels % 64 == 0 (the host keeps the f32 kernel otherwise).
 // Grid: (ceil(W/128), H * out_channels/64), block 128.
 //
-// Slot of channel j (0..15) within its block: lane pair p = (j % 8) / 2
-// holds channels {2p, 2p+1, 2p+8, 2p+9} of an m16n8k16 k-step, so those
-// four go adjacent.
-__device__ __forceinline__ int diff_channel_slot(int j) {
-    return ((j & 7) >> 1) * 4 + (j >> 3) * 2 + (j & 1);
-}
 
 extern "C" __global__ __launch_bounds__(128)
 void diff_conv2d_bf16(const unsigned short* input, const unsigned short* weight, const float* bias,

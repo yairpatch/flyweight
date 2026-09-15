@@ -104,9 +104,11 @@ prefetch stays, it is no slower.
 
 ## Balanced precision (2026-09-15)
 
-`diff_q8_bf16_gemm`: a 128x64-tile bf16 mma GEMM that stages Q8_0 blocks as
-bf16 (28 TFLOPS on 3840->11520 at 4160 rows, 16 on 10240->3840) with the
-activations packed to bf16 by `diff_pack_rows_bf16`. Step error vs f32 at
+`diff_q8_bf16_gemm`: a 128x128-tile bf16 mma GEMM (4x2 warps of 32x64)
+that stages Q8_0 blocks as bf16 in fragment slot order, so every fragment
+is one 64-bit shared load; 40 TFLOPS on 3840->11520 at 4160 rows, 34 on
+10240->3840. The activations are packed to bf16 in the same slot order by
+`diff_pack_rows_bf16`. Step error vs f32 at
 1024: fast 6.6%, balanced 3.7%, exact 3.3%, diffusers bf16 5.1%; balanced
 costs the same wall time as fast, so it is the default. Remaining error in
 balanced is the Q8_0 weights plus bf16 rounding of activations; exact
