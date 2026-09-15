@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   Image as ImageIcon,
+  Clapperboard,
   MessageSquare,
   MessageSquarePlus,
   PanelLeftClose,
@@ -28,6 +29,7 @@ export function Sidebar() {
   const mode = useStore((state) => state.mode);
   const setMode = useStore((state) => state.setMode);
   const imagesEnabled = useStore((state) => Boolean(state.health?.execution?.images));
+  const videosEnabled = useStore((state) => Boolean(state.health?.execution?.videos));
   const [query, setQuery] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -80,6 +82,11 @@ export function Sidebar() {
             <ImageIcon size={16} />
             <span className="sidebar__label">New picture</span>
           </button>
+        ) : mode === "videos" ? (
+          <button className="button button--primary sidebar__new" onClick={() => { useStore.getState().selectVideo(null); useStore.getState().setVideoPrompt(""); }} title="Clear the stage for a new clip">
+            <Clapperboard size={16} />
+            <span className="sidebar__label">New clip</span>
+          </button>
         ) : (
           <button className="button button--primary sidebar__new" onClick={() => newConversation()} title="New conversation (Ctrl+Shift+O)">
             <MessageSquarePlus size={16} />
@@ -87,20 +94,30 @@ export function Sidebar() {
           </button>
         )}
       </div>
-      {(imagesEnabled || mode === "images") && (
+      {(imagesEnabled || videosEnabled || mode !== "chat") && (
         <div className="sidebar__modes" role="tablist" aria-label="Workspace">
           <button role="tab" aria-selected={mode === "chat"} className={`sidebar__mode${mode === "chat" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("chat")} title="Chat">
             <MessageSquare size={15} />
             <span className="sidebar__label">Chat</span>
           </button>
-          <button role="tab" aria-selected={mode === "images"} className={`sidebar__mode${mode === "images" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("images")} title="Images">
-            <ImageIcon size={15} />
-            <span className="sidebar__label">Images</span>
-          </button>
+          {(imagesEnabled || mode === "images") && (
+            <button role="tab" aria-selected={mode === "images"} className={`sidebar__mode${mode === "images" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("images")} title="Images">
+              <ImageIcon size={15} />
+              <span className="sidebar__label">Images</span>
+            </button>
+          )}
+          {(videosEnabled || mode === "videos") && (
+            <button role="tab" aria-selected={mode === "videos"} className={`sidebar__mode${mode === "videos" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("videos")} title="Videos">
+              <Clapperboard size={15} />
+              <span className="sidebar__label">Videos</span>
+            </button>
+          )}
         </div>
       )}
       {mode === "images" ? (
         <ImageHistory />
+      ) : mode === "videos" ? (
+        <VideoHistory />
       ) : (
         <>
       <label className="sidebar__search">
@@ -126,7 +143,7 @@ export function Sidebar() {
       </nav>
         </>
       )}
-      {mode !== "images" && (
+      {mode === "chat" && (
       <div className="sidebar__bottom">
         <button className="button button--ghost" onClick={() => fileInput.current?.click()} title="Import conversations from JSON">
           <Upload size={15} />
@@ -171,6 +188,33 @@ function ImageHistory() {
             aria-current={image.id === currentImageId ? "true" : undefined}
           >
             <img src={urls.get(image.id)} alt={image.prompt} loading="lazy" />
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+/** The studio's rendered clips, newest first; clicking one plays it on the stage. */
+function VideoHistory() {
+  const videos = useStore((state) => state.videos);
+  const currentVideoId = useStore((state) => state.currentVideoId);
+  const selectVideo = useStore((state) => state.selectVideo);
+  const urls = useMemo(() => new Map(videos.map((video) => [video.id, URL.createObjectURL(video.blob)])), [videos]);
+  useEffect(() => () => { for (const url of urls.values()) URL.revokeObjectURL(url); }, [urls]);
+  return (
+    <nav className="sidebar__list history" aria-label="Rendered clips">
+      {videos.length === 0 && <p className="sidebar__empty">No clips yet.</p>}
+      <div className="history__grid">
+        {videos.map((video) => (
+          <button
+            key={video.id}
+            className={`history__item${video.id === currentVideoId ? " history__item--active" : ""}`}
+            onClick={() => selectVideo(video.id)}
+            title={`${video.prompt}\n${video.width}x${video.height} · ${video.frames} frames · seed ${video.seed}`}
+            aria-current={video.id === currentVideoId ? "true" : undefined}
+          >
+            <video src={urls.get(video.id)} muted playsInline preload="metadata" aria-label={video.prompt} />
           </button>
         ))}
       </div>

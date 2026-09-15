@@ -112,6 +112,14 @@ inline Header parse_header(const std::uint8_t* data, std::uint64_t size) {
             entry.shape.push_back(extent);
         }
         std::reverse(entry.shape.begin(), entry.shape.end());
+        // A rank-5 tensor whose extra axes are all 1 (a 1x1x1 Conv3d kernel)
+        // is the matrix it wraps; only a genuinely 5-D tensor is undescribable.
+        while (entry.shape.size() > 4) {
+            const auto unit = std::find(entry.shape.begin(), entry.shape.end(), std::uint64_t(1));
+            if (unit == entry.shape.end()) break;
+            entry.shape.erase(unit);
+        }
+        entry.rank_exceeded = entry.shape.size() > 4;
 
         const auto& offsets = value["data_offsets"];
         if (offsets.kind != json::Kind::Array || offsets.size() != 2)

@@ -605,6 +605,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_char_p,
                 ]
                 lib.flyweight_v2_model_attach_vision.restype = ctypes.c_int
+                lib.flyweight_v2_model_attach_config.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+                lib.flyweight_v2_model_attach_config.restype = ctypes.c_int
+                lib.flyweight_v2_model_attach_tokenizer.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+                lib.flyweight_v2_model_attach_tokenizer.restype = ctypes.c_int
                 lib.flyweight_v2_vision_info.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_VisionInfo),
@@ -640,6 +644,33 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_void_p),
                 ]
                 lib.flyweight_v2_diffusion_create.restype = ctypes.c_int
+                lib.flyweight_v2_h3_create.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.flyweight_v2_h3_create.restype = ctypes.c_int
+                lib.flyweight_v2_h3_decode.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.flyweight_v2_h3_decode.restype = ctypes.c_int
+                lib.flyweight_v2_h3_step.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint32,
+                    ctypes.c_float, ctypes.c_float,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_h3_step.restype = ctypes.c_int
                 lib.flyweight_v2_diffusion_destroy.argtypes = [ctypes.c_void_p]
                 lib.flyweight_v2_diffusion_destroy.restype = None
                 lib.flyweight_v2_diffusion_info.argtypes = [
@@ -1785,6 +1816,14 @@ class V2Model:
             self.close()
             raise
         self._architecture = str(self.info["architecture"])
+
+    def attach_config(self, path: str | Path) -> None:
+        """Take the geometry of a metadata-less GGUF from a Hugging Face config.json."""
+        self._check(self._lib.flyweight_v2_model_attach_config(self._handle, str(path).encode()))
+
+    def attach_tokenizer(self, directory: str | Path) -> None:
+        """Read tokenizer.json (and chat_template.jinja) from a directory into this model."""
+        self._check(self._lib.flyweight_v2_model_attach_tokenizer(self._handle, str(directory).encode()))
 
     @property
     def vision(self) -> dict[str, object] | None:
@@ -3490,6 +3529,87 @@ class V2Diffusion:
                 ctypes.byref(self._handle),
             )
         )
+
+    @classmethod
+    def h3(
+        cls,
+        encoder: V2Model,
+        transformer: "V2Model | None" = None,
+        vae: "V2Model | None" = None,
+        *,
+        device: int = 0,
+        max_prompt_tokens: int = 512,
+        max_width: int = 640,
+        max_height: int = 384,
+        max_frames: int = 56,
+        weights: str = "auto",
+        precision: str = "balanced",
+    ) -> "V2Diffusion":
+        """A MiniMax-H3 tower; `transformer` and `vae` may be omitted for an encoder-only tower."""
+        if weights not in DIFFUSION_WEIGHTS:
+            raise ValueError(f"weights must be one of {sorted(DIFFUSION_WEIGHTS)}")
+        if precision not in DIFFUSION_PRECISION:
+            raise ValueError(f"precision must be one of {sorted(DIFFUSION_PRECISION)}")
+        self = cls.__new__(cls)
+        self._lib = _library()
+        self._models = (encoder, transformer, vae)
+        self._handle = ctypes.c_void_p()
+        self.max_width = max_width
+        self.max_height = max_height
+        self.max_prompt_tokens = max_prompt_tokens
+        self.caption_width = int(str(encoder.config.get("hidden_size", 0)))
+        self._check(
+            self._lib.flyweight_v2_h3_create(
+                encoder._handle,
+                transformer._handle if transformer is not None else None,
+                vae._handle if vae is not None else None,
+                ctypes.c_int32(device), ctypes.c_uint32(DIFFUSION_WEIGHTS[weights] | DIFFUSION_PRECISION[precision]),
+                ctypes.c_uint32(max_prompt_tokens), ctypes.c_uint32(max_width), ctypes.c_uint32(max_height),
+                ctypes.c_uint32(max_frames), ctypes.byref(self._handle),
+            )
+        )
+        return self
+
+    def h3_decode(self, latents: Any, latent_t: int, latent_h: int, latent_w: int) -> "tuple[bytes, int]":
+        """Decode normalized latents to RGB frames: (bytes of [F][H*16][W*16][3], F)."""
+        count = 24 * latent_t * latent_h * latent_w
+        z = self._floats(latents, count, "latents")
+        capacity = latent_t * 4 + 8
+        height, width = latent_h * 16, latent_w * 16
+        rgb = ctypes.create_string_buffer(capacity * height * width * 3)
+        frames = ctypes.c_uint32(0)
+        self._check(
+            self._lib.flyweight_v2_h3_decode(
+                self._handle, (ctypes.c_float * count).from_buffer(z), ctypes.c_uint32(latent_t),
+                ctypes.c_uint32(latent_h), ctypes.c_uint32(latent_w), rgb, ctypes.c_uint32(capacity), ctypes.byref(frames),
+            )
+        )
+        return rgb.raw[: frames.value * height * width * 3], frames.value
+
+    def h3_step(
+        self, video: Any, latent_t: int, latent_h: int, latent_w: int, audio: Any, audio_latents: int,
+        caption: Any, text: int, t_video: float, t_audio: float,
+    ) -> "tuple[array.array[float], array.array[float]]":
+        """One H3 DiT forward: raw video and audio velocities."""
+        video_count = 24 * latent_t * latent_h * latent_w
+        audio_count = 2 * audio_latents * 32
+        v = self._floats(video, video_count, "video")
+        a = self._floats(audio, audio_count, "audio") if audio_count else array.array("f")
+        c = self._floats(caption, text * self.caption_width, "caption")
+        out_v = array.array("f", bytes(4 * video_count))
+        out_a = array.array("f", bytes(4 * audio_count)) if audio_count else array.array("f")
+        self._check(
+            self._lib.flyweight_v2_h3_step(
+                self._handle,
+                (ctypes.c_float * video_count).from_buffer(v), ctypes.c_uint32(latent_t), ctypes.c_uint32(latent_h), ctypes.c_uint32(latent_w),
+                (ctypes.c_float * audio_count).from_buffer(a) if audio_count else None, ctypes.c_uint32(audio_latents),
+                (ctypes.c_float * len(c)).from_buffer(c), ctypes.c_uint32(text),
+                ctypes.c_float(t_video), ctypes.c_float(t_audio),
+                (ctypes.c_float * video_count).from_buffer(out_v),
+                (ctypes.c_float * audio_count).from_buffer(out_a) if audio_count else None,
+            )
+        )
+        return out_v, out_a
 
     @property
     def info(self) -> dict[str, int | bool]:

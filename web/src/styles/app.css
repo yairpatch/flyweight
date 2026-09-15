@@ -2181,7 +2181,8 @@ kbd {
   cursor: pointer;
   aspect-ratio: 1;
 }
-.history__item img {
+.history__item img,
+.history__item video {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -2355,3 +2356,19 @@ kbd {
     display: none;
   }
 }
+
+/* Video studio: the stage plays the clip; the aspect swatches follow the image studio's. */
+.studio__video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 12px;
+  background: #000;
+}
+
+.studio__video--dim {
+  opacity: 0.35;
+}
+
+.studio__aspect-box--4-3 { width: 20px; height: 15px; }
+.studio__aspect-box--3-4 { width: 15px; height: 20px; }

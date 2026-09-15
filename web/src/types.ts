@@ -148,6 +148,20 @@ export interface ImageRecord {
   blob: Blob;
 }
 
+export interface VideoRecord {
+  id: string;
+  createdAt: number;
+  prompt: string;
+  seed: number;
+  width: number;
+  height: number;
+  frames: number;
+  fps: number;
+  steps: number;
+  seconds: number;
+  blob: Blob;
+}
+
 export interface Conversation {
   id: string;
   title: string;

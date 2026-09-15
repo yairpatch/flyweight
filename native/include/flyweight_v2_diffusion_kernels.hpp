@@ -594,6 +594,77 @@ void diff_pack_rows_bf16(const float* input, unsigned short* output, const int w
     }
 }
 
+// ---- MiniMax-H3 --------------------------------------------------------------
+
+// Partial rotate-half rope with real-valued positions: `positions` is
+// [rows][axes] f32, `inv_freq` has `freqs` entries shared by every axis, so
+// the angle vector of a row is the axes x freqs concatenation and channels
+// [0, 2*axes*freqs) of each head rotate as (j, j + axes*freqs) pairs; the
+// rest pass through. `x` is [rows][row_stride] with the heads at `offset`
+// (the q or k section of a fused qkv row). Positions are scaled by the
+// caller (the ViT decoder's are in 2*pi units).
+extern "C" __global__
+void h3_rope_rows(float* x, const float* positions, const float* inv_freq,
+                  const int axes, const int freqs, const int heads, const int head_dim,
+                  const int rows, const int row_stride, const int offset) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int half = axes * freqs;   // rotated pairs per head
+    float* base = x + (long long)row * row_stride + offset;
+    for (int index = threadIdx.x; index < heads * half; index += blockDim.x) {
+        const int head = index / half, j = index % half;
+        const int axis = j / freqs, f = j % freqs;
+        const float angle = positions[row * axes + axis] * inv_freq[f];
+        float s, c;
+        sincosf(angle, &s, &c);
+        float* vector = base + head * head_dim;
+        const float first = vector[j], second = vector[j + half];
+        vector[j] = first * c - second * s;
+        vector[j + half] = second * c + first * s;
+    }
+}
+
+// out[r] = x[r] * (1 + scale[m]) + shift[m] where m = row_ids[r] selects a
+// modulation row of `mod_stride` floats holding `width`-wide vectors; the
+// shift and scale vectors sit at `shift_index` and `scale_index` inside it.
+extern "C" __global__
+void h3_modulate_rows(const float* x, const float* mods, const int* row_ids, float* out,
+                      const int width, const int rows, const int mod_stride,
+                      const int shift_index, const int scale_index) {
+    const long long elements = (long long)rows * width;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int r = (int)(index / width), c = (int)(index % width);
+        const float* row = mods + (long long)row_ids[r] * mod_stride;
+        out[index] = x[index] * (1.0f + row[scale_index * width + c]) + row[shift_index * width + c];
+    }
+}
+
+// x[r] += gate[m] * y[r], gate taken from the same modulation rows.
+extern "C" __global__
+void h3_gated_add_rows(float* x, const float* y, const float* mods, const int* row_ids,
+                       const int width, const int rows, const int mod_stride, const int gate_index) {
+    const long long elements = (long long)rows * width;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int r = (int)(index / width), c = (int)(index % width);
+        x[index] += mods[(long long)row_ids[r] * mod_stride + gate_index * width + c] * y[index];
+    }
+}
+
+// SwiGLU over a fused projection: x is [rows][2*inner] with the gate in the
+// first half of each row and the up projection in the second.
+extern "C" __global__
+void h3_silu_mul_fused(const float* x, float* out, const int inner, const int rows) {
+    const long long elements = (long long)rows * inner;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int r = (int)(index / inner), c = (int)(index % inner);
+        const float g = x[(long long)r * 2 * inner + c];
+        out[index] = g / (1.0f + expf(-g)) * x[(long long)r * 2 * inner + inner + c];
+    }
+}
+
 // Row softmax in place over [rows][width] (the autoencoder's mid-block
 // attention scores, whose 512-wide single head the kernel above cannot hold).
 extern "C" __global__

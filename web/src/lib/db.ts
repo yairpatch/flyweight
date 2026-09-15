@@ -2,12 +2,13 @@
 // so the 5 MB localStorage ceiling the old UI fought against no longer
 // applies. A one-time migration lifts the old localStorage history across.
 import Dexie, { type Table } from "dexie";
-import type { Conversation, ImageRecord, Preset } from "../types";
+import type { Conversation, ImageRecord, Preset, VideoRecord } from "../types";
 
 class FlyweightDatabase extends Dexie {
   conversations!: Table<Conversation, string>;
   presets!: Table<Preset, string>;
   images!: Table<ImageRecord, string>;
+  videos!: Table<VideoRecord, string>;
 
   constructor() {
     super("flyweight-chat");
@@ -19,6 +20,12 @@ class FlyweightDatabase extends Dexie {
       conversations: "id, updatedAt, pinned",
       presets: "id, name",
       images: "id, createdAt",
+    });
+    this.version(3).stores({
+      conversations: "id, updatedAt, pinned",
+      presets: "id, name",
+      images: "id, createdAt",
+      videos: "id, createdAt",
     });
   }
 }

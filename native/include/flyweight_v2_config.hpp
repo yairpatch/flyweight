@@ -124,6 +124,13 @@ struct ModelConfig {
     std::uint32_t vae_block_channels[4]={0,0,0,0};
     bool vae_mid_attention=false;
     float latent_scale=0.0f, latent_shift=0.0f; // scaling_factor, shift_factor
+    // MiniMax-H3: audio latent channels, rotary frequencies per axis, and the
+    // width of the pruned adaLN timestep table (time_embed_dim of the curves).
+    std::uint32_t audio_channels=0, rope_freq_dim=0, adaln_table_width=0;
+    // MiniMax-H3's ViT video VAE decoder: temporal patch, register tokens,
+    // and the chunking the encoder trained it with.
+    std::uint32_t vae_temporal_patch=0, vae_register_tokens=0, vae_clip_length=0, vae_token_drop=0;
+    std::vector<float> vae_latents_mean, vae_latents_std;
     // GGUF tokenizer terminator ids; max means the key was absent.
     std::uint32_t eos_token_id=0xffffffffu;
     std::uint32_t eot_token_id=0xffffffffu;

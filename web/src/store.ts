@@ -29,11 +29,28 @@ import type {
   ToolCall,
   ToolDefinition,
   ImageRecord,
+  VideoRecord,
 } from "./types";
 
 export type Panel = "settings" | "tools" | "runtime" | "tokenizer" | "playground" | "inspector" | null;
 /** Which workspace the main area shows. */
-export type Mode = "chat" | "images";
+export type Mode = "chat" | "images" | "videos";
+
+/** How the video studio describes a clip; frames snap to the 17n+5 the VAE decodes. */
+export interface VideoSettings {
+  aspect: "16:9" | "9:16" | "1:1" | "4:3" | "3:4";
+  size: number;
+  frames: number;
+  steps: number;
+  seed: number | null;
+}
+
+export interface VideoProgress {
+  step: number;
+  steps: number;
+  stage: string;
+  startedAt: number;
+}
 
 export interface ImageSettings {
   aspect: "1:1" | "3:2" | "2:3" | "16:9" | "9:16";
@@ -71,6 +88,27 @@ const MODE_KEY = "flyweight.mode";
 const IMAGE_SETTINGS_KEY = "flyweight.images.settings.v1";
 
 const DEFAULT_IMAGE_SETTINGS: ImageSettings = { aspect: "1:1", size: 1024, steps: 8, seed: null };
+const VIDEO_SETTINGS_KEY = "flyweight.videos.settings.v1";
+const DEFAULT_VIDEO_SETTINGS: VideoSettings = { aspect: "16:9", size: 640, frames: 124, steps: 8, seed: null };
+
+/** Pixel size of a clip: the long side on the chosen aspect, shrunk into the server's canvas, multiples of 32. */
+export function videoDimensions(settings: VideoSettings, maxWidth: number, maxHeight: number): { width: number; height: number } {
+  const [aw, ah] = settings.aspect.split(":").map(Number) as [number, number];
+  let width = aw >= ah ? settings.size : (settings.size * aw) / ah;
+  let height = aw >= ah ? (settings.size * ah) / aw : settings.size;
+  const scale = Math.min(1, maxWidth / width, maxHeight / height);
+  width = Math.max(32, Math.floor((width * scale) / 32) * 32);
+  height = Math.max(32, Math.floor((height * scale) / 32) * 32);
+  return { width, height };
+}
+
+/** The frame counts the video VAE decodes (17n + 5) up to a server's limit. */
+export function videoFrameChoices(maxFrames: number): number[] {
+  const choices: number[] = [];
+  for (let frames = 22; frames <= maxFrames; frames += 17) choices.push(frames);
+  if (choices.length === 0) choices.push(5);
+  return choices;
+}
 
 /** Pixel dimensions for the studio's aspect and size, multiples of 16 within `limit`. */
 export function imageDimensions(settings: ImageSettings, limit: number): { width: number; height: number } {
@@ -139,6 +177,12 @@ interface StoreState {
   imageProgress: ImageProgress | null;
   imageError: string | null;
   imagePrompt: string;
+  videos: VideoRecord[];
+  videoSettings: VideoSettings;
+  currentVideoId: string | null;
+  videoProgress: VideoProgress | null;
+  videoError: string | null;
+  videoPrompt: string;
   conversations: Conversation[];
   activeId: string | null;
   settings: GenerationSettings;
@@ -219,6 +263,12 @@ interface StoreState {
   cancelImage: () => void;
   selectImage: (id: string | null) => void;
   deleteImage: (id: string) => Promise<void>;
+  setVideoPrompt: (prompt: string) => void;
+  updateVideoSettings: (patch: Partial<VideoSettings>) => void;
+  selectVideo: (id: string | null) => void;
+  generateVideo: (options?: { seed?: number | null }) => Promise<void>;
+  cancelVideo: () => void;
+  deleteVideo: (id: string) => Promise<void>;
   setTheme: (theme: ThemePreference) => void;
   toggleSidebar: (open?: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
@@ -247,6 +297,7 @@ function touch(conversation: Conversation): Conversation {
 }
 
 let imageAbort: AbortController | null = null;
+let videoAbort: AbortController | null = null;
 
 export const useStore = create<StoreState>()((set, get) => {
   const persistTimers = new Map<string, number>();
@@ -488,13 +539,19 @@ export const useStore = create<StoreState>()((set, get) => {
 
   return {
     ready: false,
-    mode: (readString(MODE_KEY, "chat") === "images" ? "images" : "chat") as Mode,
+    mode: (["images", "videos"].includes(readString(MODE_KEY, "chat")) ? readString(MODE_KEY, "chat") : "chat") as Mode,
     images: [],
     imageSettings: { ...DEFAULT_IMAGE_SETTINGS, ...readJson<Partial<ImageSettings>>(IMAGE_SETTINGS_KEY, {}) },
     currentImageId: null,
     imageProgress: null,
     imageError: null,
     imagePrompt: "",
+    videos: [],
+    videoSettings: { ...DEFAULT_VIDEO_SETTINGS, ...readJson<Partial<VideoSettings>>(VIDEO_SETTINGS_KEY, {}) },
+    currentVideoId: null,
+    videoProgress: null,
+    videoError: null,
+    videoPrompt: "",
     conversations: [],
     activeId: null,
     settings: loadSettings(),
@@ -528,12 +585,17 @@ export const useStore = create<StoreState>()((set, get) => {
       } catch {
         /* ignore */
       }
-      const [conversations, presets, images] = await Promise.all([
+      const [conversations, presets, images, videos] = await Promise.all([
         db.conversations.orderBy("updatedAt").reverse().toArray(),
         db.presets.toArray(),
         db.images.orderBy("createdAt").reverse().toArray().catch(() => [] as ImageRecord[]),
+        db.videos.orderBy("createdAt").reverse().toArray().catch(() => [] as VideoRecord[]),
       ]);
-      set({ conversations, presets, images, currentImageId: images[0]?.id ?? null, ready: true, activeId: conversations[0]?.id ?? null });
+      set({
+        conversations, presets, images, videos,
+        currentImageId: images[0]?.id ?? null, currentVideoId: videos[0]?.id ?? null,
+        ready: true, activeId: conversations[0]?.id ?? null,
+      });
       await get().pollRuntime();
     },
 
@@ -908,6 +970,87 @@ export const useStore = create<StoreState>()((set, get) => {
       } finally {
         if (imageAbort === abort) imageAbort = null;
         set({ imageProgress: null });
+      }
+    },
+
+    setVideoPrompt: (videoPrompt) => set({ videoPrompt }),
+    updateVideoSettings: (patch) => {
+      const videoSettings = { ...get().videoSettings, ...patch };
+      writeJson(VIDEO_SETTINGS_KEY, videoSettings);
+      set({ videoSettings });
+    },
+    selectVideo: (currentVideoId) => set({ currentVideoId }),
+    deleteVideo: async (id) => {
+      await db.videos.delete(id);
+      set((state) => {
+        const videos = state.videos.filter((video) => video.id !== id);
+        const currentVideoId = state.currentVideoId === id ? (videos[0]?.id ?? null) : state.currentVideoId;
+        return { videos, currentVideoId };
+      });
+    },
+    cancelVideo: () => {
+      videoAbort?.abort();
+    },
+    generateVideo: async (options = {}) => {
+      const state = get();
+      const prompt = state.videoPrompt.trim();
+      if (!prompt || state.videoProgress) return;
+      const info = state.health?.execution?.videos as { max_size?: string; max_frames?: number; fps?: number } | null | undefined;
+      const [maxWidth, maxHeight] = String(info?.max_size ?? "640x384").split("x").map((side) => parseInt(side, 10) || 32);
+      const { width, height } = videoDimensions(state.videoSettings, maxWidth, maxHeight);
+      const frames = Math.min(state.videoSettings.frames, Number(info?.max_frames ?? state.videoSettings.frames));
+      const seed = options.seed === undefined ? state.videoSettings.seed : options.seed;
+      const body: Record<string, unknown> = { prompt, size: `${width}x${height}`, frames, steps: state.videoSettings.steps, stream: true };
+      if (seed !== null) body.seed = seed;
+      const abort = new AbortController();
+      videoAbort = abort;
+      set({ videoProgress: { step: 0, steps: state.videoSettings.steps, stage: "encode", startedAt: Date.now() }, videoError: null });
+      try {
+        const response = await openStream("/v1/videos/generations", body, abort.signal);
+        if (!response.body) throw new Error("empty response");
+        for await (const frame of readSse(response.body)) {
+          if (frame.data === "[DONE]") break;
+          let event: Record<string, unknown>;
+          try {
+            event = JSON.parse(frame.data);
+          } catch {
+            continue;
+          }
+          if (event.error && typeof event.error === "object") {
+            throw new Error(String((event.error as { message?: string }).message ?? "video generation failed"));
+          }
+          if (event.type === "progress") {
+            set((current) => (current.videoProgress
+              ? { videoProgress: { ...current.videoProgress, step: Number(event.step), steps: Number(event.steps), stage: String(event.stage ?? "denoise") } }
+              : {}));
+          } else if (event.type === "video") {
+            const bytes = Uint8Array.from(atob(String(event.b64_json)), (character) => character.charCodeAt(0));
+            const record: VideoRecord = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              createdAt: Date.now(),
+              prompt,
+              seed: Number(event.seed),
+              width,
+              height,
+              frames,
+              fps: Number(info?.fps ?? 24),
+              steps: state.videoSettings.steps,
+              seconds: Number(event.seconds),
+              blob: new Blob([bytes], { type: "video/mp4" }),
+            };
+            await db.videos.put(record).catch(() => get().toast("Could not save the clip", "error"));
+            set((current) => ({ videos: [record, ...current.videos], currentVideoId: record.id }));
+          }
+        }
+      } catch (failure) {
+        if (!abort.signal.aborted) {
+          const message = failure instanceof ApiError ? failure.message : String(failure);
+          set({ videoError: message });
+          get().toast(message, "error");
+        }
+      } finally {
+        if (videoAbort === abort) videoAbort = null;
+        set({ videoProgress: null });
       }
     },
 

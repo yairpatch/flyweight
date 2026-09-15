@@ -52,6 +52,10 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
   encoder, the single-stream DiT and the KL autoencoder all run on the
   engine's own kernels from the diffusers safetensors, quantized on load
   and served at `/v1/images/generations` and in the chat UI's Image studio
+- Video generation with MiniMax-H3 (`--video-model`): the Qwen3-VL-32B
+  conditioner, the 15B DiT and the ViT video VAE run from the unsloth GGUFs
+  and the fp16 VAE, served at `/v1/videos/generations` as an MP4 and in the
+  chat UI's Video studio (silent clips; the audio decoder is not ported yet)
 - Thinking controls: per-request effort for checkpoints that grade their
   reasoning, and a hard thinking-token budget the sampler cannot overrun
 - OpenAI Chat Completions, Responses, and legacy Completions APIs
@@ -579,6 +583,61 @@ the built-in default. `GET /props`
 reports the resolved defaults and their sources, and the bundled UI adopts
 them until the user saves custom settings.
 
+
+### Video generation
+
+`--video-model` attaches [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
+beside the chat model and serves text-to-video at `/v1/videos/generations`
+(`prompt`, `size` in multiples of 32, `frames`, `steps`, `seed`, `shift`;
+the clip comes back as base64 MP4 in `data[0].b64_json`) and in the chat
+UI's **Video studio**. The model directory holds the
+[unsloth GGUFs](https://huggingface.co/unsloth/MiniMax-H3-GGUF) next to
+the release's configs:
+
+~~~
+h3/
+  text_encoder.gguf   -> qwen3vl_32b_minimax_h3-Q4_K_M.gguf   (unsloth/MiniMax-H3-GGUF)
+  transformer.gguf    -> minimax_h3_fl2va_pruned-Q6_K.gguf    (unsloth/MiniMax-H3-GGUF)
+  vae/model.safetensors -> vae/minimax_h3_video_vae_fp16.safetensors (same repo)
+  vae/config.json     -> vae/config.json                        (MiniMaxAI/MiniMax-H3)
+  text_encoder/ transformer/ tokenizer/                        (MiniMaxAI/MiniMax-H3)
+~~~
+
+Symlinks into the Hugging Face cache are fine. Then:
+
+~~~bash
+pip install 'flyweight-llm[video]'   # numpy for the schedule, PyAV for the MP4
+flyweight serve Qwen3.6-35B-A3B-Q6_K.gguf --video-model ~/models/h3
+
+curl http://127.0.0.1:8080/v1/videos/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "a paper boat drifting down a rain-filled gutter", "size": "640x384", "frames": 124, "seed": 7}'
+~~~
+
+The three components run on the engine's own kernels. The Qwen3-VL
+conditioner reads the raw prompt and hands over its last hidden state; the
+DiT (50 blocks, 3-axis rope over text, audio and video rows, a pruned
+adaLN table) steps the video and audio latents down two rectified-flow
+schedules (shift 12 and 3) with the model's data-ward velocity; the ViT
+decoder turns the video latents into frames in the same overlapping chunks
+as diffusers. The audio rows take part in every step because the video
+attends to them, but the audio VAE is not ported yet, so clips are silent.
+The VAE is quantized to Q8_0 on first open and cached beside it. Frames
+snap up to the `17n + 5` the VAE decodes, at 24 fps; the released model is
+trained for five seconds and up (124 frames), and shorter clips come out
+noticeably rougher.
+
+Weights stream from pinned host memory by default (`--video-weights`): the
+encoder and DiT are 31 GB together, so the tower holds about 1.1 GB of VRAM
+at 640x384 and the chat model keeps the card. The whole run is compute on
+the DiT: a step at 640x384 and 124 frames takes 16 s on an RTX 5070 Ti
+laptop, so an eight-step clip is about two minutes; the decode is a
+second. `--video-max-size` and `--video-max-frames` size the workspace
+(default 640x384 and 124 frames); a larger canvas costs attention time
+quadratically. Against the torch reference on the same GGUF weights the
+encoder matches to 0.02% RMS, the DiT step to a cosine of 0.9999, and the
+VAE decode to 0.65% RMS (the Q8_0 weights), so what the engine renders is
+what diffusers would render from the same weights.
 ### Thinking controls
 
 Reasoning models expose two knobs, one soft and one hard:
@@ -1046,6 +1105,10 @@ device are skipped.
   is refused at attach until the decoder-side injection lands. The tower's
   attention and GEMM kernels are plain CUDA rather than tensor-core paths, so
   a 1024-token image costs a few seconds to encode.
+- Video generation covers MiniMax-H3 text-to-video without sound: the
+  audio VAE decoder and the image and video references (FL2VA, Ref2VA) are
+  not ported. Sequences longer than the workspace was planned for are
+  refused rather than chunked.
 - Image generation covers Z-Image-Turbo only. Against an f32 reference
   the native DiT step is within 7% RMS, which is the same distance
   diffusers' own bf16 run sits at, so renders match diffusers in kind but

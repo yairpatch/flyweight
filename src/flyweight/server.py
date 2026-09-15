@@ -1969,6 +1969,24 @@ class InferenceService:
             "not_found_error",
         )
 
+    def videos_generations(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Text-to-video generation; services without a video model 404."""
+        raise APIError(
+            404,
+            "video generation is not enabled on this server (start with --video-model)",
+            "not_found_error",
+        )
+
+    def stream_videos_generations(
+        self, payload: Mapping[str, Any]
+    ) -> Iterator[dict[str, Any] | str]:
+        """The same render as server-sent events: progress per step, then the clip."""
+        raise APIError(
+            404,
+            "video generation is not enabled on this server (start with --video-model)",
+            "not_found_error",
+        )
+
     def tokenize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         content = payload.get("content", payload.get("prompt"))
         if not isinstance(content, str):
@@ -3780,6 +3798,14 @@ def create_handler(
                             self._send_sse(service.stream_images_generations(payload))
                         else:
                             self._send_json(200, service.images_generations(payload))
+                    self.log_message("request completed: %s", path)
+                    return
+                if path == "/v1/videos/generations":
+                    with service._admission():
+                        if _boolean_option(payload, "stream", False):
+                            self._send_sse(service.stream_videos_generations(payload))
+                        else:
+                            self._send_json(200, service.videos_generations(payload))
                     self.log_message("request completed: %s", path)
                     return
                 if path == "/detokenize":

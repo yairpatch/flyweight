@@ -8079,7 +8079,7 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     // not what decides whether an image model fits. The VAE decoder is 50M
     // parameters of convolutions and stays f32 outright, as diffusers runs it
     // (force_upcast).
-    if(m.architecture=="zimage-dit")policy=hf::policy_for_weights(hf::Target::Q8_0);
+    if(m.architecture=="zimage-dit"||m.architecture=="minimax-h3-vae")policy=hf::policy_for_weights(hf::Target::Q8_0);
     // The plain-Qwen3 text encoder conditions the DiT with its hidden state,
     // and Q8_0 halves that state's error against Q6_K (0.9% vs 2.1% rms on
     // Z-Image's encoder) for 1.1 GB more, which lives in host memory anyway
@@ -10947,6 +10947,53 @@ int flyweight_v2_model_open(const char* path, FlyweightV2Model** out) { return g
         }
     }
     *out=m.release(); return 0; }); }
+// GGUFs written for stable-diffusion.cpp carry no metadata at all: the file
+// is tensors under their Hugging Face names. Such a model opens with an empty
+// architecture and takes its geometry from a config.json and its vocabulary
+// from a tokenizer directory through these two calls.
+int flyweight_v2_model_attach_config(FlyweightV2Model* m,const char*path){return guarded([&]{
+    if(!m||!path||!path[0])throw std::runtime_error("model and config.json path are required");
+    const auto text=read_text_file(path);
+    if(text.empty())throw std::runtime_error(std::string("cannot read ")+path);
+    m->config=flyweight::v2::hf::config_from_json(flyweight::v2::json::parse(text));
+    m->architecture=m->config.architecture;
+    if(m->config.layer_count){
+        // The file may carry fewer layers than the config (MiniMax-H3's
+        // encoder is Qwen3-VL cut to 50): count what is really there.
+        std::uint32_t layers=0;
+        for(const auto&t:m->tensors){
+            for(const char*prefix:{"model.layers.","blk."}){
+                const std::string p=prefix;
+                if(t.name.compare(0,p.size(),p)==0){
+                    const auto index=std::strtoul(t.name.c_str()+p.size(),nullptr,10);
+                    layers=std::max<std::uint32_t>(layers,static_cast<std::uint32_t>(index)+1);
+                }
+            }
+        }
+        if(layers&&layers<m->config.layer_count)m->config.layer_count=layers;
+    }
+    return 0;
+}); }
+
+int flyweight_v2_model_attach_tokenizer(FlyweightV2Model* m,const char*directory){return guarded([&]{
+    if(!m||!directory||!directory[0])throw std::runtime_error("model and tokenizer directory are required");
+    namespace hf=flyweight::v2::hf;
+    const std::string dir=directory;
+    const auto text=read_text_file(dir+"/tokenizer.json");
+    if(text.empty())throw std::runtime_error("cannot read "+dir+"/tokenizer.json");
+    auto tokenizer=hf::tokenizer_from_json(flyweight::v2::json::parse(text),m->config.vocabulary_size);
+    if(tokenizer.pre.empty())
+        throw std::runtime_error("tokenizer.json uses a pre-tokenizer pattern this runtime has not transcribed");
+    m->vocabulary=std::move(tokenizer.vocabulary);
+    m->merges=std::move(tokenizer.merges);
+    m->token_types=std::move(tokenizer.token_types);
+    m->tokenizer_pre=std::move(tokenizer.pre);
+    if(!m->config.vocabulary_size)m->config.vocabulary_size=static_cast<std::uint32_t>(m->vocabulary.size());
+    build_tokenizer_tables(*m);
+    m->chat_template=hf_tokenizer_file(dir,"chat_template.jinja");
+    return 0;
+}); }
+
 int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return guarded([&]{
     if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
     if(m->mtp_sidecar)throw std::runtime_error("an MTP sidecar is already attached");
@@ -18991,6 +19038,7 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
 #include "v2_mtp_verifier.inc"
 #include "v2_vision.inc"
 #include "v2_diffusion.inc"
+#include "v2_h3.inc"
 
 // Layer-synchronous chunked prefill. Attention stays a per-row pass with the
 // decode kernels -- a row's attention at layer L needs only earlier rows' KV

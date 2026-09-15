@@ -21,6 +21,8 @@ client = ["openai>=2.0"]
 test = ["pytest>=8", "pytest-xdist>=3"]
 # Image input decoding and resizing for the vision tower (--mmproj).
 vision = ["Pillow>=10"]
+# Video generation output (--video-model): the denoising loop and the MP4 writer.
+video = ["numpy>=1.26", "av>=12"]
 
 [project.scripts]
 flyweight = "flyweight.cli:main"

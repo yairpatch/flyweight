@@ -8,6 +8,7 @@ import { PreviewOverlay } from "./components/PreviewOverlay";
 import { CommandPalette } from "./components/CommandPalette";
 import { SidePanel } from "./components/SidePanel";
 import { Studio } from "./components/Studio";
+import { VideoStudio } from "./components/VideoStudio";
 import { useStore } from "./store";
 
 const POLL_MS = 5000;
@@ -90,6 +91,8 @@ export function App() {
         <TopBar />
         {mode === "images" ? (
           <Studio />
+        ) : mode === "videos" ? (
+          <VideoStudio />
         ) : (
           <>
             <Transcript />

@@ -31,6 +31,7 @@ from .server import (
     _split_reasoning_content,
 )
 from .images import ImageGenerator
+from .videos import VideoGenerator
 from .vision import (
     IMAGE_PAD_TOKEN, IMAGE_PLACEHOLDER, ImageError, ImageInput, ImagePreprocessor,
     PreparedImage, expand_image_pads, image_token_offsets,
@@ -2729,6 +2730,11 @@ class NativeV2InferenceService(InferenceService):
         image_max_size: int = 1024,
         image_weights: str = "auto",
         image_precision: str = "balanced",
+        video_model_path: Path | str | None = None,
+        video_max_size: str = "640x384",
+        video_max_frames: int = 124,
+        video_weights: str = "host",
+        video_precision: str = "balanced",
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
@@ -2787,6 +2793,21 @@ class NativeV2InferenceService(InferenceService):
                     weights=image_weights, precision=image_precision,
                 )
             except BaseException:
+                self.v2_model.close()
+                raise
+        self.videos: VideoGenerator | None = None
+        if video_model_path is not None:
+            try:
+                width_text, height_text = str(video_max_size).lower().split("x", 1)
+                self.videos = VideoGenerator(
+                    video_model_path, device=device,
+                    max_width=int(width_text), max_height=int(height_text),
+                    max_frames=int(video_max_frames),
+                    weights=video_weights, precision=video_precision,
+                )
+            except BaseException:
+                if self.images is not None:
+                    self.images.close()
                 self.v2_model.close()
                 raise
         # BailingMoE3 runs on its own runtime rather than the Qwen one: 24 of
@@ -2968,6 +2989,10 @@ class NativeV2InferenceService(InferenceService):
         if images is not None:
             images.close()
             self.images = None
+        videos = getattr(self, "videos", None)
+        if videos is not None:
+            videos.close()
+            self.videos = None
         bailing = getattr(self, "bailing_runtime", None)
         if bailing is not None:
             bailing.close()
@@ -3006,6 +3031,7 @@ class NativeV2InferenceService(InferenceService):
             "gpu_cache_mib": self.gpu_cache_mib,
             "vision": self._vision_health(),
             "images": self._images_health(),
+            "videos": self._videos_health(),
         }
         return value
 
@@ -3026,6 +3052,24 @@ class NativeV2InferenceService(InferenceService):
         if images is None:
             return super().stream_images_generations(payload)
         return images.stream(payload)
+
+    def _videos_health(self) -> dict[str, object] | None:
+        videos = getattr(self, "videos", None)
+        return videos.describe() if videos is not None else None
+
+    def videos_generations(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        videos = getattr(self, "videos", None)
+        if videos is None:
+            return super().videos_generations(payload)
+        return videos.generate(payload)
+
+    def stream_videos_generations(
+        self, payload: Mapping[str, Any]
+    ) -> Iterator[dict[str, Any] | str]:
+        videos = getattr(self, "videos", None)
+        if videos is None:
+            return super().stream_videos_generations(payload)
+        return videos.stream(payload)
 
     def _vision_health(self) -> dict[str, object] | None:
         tokenizer = getattr(self.generator, "tokenizer", None)

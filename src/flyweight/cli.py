@@ -545,6 +545,32 @@ def _add_runtime_options(
              "they would take more than half the card",
     )
     add(
+        placement, "--video-model", type=Path, metavar="DIR",
+        help="video generation: a MiniMax-H3 model directory (text_encoder.gguf, "
+             "transformer.gguf, vae/, and the release's text_encoder/, "
+             "transformer/ and tokenizer/ configs), served at "
+             "/v1/videos/generations beside the chat model",
+    )
+    add(
+        placement, "--video-max-size", default="640x384", metavar="WxH",
+        help="largest canvas the video model renders, multiples of 32; its "
+             "workspace is reserved for it at startup (default 640x384)",
+    )
+    add(
+        placement, "--video-max-frames", type=int, default=124, metavar="N",
+        help="most frames a clip may have at 24 fps, rounded up to 17n+5 "
+             "(default 124, about five seconds)",
+    )
+    add(
+        placement, "--video-weights", choices=("auto", "device", "host"), default="host",
+        help="where the video model's weights live; the transformer alone is "
+             "16 GB, so host (pinned, streamed a block at a time) is the default",
+    )
+    add(
+        placement, "--video-precision", choices=("fast", "balanced", "exact"), default="balanced",
+        help="as --image-precision, for the video model",
+    )
+    add(
         placement, "--image-precision", choices=("fast", "balanced", "exact"), default="balanced",
         help="fast: Q8 activations on int8 tensor cores; balanced: bf16 "
              "activations over the Q8_0 weights on bf16 tensor cores (the "
@@ -1628,6 +1654,11 @@ def _serve(args: argparse.Namespace) -> int:
         image_max_size=getattr(args, "image_max_size", 1024),
         image_weights=getattr(args, "image_weights", "auto"),
         image_precision=getattr(args, "image_precision", "balanced"),
+        video_model_path=getattr(args, "video_model", None),
+        video_max_size=getattr(args, "video_max_size", "640x384"),
+        video_max_frames=getattr(args, "video_max_frames", 124),
+        video_weights=getattr(args, "video_weights", "host"),
+        video_precision=getattr(args, "video_precision", "balanced"),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,

@@ -410,6 +410,11 @@ typedef struct FlyweightV2VisionResize {
 } FlyweightV2VisionResize;
 
 FLYWEIGHT_V2_API int flyweight_v2_model_attach_vision(FlyweightV2Model* model, const char* path);
+/* For a GGUF without metadata (stable-diffusion.cpp style): take the geometry
+   from a Hugging Face config.json and the vocabulary from a tokenizer
+   directory (tokenizer.json, optionally chat_template.jinja). */
+FLYWEIGHT_V2_API int flyweight_v2_model_attach_config(FlyweightV2Model* model, const char* path);
+FLYWEIGHT_V2_API int flyweight_v2_model_attach_tokenizer(FlyweightV2Model* model, const char* directory);
 
 /* Diffusion image generation (Z-Image-Turbo): a Qwen3 text encoder, the
    single-stream DiT and the KL autoencoder, each opened as a model from its
@@ -447,6 +452,26 @@ FLYWEIGHT_V2_API int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, Fl
                                                    uint32_t max_height, uint32_t max_prompt_tokens,
                                                    uint32_t weights, FlyweightV2Diffusion** out);
 FLYWEIGHT_V2_API void flyweight_v2_diffusion_destroy(FlyweightV2Diffusion* tower);
+/* MiniMax-H3 video tower over the same handle type: a Qwen3-VL language
+   model as the text encoder (all of its layers run), the packed video/audio
+   DiT and its VAE. `transformer` and `vae` may be null for an encoder-only
+   tower; `weights` takes the same placement and precision flags. */
+FLYWEIGHT_V2_API int flyweight_v2_h3_create(FlyweightV2Model* encoder, FlyweightV2Model* transformer,
+                                            FlyweightV2Model* vae, int32_t device, uint32_t weights,
+                                            uint32_t max_prompt_tokens, uint32_t max_width, uint32_t max_height,
+                                            uint32_t max_frames, FlyweightV2Diffusion** out);
+/* One DiT forward: video latents [C][T][H][W] (normalized), audio latents
+   [2][audio_latents][audio_channels], caption [text][text_dim], the video and
+   audio timesteps (1 - sigma). Writes the raw velocities in the same layouts. */
+/* Decode normalized latents [C][T][H][W] to RGB frames [F][H*16][W*16][3];
+   `frames_capacity` bounds F, which is written to `frames_out`. */
+FLYWEIGHT_V2_API int flyweight_v2_h3_decode(FlyweightV2Diffusion* tower, const float* latents, uint32_t latent_t,
+                                            uint32_t latent_h, uint32_t latent_w, uint8_t* rgb,
+                                            uint32_t frames_capacity, uint32_t* frames_out);
+FLYWEIGHT_V2_API int flyweight_v2_h3_step(FlyweightV2Diffusion* tower, const float* video, uint32_t latent_t,
+                                          uint32_t latent_h, uint32_t latent_w, const float* audio,
+                                          uint32_t audio_latents, const float* caption, uint32_t text,
+                                          float t_video, float t_audio, float* video_velocity, float* audio_velocity);
 FLYWEIGHT_V2_API int flyweight_v2_diffusion_info(const FlyweightV2Diffusion* tower, FlyweightV2DiffusionInfo* out);
 /* hidden_states[-2] of the encoder for `count` tokens: count * hidden f32. */
 FLYWEIGHT_V2_API int flyweight_v2_diffusion_encode_text(FlyweightV2Diffusion* tower, const uint32_t* tokens,

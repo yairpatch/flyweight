@@ -89,7 +89,15 @@ constexpr int kVaeBlendPixels = 128;
 
 }  // namespace
 
+struct FlyweightV2H3;
+
 struct FlyweightV2Diffusion {
+    // Which pipeline this tower runs: Z-Image (image) or MiniMax-H3 (video).
+    enum class Kind { zimage, h3 } kind = Kind::zimage;
+    // The H3 state, owned; released through `release_extra` since the type
+    // is completed after this struct (v2_h3.inc).
+    FlyweightV2H3* h3 = nullptr;
+    void (*release_extra)(FlyweightV2Diffusion&) = nullptr;
     FlyweightV2Model* encoder = nullptr;      // borrowed
     FlyweightV2Model* transformer = nullptr;  // borrowed
     FlyweightV2Model* vae = nullptr;          // borrowed
@@ -115,6 +123,10 @@ struct FlyweightV2Diffusion {
     int encoder_hidden = 0, encoder_heads = 0, encoder_kv_heads = 0, encoder_head_dim = 0;
     int encoder_intermediate = 0;
     float encoder_epsilon = 1e-6f, encoder_theta = 1e6f;
+    // How many of the encoder's layers run: Z-Image reads hidden_states[-2]
+    // (all but the last), MiniMax-H3 ships its encoder already cut to the
+    // 50 layers it reads.
+    int encoder_layers_used = 0;
 
     // DiT.
     DiffMatrix x_embed, cap_embed, t_mlp0, t_mlp1, final_adaln, final_linear;
@@ -151,6 +163,10 @@ struct FlyweightV2Diffusion {
     // take most of the card, so a chat model can still be planned beside it.
     bool host_weights = false;
     std::vector<void*> host_allocations;
+    // Model mappings pinned in place (cuMemHostRegister) so streamed weights
+    // read straight from the file's pages instead of a second copy; the
+    // pinned copy above is the fallback when a mapping cannot be registered.
+    std::vector<std::pair<const void*, std::uint64_t>> registered_ranges;
     std::uint64_t host_bytes = 0;
     std::uint64_t copy_stream = 0;
     std::uint64_t staging[2] = {0, 0};
@@ -194,6 +210,36 @@ std::uint64_t diff_elements(const Tensor& tensor) {
     return count;
 }
 
+// Pins the byte ranges every tensor of `model` lives in (one range per
+// backing mapping) so host-resident matrices can stream from them. False
+// when the driver refuses, in which case the caller copies into pinned memory.
+bool diff_register_model(FlyweightV2Diffusion& d, const FlyweightV2Model& model) {
+    std::map<const std::uint8_t*, std::pair<std::uint64_t, std::uint64_t>> ranges;  // base -> [begin, end)
+    for (const auto& tensor : model.tensors) {
+        const std::uint8_t* base = tensor.source ? tensor.source : model.data;
+        const std::uint64_t begin = tensor.offset, end = tensor.offset + tensor.size;
+        auto it = ranges.find(base);
+        if (it == ranges.end()) ranges[base] = {begin, end};
+        else {
+            it->second.first = std::min(it->second.first, begin);
+            it->second.second = std::max(it->second.second, end);
+        }
+    }
+    const std::uint64_t page = 4096;
+    for (const auto& [base, range] : ranges) {
+        const auto start = reinterpret_cast<std::uintptr_t>(base + range.first) & ~(page - 1);
+        const auto stop = (reinterpret_cast<std::uintptr_t>(base + range.second) + page - 1) & ~(page - 1);
+        const void* pointer = reinterpret_cast<const void*>(start);
+        bool already = false;
+        for (const auto& done : d.registered_ranges)
+            if (done.first == pointer) already = true;
+        if (already) continue;
+        if (flyweight_gpu_host_register(pointer, stop - start) != 0) return false;
+        d.registered_ranges.push_back({pointer, stop - start});
+    }
+    return true;
+}
+
 // Raw upload of a tensor's arena bytes.
 std::uint64_t diff_upload_raw(FlyweightV2Diffusion& d, const FlyweightV2Model& model,
                               const Tensor& tensor) {
@@ -225,10 +271,13 @@ DiffMatrix diff_upload_matrix(FlyweightV2Diffusion& d, const FlyweightV2Model& m
                               const std::string& name, int in, int out,
                               const std::string& bias_name = {}) {
     const Tensor& tensor = diff_tensor(model, name);
-    if (tensor.shape.size() < 2 || tensor.shape[0] != static_cast<std::uint64_t>(in))
+    // A 1x1(x1) convolution stored as [1][1][in][out] is the same matrix.
+    std::vector<std::uint64_t> shape(tensor.shape.begin(), tensor.shape.end());
+    while (shape.size() > 2 && shape.front() == 1) shape.erase(shape.begin());
+    if (shape.size() < 2 || shape[0] != static_cast<std::uint64_t>(in))
         throw std::runtime_error(name + " does not have input width " + std::to_string(in));
-    std::uint64_t rows = tensor.shape[1];
-    for (std::size_t axis = 2; axis < tensor.shape.size(); ++axis) rows *= tensor.shape[axis];
+    std::uint64_t rows = shape[1];
+    for (std::size_t axis = 2; axis < shape.size(); ++axis) rows *= shape[axis];
     if (rows != static_cast<std::uint64_t>(out))
         throw std::runtime_error(name + " does not have output width " + std::to_string(out));
     DiffMatrix matrix;
@@ -238,13 +287,23 @@ DiffMatrix diff_upload_matrix(FlyweightV2Diffusion& d, const FlyweightV2Model& m
     if (matrix.type != 0 && matrix.type != 30 && !flyweight::v2::qwen_format(matrix.type))
         throw std::runtime_error(name + " is stored in a format without GEMM kernels");
     if (d.host_weights && d.grouping) {
-        void* pinned = nullptr;
-        if (flyweight_gpu_host_alloc(tensor.size, &pinned) != 0 || !pinned)
-            throw std::runtime_error("diffusion tower pinned host allocation failed for " + name);
-        d.host_allocations.push_back(pinned);
+        const bool registered = std::any_of(
+            d.registered_ranges.begin(), d.registered_ranges.end(), [&](const auto& range) {
+                const auto* data = tensor_data(model, tensor);
+                return data >= static_cast<const std::uint8_t*>(range.first) &&
+                       data + tensor.size <= static_cast<const std::uint8_t*>(range.first) + range.second;
+            });
+        if (registered) {
+            matrix.host = tensor_data(model, tensor);
+        } else {
+            void* pinned = nullptr;
+            if (flyweight_gpu_host_alloc(tensor.size, &pinned) != 0 || !pinned)
+                throw std::runtime_error("diffusion tower pinned host allocation failed for " + name);
+            d.host_allocations.push_back(pinned);
+            std::memcpy(pinned, tensor_data(model, tensor), tensor.size);
+            matrix.host = pinned;
+        }
         d.host_bytes += tensor.size;
-        std::memcpy(pinned, tensor_data(model, tensor), tensor.size);
-        matrix.host = pinned;
         matrix.bytes = tensor.size;
         matrix.slot_offset = d.group_cursor;
         d.group_cursor += diff_align(tensor.size);
@@ -396,15 +455,22 @@ void diff_upload_encoder(FlyweightV2Diffusion& d) {
     d.encoder_theta = config.rope_freq_base;
     if (d.encoder_head_dim > 128)
         throw std::runtime_error("text encoder head width above 128 is not supported");
-    if (d.encoder_hidden != d.caption_dim)
+    if (d.caption_dim && d.encoder_hidden != d.caption_dim)
         throw std::runtime_error("text encoder width " + std::to_string(d.encoder_hidden) +
-                                 " does not match the DiT's cap_feat_dim " +
+                                 " does not match the DiT's text width " +
                                  std::to_string(d.caption_dim));
-    d.token_embedding = &diff_tensor(model, "token_embd.weight");
-    // hidden_states[-2] is the residual stream entering the last layer, so
-    // the last layer's weights are never read and never uploaded.
-    const int used_layers = static_cast<int>(config.layer_count) - 1;
-    if (used_layers < 1) throw std::runtime_error("text encoder has too few layers");
+    // GGUF spellings from llama.cpp's conversion, or Hugging Face's from a
+    // stable-diffusion.cpp GGUF; whichever the file carries.
+    const bool hf_names = diff_has_tensor(model, "model.embed_tokens.weight");
+    auto name_of = [&](int index, const char* gguf, const char* hf) {
+        return hf_names ? "model.layers." + std::to_string(index) + "." + hf
+                        : "blk." + std::to_string(index) + "." + gguf;
+    };
+    d.token_embedding = &diff_tensor(model, hf_names ? "model.embed_tokens.weight" : "token_embd.weight");
+    const int used_layers = d.encoder_layers_used ? d.encoder_layers_used
+                                                  : static_cast<int>(config.layer_count) - 1;
+    if (used_layers < 1 || used_layers > static_cast<int>(config.layer_count))
+        throw std::runtime_error("text encoder layer budget is outside the checkpoint");
     {
         std::vector<double> frequencies(d.encoder_head_dim / 2);
         for (std::size_t j = 0; j < frequencies.size(); ++j)
@@ -416,20 +482,19 @@ void diff_upload_encoder(FlyweightV2Diffusion& d) {
     const int kv_width = d.encoder_kv_heads * d.encoder_head_dim;
     d.encoder_layers.reserve(used_layers);
     for (int index = 0; index < used_layers; ++index) {
-        const std::string prefix = "blk." + std::to_string(index) + ".";
         DiffGroup group(d);
         DiffEncoderLayer layer;
-        layer.attn_norm = diff_upload_f32(d, model, prefix + "attn_norm.weight", d.encoder_hidden);
-        layer.ffn_norm = diff_upload_f32(d, model, prefix + "post_attention_norm.weight", d.encoder_hidden);
-        layer.q_norm = diff_upload_f32(d, model, prefix + "attn_q_norm.weight", d.encoder_head_dim);
-        layer.k_norm = diff_upload_f32(d, model, prefix + "attn_k_norm.weight", d.encoder_head_dim);
-        layer.q = diff_upload_matrix(d, model, prefix + "attn_q.weight", d.encoder_hidden, q_width);
-        layer.k = diff_upload_matrix(d, model, prefix + "attn_k.weight", d.encoder_hidden, kv_width);
-        layer.v = diff_upload_matrix(d, model, prefix + "attn_v.weight", d.encoder_hidden, kv_width);
-        layer.o = diff_upload_matrix(d, model, prefix + "attn_output.weight", q_width, d.encoder_hidden);
-        layer.gate = diff_upload_matrix(d, model, prefix + "ffn_gate.weight", d.encoder_hidden, d.encoder_intermediate);
-        layer.up = diff_upload_matrix(d, model, prefix + "ffn_up.weight", d.encoder_hidden, d.encoder_intermediate);
-        layer.down = diff_upload_matrix(d, model, prefix + "ffn_down.weight", d.encoder_intermediate, d.encoder_hidden);
+        layer.attn_norm = diff_upload_f32(d, model, name_of(index, "attn_norm.weight", "input_layernorm.weight"), d.encoder_hidden);
+        layer.ffn_norm = diff_upload_f32(d, model, name_of(index, "post_attention_norm.weight", "post_attention_layernorm.weight"), d.encoder_hidden);
+        layer.q_norm = diff_upload_f32(d, model, name_of(index, "attn_q_norm.weight", "self_attn.q_norm.weight"), d.encoder_head_dim);
+        layer.k_norm = diff_upload_f32(d, model, name_of(index, "attn_k_norm.weight", "self_attn.k_norm.weight"), d.encoder_head_dim);
+        layer.q = diff_upload_matrix(d, model, name_of(index, "attn_q.weight", "self_attn.q_proj.weight"), d.encoder_hidden, q_width);
+        layer.k = diff_upload_matrix(d, model, name_of(index, "attn_k.weight", "self_attn.k_proj.weight"), d.encoder_hidden, kv_width);
+        layer.v = diff_upload_matrix(d, model, name_of(index, "attn_v.weight", "self_attn.v_proj.weight"), d.encoder_hidden, kv_width);
+        layer.o = diff_upload_matrix(d, model, name_of(index, "attn_output.weight", "self_attn.o_proj.weight"), q_width, d.encoder_hidden);
+        layer.gate = diff_upload_matrix(d, model, name_of(index, "ffn_gate.weight", "mlp.gate_proj.weight"), d.encoder_hidden, d.encoder_intermediate);
+        layer.up = diff_upload_matrix(d, model, name_of(index, "ffn_up.weight", "mlp.up_proj.weight"), d.encoder_hidden, d.encoder_intermediate);
+        layer.down = diff_upload_matrix(d, model, name_of(index, "ffn_down.weight", "mlp.down_proj.weight"), d.encoder_intermediate, d.encoder_hidden);
         d.encoder_layers.push_back(layer);
     }
 }
@@ -762,7 +827,10 @@ struct DiffLaunch {
             if (m.bias) add_bias(output, m.bias, out, rows);
             return;
         }
-        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact && !d.balanced;
+        // Balanced keeps bf16 activations only where a bf16 kernel exists (Q8_0
+        // above); other quantized weights run the int8 tensor-core path rather
+        // than the per-token rows kernels, which re-read the weights for every row.
+        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact;
         if (mmq) {
             int scale_stride = (in / 32) * 2;
             {
@@ -785,9 +853,13 @@ struct DiffLaunch {
                 throw std::runtime_error("diffusion GEMM: weight type " + std::to_string(m.type) +
                                          " has no rows kernel");
             void* arguments[] = {const_cast<std::uint64_t*>(&m.device), &input, &output, &in, &out, &count};
+            // The rows kernels differ in what a block covers: a 32x32 tile, one
+            // (output, token) pair, or one output over four tokens.
             if (format->matmul_rows_grid == flyweight::v2::RowsMatmulGrid::tiled32)
                 run(format->matmul_rows, static_cast<std::uint32_t>((out + 31) / 32),
                     static_cast<std::uint32_t>((rows + 31) / 32), 256, arguments);
+            else if (format->matmul_rows_grid == flyweight::v2::RowsMatmulGrid::per_token)
+                run(format->matmul_rows, static_cast<std::uint32_t>(out), static_cast<std::uint32_t>(rows), 256, arguments);
             else
                 run(format->matmul_rows, static_cast<std::uint32_t>(out),
                     static_cast<std::uint32_t>((rows + 3) / 4), 256, arguments);
@@ -1542,6 +1614,7 @@ void diff_gaussian_noise(std::uint64_t seed, std::vector<float>& out) {
 
 void diff_release(FlyweightV2Diffusion& d) {
     if (d.stream) flyweight_gpu_stream_sync(d.stream);
+    if (d.release_extra) d.release_extra(d);
     if (d.copy_stream) flyweight_gpu_stream_sync(d.copy_stream);
     for (const auto pointer : d.allocations) flyweight_gpu_free(pointer);
     d.allocations.clear();
@@ -1551,6 +1624,8 @@ void diff_release(FlyweightV2Diffusion& d) {
     }
     for (auto* pinned : d.host_allocations) flyweight_gpu_host_free(pinned);
     d.host_allocations.clear();
+    for (const auto& range : d.registered_ranges) flyweight_gpu_host_unregister(range.first);
+    d.registered_ranges.clear();
     for (int slot = 0; slot < 2; ++slot) {
         if (d.staged_event[slot]) flyweight_gpu_event_destroy(d.staged_event[slot]);
         if (d.consumed_event[slot]) flyweight_gpu_event_destroy(d.consumed_event[slot]);
@@ -1650,6 +1725,11 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
                 if (flyweight_gpu_event_create(&d->staged_event[slot]) != 0 ||
                     flyweight_gpu_event_create(&d->consumed_event[slot]) != 0)
                     throw std::runtime_error("failed to create diffusion staging events");
+        }
+        if (d->host_weights) {
+            // Best effort: a mapping that will not pin falls back to copies.
+            diff_register_model(*d, *transformer);
+            diff_register_model(*d, *encoder);
         }
         diff_upload_transformer(*d);
         diff_upload_encoder(*d);
@@ -1766,5 +1846,126 @@ int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* d, const uint32_t* tok
         if (progress && progress(user_data, step + 1, steps) != 0) throw std::runtime_error("cancelled");
     }
     diff_decode_latents(*d, latents.data(), latent_h, latent_w, rgb);
+    return 0;
+}); }
+
+// ---- MiniMax-H3 --------------------------------------------------------------
+
+// The H3 tower shares the encoder, the streaming and the GEMM helpers with
+// the Z-Image tower; the DiT and the VAE decoder are its own (stages below).
+// `transformer` and `vae` may be null for an encoder-only tower.
+// Defined in v2_h3.inc, which follows this file.
+void h3_attach(FlyweightV2Diffusion& d);
+void h3_attach_vae(FlyweightV2Diffusion& d);
+std::uint64_t h3_workspace_for(const FlyweightV2Diffusion& d, std::uint32_t text, std::uint32_t width,
+                               std::uint32_t height, std::uint32_t frames);
+
+int flyweight_v2_h3_create(FlyweightV2Model* encoder, FlyweightV2Model* transformer, FlyweightV2Model* vae,
+                           int32_t device, uint32_t weights, uint32_t max_prompt_tokens,
+                           uint32_t max_width, uint32_t max_height, uint32_t max_frames,
+                           FlyweightV2Diffusion** out) { return guarded([&]{
+    if (!encoder || !out) throw std::runtime_error("invalid H3 create arguments");
+    if (encoder->config.architecture != "qwen3")
+        throw std::runtime_error("the H3 text encoder must be a Qwen3 / Qwen3-VL language model (got " +
+                                 encoder->config.architecture + ")");
+    if (transformer && transformer->config.architecture != "minimax-h3")
+        throw std::runtime_error("the transformer must be a MiniMaxH3Transformer3DModel checkpoint");
+    if (vae && vae->config.architecture != "minimax-h3-vae")
+        throw std::runtime_error("the video VAE must be an AutoencoderKLMiniMaxH3 checkpoint");
+    if (!max_prompt_tokens) throw std::runtime_error("max_prompt_tokens must be positive");
+    if (transformer && (!max_width || !max_height || !max_frames || max_width % 32 || max_height % 32))
+        throw std::runtime_error("max_width and max_height must be positive multiples of 32 and max_frames positive");
+    const bool exact = (weights & FLYWEIGHT_V2_DIFFUSION_EXACT) != 0;
+    const bool balanced = (weights & FLYWEIGHT_V2_DIFFUSION_BALANCED) != 0 && !exact;
+    weights &= ~(FLYWEIGHT_V2_DIFFUSION_EXACT | FLYWEIGHT_V2_DIFFUSION_BALANCED);
+    if (weights > FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO)
+        throw std::runtime_error("invalid diffusion weights placement");
+    auto d = std::make_unique<FlyweightV2Diffusion>();
+    d->kind = FlyweightV2Diffusion::Kind::h3;
+    d->max_width = max_width;
+    d->max_height = max_height;
+    d->encoder = encoder;
+    d->transformer = transformer;
+    d->vae = vae;
+    d->device = device;
+    d->max_prompt_tokens = max_prompt_tokens;
+    d->exact = exact;
+    d->balanced = balanced;
+    // The encoder ships cut to the layers H3 reads; run all of them.
+    d->encoder_layers_used = static_cast<int>(encoder->config.layer_count);
+    if (transformer) d->caption_dim = static_cast<int>(transformer->config.caption_dim);
+    if (flyweight_gpu_init(device) != 0) throw std::runtime_error("failed to initialize native CUDA runtime");
+    {
+        std::vector<std::string> option_storage;
+#if !defined(_WIN32)
+        for (const char* path : {"/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"})
+            if (access((std::string(path) + "/cuda_fp16.h").c_str(), R_OK) == 0) {
+                option_storage.push_back(std::string("-I") + path);
+                option_storage.push_back(std::string("-I") + path + "/cccl");
+            }
+#endif
+        if (const char* cuda_home = std::getenv("CUDA_HOME")) {
+            option_storage.push_back(std::string("-I") + cuda_home + "/include");
+            option_storage.push_back(std::string("-I") + cuda_home + "/include/cccl");
+        }
+        std::vector<const char*> compile_options;
+        for (const auto& option : option_storage) compile_options.push_back(option.c_str());
+        std::array<char, 16384> compile_log{};
+        const std::string cuda_source = qwen_cuda_corpus();
+        if (flyweight_gpu_compile(cuda_source.c_str(), compile_options.data(),
+                                  static_cast<int32_t>(compile_options.size()), device,
+                                  compile_log.data(), compile_log.size()) != 0)
+            throw std::runtime_error(std::string("failed to compile native diffusion CUDA kernels: ") +
+                                     compile_log.data());
+    }
+    try {
+        if (flyweight_gpu_stream_create(&d->stream) != 0) throw std::runtime_error("failed to create diffusion stream");
+        FlyweightV2GpuInfo probe{};
+        const bool probed = gpu_probe(probe, device) == 0;
+        if (probed) d->int8_tensor_cores = probe.compute_major * 10 + probe.compute_minor >= 75;
+        d->flash_attention = probed && probe.compute_major >= 8 && !flyweight_backend_is_cpu() &&
+            !(std::getenv("FLYWEIGHT_DIFF_FLASH") && std::getenv("FLYWEIGHT_DIFF_FLASH")[0] == '0');
+        std::uint64_t layer_bytes = 0;
+        for (const auto& tensor : encoder->tensors) layer_bytes += tensor.size;
+        if (transformer) for (const auto& tensor : transformer->tensors) layer_bytes += tensor.size;
+        d->host_weights = weights == FLYWEIGHT_V2_DIFFUSION_WEIGHTS_HOST ||
+            (weights == FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO && probed && probe.total_memory &&
+             layer_bytes * 2 > probe.total_memory);
+        if (d->host_weights) {
+            if (flyweight_gpu_stream_create(&d->copy_stream) != 0)
+                throw std::runtime_error("failed to create diffusion copy stream");
+            for (int slot = 0; slot < 2; ++slot)
+                if (flyweight_gpu_event_create(&d->staged_event[slot]) != 0 ||
+                    flyweight_gpu_event_create(&d->consumed_event[slot]) != 0)
+                    throw std::runtime_error("failed to create diffusion staging events");
+            diff_register_model(*d, *encoder);
+            if (transformer) diff_register_model(*d, *transformer);
+        }
+        diff_upload_encoder(*d);
+        if (transformer) h3_attach(*d);
+        if (transformer && vae) h3_attach_vae(*d);
+        if (d->host_weights) {
+            for (auto& slot : d->staging)
+                if (flyweight_gpu_alloc(d->staging_bytes, &slot) != 0 || !slot)
+                    throw std::runtime_error("diffusion staging allocation failed (" +
+                                             std::to_string(d->staging_bytes / 1048576) + " MiB)");
+        }
+        std::uint64_t bytes = diff_encoder_workspace(*d, max_prompt_tokens);
+        if (transformer) bytes = std::max(bytes, h3_workspace_for(*d, max_prompt_tokens, max_width, max_height, max_frames));
+        if (flyweight_gpu_alloc(bytes, &d->workspace) != 0 || !d->workspace)
+            throw std::runtime_error("diffusion workspace allocation failed (" + std::to_string(bytes / 1048576) + " MiB)");
+        d->workspace_bytes = bytes;
+        std::fprintf(stderr,
+                     "[flyweight] h3: encoder %d layers, %llu MiB %s, %llu MiB resident, %llu MiB workspace\n",
+                     d->encoder_layers_used,
+                     static_cast<unsigned long long>((d->host_weights ? d->host_bytes : d->weight_bytes) / 1048576),
+                     d->host_weights ? "streamed from host memory" : "on the device",
+                     static_cast<unsigned long long>(d->weight_bytes / 1048576),
+                     static_cast<unsigned long long>(bytes / 1048576));
+    } catch (...) {
+        diff_release(*d);
+        throw;
+    }
+    *out = d.release();
     return 0;
 }); }

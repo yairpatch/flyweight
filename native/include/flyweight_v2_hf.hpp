@@ -191,6 +191,99 @@ inline ModelConfig config_from_qwen3(const json::Value& config) {
     return out;
 }
 
+// Qwen3-VL (`Qwen3VLForConditionalGeneration`): the language model under
+// `text_config` is a plain Qwen3 decoder with interleaved MRoPE, which on a
+// text-only prompt degenerates to ordinary rope. Loaded as MiniMax-H3's text
+// encoder; the vision tower is recognised but not run.
+inline bool is_qwen3_vl(const std::string& model_type,
+                        const std::string& architecture) {
+    return model_type == "qwen3_vl" || model_type == "qwen3_vl_text" ||
+           architecture == "Qwen3VLForConditionalGeneration";
+}
+
+inline ModelConfig config_from_qwen3_vl(const json::Value& config) {
+    const auto& text = config.contains("text_config") ? config["text_config"] : config;
+    ModelConfig out = config_from_qwen3(text);
+    out.architecture = "qwen3";
+    const auto& scaling = text["rope_scaling"];
+    if (scaling.contains("mrope_section")) {
+        const auto& sections = scaling["mrope_section"];
+        for (std::size_t axis = 0; axis < 3 && axis < sections.size(); ++axis)
+            out.rope_sections[axis] = static_cast<std::uint32_t>(sections[axis].as_uint());
+    }
+    return out;
+}
+
+// MiniMax-H3's packed video/audio DiT (`MiniMaxH3Transformer3DModel`).
+inline bool is_minimax_h3_transformer(const json::Value& config) {
+    return config["_class_name"].as_string() == "MiniMaxH3Transformer3DModel";
+}
+
+inline ModelConfig config_from_minimax_h3(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "minimax-h3";
+    out.hidden_size = static_cast<std::uint32_t>(config["hidden_size"].as_uint(5376));
+    out.layer_count = static_cast<std::uint32_t>(config["num_layers"].as_uint(50));
+    out.refiner_layer_count = static_cast<std::uint32_t>(config["num_refiner_layers"].as_uint(2));
+    out.attention_heads = static_cast<std::uint32_t>(config["num_attention_heads"].as_uint(56));
+    out.attention_kv_heads = out.attention_heads;
+    out.attention_head_dim = static_cast<std::uint32_t>(config["attention_head_dim"].as_uint(128));
+    out.key_length = out.value_length = out.attention_head_dim;
+    out.intermediate_size = static_cast<std::uint32_t>(config["ffn_dim"].as_uint(14336));
+    out.dense_intermediate_size = out.intermediate_size;
+    out.in_channels = static_cast<std::uint32_t>(config["in_channels"].as_uint(24));
+    out.audio_channels = static_cast<std::uint32_t>(config["audio_in_channels"].as_uint(32));
+    out.patch_size = static_cast<std::uint32_t>(config["patch_size"][1].as_uint(2));
+    out.caption_dim = static_cast<std::uint32_t>(config["text_dim"].as_uint(5120));
+    out.rope_freq_dim = static_cast<std::uint32_t>(config["rope_freq_dim"].as_uint(16));
+    out.rope_freq_base = static_cast<float>(config["rope_theta"].as_double(10000.0));
+    out.rms_norm_epsilon = static_cast<float>(config["norm_eps"].as_double(1e-5));
+    return out;
+}
+
+// MiniMax-H3's video VAE (`AutoencoderKLMiniMaxH3`): only the ViT decoder
+// and the post-quant projection are loaded.
+inline bool is_minimax_h3_vae(const json::Value& config) {
+    return config["_class_name"].as_string() == "AutoencoderKLMiniMaxH3";
+}
+
+inline ModelConfig config_from_minimax_h3_vae(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "minimax-h3-vae";
+    out.latent_channels = static_cast<std::uint32_t>(config["latent_channels"].as_uint(24));
+    out.in_channels = static_cast<std::uint32_t>(config["out_channels"].as_uint(3));
+    out.layer_count = static_cast<std::uint32_t>(config["decoder_num_layers"].as_uint(36));
+    out.attention_heads = static_cast<std::uint32_t>(config["decoder_num_attention_heads"].as_uint(32));
+    out.attention_kv_heads = out.attention_heads;
+    out.attention_head_dim = static_cast<std::uint32_t>(config["decoder_attention_head_dim"].as_uint(64));
+    out.key_length = out.value_length = out.attention_head_dim;
+    out.hidden_size = out.attention_heads * out.attention_head_dim;
+    out.intermediate_size = out.hidden_size * static_cast<std::uint32_t>(config["decoder_ffn_mult"].as_uint(4));
+    out.dense_intermediate_size = out.intermediate_size;
+    out.vae_register_tokens = static_cast<std::uint32_t>(config["decoder_num_register_tokens"].as_uint(4));
+    out.rope_freq_base = static_cast<float>(config["decoder_rope_theta"].as_double(100.0));
+    // rope_dim_ratio of the head, three axes, two channels per frequency.
+    const double ratio = config["decoder_rope_dim_ratio"].as_double(0.75);
+    out.rope_freq_dim = static_cast<std::uint32_t>(out.attention_head_dim * ratio / 6.0 + 0.5);
+    out.rms_norm_epsilon = static_cast<float>(config["decoder_norm_eps"].as_double(1e-5));
+    std::uint32_t spatial = 1, temporal = 1;
+    const auto& spatial_factors = config["spatial_downsample_factors"];
+    for (std::size_t i = 0; i < spatial_factors.size(); ++i) spatial *= static_cast<std::uint32_t>(spatial_factors[i].as_uint(1));
+    const auto& temporal_factors = config["temporal_downsample_factors"];
+    for (std::size_t i = 0; i < temporal_factors.size(); ++i) temporal *= static_cast<std::uint32_t>(temporal_factors[i].as_uint(1));
+    out.patch_size = spatial;
+    out.vae_temporal_patch = temporal;
+    out.vae_clip_length = static_cast<std::uint32_t>(config["clip_length"].as_uint(17));
+    out.vae_token_drop = static_cast<std::uint32_t>(config["token_drop"].as_uint(3));
+    const auto& mean = config["latents_mean"];
+    const auto& std = config["latents_std"];
+    for (std::size_t i = 0; i < mean.size(); ++i) out.vae_latents_mean.push_back(static_cast<float>(mean[i].as_double()));
+    for (std::size_t i = 0; i < std.size(); ++i) out.vae_latents_std.push_back(static_cast<float>(std[i].as_double()));
+    return out;
+}
+
+inline bool is_diffusion_architecture(const std::string& architecture);
+
 // Diffusers components carry `_class_name` instead of `model_type`, and no
 // tokenizer. Two are recognised: Z-Image's single-stream DiT and the FLUX
 // 16-channel KL autoencoder it renders through.
@@ -205,7 +298,8 @@ inline bool is_autoencoder_kl(const json::Value& config) {
 // True for the diffusion components, which have no vocabulary and whose open
 // must not look for tokenizer.json.
 inline bool is_diffusion_architecture(const std::string& architecture) {
-    return architecture == "zimage-dit" || architecture == "autoencoder-kl";
+    return architecture == "zimage-dit" || architecture == "autoencoder-kl" ||
+           architecture == "minimax-h3" || architecture == "minimax-h3-vae";
 }
 
 inline ModelConfig config_from_zimage_transformer(const json::Value& config) {
@@ -398,7 +492,10 @@ inline ModelConfig config_from_json(const json::Value& config) {
     const auto architecture = config["architectures"][0].as_string();
 
     if (is_zimage_transformer(config)) return config_from_zimage_transformer(config);
+    if (is_minimax_h3_transformer(config)) return config_from_minimax_h3(config);
+    if (is_minimax_h3_vae(config)) return config_from_minimax_h3_vae(config);
     if (is_autoencoder_kl(config)) return config_from_autoencoder_kl(config);
+    if (is_qwen3_vl(model_type, architecture)) return config_from_qwen3_vl(config);
     if (is_qwen3_5(model_type, architecture))
         return config_from_qwen3_5(config);
     if (is_qwen3(model_type, architecture))
@@ -800,6 +897,22 @@ inline ParsedName translate_autoencoder_kl(const std::string& name) {
     return parsed;
 }
 
+// MiniMax-H3 video VAE: the decoder, the post-quant conv and the latent
+// statistics keep their names; the encoder side is dropped. The fused
+// `attn.to_qkv` is stored per-head interleaved ([head0: q k v][head1 ...]);
+// it is restacked into [q_all; k_all; v_all] through the expert-stack path,
+// one piece per (head, projection), so the runtime sees one plain matrix.
+inline ParsedName translate_minimax_h3_vae(const std::string& name) {
+    ParsedName parsed;
+    parsed.matched = true;
+    if (name.rfind("encoder.", 0) == 0 || name.rfind("quant_conv.", 0) == 0) {
+        parsed.skip = true;
+        return parsed;
+    }
+    parsed.gguf = name;
+    return parsed;
+}
+
 // Splits `model.layers.<N>.<rest>` and translates. `full_attention` decides the
 // two ambiguous g_proj cases.
 inline ParsedName translate(const std::string& name,
@@ -808,6 +921,7 @@ inline ParsedName translate(const std::string& name,
     if (config.architecture == "qwen3") return translate_qwen3(name);
     if (config.architecture == "zimage-dit") return translate_zimage(name);
     if (config.architecture == "autoencoder-kl") return translate_autoencoder_kl(name);
+    if (config.architecture == "minimax-h3-vae") return translate_minimax_h3_vae(name);
     const auto& linear_layer = config.sliding_window_pattern;
     ParsedName parsed;
     const auto& globals = global_names();
@@ -1200,6 +1314,25 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
                     tensor.adjust = adjust_for(parsed.gguf);
                     apply_value_head_order(tensor, config, shard.base, entry);
                     drop_conv1d_singleton(tensor);
+                }
+                if (config.architecture == "minimax-h3-vae" &&
+                    (parsed.gguf.find(".attn.to_qkv.weight") != std::string::npos ||
+                     parsed.gguf.find(".attn.to_qkv.bias") != std::string::npos)) {
+                    // [head][q k v][head_dim] rows -> [q_all; k_all; v_all]: one
+                    // part per (projection, head), each `head_dim` rows.
+                    const std::uint64_t heads = config.attention_heads, head_dim = config.attention_head_dim;
+                    const bool matrix = entry.shape.size() == 2;
+                    const std::uint64_t row_bytes = matrix ? entry.shape[0] * (entry.type == 0 ? 4 : 2) : (entry.type == 0 ? 4 : 2);
+                    const std::uint64_t rows = matrix ? entry.shape[1] : entry.shape[0];
+                    if (rows != heads * 3 * head_dim)
+                        throw std::runtime_error("unexpected fused qkv shape on " + entry.name);
+                    tensor.parts.clear();
+                    for (std::uint64_t projection = 0; projection < 3; ++projection)
+                        for (std::uint64_t head = 0; head < heads; ++head) {
+                            const std::uint64_t first_row = (head * 3 + projection) * head_dim;
+                            tensor.parts.push_back({shard.base, entry.offset + first_row * row_bytes, head_dim * row_bytes});
+                        }
+                    tensor.offset = 0;
                 }
                 out.push_back(std::move(tensor));
                 continue;
