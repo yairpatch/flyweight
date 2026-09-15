@@ -121,7 +121,8 @@ UI_CONTENT_TYPES = {
 # them, so style-src allows inline styles; scripts stay same-origin only.
 UI_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-    "connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; "
+    "connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+    "font-src 'self'; "
     "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
     "form-action 'self'"
 )
