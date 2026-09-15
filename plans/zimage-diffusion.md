@@ -90,6 +90,18 @@ times when syncing).
   ~1.65 s: MMQ ~1 s (47 TFLOP at ~45 TOPS), attention 0.15 s, the rest
   elementwise. 512x512: 3.5 s.
 
+## Decoder fixes (2026-09-15)
+
+The 2.8 s tiled decode at 1024 was not the convolutions: the group-norm
+apply kernel re-summed 64 double partials per element and wrote its
+channels-last output uncoalesced, 3.6 s of a 4.7 s synced trace. A finalize
+kernel folds the partials once per group and the apply and the layout
+conversion go through a 32x32 shared tile. Decode at 1024: 2.8 s -> 0.75 s;
+at 512: 0.44 s -> 0.10 s. The bf16 conv measures 44-48 TFLOPS once the
+harness stops timing its own reference einsums (the earlier 2.6-9 TFLOPS
+figures were that artifact); the shared-memory staging with register
+prefetch stays, it is no slower.
+
 ## Balanced precision (2026-09-15)
 
 `diff_q8_bf16_gemm`: a 128x64-tile bf16 mma GEMM that stages Q8_0 blocks as
@@ -127,7 +139,8 @@ Per step: MMQ 188 ms, attention 163 ms, quantize 12 ms; VAE 1 s; 6.75 s in all.
 
 - The Q8 GEMMs: cuBLASLt int8 needs per-channel scales (a requant of the
   DiT away from Q8_0 blocks), or an MMQ variant with cp.async pipelining.
-- The conv: stage the input window and weights through shared memory.
+- Fusions: pack the GEMM input to bf16 inside the preceding norm, and fold
+  SiLU x up into the w1/w3 GEMM; ~10% of a step.
 - Encoder at Q4_K by default would save 0.8 GB of host memory for a
   quality cost nobody has measured yet (moot for VRAM in host mode).
 - Plain Qwen3 dense GGUFs (Qwen3-1.7B etc.) have never run on the chat

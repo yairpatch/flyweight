@@ -1256,7 +1256,7 @@ extern "C" int flyweight_gpu_compile(
              "diff_fill_rows", "diff_layer_norm_rows", "diff_head_rms_norm",
              "diff_rope_axes_rows", "diff_rope_half_rows", "diff_attention_rows",
              "diff_softmax_rows", "diff_transpose", "diff_conv2d",
-             "diff_group_norm_stats", "diff_group_norm_apply",
+             "diff_group_norm_stats", "diff_group_norm_finalize", "diff_group_norm_apply",
              "diff_upsample_nearest_2x", "diff_pack_attention_bf16",
              "diff_flash_attention_bf16", "diff_conv2d_bf16", "diff_to_hwc_bf16",
              "diff_upsample_nearest_2x_hwc_bf16", "diff_q8_bf16_gemm", "diff_pack_rows_bf16",

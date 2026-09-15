@@ -722,44 +722,81 @@ extern "C" __global__ __launch_bounds__(128)
 void diff_conv2d_bf16(const unsigned short* input, const unsigned short* weight, const float* bias,
                       float* output, const int in_channels, const int out_channels,
                       const int height, const int width, const int kernel) {
+    // One input row segment of 130 pixels (128 plus the halo) x 16 channels,
+    // and the tap weights of that row for all 64 output channels, staged per
+    // (tap row, 16-channel block); every uint2 is one lane pair's four
+    // channel slots. The next slab is fetched into registers while the
+    // current one is multiplied, which is what hides the load latency.
+    __shared__ uint2 a_s[130][4];
+    __shared__ uint2 b_s[3][64][4];
     const int co_groups = out_channels / 64;
     const int y = blockIdx.y / co_groups, co0 = (blockIdx.y % co_groups) * 64;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int quad = lane >> 2, pair = lane & 3;
-    const int x_base = blockIdx.x * 128 + warp * 32;
-    const int radius = kernel == 3 ? 1 : 0, taps = kernel * kernel;
+    const int x0 = blockIdx.x * 128;
+    const int radius = kernel == 3 ? 1 : 0;
     const int blocks = in_channels >> 4;
+    const int slabs = kernel * blocks;   // (tap row, channel block) pairs
     float acc[2][8][4];
     for (int m = 0; m < 2; ++m) for (int n = 0; n < 8; ++n) for (int i = 0; i < 4; ++i) acc[m][n][i] = 0.0f;
-    for (int tap = 0; tap < taps; ++tap) {
-        const int dy = tap / kernel - radius, dx = tap % kernel - radius;
-        const int sy = y + dy;
+
+    uint2 a_next[5], b_next[6];
+    auto fetch = [&](int slab) {
+        const int ty = slab / blocks, blk = slab % blocks;
+        const int sy = y + ty - radius;
         const bool row_ok = sy >= 0 && sy < height;
-        // Four pixel rows of the two m-tiles: quad, quad+8, quad+16, quad+24.
-        const unsigned short* in_row[4];
-        bool ok[4];
-        for (int r = 0; r < 4; ++r) {
-            const int sx = x_base + r * 8 + quad + dx;
-            ok[r] = row_ok && sx >= 0 && sx < width;
-            in_row[r] = input + ((long long)sy * width + sx) * in_channels + pair * 4;
+        for (int i = 0; i < 5; ++i) {
+            const int index = threadIdx.x + i * 128;
+            const int px = index >> 2, p = index & 3;
+            const int sx = x0 - 1 + px;
+            a_next[i] = (index < 520 && row_ok && sx >= 0 && sx < width)
+                ? *(const uint2*)(input + ((long long)sy * width + sx) * in_channels + blk * 16 + p * 4)
+                : make_uint2(0u, 0u);
         }
-        const unsigned short* w_tap = weight + (long long)tap * out_channels * in_channels;
-        for (int blk = 0; blk < blocks; ++blk) {
+        for (int i = 0; i < 6; ++i) {
+            const int index = threadIdx.x + i * 128;
+            const int tx = index >> 8, co = (index >> 2) & 63, p = index & 3;
+            b_next[i] = tx < kernel
+                ? *(const uint2*)(weight + ((long long)(ty * kernel + tx) * out_channels + co0 + co) * in_channels + blk * 16 + p * 4)
+                : make_uint2(0u, 0u);
+        }
+    };
+    auto store = [&]() {
+        for (int i = 0; i < 5; ++i) {
+            const int index = threadIdx.x + i * 128;
+            if (index < 520) a_s[index >> 2][index & 3] = a_next[i];
+        }
+        for (int i = 0; i < 6; ++i) {
+            const int index = threadIdx.x + i * 128;
+            const int tx = index >> 8;
+            if (tx < kernel) b_s[tx][(index >> 2) & 63][index & 3] = b_next[i];
+        }
+    };
+
+    fetch(0);
+    for (int slab = 0; slab < slabs; ++slab) {
+        store();
+        __syncthreads();
+        if (slab + 1 < slabs) fetch(slab + 1);
+        for (int tx = 0; tx < kernel; ++tx) {
             unsigned int a[2][4];
             for (int r = 0; r < 4; ++r) {
-                uint2 bits = ok[r] ? *(const uint2*)(in_row[r] + blk * 16) : make_uint2(0u, 0u);
-                a[r >> 1][(r & 1)] = bits.x;        // a0 (row quad) / a1 (row quad+8)
-                a[r >> 1][(r & 1) + 2] = bits.y;    // a2 / a3: channels +8
+                const int px = warp * 32 + r * 8 + quad + tx + (1 - radius);
+                const uint2 bits = a_s[px][pair];
+                a[r >> 1][(r & 1)] = bits.x;
+                a[r >> 1][(r & 1) + 2] = bits.y;
             }
             for (int n = 0; n < 8; ++n) {
-                const uint2 bits = *(const uint2*)(w_tap + ((long long)(co0 + n * 8 + quad) * blocks + blk) * 16 + pair * 4);
+                const uint2 bits = b_s[tx][n * 8 + quad][pair];
                 unsigned int b[2] = {bits.x, bits.y};
                 kv_mma_m16n8k16(acc[0][n], a[0], b, (const __nv_bfloat16*)0);
                 kv_mma_m16n8k16(acc[1][n], a[1], b, (const __nv_bfloat16*)0);
             }
         }
+        __syncthreads();
     }
     const long long plane = (long long)height * width;
+    const int x_base = x0 + warp * 32;
     for (int n = 0; n < 8; ++n) {
         const int co = co0 + n * 8 + pair * 2;
         const float b0 = bias ? bias[co] : 0.0f, b1 = bias ? bias[co + 1] : 0.0f;
@@ -770,19 +807,6 @@ void diff_conv2d_bf16(const unsigned short* input, const unsigned short* weight,
                 output[(long long)co * plane + (long long)y * width + px] = acc[m][n][half * 2] + b0;
                 output[(long long)(co + 1) * plane + (long long)y * width + px] = acc[m][n][half * 2 + 1] + b1;
             }
-    }
-}
-
-// [C][H][W] f32 -> channels-last bf16 in slot order, for a tensor-core conv
-// whose input did not come from a norm or an upsample (conv_in, shortcuts).
-extern "C" __global__
-void diff_to_hwc_bf16(const float* input, unsigned short* output, const int channels, const int plane) {
-    const long long elements = (long long)channels * plane;
-    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         index < elements; index += (long long)blockDim.x * gridDim.x) {
-        const int c = (int)(index / plane);
-        const long long pixel = index % plane;
-        output[pixel * channels + (c & ~15) + diff_channel_slot(c & 15)] = diff_f32_to_bf16(input[index]);
     }
 }
 
@@ -842,36 +866,77 @@ void diff_group_norm_stats(const float* input, double* partials, const int chann
     }
 }
 
-// Group norm, pass 2: normalize with per-channel affine, optional SiLU.
-// `output_hwc` non-null writes channels-last bf16 there (for the tensor-core
-// conv) instead of [C][H][W] f32 to `output`.
+// Group norm, pass 2: fold the slices into one (mean, inverse deviation)
+// per group, so the apply pass reads two floats per element instead of
+// re-summing 64 partials for each. One block, `groups` threads or more.
 extern "C" __global__
-void diff_group_norm_apply(const float* input, const double* partials,
+void diff_group_norm_finalize(const double* partials, float* stats, const int groups,
+                              const int slices, const long long count, const float epsilon) {
+    const int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= groups) return;
+    double sum = 0.0, square = 0.0;
+    for (int slice = 0; slice < slices; ++slice) {
+        sum += partials[((long long)group * slices + slice) * 2];
+        square += partials[((long long)group * slices + slice) * 2 + 1];
+    }
+    const double mean = sum / (double)count;
+    const double variance = square / (double)count - mean * mean;
+    stats[group * 2] = (float)mean;
+    stats[group * 2 + 1] = (float)(1.0 / sqrt(variance + (double)epsilon));
+}
+
+// Group norm, pass 3: normalize with the per-channel affine and optional
+// SiLU, through a 32-channel x 32-pixel tile so both layouts write
+// coalesced: [C][H][W] f32 to `output`, or channels-last bf16 in slot order
+// to `output_hwc` when that is non-null (the tensor-core conv's input).
+// Grid (ceil(plane/32), ceil(channels/32)), block 256.
+extern "C" __global__
+void diff_group_norm_apply(const float* input, const float* stats,
                            const float* weight, const float* bias, float* output,
                            unsigned short* output_hwc,
-                           const int channels, const int plane, const int groups,
-                           const int slices, const float epsilon, const int silu) {
+                           const int channels, const int plane, const int groups, const int silu) {
+    __shared__ float tile[32][33];
     const int channels_per_group = channels / groups;
-    const long long elements = (long long)channels * plane;
-    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         index < elements; index += (long long)blockDim.x * gridDim.x) {
-        const int channel = (int)(index / plane);
-        const int group = channel / channels_per_group;
-        double sum = 0.0, square = 0.0;
-        for (int slice = 0; slice < slices; ++slice) {
-            sum += partials[((long long)group * slices + slice) * 2];
-            square += partials[((long long)group * slices + slice) * 2 + 1];
+    const int p0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;   // 32 x 8
+    for (int i = ty; i < 32; i += 8) {
+        const int c = c0 + i, p = p0 + tx;
+        if (c < channels && p < plane) {
+            const int group = c / channels_per_group;
+            float value = (input[(long long)c * plane + p] - stats[group * 2]) * stats[group * 2 + 1] * weight[c] + bias[c];
+            if (silu) value = value / (1.0f + expf(-value));
+            tile[i][tx] = value;
+            if (!output_hwc) output[(long long)c * plane + p] = value;
         }
-        const double count = (double)channels_per_group * plane;
-        const double mean = sum / count;
-        const double variance = square / count - mean * mean;
-        const float inverse = (float)(1.0 / sqrt(variance + (double)epsilon));
-        float value = ((float)(input[index] - mean)) * inverse * weight[channel] + bias[channel];
-        if (silu) value = value / (1.0f + expf(-value));
-        if (output_hwc)
-            output_hwc[(index % plane) * (long long)channels + (channel & ~15) + diff_channel_slot(channel & 15)] =
-                diff_f32_to_bf16(value);
-        else output[index] = value;
+    }
+    if (!output_hwc) return;
+    __syncthreads();
+    // Transposed write: lanes walk channels for one pixel; slots keep each
+    // block of 16 channels together, so a warp writes two 32-byte runs.
+    for (int i = ty; i < 32; i += 8) {
+        const int p = p0 + i, c = c0 + tx;
+        if (c < channels && p < plane)
+            output_hwc[(long long)p * channels + (c & ~15) + diff_channel_slot(c & 15)] = diff_f32_to_bf16(tile[tx][i]);
+    }
+}
+
+// [C][H][W] f32 -> channels-last bf16 in slot order, for a tensor-core conv
+// whose input did not come from a norm or an upsample (conv_in, shortcuts).
+// Same tile as the norm above. Grid (ceil(plane/32), ceil(channels/32)).
+extern "C" __global__
+void diff_to_hwc_bf16(const float* input, unsigned short* output, const int channels, const int plane) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    for (int i = ty; i < 32; i += 8) {
+        const int c = c0 + i, p = p0 + tx;
+        if (c < channels && p < plane) tile[i][tx] = input[(long long)c * plane + p];
+    }
+    __syncthreads();
+    for (int i = ty; i < 32; i += 8) {
+        const int p = p0 + i, c = c0 + tx;
+        if (c < channels && p < plane)
+            output[(long long)p * channels + (c & ~15) + diff_channel_slot(c & 15)] = diff_f32_to_bf16(tile[tx][i]);
     }
 }
 

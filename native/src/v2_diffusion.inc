@@ -606,7 +606,7 @@ std::uint64_t diff_vae_workspace(const FlyweightV2Diffusion& d, int latent_h, in
     total += diff_align(plane_max * 2);                                     // channels-last bf16 conv input
     total += diff_align(top_plane * top * f) * 4;                           // q, k, v^T, attention out (HWC)
     total += diff_align(static_cast<std::uint64_t>(kVaeAttentionChunk) * top_plane * f);  // scores
-    total += diff_align(static_cast<std::uint64_t>(d.vae_groups) * 64 * 2 * sizeof(double));
+    total += diff_align(static_cast<std::uint64_t>(d.vae_groups) * (64 * 2 * sizeof(double) + 2 * sizeof(float)));
     total += diff_align(static_cast<std::uint64_t>(top) * f);                 // query scale
     return total;
 }
@@ -1233,11 +1233,17 @@ struct VaeState {
                     int channels, int plane, bool silu) const {
         int groups = d.vae_groups, slices = 64, silu_flag = silu ? 1 : 0, c = channels, p = plane;
         float epsilon = 1e-6f;
+        long long count = static_cast<long long>(channels / groups) * plane;
         std::uint64_t partial = partials, weight = norm.weight, bias = norm.bias;
+        // The 2 floats per group land past the partials, which are sized for it.
+        std::uint64_t stat = partials + static_cast<std::uint64_t>(groups) * slices * 2 * sizeof(double);
         void* stats[] = {&input, &partial, &c, &p, &groups, &slices};
         launch.run("diff_group_norm_stats", static_cast<std::uint32_t>(groups), static_cast<std::uint32_t>(slices), 256, stats);
-        void* apply[] = {&input, &partial, &weight, &bias, &output, &output_hwc, &c, &p, &groups, &slices, &epsilon, &silu_flag};
-        launch.run("diff_group_norm_apply", DiffLaunch::grid_for(static_cast<std::uint64_t>(channels) * plane), 1, 256, apply);
+        void* finalize[] = {&partial, &stat, &groups, &slices, &count, &epsilon};
+        launch.run("diff_group_norm_finalize", static_cast<std::uint32_t>((groups + 255) / 256), 1, 256, finalize);
+        void* apply[] = {&input, &stat, &weight, &bias, &output, &output_hwc, &c, &p, &groups, &silu_flag};
+        launch.run("diff_group_norm_apply", static_cast<std::uint32_t>((plane + 31) / 32),
+                   static_cast<std::uint32_t>((channels + 31) / 32), 256, apply);
     }
 
     // [C][H][W] f32 -> the hwc staging buffer.
@@ -1245,7 +1251,8 @@ struct VaeState {
         int c = channels, p = plane;
         std::uint64_t out = hwc;
         void* arguments[] = {&input, &out, &c, &p};
-        launch.run("diff_to_hwc_bf16", DiffLaunch::grid_for(static_cast<std::uint64_t>(channels) * plane), 1, 256, arguments);
+        launch.run("diff_to_hwc_bf16", static_cast<std::uint32_t>((plane + 31) / 32),
+                   static_cast<std::uint32_t>((channels + 31) / 32), 256, arguments);
     }
 
     // Runs `conv` on an f32 [C][H][W] input, staging it if the conv is tensor-core.
@@ -1295,7 +1302,7 @@ void diff_decode_tile(FlyweightV2Diffusion& d, const float* latents, int latent_
     const std::uint64_t d_vt = arena.take(top_plane * top * f);
     const std::uint64_t d_attn = arena.take(top_plane * top * f);
     const std::uint64_t d_scores = arena.take(static_cast<std::uint64_t>(kVaeAttentionChunk) * top_plane * f);
-    const std::uint64_t d_partials = arena.take(static_cast<std::uint64_t>(d.vae_groups) * 64 * 2 * sizeof(double));
+    const std::uint64_t d_partials = arena.take(static_cast<std::uint64_t>(d.vae_groups) * (64 * 2 * sizeof(double) + 2 * sizeof(float)));
     const std::uint64_t d_scale = arena.take(static_cast<std::uint64_t>(top) * f);
     const std::vector<float> query_scale(top, 1.0f / std::sqrt(static_cast<float>(top)));
     const std::uint64_t d_hwc = arena.take(plane_max * 2);

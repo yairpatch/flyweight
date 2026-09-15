@@ -499,9 +499,9 @@ the checkpoint -- both at Q8_0 (the DiT is 6.2 GB from 24.6 GB of f32),
 keeps f32 weights with its large convolutions on bf16 tensor cores. The
 DiT's attention runs on bf16 tensor cores too, and the decoder tiles
 anything past 512x512 the way diffusers' `enable_tiling` does, so the
-model's native 1024x1024 fits a 12 GB card. Eight steps take about 15 s at
-1024x1024 and 3.5 s at 512x512 on an RTX 5070 Ti laptop, of which the Q8
-GEMMs are the larger part. Render at 1024: the model is trained there,
+model's native 1024x1024 fits a 12 GB card. Eight steps take about 14 s at
+1024x1024 and 3 s at 512x512 on an RTX 5070 Ti laptop, almost all of it
+the DiT's GEMMs; the decode is under a second. Render at 1024: the model is trained there,
 and at 512 its compositions come out visibly weaker in diffusers as well.
 
 `--image-weights` decides where the 9 GB of encoder and DiT weights live.
