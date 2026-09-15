@@ -162,19 +162,71 @@ def dit(args: argparse.Namespace) -> None:
         return table[lo] + (table[lo + 1] - table[lo]) * fr
     temb = torch.stack([curve(t) for t in timesteps])  # [n_t][8]
 
+    # --w8a8 simulates the int8 tensor-core GEMM: activations quantized per token, weights per output channel.
+    def quant_rows(t, mode, block=None):
+        """Simulated low-precision rows: int8 or fp8 e4m3 with one scale per row (or per `block` columns)."""
+        if block:
+            shape = t.shape
+            t = t.reshape(shape[0], -1, block)
+        peak = 127.0 if mode == "int8" else 448.0
+        scale = t.abs().amax(-1, keepdim=True).clamp_min(1e-12) / peak
+        if mode == "int8":
+            q = (t / scale).round().clamp(-127, 127)
+        else:
+            q = (t / scale).to(torch.float8_e4m3fn).float()
+        out = q * scale
+        return out.reshape(shape) if block else out
+
+    def mm(x, weight):
+        sim = args.gemm_sim
+        if sim == "none":
+            return x @ weight.T
+        if sim == "w8a8":
+            return quant_rows(x, "int8") @ quant_rows(weight, "int8").T
+        if sim == "w8":
+            return x @ quant_rows(weight, "int8").T
+        if sim == "a8":
+            return quant_rows(x, "int8") @ weight.T
+        if sim == "fp8":
+            return quant_rows(x, "fp8") @ quant_rows(weight, "fp8").T
+        if sim == "fp8blk":   # DeepSeek-style: activations per 128 columns, weights per 128x128 block
+            return quant_rows(x, "fp8", 128) @ quant_rows(weight, "fp8", 128).T
+        if sim == "mxfp8":    # Blackwell MXFP8: e4m3 elements, one power-of-two scale per 32, both operands
+            def mx(t):
+                shape = t.shape; t = t.reshape(shape[0], -1, 32)
+                scale = torch.exp2(torch.ceil(torch.log2(t.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 448.0)))
+                return ((t / scale).to(torch.float8_e4m3fn).float() * scale).reshape(shape)
+            return mx(x) @ mx(weight).T
+        if sim == "mxw8a8":   # MXFP8 activations against per-32 int8 weights (what a mixed kernel would do)
+            def mx(t):
+                shape = t.shape; t = t.reshape(shape[0], -1, 32)
+                scale = torch.exp2(torch.ceil(torch.log2(t.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 448.0)))
+                return ((t / scale).to(torch.float8_e4m3fn).float() * scale).reshape(shape)
+            return mx(x) @ quant_rows(weight, "int8", 32).T
+        if sim in ("sq", "sq75"):  # SmoothQuant: per-input-channel factor moves activation outliers into the weights
+            alpha = 0.5 if sim == "sq" else 0.75
+            xmax = x.abs().amax(0).clamp_min(1e-6); wmax = weight.abs().amax(0).clamp_min(1e-6)
+            factor = (xmax ** alpha) / (wmax ** (1 - alpha))
+            return quant_rows(x / factor, "int8") @ quant_rows(weight * factor, "int8").T
+        if sim in ("wq32a8blk32", "wq16a8blk32"):   # per-32 (or per-16) int8 requant of the weights + per-32 int8 activations
+            return quant_rows(x, "int8", 32) @ quant_rows(weight, "int8", 32 if sim == "wq32a8blk32" else 16).T
+        if sim == "a8blk32":  # what the MMQ path does today for activations, weights exact
+            return quant_rows(x, "int8", 32) @ weight.T
+        raise ValueError(sim)
+
     def attention(x, q_norm, k_norm, qkv_w, out_w, use_rope):
-        qkv = x @ qkv_w.T
+        qkv = mm(x, qkv_w)
         q, k, v = qkv.split(inner, -1)
         q = rms_norm(q.view(-1, heads, head_dim), q_norm, eps); k = rms_norm(k.view(-1, heads, head_dim), k_norm, eps)
         v = v.view(-1, heads, head_dim)
         if use_rope: q, k = rope(q), rope(k)
         scores = torch.einsum("qhd,khd->hqk", q, k) / head_dim ** 0.5
         o = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v).reshape(-1, inner)
-        return o @ out_w.T
+        return mm(o, out_w)
 
     def swiglu(x, fc1, fc2):
-        gate, up = (x @ fc1.T).chunk(2, -1)   # the GGUF's [gate; up] order
-        return (torch.nn.functional.silu(gate) * up) @ fc2.T
+        gate, up = mm(x, fc1).chunk(2, -1)   # the GGUF's [gate; up] order
+        return mm(torch.nn.functional.silu(gate) * up, fc2)
 
     # ---- embeddings ----
     started = time.time()
@@ -361,6 +413,8 @@ def main() -> None:
     step.add_argument("--gguf", required=True, help="minimax_h3_*_pruned-*.gguf")
     step.add_argument("--inputs", required=True, help="npz with video, audio, caption, t_video, t_audio")
     step.add_argument("--out", required=True)
+    step.add_argument("--gemm-sim", default="none", choices=("none", "w8a8", "w8", "a8", "fp8", "fp8blk", "a8blk32", "mxfp8", "mxw8a8", "sq", "sq75", "wq32a8blk32", "wq16a8blk32"),
+                      help="simulate a low-precision GEMM in the blocks")
     step.set_defaults(func=dit)
     dec = sub.add_parser("vae")
     dec.add_argument("--weights", required=True, help="minimax_h3_video_vae_fp16.safetensors")

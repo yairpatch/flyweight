@@ -277,13 +277,15 @@ void diff_attention_rows(
     }
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 // ---- Tensor-core attention -------------------------------------------------
 // The f32 kernel above is O(rows^2) at a few TFLOPS, which at 4096 image
 // tokens is three seconds a step. This pair runs the same attention on bf16
 // mma.sync tiles (sm_80+; the host falls back to diff_attention_rows
 // elsewhere): 64 queries per 128-thread block, each warp owning 16 rows with
 // the Q fragments in registers, keys and values streamed through shared
-// memory 64 at a time with the flash online softmax. head_dim is 128.
+// memory 32 at a time with the flash online softmax. head_dim is 128.
 //
 // f32 rows -> head-major bf16 planes [heads][rows][128], the queries
 // pre-scaled by `q_scale` (the softmax scale times log2 e, so the softmax
@@ -330,31 +332,87 @@ void diff_pack_attention_bf16(
     }
 }
 
-#define FLYWEIGHT_DIFF_FLASH_QUERIES 64
-#define FLYWEIGHT_DIFF_FLASH_KEYS 64
+// Shared-memory fragment loads and asynchronous tile copies for the flash
+// kernel. ldmatrix hands every lane its mma operand straight from a row-major
+// tile (`.trans` for the V operand, whose fragments run down a column), and
+// cp.async lets the next tile's global reads overlap this tile's mma work.
+// The host build of the corpus never runs these (attention falls back to
+// diff_attention_rows there), so they compile to nothing without a GPU arch.
+__device__ __forceinline__ unsigned int fa2_smem_addr(const void* p) {
+#if defined(__CUDA_ARCH__)
+    unsigned int address;
+    asm("{ .reg .u64 wide;\n  cvta.to.shared.u64 wide, %1;\n  cvt.u32.u64 %0, wide; }" : "=r"(address) : "l"(p));
+    return address;
+#else
+    return 0u;
+#endif
+}
+__device__ __forceinline__ void fa2_ldmatrix_x4(unsigned int* r, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(fa2_smem_addr(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0u;
+#endif
+}
+__device__ __forceinline__ void fa2_ldmatrix_x4_trans(unsigned int* r, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(fa2_smem_addr(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0u;
+#endif
+}
+__device__ __forceinline__ void fa2_cp_async16(void* smem, const void* gmem) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(fa2_smem_addr(smem)), "l"(gmem));
+#else
+    *(uint4*)smem = *(const uint4*)gmem;
+#endif
+}
+__device__ __forceinline__ void fa2_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+__device__ __forceinline__ void fa2_cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;");
+#endif
+}
+__device__ __forceinline__ void fa2_cp_async_wait_one() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 1;");
+#endif
+}
+
+// 64 queries per 128-thread block (a warp owns 16 rows, Q fragments in
+// registers), keys and values streamed as 32-key tiles, double buffered so
+// the copy of tile t+1 overlaps the mma work of tile t. Measured at 9,300
+// tokens x 56 heads on an RTX 5070 Ti laptop: 50 TFLOPS, from 30 for the
+// single-buffered version that transposed V through scalar shared stores.
+#define FA2_KEYS 32
+#define FA2_NT (FA2_KEYS / 8)
+#define FA2_KT (FA2_KEYS / 16)
+#define FA2_STRIDE 136
 extern "C" __global__ __launch_bounds__(128)
 void diff_flash_attention_bf16(
     const unsigned short* q, const unsigned short* k, const unsigned short* v,
     float* output, const int heads, const int kv_heads, const int rows, const int causal
 ) {
-    // Declared as uint4 rows for 16-byte alignment (the host build of the
-    // corpus has no __align__); read through the half-width views below.
-    __shared__ uint4 k_tile4[FLYWEIGHT_DIFF_FLASH_KEYS][17];
-    __shared__ uint4 vt_tile4[128][9];
-    unsigned short (*k_tile)[136] = (unsigned short (*)[136])k_tile4;
-    unsigned short (*vt_tile)[72] = (unsigned short (*)[72])vt_tile4;
+    __shared__ uint4 k_tile4[2][FA2_KEYS][FA2_STRIDE / 8];
+    __shared__ uint4 v_tile4[2][FA2_KEYS][FA2_STRIDE / 8];
     const int head = blockIdx.y;
     const int kv_head = head / (heads / kv_heads);
-    const int query_base = blockIdx.x * FLYWEIGHT_DIFF_FLASH_QUERIES;
+    const int query_base = blockIdx.x * 64;
     if (query_base >= rows) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int quad = lane >> 2, pair = lane & 3;   // fragment row and column pair
+    const int quad = lane >> 2, pair = lane & 3;
     const int row0 = query_base + warp * 16 + quad, row1 = row0 + 8;
     const unsigned short* q_head = q + (long long)head * rows * 128;
     const unsigned short* k_head = k + (long long)kv_head * rows * 128;
     const unsigned short* v_head = v + (long long)kv_head * rows * 128;
-
-    // Q fragments: A operand of m16n8k16 for eight k-steps of 16.
+    // Zero row: keys past the end read from it.
     unsigned int q_frag[8][4];
     for (int step = 0; step < 8; ++step) {
         const int column = step * 16 + pair * 2;
@@ -366,39 +424,44 @@ void diff_flash_attention_bf16(
     float o[16][4];
     for (int d = 0; d < 16; ++d) for (int i = 0; i < 4; ++i) o[d][i] = 0.0f;
     float m0 = -1.0e30f, m1 = -1.0e30f, l0 = 0.0f, l1 = 0.0f;
+    const int key_limit = causal ? min(rows, query_base + 64) : rows;
+    const int tiles = (key_limit + FA2_KEYS - 1) / FA2_KEYS;
 
-    const int key_limit = causal ? min(rows, query_base + FLYWEIGHT_DIFF_FLASH_QUERIES) : rows;
-    for (int key_base = 0; key_base < key_limit; key_base += FLYWEIGHT_DIFF_FLASH_KEYS) {
-        // Stage K [64][128] and V^T [128][64]; keys past the end read as zero.
-        for (int load = threadIdx.x; load < FLYWEIGHT_DIFF_FLASH_KEYS * 16; load += 128) {
+    auto load_tile = [&](int tile, int buffer) {
+        const int key_base = tile * FA2_KEYS;
+        unsigned short (*k_tile)[FA2_STRIDE] = (unsigned short (*)[FA2_STRIDE])k_tile4[buffer];
+        unsigned short (*v_tile)[FA2_STRIDE] = (unsigned short (*)[FA2_STRIDE])v_tile4[buffer];
+        for (int load = threadIdx.x; load < FA2_KEYS * 16; load += 128) {
             const int key = load >> 4, chunk = (load & 15) * 8;
-            const int key_index = key_base + key;
-            uint4 k_bits = make_uint4(0u, 0u, 0u, 0u), v_bits = make_uint4(0u, 0u, 0u, 0u);
-            if (key_index < rows) {
-                k_bits = *(const uint4*)(k_head + (long long)key_index * 128 + chunk);
-                v_bits = *(const uint4*)(v_head + (long long)key_index * 128 + chunk);
-            }
-            *(uint4*)(&k_tile[key][chunk]) = k_bits;
-            const unsigned short* v_halves = (const unsigned short*)&v_bits;
-            for (int i = 0; i < 8; ++i) vt_tile[chunk + i][key] = v_halves[i];
+            const int key_index = min(key_base + key, rows - 1);   // clamp: masked below
+            fa2_cp_async16(&k_tile[key][chunk], k_head + (long long)key_index * 128 + chunk);
+            fa2_cp_async16(&v_tile[key][chunk], v_head + (long long)key_index * 128 + chunk);
         }
+        fa2_cp_async_commit();
+    };
+    load_tile(0, 0);
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int buffer = tile & 1;
+        if (tile + 1 < tiles) { load_tile(tile + 1, buffer ^ 1); fa2_cp_async_wait_one(); }
+        else fa2_cp_async_wait_all();
         __syncthreads();
+        unsigned short (*k_tile)[FA2_STRIDE] = (unsigned short (*)[FA2_STRIDE])k_tile4[buffer];
+        unsigned short (*v_tile)[FA2_STRIDE] = (unsigned short (*)[FA2_STRIDE])v_tile4[buffer];
+        const int key_base = tile * FA2_KEYS;
 
-        // S = Q K^T over eight n-tiles of 8 keys.
-        float s[8][4];
-        for (int j = 0; j < 8; ++j) for (int i = 0; i < 4; ++i) s[j][i] = 0.0f;
-        for (int j = 0; j < 8; ++j) {
-            const int key = j * 8 + quad;
-            for (int step = 0; step < 8; ++step) {
-                unsigned int b[2];
-                b[0] = *(const unsigned int*)(&k_tile[key][step * 16 + pair * 2]);
-                b[1] = *(const unsigned int*)(&k_tile[key][step * 16 + pair * 2 + 8]);
+        float s[FA2_NT][4];
+        for (int j = 0; j < FA2_NT; ++j) for (int i = 0; i < 4; ++i) s[j][i] = 0.0f;
+        for (int j = 0; j < FA2_NT; ++j) {
+            // Two k-steps per ldmatrix.x4: lanes 0-7 rows of step, dims +0; 8-15 dims +8; 16-23 next step; 24-31 next step +8.
+            for (int step = 0; step < 8; step += 2) {
+                unsigned int b[4];
+                fa2_ldmatrix_x4(b, &k_tile[j * 8 + (lane & 7)][step * 16 + (lane >> 3) * 8]);
                 kv_mma_m16n8k16(s[j], q_frag[step], b, (const __nv_bfloat16*)0);
+                kv_mma_m16n8k16(s[j], q_frag[step + 1], b + 2, (const __nv_bfloat16*)0);
             }
         }
-        // Mask keys past the end and, for causal, past the query.
         float block_max0 = -1.0e30f, block_max1 = -1.0e30f;
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < FA2_NT; ++j) {
             const int key = key_base + j * 8 + pair * 2;
             for (int i = 0; i < 2; ++i) {
                 const int key_index = key + i;
@@ -415,42 +478,28 @@ void diff_flash_attention_bf16(
         const float new_m0 = fmaxf(m0, block_max0), new_m1 = fmaxf(m1, block_max1);
         const float alpha0 = exp2f(m0 - new_m0), alpha1 = exp2f(m1 - new_m1);
         float sum0 = 0.0f, sum1 = 0.0f;
-        unsigned int p_frag[4][4];
-        for (int j = 0; j < 8; ++j) {
+        unsigned int p_frag[FA2_KT][4];
+        for (int j = 0; j < FA2_NT; ++j) {
             const float p0 = exp2f(s[j][0] - new_m0), p1 = exp2f(s[j][1] - new_m0);
             const float p2 = exp2f(s[j][2] - new_m1), p3 = exp2f(s[j][3] - new_m1);
-            sum0 += p0 + p1;
-            sum1 += p2 + p3;
-            // C fragment of tiles (2t, 2t+1) is the A fragment of k-step t.
+            sum0 += p0 + p1; sum1 += p2 + p3;
             const int t = j >> 1;
-            if ((j & 1) == 0) {
-                p_frag[t][0] = kv_mma_pack<__nv_bfloat16>(p0, p1);
-                p_frag[t][1] = kv_mma_pack<__nv_bfloat16>(p2, p3);
-            } else {
-                p_frag[t][2] = kv_mma_pack<__nv_bfloat16>(p0, p1);
-                p_frag[t][3] = kv_mma_pack<__nv_bfloat16>(p2, p3);
-            }
+            if ((j & 1) == 0) { p_frag[t][0] = kv_mma_pack<__nv_bfloat16>(p0, p1); p_frag[t][1] = kv_mma_pack<__nv_bfloat16>(p2, p3); }
+            else { p_frag[t][2] = kv_mma_pack<__nv_bfloat16>(p0, p1); p_frag[t][3] = kv_mma_pack<__nv_bfloat16>(p2, p3); }
         }
         for (int shift = 1; shift <= 2; shift <<= 1) {
             sum0 += __shfl_xor_sync(0xffffffff, sum0, shift);
             sum1 += __shfl_xor_sync(0xffffffff, sum1, shift);
         }
-        l0 = l0 * alpha0 + sum0;
-        l1 = l1 * alpha1 + sum1;
-        m0 = new_m0;
-        m1 = new_m1;
-        for (int d = 0; d < 16; ++d) {
-            o[d][0] *= alpha0; o[d][1] *= alpha0;
-            o[d][2] *= alpha1; o[d][3] *= alpha1;
-        }
-        // O += P V over sixteen n-tiles of 8 dims, four k-steps of 16 keys.
-        for (int d = 0; d < 16; ++d) {
-            const int dim = d * 8 + quad;
-            for (int t = 0; t < 4; ++t) {
-                unsigned int b[2];
-                b[0] = *(const unsigned int*)(&vt_tile[dim][t * 16 + pair * 2]);
-                b[1] = *(const unsigned int*)(&vt_tile[dim][t * 16 + pair * 2 + 8]);
+        l0 = l0 * alpha0 + sum0; l1 = l1 * alpha1 + sum1; m0 = new_m0; m1 = new_m1;
+        for (int d = 0; d < 16; ++d) { o[d][0] *= alpha0; o[d][1] *= alpha0; o[d][2] *= alpha1; o[d][3] *= alpha1; }
+        // O += P V: ldmatrix.trans x4 fetches (keys t*16..+15) x (dims d*8..+15): two n-tiles per load.
+        for (int d = 0; d < 16; d += 2) {
+            for (int t = 0; t < FA2_KT; ++t) {
+                unsigned int b[4];
+                fa2_ldmatrix_x4_trans(b, &v_tile[t * 16 + (lane & 7) + ((lane >> 3) & 1) * 8][(d + (lane >> 4)) * 8]);
                 kv_mma_m16n8k16(o[d], p_frag[t], b, (const __nv_bfloat16*)0);
+                kv_mma_m16n8k16(o[d + 1], p_frag[t], b + 2, (const __nv_bfloat16*)0);
             }
         }
         __syncthreads();
@@ -459,14 +508,8 @@ void diff_flash_attention_bf16(
     const long long out_stride = (long long)heads * 128;
     for (int d = 0; d < 16; ++d) {
         const int column = head * 128 + d * 8 + pair * 2;
-        if (row0 < rows) {
-            float2 value = make_float2(o[d][0] * inverse0, o[d][1] * inverse0);
-            *(float2*)(output + row0 * out_stride + column) = value;
-        }
-        if (row1 < rows) {
-            float2 value = make_float2(o[d][2] * inverse1, o[d][3] * inverse1);
-            *(float2*)(output + row1 * out_stride + column) = value;
-        }
+        if (row0 < rows) *(float2*)(output + row0 * out_stride + column) = make_float2(o[d][0] * inverse0, o[d][1] * inverse0);
+        if (row1 < rows) *(float2*)(output + row1 * out_stride + column) = make_float2(o[d][2] * inverse1, o[d][3] * inverse1);
     }
 }
 
@@ -1044,6 +1087,193 @@ void diff_upsample_nearest_2x(const float* input, float* output, const int chann
     }
 }
 
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// ---- Block-scaled int8 GEMM --------------------------------------------------
+// out[t][n] = sum_k x[t][k] w[n][k] xs[t][k/32] ws[n][k/32]: int8 tensor
+// cores (m16n8k32) with one scale per 32 elements on both operands, which is
+// the activation granularity the tower's quality depends on (per-token
+// scales cost 10% per DiT step against f32, per-32 blocks 2.4%). Weights are
+// planar int8 [N][K] followed by fp16 scales [N][K/32] (diff_requant_*
+// below builds them from the stored quant at load). 128x128 output tiles,
+// K in 64-wide stages double buffered through cp.async, fragments through
+// ldmatrix, 8 warps each owning 64 channels x 32 tokens. The int32
+// accumulator starts at 2^23 + 2^22 so the result reads back as a float
+// with one subtraction (a k32 int8 dot is under 2^22). Blocks walk the
+// token tiles of eight channel tiles at a time so a group's weights stay in
+// L2. Measured at 9,344 x 5,376 x 21,504 on an RTX 5070 Ti laptop: 83 TOPS,
+// against 32 for the MMQ kernel that re-decodes the quant per tile.
+__device__ __forceinline__ void diff_mma_k32_s8(int* d, const unsigned int* a, const unsigned int* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+__device__ __forceinline__ void fa2_cp_async16_zfill(void* smem, const void* gmem, bool valid) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int bytes = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(fa2_smem_addr(smem)), "l"(gmem), "r"(bytes));
+#else
+    *(uint4*)smem = valid ? *(const uint4*)gmem : make_uint4(0u, 0u, 0u, 0u);
+#endif
+}
+
+#define FLYWEIGHT_DIFF_I8_BM 128
+#define FLYWEIGHT_DIFF_I8_BN 128
+#define FLYWEIGHT_DIFF_I8_BK 64
+#define FLYWEIGHT_DIFF_I8_STRIDE 80
+extern "C" __global__ __launch_bounds__(256)
+void diff_int8_gemm(const signed char* w, const __half* w_scales, const signed char* x,
+                    const __half* x_scales, const int xs_stride, float* out,
+                    const int K, const int N, const int rows) {
+    __shared__ uint4 w_tile4[2][FLYWEIGHT_DIFF_I8_BM * FLYWEIGHT_DIFF_I8_STRIDE / 16];
+    __shared__ uint4 x_tile4[2][FLYWEIGHT_DIFF_I8_BN * FLYWEIGHT_DIFF_I8_STRIDE / 16];
+    __shared__ float w_sc[2][FLYWEIGHT_DIFF_I8_BM][2];
+    __shared__ float x_sc[2][FLYWEIGHT_DIFF_I8_BN][2];
+    const int n_tiles = N / FLYWEIGHT_DIFF_I8_BM, t_tiles = (rows + FLYWEIGHT_DIFF_I8_BN - 1) / FLYWEIGHT_DIFF_I8_BN;
+    const int pid = blockIdx.x;
+    if (pid >= n_tiles * t_tiles) return;
+    const int group_size = 8 * t_tiles;
+    const int group = pid / group_size, in_group = pid - group * group_size;
+    const int group_width = min(8, n_tiles - group * 8);
+    const int n_tile = group * 8 + in_group % group_width, t_tile = in_group / group_width;
+    const int n_base = n_tile * FLYWEIGHT_DIFF_I8_BM, t_base = t_tile * FLYWEIGHT_DIFF_I8_BN;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp_n = (warp >> 2) * 64, warp_t = (warp & 3) * 32;
+    const int quad = lane >> 2, slot = lane & 3;
+    const int blocks = K / 32, stages = K / FLYWEIGHT_DIFF_I8_BK;
+    float acc[4][4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+    for (int stage = 0; stage <= stages; ++stage) {
+        if (stage < stages) {
+            const int buffer = stage & 1;
+            const int k0 = stage * FLYWEIGHT_DIFF_I8_BK;
+            signed char* wt = (signed char*)w_tile4[buffer];
+            signed char* xt = (signed char*)x_tile4[buffer];
+            for (int c = threadIdx.x; c < FLYWEIGHT_DIFF_I8_BM * 4; c += 256) {
+                const int r = c >> 2, chunk = (c & 3) * 16;
+                fa2_cp_async16(wt + r * FLYWEIGHT_DIFF_I8_STRIDE + chunk, w + (long long)(n_base + r) * K + k0 + chunk);
+                const int t = t_base + r;
+                const bool valid = t < rows;
+                fa2_cp_async16_zfill(xt + r * FLYWEIGHT_DIFF_I8_STRIDE + chunk, x + (long long)(valid ? t : 0) * K + k0 + chunk, valid);
+            }
+            fa2_cp_async_commit();
+            {
+                const int r = threadIdx.x >> 1, half = threadIdx.x & 1;
+                w_sc[buffer][r][half] = __half2float(w_scales[(long long)(n_base + r) * blocks + (k0 >> 5) + half]);
+                const int t = t_base + r;
+                x_sc[buffer][r][half] = t < rows ? __half2float(x_scales[(long long)t * xs_stride + (k0 >> 5) + half]) : 0.0f;
+            }
+        }
+        if (stage == 0) continue;
+        // Compute stage - 1 while stage's copies are in flight.
+        if (stage < stages) fa2_cp_async_wait_one(); else fa2_cp_async_wait_all();
+        __syncthreads();
+        const int buffer = (stage - 1) & 1;
+        const signed char* wt = (const signed char*)w_tile4[buffer];
+        const signed char* xt = (const signed char*)x_tile4[buffer];
+        for (int kb = 0; kb < 2; ++kb) {
+            const int kbyte = kb * 32;
+            unsigned int a[4][4];
+            for (int rf = 0; rf < 4; ++rf) {
+                const int r = warp_n + rf * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                fa2_ldmatrix_x4(a[rf], wt + r * FLYWEIGHT_DIFF_I8_STRIDE + kbyte + (lane >> 4) * 16);
+            }
+            unsigned int b[4][2];
+            for (int tf = 0; tf < 4; tf += 2) {
+                const int t = warp_t + tf * 8 + (lane & 7) + (lane >> 4) * 8;
+                unsigned int r4[4];
+                fa2_ldmatrix_x4(r4, xt + t * FLYWEIGHT_DIFF_I8_STRIDE + kbyte + ((lane >> 3) & 1) * 16);
+                b[tf][0] = r4[0]; b[tf][1] = r4[1]; b[tf + 1][0] = r4[2]; b[tf + 1][1] = r4[3];
+            }
+            float ws0[4], ws1[4], xs0[4], xs1[4];
+            for (int rf = 0; rf < 4; ++rf) {
+                ws0[rf] = w_sc[buffer][warp_n + rf * 16 + quad][kb];
+                ws1[rf] = w_sc[buffer][warp_n + rf * 16 + quad + 8][kb];
+            }
+            for (int tf = 0; tf < 4; ++tf) {
+                xs0[tf] = x_sc[buffer][warp_t + tf * 8 + slot * 2][kb];
+                xs1[tf] = x_sc[buffer][warp_t + tf * 8 + slot * 2 + 1][kb];
+            }
+            for (int rf = 0; rf < 4; ++rf)
+                for (int tf = 0; tf < 4; ++tf) {
+                    int d[4] = {0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000};
+                    diff_mma_k32_s8(d, a[rf], b[tf]);
+                    acc[rf][tf][0] += (__uint_as_float((unsigned int)d[0]) - 12582912.0f) * (ws0[rf] * xs0[tf]);
+                    acc[rf][tf][1] += (__uint_as_float((unsigned int)d[1]) - 12582912.0f) * (ws0[rf] * xs1[tf]);
+                    acc[rf][tf][2] += (__uint_as_float((unsigned int)d[2]) - 12582912.0f) * (ws1[rf] * xs0[tf]);
+                    acc[rf][tf][3] += (__uint_as_float((unsigned int)d[3]) - 12582912.0f) * (ws1[rf] * xs1[tf]);
+                }
+        }
+        __syncthreads();
+    }
+    for (int rf = 0; rf < 4; ++rf)
+        for (int tf = 0; tf < 4; ++tf)
+            for (int e = 0; e < 4; ++e) {
+                const int n = n_base + warp_n + rf * 16 + quad + (e >> 1) * 8;
+                const int t = t_base + warp_t + tf * 8 + slot * 2 + (e & 1);
+                if (t < rows) out[(long long)t * N + n] = acc[rf][tf][e];
+            }
+}
+
+// Row activations -> per-32 int8 blocks with fp16 scales, the layout
+// quantize_q8_blocks_rows writes (scales at [row][xs_stride]), computed the
+// same way so the two are interchangeable: one float4 per thread, the eight
+// lanes of a block reduce by shuffle. quantize_q8_blocks_rows runs a 32-thread
+// block per (row, block) and reads scalars, which at 9,300 x 5,376 costs 2.5 ms
+// against the 0.5 ms the bytes need.
+extern "C" __global__
+void diff_quantize_q8_rows(const float* input, signed char* output, __half* scales, const int width,
+                           const int rows, const int xs_stride) {
+    const long long quads = (long long)rows * (width / 4);
+    const int lane = threadIdx.x & 31;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x; index < quads; index += (long long)blockDim.x * gridDim.x) {
+        const long long row = index / (width / 4);
+        const int column = (int)(index - row * (width / 4)) * 4;
+        const float4 value = *(const float4*)(input + row * width + column);
+        float maximum = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)), fmaxf(fabsf(value.z), fabsf(value.w)));
+        for (int offset = 4; offset > 0; offset >>= 1)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+        const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+        if ((lane & 7) == 0) scales[row * xs_stride + (column >> 5)] = __float2half(scale);
+        const int q0 = max(-127, min(127, __float2int_rn(value.x / scale)));
+        const int q1 = max(-127, min(127, __float2int_rn(value.y / scale)));
+        const int q2 = max(-127, min(127, __float2int_rn(value.z / scale)));
+        const int q3 = max(-127, min(127, __float2int_rn(value.w / scale)));
+        *(int*)(output + row * width + column) = (q0 & 0xff) | ((q1 & 0xff) << 8) | ((q2 & 0xff) << 16) | ((q3 & 0xff) << 24);
+    }
+}
+
+// Q6_K rows -> planar int8 [rows][K] with one fp16 scale per 32: the
+// sub-block scales are folded in and the 32 values requantized to their own
+// maximum, which keeps every value's 6 bits (the new scale is at least as
+// fine as the larger of the two it replaces). One thread per 32-group.
+extern "C" __global__
+void diff_requant_q6k_int8(const unsigned char* packed, signed char* values, __half* scales,
+                           const int rows, const int K) {
+    const int blocks = K / 32;
+    const long long groups = (long long)rows * blocks;
+    for (long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += (long long)blockDim.x * gridDim.x) {
+        const int row = (int)(g / blocks), group = (int)(g - (long long)row * blocks);
+        int words[8];
+        float low, high;
+        q6k_q8_decode(packed + (long long)row * (K / 256) * 210, group, words, &low, &high);
+        float v[32];
+        float peak = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const int q = (int)((signed char)((words[i >> 2] >> ((i & 3) * 8)) & 0xff));
+            v[i] = (float)q * (i < 16 ? low : high);
+            peak = fmaxf(peak, fabsf(v[i]));
+        }
+        const float scale = peak > 0.0f ? peak / 127.0f : 1.0f, inverse = 1.0f / scale;
+        signed char* out = values + (long long)row * K + group * 32;
+        for (int i = 0; i < 32; ++i) out[i] = (signed char)max(-127, min(127, __float2int_rn(v[i] * inverse)));
+        scales[g] = __float2half(scale);
+    }
+}
 )FLYWEIGHT_CUDA";
 
 }  // namespace flyweight::v2

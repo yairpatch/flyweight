@@ -636,11 +636,20 @@ noticeably rougher.
 Weights stream from pinned host memory by default (`--video-weights`): the
 encoder and DiT are 31 GB together, so the tower holds about 1.1 GB of VRAM
 at 640x384 and the chat model keeps the card. The whole run is compute on
-the DiT: a step at 640x384 and 124 frames takes 16 s on an RTX 5070 Ti
+the DiT: a step at 640x384 and 124 frames takes 8.3 s on an RTX 5070 Ti
 laptop. The model is guidance-distilled but not step-distilled, and the
 reference runs 50 steps (the default here too), so a clip at that size is
-about 13 minutes; `steps` trades quality for time. The decode is a few
-seconds. `--video-max-size` and `--video-max-frames` size the workspace
+about seven minutes; `steps` trades quality for time. The decode is a few
+seconds. Two kernels carry that step. The DiT's block matrices are
+requantized at load from Q6_K to planar int8 with one scale per 32 weights
+(about 30 s, and 17.6 GB of pinned memory in place of the GGUF's pages)
+and run on an int8 tensor-core GEMM written for that layout, at 80 TOPS
+against 32 for the generic MMQ kernel; the activations keep the same
+per-32 int8 blocks, which is what the model's accuracy needs (per-token
+scales, FP8 and MXFP8 all cost 10% or more per step against f32, while this
+path lands at 2.6%). Attention runs a bf16 tensor-core flash kernel with
+asynchronous double-buffered tiles at 50 TFLOPS, level with PyTorch's.
+`FLYWEIGHT_DIFF_INT8=0` keeps the stored quant and the MMQ path. `--video-max-size` and `--video-max-frames` size the workspace
 (default 640x384 and 124 frames); a larger canvas costs attention time
 quadratically. Against the torch reference on the same GGUF weights the
 encoder matches to 0.02% RMS, the DiT step to a cosine of 0.9999, and the

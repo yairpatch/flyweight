@@ -37,6 +37,35 @@ same weights: encoder 0.02% RMS, DiT step cosine 0.99994 (video rows) and
 weights. Native step at 640x384 x 124 frames: 16 s; at 256x256 x 22: 2.3 s
 (the host-streaming floor for 16.6 GB of DiT weights).
 
+## Performance round (2026-09-15 evening)
+
+Step at 640x384 x 124 frames (about 9,300 tokens): 16.0 s -> 8.3 s.
+
+- Profile (FLYWEIGHT_DIFF_SYNC=1 FLYWEIGHT_DIFF_TRACE=1): the Q6_K MMQ GEMM
+  was 66% of the step at 30 TOPS, attention 26% at 27 TFLOPS. cuBLAS reaches
+  200 TOPS on int8 and 54 TFLOPS on bf16 at these shapes; PyTorch's flash
+  attention 53 TFLOPS.
+- GEMM precision study (tools/h3_reference.py dit --gemm-sim): only per-32
+  int8 activation blocks hold accuracy (2.4% per step vs f32). Per-token int8
+  10%, FP8 16%, MXFP8 13%, SmoothQuant 11%. So cuBLASLt's int8/FP8 modes are
+  out; the answer is our own block-scaled int8 tensor-core GEMM.
+- `diff_int8_gemm`: m16n8k32 int8 mma, ldmatrix fragments, cp.async double
+  buffering, grouped raster, magic-number int-to-float. 83 TOPS on the qkv
+  shape (unscaled ceiling of the same structure 119). Weights come from a
+  load-time Q6_K -> per-32 int8 requantization on the device
+  (`diff_requant_q6k_int8`, 0.5% RMS from the dequantized Q6_K). Against
+  the f32 reference at a realistic 280-row step: video 2.6% (MMQ 3.8%),
+  audio 1.0%.
+- `diff_flash_attention_bf16`: rewritten with ldmatrix (V through
+  `.trans`, no scalar transpose) and 32-key double-buffered cp.async tiles:
+  30 -> 50 TFLOPS.
+- `diff_quantize_q8_rows`: float4 activation quantizer, bit-identical, 5x
+  faster than the 32-thread-block one.
+
+Left on the table: the GEMM's scale epilogue (~30% over the unscaled kernel),
+elementwise fusions (~12% of the step in norms, rope, modulation, gating),
+and the same int8 GEMM for Z-Image's Q8_0 DiT.
+
 ## Decisions
 
 - Weights stream from pinned host memory by default: the encoder and DiT

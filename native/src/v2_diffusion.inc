@@ -16,6 +16,10 @@ namespace {
 
 // A [out][in] weight as uploaded: quantized bytes straight from the arena, or
 // f32/bf16 as stored. `bias` is an f32 device vector or zero.
+// A DiffMatrix type of its own: planar int8 [out][in] followed by fp16
+// scales [out][in/32], built at load by diff_requant_* for the int8 GEMM.
+constexpr std::uint32_t kDiffInt8Type = 0xF8u;
+
 struct DiffMatrix {
     std::uint64_t device = 0;
     std::uint32_t type = 0;
@@ -311,6 +315,75 @@ DiffMatrix diff_upload_matrix(FlyweightV2Diffusion& d, const FlyweightV2Model& m
         matrix.device = diff_upload_raw(d, model, tensor);
     }
     if (!bias_name.empty()) matrix.bias = diff_upload_f32(d, model, bias_name, out);
+    return matrix;
+}
+
+// Whether a stored matrix can be requantized to the int8 GEMM's layout: a
+// Q6_K tensor whose shape fits the kernel's tiles, streamed from host memory
+// (the copies live in pinned buffers of their own) on a card with int8
+// tensor cores, outside exact mode. FLYWEIGHT_DIFF_INT8=0 keeps the stored
+// quant and the MMQ path for an A/B.
+bool diff_int8_eligible(const FlyweightV2Diffusion& d, const Tensor& tensor, int in, int out) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FLYWEIGHT_DIFF_INT8");
+        return !value || value[0] != '0';
+    }();
+    return enabled && d.host_weights && d.grouping && d.int8_tensor_cores && d.flash_attention && !d.exact &&
+           tensor.type == 14 && in % 256 == 0 && out % 128 == 0;
+}
+
+// diff_upload_matrix for the int8 GEMM: the stored Q6_K rows go through the
+// device once (upload, requantize, download) into a pinned host buffer of
+// planar int8 values and fp16 block scales, which then streams like any
+// other host-resident matrix.
+DiffMatrix diff_upload_matrix_int8(FlyweightV2Diffusion& d, const FlyweightV2Model& model,
+                                   const std::string& name, int in, int out) {
+    const Tensor& tensor = diff_tensor(model, name);
+    if (tensor.shape.size() != 2 || tensor.shape[0] != static_cast<std::uint64_t>(in) ||
+        tensor.shape[1] != static_cast<std::uint64_t>(out))
+        throw std::runtime_error(name + " does not have the expected shape for the int8 GEMM");
+    const std::uint64_t value_bytes = static_cast<std::uint64_t>(in) * out;
+    const std::uint64_t scale_bytes = static_cast<std::uint64_t>(out) * (in / 32) * 2;
+    const std::uint64_t bytes = value_bytes + scale_bytes;
+    std::uint64_t packed = 0, built = 0;
+    if (flyweight_gpu_alloc(tensor.size, &packed) != 0 || flyweight_gpu_alloc(bytes, &built) != 0) {
+        if (packed) flyweight_gpu_free(packed);
+        throw std::runtime_error("int8 requantization scratch allocation failed for " + name);
+    }
+    void* pinned = nullptr;
+    try {
+        if (flyweight_gpu_upload_sync(packed, tensor_data(model, tensor), tensor.size) != 0)
+            throw std::runtime_error("int8 requantization upload failed for " + name);
+        std::uint64_t values = built, scales = built + value_bytes;
+        int rows = out, width = in;
+        void* arguments[] = {&packed, &values, &scales, &rows, &width};
+        const std::uint64_t groups = static_cast<std::uint64_t>(out) * (in / 32);
+        if (flyweight_gpu_launch_named("diff_requant_q6k_int8",
+                                       static_cast<std::uint32_t>(std::min<std::uint64_t>((groups + 255) / 256, 4096)),
+                                       1, 256, 0, d.stream, arguments) != 0)
+            throw std::runtime_error("int8 requantization kernel failed for " + name);
+        if (flyweight_gpu_host_alloc(bytes, &pinned) != 0 || !pinned)
+            throw std::runtime_error("diffusion tower pinned host allocation failed for " + name);
+        if (flyweight_gpu_download(pinned, built, bytes, d.stream) != 0 || flyweight_gpu_stream_sync(d.stream) != 0)
+            throw std::runtime_error("int8 requantization download failed for " + name);
+    } catch (...) {
+        if (pinned) flyweight_gpu_host_free(pinned);
+        flyweight_gpu_free(packed);
+        flyweight_gpu_free(built);
+        throw;
+    }
+    flyweight_gpu_free(packed);
+    flyweight_gpu_free(built);
+    d.host_allocations.push_back(pinned);
+    DiffMatrix matrix;
+    matrix.type = kDiffInt8Type;
+    matrix.in = in;
+    matrix.out = out;
+    matrix.host = pinned;
+    matrix.bytes = bytes;
+    matrix.slot_offset = d.group_cursor;
+    d.group_cursor += diff_align(bytes);
+    d.host_bytes += bytes;
     return matrix;
 }
 
@@ -811,6 +884,21 @@ struct DiffLaunch {
             run(m.type == 30 ? "vision_bf16_gemm_rows" : "vision_f32_gemm_rows",
                 static_cast<std::uint32_t>((out + 63) / 64), static_cast<std::uint32_t>((rows + 63) / 64),
                 256, arguments);
+            return;
+        }
+        if (m.type == kDiffInt8Type) {
+            if (!q8) throw std::runtime_error("diffusion int8 GEMM needs the activation staging");
+            int scale_stride = (in / 32) * 2;
+            {
+                void* arguments[] = {&input, &q8, &q8_scales, &in, &count, &scale_stride};
+                run("diff_quantize_q8_rows", grid_for(static_cast<std::uint64_t>(rows) * (in / 4)), 1, 256, arguments);
+            }
+            std::uint64_t scales = m.device + static_cast<std::uint64_t>(in) * out;
+            void* arguments[] = {const_cast<std::uint64_t*>(&m.device), &scales, &q8, &q8_scales, &scale_stride,
+                                 &output, &in, &out, &count};
+            const std::uint64_t tiles = static_cast<std::uint64_t>(out / 128) * ((rows + 127) / 128);
+            run("diff_int8_gemm", static_cast<std::uint32_t>(tiles), 1, 256, arguments);
+            if (m.bias) add_bias(output, m.bias, out, rows);
             return;
         }
         const auto* format = flyweight::v2::qwen_format(m.type);
@@ -1856,6 +1944,7 @@ int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* d, const uint32_t* tok
 // `transformer` and `vae` may be null for an encoder-only tower.
 // Defined in v2_h3.inc, which follows this file.
 void h3_attach(FlyweightV2Diffusion& d);
+bool h3_int8_blocks(const FlyweightV2Diffusion& d);
 void h3_attach_vae(FlyweightV2Diffusion& d);
 std::uint64_t h3_workspace_for(const FlyweightV2Diffusion& d, std::uint32_t text, std::uint32_t width,
                                std::uint32_t height, std::uint32_t frames);
@@ -1939,7 +2028,10 @@ int flyweight_v2_h3_create(FlyweightV2Model* encoder, FlyweightV2Model* transfor
                     flyweight_gpu_event_create(&d->consumed_event[slot]) != 0)
                     throw std::runtime_error("failed to create diffusion staging events");
             diff_register_model(*d, *encoder);
-            if (transformer) diff_register_model(*d, *transformer);
+            // The DiT's blocks requantize into pinned buffers of their own
+            // (diff_upload_matrix_int8), so its mmap stays unregistered
+            // unless that path is off.
+            if (transformer && !h3_int8_blocks(*d)) diff_register_model(*d, *transformer);
         }
         diff_upload_encoder(*d);
         if (transformer) h3_attach(*d);

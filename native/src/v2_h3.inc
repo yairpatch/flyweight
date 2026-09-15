@@ -74,6 +74,25 @@ struct FlyweightV2H3 {
 
 namespace {
 
+// Whether the DiT's block matrices take the int8 GEMM (see diff_int8_eligible).
+bool h3_int8_blocks(const FlyweightV2Diffusion& d) {
+    if (!d.transformer) return false;
+    const auto& model = *d.transformer;
+    const auto it = std::find_if(model.tensors.begin(), model.tensors.end(),
+                                 [](const Tensor& t) { return t.name == "blocks.0.attn.qkv_proj.weight"; });
+    if (it == model.tensors.end() || it->shape.size() != 2) return false;
+    FlyweightV2Diffusion probe = d;   // the eligibility test reads flags only
+    probe.grouping = true;
+    return diff_int8_eligible(probe, *it, static_cast<int>(it->shape[0]), static_cast<int>(it->shape[1]));
+}
+
+DiffMatrix h3_upload_block_matrix(FlyweightV2Diffusion& d, const FlyweightV2Model& model, const std::string& name,
+                                  int in, int out) {
+    const Tensor& tensor = diff_tensor(model, name);
+    if (diff_int8_eligible(d, tensor, in, out)) return diff_upload_matrix_int8(d, model, name, in, out);
+    return diff_upload_matrix(d, model, name, in, out);
+}
+
 H3Block h3_upload_block(FlyweightV2Diffusion& d, FlyweightV2H3& h3, const FlyweightV2Model& model,
                         const std::string& prefix, bool modulated) {
     DiffGroup group(d);
@@ -83,10 +102,10 @@ H3Block h3_upload_block(FlyweightV2Diffusion& d, FlyweightV2H3& h3, const Flywei
     block.norm2 = diff_upload_f32(d, model, prefix + ".norm2.weight", h3.hidden);
     block.q_norm = diff_upload_f32(d, model, prefix + ".attn.q_norm.weight", h3.head_dim);
     block.k_norm = diff_upload_f32(d, model, prefix + ".attn.k_norm.weight", h3.head_dim);
-    block.qkv = diff_upload_matrix(d, model, prefix + ".attn.qkv_proj.weight", h3.hidden, 3 * h3.inner);
-    block.out = diff_upload_matrix(d, model, prefix + ".attn.out_proj.weight", h3.inner, h3.hidden);
-    block.fc1 = diff_upload_matrix(d, model, prefix + ".mlp.fc1.weight", h3.hidden, 2 * h3.ffn);
-    block.fc2 = diff_upload_matrix(d, model, prefix + ".mlp.fc2.weight", h3.ffn, h3.hidden);
+    block.qkv = h3_upload_block_matrix(d, model, prefix + ".attn.qkv_proj.weight", h3.hidden, 3 * h3.inner);
+    block.out = h3_upload_block_matrix(d, model, prefix + ".attn.out_proj.weight", h3.inner, h3.hidden);
+    block.fc1 = h3_upload_block_matrix(d, model, prefix + ".mlp.fc1.weight", h3.hidden, 2 * h3.ffn);
+    block.fc2 = h3_upload_block_matrix(d, model, prefix + ".mlp.fc2.weight", h3.ffn, h3.hidden);
     if (modulated)
         block.adaln = diff_upload_matrix(d, model, prefix + ".adaln_proj.linear.weight", h3.adaln_width,
                                          6 * kH3Modalities * h3.hidden, prefix + ".adaln_proj.linear.bias");
