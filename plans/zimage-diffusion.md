@@ -90,6 +90,16 @@ times when syncing).
   ~1.65 s: MMQ ~1 s (47 TFLOP at ~45 TOPS), attention 0.15 s, the rest
   elementwise. 512x512: 3.5 s.
 
+## Precision switch (2026-09-15)
+
+`--image-precision exact` (`FLYWEIGHT_V2_DIFFUSION_EXACT` in the create
+flags) keeps every fast path off: rows kernels with f32 activations instead
+of MMQ, `diff_attention_rows` instead of the bf16 flash kernel, the f32
+conv instead of the bf16 implicit GEMM. At 1024 against the f32 step-0
+reference: fast 6.6%, exact 3.3%, diffusers bf16 5.1%. Exact is ~16 s per
+step. What remains in exact mode is the Q8_0 weights; a bf16 pack target
+in the loader would remove that at 2x the host memory.
+
 ## Parity (2026-09-14, 512x512, RTX 5070 Ti laptop)
 
 Against the bf16 diffusers run (`tools/check_zimage_parity.py`):

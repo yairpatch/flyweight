@@ -123,6 +123,14 @@ class ZImageLoaderTests(unittest.TestCase):
             self.assertEqual(rgb, tower.generate(tokens, 64, 48, steps=2, seed=3))
         finally:
             tower.close()
+        # Exact precision takes the f32 paths end to end.
+        tower = V2Diffusion(encoder, transformer, vae, max_width=64, max_height=48,
+                            max_prompt_tokens=64, weights="device", precision="exact")
+        try:
+            self.assertTrue(tower.info["exact"])
+            self.assertEqual(len(tower.generate(tokens, 64, 48, steps=2, seed=3)), 64 * 48 * 3)
+        finally:
+            tower.close()
         # Past 64 latents a side the decoder tiles; the picture is still whole.
         tower = V2Diffusion(encoder, transformer, vae, max_width=640, max_height=528,
                             max_prompt_tokens=64, weights="device")

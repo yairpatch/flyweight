@@ -544,6 +544,12 @@ def _add_runtime_options(
              "chat model, costs a few seconds per image), or auto: host when "
              "they would take more than half the card",
     )
+    add(
+        placement, "--image-precision", choices=("fast", "exact"), default="fast",
+        help="fast: Q8 activations and bf16 tensor-core attention and "
+             "convolutions; exact: f32 activations everywhere but the stored "
+             "weights, several times slower and closer to the reference",
+    )
 
     add(
         tuning, "--hybrid-prefill", choices=("split", "cpu"), default=None,
@@ -1620,6 +1626,7 @@ def _serve(args: argparse.Namespace) -> int:
         image_model_path=getattr(args, "image_model", None),
         image_max_size=getattr(args, "image_max_size", 1024),
         image_weights=getattr(args, "image_weights", "auto"),
+        image_precision=getattr(args, "image_precision", "fast"),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,

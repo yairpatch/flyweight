@@ -100,6 +100,10 @@ struct FlyweightV2Diffusion {
     bool int8_tensor_cores = false;
     // bf16 mma attention (sm_80+, head_dim 128); the f32 kernel otherwise.
     bool flash_attention = false;
+    // Exact mode: f32 activations through every GEMM (no Q8 activation
+    // quantization), f32 attention and f32 convolutions. Several times
+    // slower; the weights stay quantized as loaded.
+    bool exact = false;
 
     // Text encoder.
     const Tensor* token_embedding = nullptr;
@@ -282,7 +286,7 @@ VaeConv diff_upload_conv(FlyweightV2Diffusion& d, const FlyweightV2Model& model,
     conv.kernel = kernel;
     conv.weight = diff_upload_raw(d, model, tensor);
     conv.bias = diff_upload_f32(d, model, prefix + ".bias", out);
-    if (d.flash_attention && in % 16 == 0 && out % 64 == 0) {
+    if (d.flash_attention && !d.exact && in % 16 == 0 && out % 64 == 0) {
         // The same mma path as the attention; pack [out][in][k][k] f32 into
         // [tap][out][in/16][16 slots] bf16.
         const float* source = reinterpret_cast<const float*>(tensor_data(model, tensor));
@@ -707,7 +711,7 @@ struct DiffLaunch {
                    bool causal, std::uint64_t q16, std::uint64_t k16, std::uint64_t v16) const {
         int count = static_cast<int>(rows), causal_flag = causal ? 1 : 0;
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        if (d.flash_attention && head_dim == 128) {
+        if (d.flash_attention && !d.exact && head_dim == 128) {
             float q_scale = scale * 1.4426950408889634f;   // exp2 softmax
             void* pack_arguments[] = {&q, &k, &v, &q16, &k16, &v16, &heads, &kv_heads, &count,
                                       &q_stride, &kv_stride, &q_scale};
@@ -741,7 +745,7 @@ struct DiffLaunch {
         }
         const auto* format = flyweight::v2::qwen_format(m.type);
         if (!format) throw std::runtime_error("diffusion GEMM: no kernels for weight type " + std::to_string(m.type));
-        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8;
+        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact;
         if (mmq) {
             int scale_stride = (in / 32) * 2;
             {
@@ -1552,6 +1556,8 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
                                   FlyweightV2Model* vae, int32_t device, uint32_t max_width,
                                   uint32_t max_height, uint32_t max_prompt_tokens, uint32_t weights,
                                   FlyweightV2Diffusion** out) { return guarded([&]{
+    const bool exact = (weights & FLYWEIGHT_V2_DIFFUSION_EXACT) != 0;
+    weights &= ~FLYWEIGHT_V2_DIFFUSION_EXACT;
     if (weights > FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO)
         throw std::runtime_error("invalid diffusion weights placement");
     if (!encoder || !transformer || !vae || !out) throw std::runtime_error("invalid diffusion create arguments");
@@ -1573,6 +1579,7 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
     d->max_width = max_width;
     d->max_height = max_height;
     d->max_prompt_tokens = max_prompt_tokens;
+    d->exact = exact;
     if (flyweight_gpu_init(device) != 0) throw std::runtime_error("failed to initialize native CUDA runtime");
     {
         std::vector<std::string> option_storage;
@@ -1663,6 +1670,7 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
 int flyweight_v2_diffusion_info(const FlyweightV2Diffusion* d, FlyweightV2DiffusionInfo* out) { return guarded([&]{
     if (!d || !out) throw std::runtime_error("invalid diffusion info arguments");
     out->host_weights = d->host_weights ? 1u : 0u;
+    out->exact = d->exact ? 1u : 0u;
     out->device_bytes = d->weight_bytes + d->workspace_bytes + 2 * (d->host_weights ? d->staging_bytes : 0);
     out->host_bytes = d->host_bytes;
     out->max_width = d->max_width;

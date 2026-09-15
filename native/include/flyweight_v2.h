@@ -424,8 +424,12 @@ typedef struct FlyweightV2Diffusion FlyweightV2Diffusion;
 #define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_DEVICE 0u
 #define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_HOST 1u
 #define FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO 2u
+/* OR-ed into `weights`: f32 activations in every GEMM, f32 attention and
+   convolutions instead of the Q8 / bf16 tensor-core paths. Slower, closer. */
+#define FLYWEIGHT_V2_DIFFUSION_EXACT 8u
 typedef struct FlyweightV2DiffusionInfo {
     uint32_t host_weights;
+    uint32_t exact;
     uint32_t max_width, max_height;
     uint64_t device_bytes;   /* resident weights + workspace + staging */
     uint64_t host_bytes;     /* pinned host memory, zero when resident */

@@ -498,6 +498,7 @@ _DiffusionProgress = ctypes.CFUNCTYPE(
 class _DiffusionInfo(ctypes.Structure):
     _fields_ = [
         ("host_weights", ctypes.c_uint32),
+        ("exact", ctypes.c_uint32),
         ("max_width", ctypes.c_uint32),
         ("max_height", ctypes.c_uint32),
         ("device_bytes", ctypes.c_uint64),
@@ -507,6 +508,9 @@ class _DiffusionInfo(ctypes.Structure):
 
 # Where the image model's weights live; see flyweight_v2.h.
 DIFFUSION_WEIGHTS = {"device": 0, "host": 1, "auto": 2}
+# OR-ed into the weights flag: exact f32 activations instead of the Q8/bf16 paths.
+DIFFUSION_EXACT = 8
+DIFFUSION_PRECISION = {"fast": 0, "exact": DIFFUSION_EXACT}
 
 
 class _QwenTaskEvent(ctypes.Structure):
@@ -3444,6 +3448,9 @@ class V2Diffusion:
     ``"host"`` (pinned host memory, streamed a layer at a time through a few
     hundred MiB of device memory, so a chat model can share the card), or
     ``"auto"`` (host when they would take more than half the card).
+    ``precision`` is ``"fast"`` (Q8 activations, bf16 attention and
+    convolutions on tensor cores) or ``"exact"`` (f32 everywhere but the
+    stored weights; several times slower).
     """
 
     def __init__(
@@ -3457,9 +3464,12 @@ class V2Diffusion:
         max_height: int = 1024,
         max_prompt_tokens: int = 512,
         weights: str = "auto",
+        precision: str = "fast",
     ) -> None:
         if weights not in DIFFUSION_WEIGHTS:
             raise ValueError(f"weights must be one of {sorted(DIFFUSION_WEIGHTS)}")
+        if precision not in DIFFUSION_PRECISION:
+            raise ValueError(f"precision must be one of {sorted(DIFFUSION_PRECISION)}")
         self._lib = _library()
         self._models = (encoder, transformer, vae)
         self._handle = ctypes.c_void_p()
@@ -3472,7 +3482,8 @@ class V2Diffusion:
                 encoder._handle, transformer._handle, vae._handle,
                 ctypes.c_int32(device), ctypes.c_uint32(max_width),
                 ctypes.c_uint32(max_height), ctypes.c_uint32(max_prompt_tokens),
-                ctypes.c_uint32(DIFFUSION_WEIGHTS[weights]), ctypes.byref(self._handle),
+                ctypes.c_uint32(DIFFUSION_WEIGHTS[weights] | DIFFUSION_PRECISION[precision]),
+                ctypes.byref(self._handle),
             )
         )
 
@@ -3483,6 +3494,7 @@ class V2Diffusion:
         self._check(self._lib.flyweight_v2_diffusion_info(self._handle, ctypes.byref(value)))
         return {
             "host_weights": bool(value.host_weights),
+            "exact": bool(value.exact),
             "max_width": int(value.max_width),
             "max_height": int(value.max_height),
             "device_bytes": int(value.device_bytes),

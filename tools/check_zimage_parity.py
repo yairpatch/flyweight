@@ -40,6 +40,7 @@ def main() -> None:
     parser.add_argument("--stages", default="text,step,decode,generate")
     parser.add_argument("--max-size", type=int, default=0)
     parser.add_argument("--weights", default="device", choices=("device", "host", "auto"))
+    parser.add_argument("--precision", default="fast", choices=("fast", "exact"))
     args = parser.parse_args()
     ref = np.load(args.ref)
     size = ref["image"].shape[0]
@@ -52,7 +53,8 @@ def main() -> None:
     transformer = V2Model(root + "transformer")
     vae = V2Model(root + "vae")
     tower = V2Diffusion(encoder, transformer, vae, max_width=args.max_size or size,
-                        max_height=args.max_size or size, max_prompt_tokens=512, weights=args.weights)
+                        max_height=args.max_size or size, max_prompt_tokens=512, weights=args.weights,
+                        precision=args.precision)
     print(f"tower ready in {time.time() - started:.1f}s", flush=True)
 
     ids = [int(t) for t in ref["input_ids"]]
