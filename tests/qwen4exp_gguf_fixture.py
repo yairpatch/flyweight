@@ -48,6 +48,137 @@ except ImportError:  # direct execution from the tests directory
     )
 
 GGUF_ARRAY = 9
+GGML_Q2_0 = 42
+
+
+def pack_q2_0(matrix: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """Pack rows (the last axis) as GGML Q2_0 and return what they decode to.
+
+    Q2_0 (ggml type 42) is an f16 scale d = max|x| over 64 values, then 16
+    bytes of two-bit codes with element j at bits 2*(j%4) of byte j/4. Code q
+    stands for (q-1)*d, so the levels are {-d, 0, d, 2d}; the quantizer is
+    round(x/d) clamped to [-1, 2], as in ggml's quantize_row_q2_0_ref.
+    """
+    rows = np.ascontiguousarray(matrix, dtype=np.float32).reshape(-1, matrix.shape[-1])
+    assert rows.shape[1] % 64 == 0, rows.shape
+    blocks = rows.reshape(rows.shape[0], -1, 64)
+    d = np.abs(blocks).max(axis=-1, keepdims=True).astype(np.float16)
+    d32 = d.astype(np.float32)
+    inverse = np.where(d32 > 0, 1.0 / np.where(d32 > 0, d32, 1.0), 0.0)
+    codes = np.clip(np.rint(blocks * inverse).astype(np.int32) + 1, 0, 3)
+    packed = (
+        codes[..., 0::4] | (codes[..., 1::4] << 2)
+        | (codes[..., 2::4] << 4) | (codes[..., 3::4] << 6)
+    ).astype(np.uint8)
+    raw = np.concatenate(
+        [d.view(np.uint8).reshape(*packed.shape[:2], 2), packed], axis=-1
+    ).tobytes()
+    decoded = (d32 * (codes - 1).astype(np.float32)).reshape(matrix.shape)
+    return raw, decoded
+
+
+GGML_IQ4_NL = 20
+IQ4_NL_VALUES = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.float32,
+)
+
+
+def pack_iq4_nl(matrix: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """Pack rows as GGML IQ4_NL: f16 scale then 16 bytes of nibbles per 32
+    values, byte j holding element j low and element j+16 high, each nibble
+    indexing the 16-entry codebook. The scale is simply max|x|/113 with a
+    nearest-codebook search; ggml's quantizer refines the scale, but any scale
+    yields a valid block, and what matters here is that the runtime decodes
+    the bytes it is given."""
+    rows = np.ascontiguousarray(matrix, dtype=np.float32).reshape(-1, matrix.shape[-1])
+    assert rows.shape[1] % 32 == 0, rows.shape
+    blocks = rows.reshape(rows.shape[0], -1, 32)
+    d = (np.abs(blocks).max(axis=-1, keepdims=True) / 113.0).astype(np.float16)
+    d32 = d.astype(np.float32)
+    scaled = np.where(d32 > 0, blocks / np.where(d32 > 0, d32, 1.0), 0.0)
+    codes = np.abs(scaled[..., None] - IQ4_NL_VALUES).argmin(axis=-1).astype(np.uint8)
+    packed = codes[..., :16] | (codes[..., 16:] << 4)
+    raw = np.concatenate(
+        [d.view(np.uint8).reshape(*packed.shape[:2], 2), packed], axis=-1
+    ).tobytes()
+    decoded = (d32 * IQ4_NL_VALUES[codes]).reshape(matrix.shape)
+    return raw, decoded
+
+
+GGML_BF16 = 30
+
+
+def pack_bf16(matrix: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """Round to bf16 (truncation, which is what the runtime's decoder inverts
+    exactly) and return the rounded values."""
+    bits = np.ascontiguousarray(matrix, dtype=np.float32).view(np.uint32) >> 16
+    decoded = (bits.astype(np.uint32) << 16).view(np.float32)
+    return bits.astype("<u2").tobytes(), decoded
+
+
+GGML_IQ2_S = 22
+_IQ2S_GRID: np.ndarray | None = None
+
+
+def _iq2s_grid() -> np.ndarray:
+    """The runtime's own 1024x8 IQ2_S grid, parsed from its header."""
+    global _IQ2S_GRID
+    if _IQ2S_GRID is None:
+        import re
+        header = (Path(__file__).resolve().parents[1] / "native" / "src"
+                  / "qwen_iq_tables.h").read_text()
+        body = header.split("kIq2sGrid[1024] = {", 1)[1].split("};", 1)[0]
+        words = np.array([int(w) for w in re.findall(r"(\d+)ull", body)], dtype=np.uint64)
+        assert words.size == 1024, words.size
+        _IQ2S_GRID = np.stack(
+            [((words >> np.uint64(8 * e)) & np.uint64(0xFF)).astype(np.float32)
+             for e in range(8)], axis=1)
+    return _IQ2S_GRID
+
+
+def pack_iq2_s(matrix: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """Pack rows as GGML IQ2_S: per 256 values d(f16), qs[32] grid indices
+    (low 8 bits), signs[32] (bit e negates value e of the octet), qh[8]
+    (two high index bits per octet), scales[8] (a nibble per 16 values).
+    Value = d * (0.5 + scale) * 0.25 * grid[e] * sign. A nearest-octet
+    search over the grid; ggml's quantizer is smarter about the scale, but
+    any well-formed block serves, since the twin holds the decoded values."""
+    grid = _iq2s_grid()
+    rows = np.ascontiguousarray(matrix, dtype=np.float32).reshape(-1, matrix.shape[-1])
+    assert rows.shape[1] % 256 == 0, rows.shape
+    blocks = rows.reshape(-1, 256)
+    out = bytearray()
+    decoded = np.zeros_like(blocks)
+    for b, block in enumerate(blocks):
+        amax = float(np.abs(block).max())
+        d = np.float16(amax / (43.0 * 15.5 * 0.25)) if amax > 0 else np.float16(0)
+        d32 = float(d)
+        qs = np.zeros(32, np.uint8); signs = np.zeros(32, np.uint8)
+        qh = np.zeros(8, np.uint8); scales = np.zeros(8, np.uint8)
+        for group in range(16):
+            values = block[group * 16:(group + 1) * 16]
+            gmax = float(np.abs(values).max())
+            scale = 0 if d32 == 0 else int(np.clip(round(gmax / (d32 * 0.25 * 43.0) - 0.5), 0, 15))
+            scales[group >> 1] |= scale << (4 * (group & 1))
+            db = d32 * (0.5 + scale) * 0.25
+            for half in range(2):
+                index = group * 2 + half
+                octet = values[half * 8:(half + 1) * 8]
+                target = np.abs(octet) / db if db > 0 else np.zeros(8, np.float32)
+                entry = int(np.argmin(((grid - target) ** 2).sum(axis=1)))
+                qs[index] = entry & 0xFF
+                qh[index >> 2] |= (entry >> 8) << (2 * (index & 3))
+                negative = octet < 0
+                signs[index] = int(sum(1 << e for e in range(8) if negative[e]))
+                decoded[b, group * 16 + half * 8:group * 16 + half * 8 + 8] = (
+                    db * grid[entry] * np.where(negative, -1.0, 1.0))
+        out += np.array([d], dtype=np.float16).tobytes() + qs.tobytes() + signs.tobytes() + qh.tobytes() + scales.tobytes()
+    return bytes(out), decoded.reshape(matrix.shape)
+
+
+_PACKERS = {GGML_Q2_0: pack_q2_0, GGML_IQ4_NL: pack_iq4_nl, GGML_BF16: pack_bf16,
+            GGML_IQ2_S: pack_iq2_s}
 
 
 def _u32_array(values) -> bytes:
@@ -212,8 +343,17 @@ def build_qwen4exp_gguf(
     *,
     mute_mixer: bool = False,
     mtp: bool = False,
+    quantize: dict[str, int] | None = None,
+    quantize_in_f32: bool = False,
 ) -> Qwen4ExpSpec:
     """Write the fixture.
+
+    ``quantize`` maps a tensor-name suffix (``"ffn_down_exps.weight"``) to the
+    GGML type it should be stored in; ``spec.tensors`` then holds what those
+    bytes decode to, so a reference built from it sees the same weights the
+    runtime does. ``quantize_in_f32`` rounds through the same quantizer but
+    stores the decoded values as f32: a twin file whose every weight equals
+    the quantized one, so the two runs must agree to float-order noise.
 
     ``mute_mixer`` zeroes the attention and DeltaNet output projections so each
     block contributes only its feed-forward through the gated residual --
@@ -412,14 +552,26 @@ def build_qwen4exp_gguf(
 
     infos = bytearray()
     payloads = bytearray()
+    decoded_tensors: list[tuple[str, tuple[int, ...], np.ndarray]] = []
     for name, shape, data in tensors:
         offset = len(payloads)
+        ggml_type = GGML_F32
+        for suffix, wanted in (quantize or {}).items():
+            if name.endswith(suffix):
+                ggml_type = wanted
+        if ggml_type != GGML_F32:
+            raw, data = _PACKERS[ggml_type](np.ascontiguousarray(data, dtype=np.float32))
+            if quantize_in_f32:
+                ggml_type = GGML_F32
+                raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
+        else:
+            raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
+            assert len(raw) == int(np.prod(shape)) * 4, name
+        decoded_tensors.append((name, shape, data))
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
-        infos += struct.pack("<IQ", GGML_F32, offset)
-        raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
-        assert len(raw) == int(np.prod(shape)) * 4, name
+        infos += struct.pack("<IQ", ggml_type, offset)
         payloads += raw
         payloads += b"\0" * ((-len(payloads)) % ALIGNMENT)
 
@@ -431,6 +583,6 @@ def build_qwen4exp_gguf(
     # the same weights.
     spec.tensors = {
         name: np.ascontiguousarray(data, dtype=np.float32)
-        for name, shape, data in tensors
+        for name, shape, data in decoded_tensors
     }
     return spec

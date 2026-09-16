@@ -242,6 +242,17 @@ inline float mxfp4_element(const std::uint8_t* row, std::size_t index) {
     return scale * lut[within < 16 ? (byte & 15) : (byte >> 4)];
 }
 
+// Q2_0: f16 scale then 64 two-bit codes, element j at bits 2*(j%4) of byte
+// j/4; code q is (q-1)*d.
+inline float q2_0_element(const std::uint8_t* row, std::size_t index) {
+    const auto* base = row + index / 64 * 18;
+    const int within = static_cast<int>(index & 63);
+    std::uint16_t d_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    const int code = (base[2 + within / 4] >> ((within & 3) * 2)) & 3;
+    return qwen_half_value(d_bits) * static_cast<float>(code - 1);
+}
+
 inline float nvfp4_element(const std::uint8_t* row, std::size_t index) {
     // E2M1 LUT: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives).
     static constexpr float lut[16] = {
@@ -292,6 +303,7 @@ inline std::size_t row_bytes(std::uint32_t type, std::size_t elements) {
         case 29: return elements / kBlockElements * kIq1mBlockBytes;
         case 39: return elements / 32 * 17;                            // MXFP4
         case 40: return elements / 64 * 36;                            // NVFP4
+        case 42: return elements / 64 * 18;                            // Q2_0
         default: throw std::runtime_error(
             "bailing: unsupported weight type " + std::to_string(type));
     }
@@ -325,6 +337,7 @@ inline void row_decode(const std::uint8_t* row, std::uint32_t type,
         case 29: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq1m_value(row, i); return;
         case 39: for (std::size_t i = 0; i < elements; ++i) output[i] = mxfp4_element(row, i); return;
         case 40: for (std::size_t i = 0; i < elements; ++i) output[i] = nvfp4_element(row, i); return;
+        case 42: for (std::size_t i = 0; i < elements; ++i) output[i] = q2_0_element(row, i); return;
         default: throw std::runtime_error(
             "bailing: unsupported weight type " + std::to_string(type));
     }
@@ -378,7 +391,7 @@ inline float row_dot(const std::uint8_t* row, std::uint32_t type,
         case 22: return qwen_iq2s_dot_row(row, input, static_cast<int>(elements), 0);
         case 23: return qwen_iq4xs_dot_row(row, input, static_cast<int>(elements), 0);
         case 29: return qwen_iq1m_dot_row(row, input, static_cast<int>(elements), 0);
-        case 2: case 3: case 6: case 7: case 39: case 40: {
+        case 2: case 3: case 6: case 7: case 39: case 40: case 42: {
             float total = 0.0f;
             for (std::size_t i = 0; i < elements; ++i) {
                 float value;
@@ -388,6 +401,7 @@ inline float row_dot(const std::uint8_t* row, std::uint32_t type,
                     case 6:  value = q5_0_element(row, i); break;
                     case 7:  value = q5_1_element(row, i); break;
                     case 39: value = mxfp4_element(row, i); break;
+                    case 42: value = q2_0_element(row, i); break;
                     default: value = nvfp4_element(row, i); break;
                 }
                 total += value * input[i];

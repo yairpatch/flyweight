@@ -666,3 +666,218 @@ void qwen_u8_gemm_k32_vnni512(
                                 activations + t, activation_pair_scales + t, row_out + t);
     }
 }
+
+// ---------------------------------------------------------------------------
+// int16 rows path for the prefill expert sweep: exact weights, 14-bit
+// activations, dpwssd.
+//
+// Every IQ codebook value is one float per 256-block times a small integer:
+// IQ2_XXS/XS/S are d/8 * (2s+1) * grid (grid <= 43, s a 4-bit group scale),
+// IQ3_XXS is d/4 * (2s+1) * grid (grid <= 62), IQ3_S is d * (1+2s) * grid,
+// IQ1_S is d/8 * (2s+1) * (8w +- 1), IQ4_XS is d * (s-32) * grid. None of
+// those integers exceeds 3937, so an int16 holds the weight exactly and the
+// only rounding in the whole product is the activation's, which at 14 bits
+// per 256-block is ~1/128 of a Q8 step. The folds below recover the integer
+// from the float decoder's output (relative error ~3e-7 on integers under
+// 4000, so round-to-nearest is exact); the block scale is d over the format's
+// power-of-two.
+//
+// Overflow: a dpwssd lane sums two products, eight instructions per 256
+// block, sixteen products of at most 3937 * 16383 = 1.03e9 < 2^31. The int32
+// is converted once per block, where the activation scale changes anyway.
+// ---------------------------------------------------------------------------
+
+void qwen_quantize_i16_k256_vnni512(
+    const float* input, int elements, std::int16_t* output, float* scales
+) {
+    const __m512i magnitude_mask = _mm512_set1_epi32(0x7fffffff);
+    const __m512i minimum = _mm512_set1_epi32(-16383);
+    const __m512i limit = _mm512_set1_epi32(16383);
+    for (int block = 0; block < elements / 256; ++block) {
+        const float* values = input + block * 256;
+        __m512 maximum = _mm512_setzero_ps();
+        for (int index = 0; index < 256; index += 16)
+            maximum = _mm512_max_ps(
+                maximum, _mm512_castsi512_ps(_mm512_and_si512(
+                    magnitude_mask, _mm512_castps_si512(_mm512_loadu_ps(values + index)))));
+        const float max_value = _mm512_reduce_max_ps(maximum);
+        std::int16_t* out = output + block * 256;
+        if (max_value == 0.0f) {
+            scales[block] = 0.0f;
+            std::memset(out, 0, 256 * sizeof(std::int16_t));
+            continue;
+        }
+        const float scale = max_value / 16383.0f;
+        scales[block] = scale;
+        const __m512 inverse = _mm512_set1_ps(1.0f / scale);
+        for (int index = 0; index < 256; index += 16) {
+            __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(values + index), inverse));
+            q = _mm512_min_epi32(limit, _mm512_max_epi32(minimum, q));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + index), _mm512_cvtepi32_epi16(q));
+        }
+    }
+}
+
+void qwen_fold_rows_i16_vnni512(
+    const float* rows_f32, const float* block_inverse, int rows, int elements,
+    std::int16_t* out
+) {
+    const int blocks = elements / 256;
+    for (int r = 0; r < rows; ++r) {
+        const float* row = rows_f32 + static_cast<std::size_t>(r) * elements;
+        std::int16_t* row_out = out + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const __m512 inverse = _mm512_set1_ps(block_inverse[r * blocks + block]);
+            const float* values = row + block * 256;
+            std::int16_t* dst = row_out + block * 256;
+            for (int index = 0; index < 256; index += 16) {
+                const __m512i q = _mm512_cvtps_epi32(
+                    _mm512_mul_ps(_mm512_loadu_ps(values + index), inverse));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + index), _mm512_cvtepi32_epi16(q));
+            }
+        }
+    }
+}
+
+namespace {
+
+template <int kTile>
+void i16_gemm_k256_tile(
+    const std::int16_t* row, const float* row_scales, int blocks,
+    const std::int16_t* const* activations, const float* const* activation_scales, float* out
+) {
+    __m512 acc[kTile];
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+    for (int t = 0; t < kTile; ++t) acc[t] = _mm512_setzero_ps();
+    for (int block = 0; block < blocks; ++block) {
+        const std::int16_t* w = row + block * 256;
+        __m512i wv[8];
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+        for (int k = 0; k < 8; ++k)
+            wv[k] = _mm512_loadu_si512(static_cast<const void*>(w + k * 32));
+        const float row_scale = row_scales[block];
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+        for (int t = 0; t < kTile; ++t) {
+            const std::int16_t* x = activations[t] + block * 256;
+            __m512i a = _mm512_setzero_si512();
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+            for (int k = 0; k < 8; ++k)
+                a = _mm512_dpwssd_epi32(
+                    a, _mm512_loadu_si512(static_cast<const void*>(x + k * 32)), wv[k]);
+            acc[t] = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(a),
+                _mm512_set1_ps(row_scale * activation_scales[t][block]), acc[t]);
+        }
+    }
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+    for (int t = 0; t < kTile; ++t) out[t] = _mm512_reduce_add_ps(acc[t]);
+}
+
+// Four rows by two tokens. The per-row tile above streams every activation
+// from L2 once per row -- the same traffic pattern as the f32 GEMM, which is
+// why both sit at ~85 GMAC/s at the sweep's token counts while an
+// L1-resident run of the int16 kernel does 184. Blocking over the task's four
+// rows reads each activation once per task; the rows' weights (20 KB) stay
+// in L1 and are re-read per token pair, which L1 bandwidth covers. Eight
+// int32 and eight float accumulators plus six operands fit the 32 zmm.
+void i16_gemm_k256_rows4(
+    const std::int16_t* const rows[4], const float* const row_scales[4], int blocks,
+    const std::int16_t* const activations[2], const float* const activation_scales[2],
+    float* const out[4]
+) {
+    __m512 acc[4][2];
+    for (int r = 0; r < 4; ++r) for (int t = 0; t < 2; ++t) acc[r][t] = _mm512_setzero_ps();
+    for (int block = 0; block < blocks; ++block) {
+        __m512i sum[4][2];
+        for (int r = 0; r < 4; ++r) for (int t = 0; t < 2; ++t) sum[r][t] = _mm512_setzero_si512();
+        const std::int16_t* x0 = activations[0] + block * 256;
+        const std::int16_t* x1 = activations[1] + block * 256;
+#if defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+        for (int k = 0; k < 8; ++k) {
+            const __m512i a0 = _mm512_loadu_si512(static_cast<const void*>(x0 + k * 32));
+            const __m512i a1 = _mm512_loadu_si512(static_cast<const void*>(x1 + k * 32));
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+            for (int r = 0; r < 4; ++r) {
+                const __m512i w = _mm512_loadu_si512(
+                    static_cast<const void*>(rows[r] + block * 256 + k * 32));
+                sum[r][0] = _mm512_dpwssd_epi32(sum[r][0], a0, w);
+                sum[r][1] = _mm512_dpwssd_epi32(sum[r][1], a1, w);
+            }
+        }
+        for (int r = 0; r < 4; ++r) {
+            const float row_scale = row_scales[r][block];
+            acc[r][0] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum[r][0]),
+                                        _mm512_set1_ps(row_scale * activation_scales[0][block]), acc[r][0]);
+            acc[r][1] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum[r][1]),
+                                        _mm512_set1_ps(row_scale * activation_scales[1][block]), acc[r][1]);
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        out[r][0] = _mm512_reduce_add_ps(acc[r][0]);
+        out[r][1] = _mm512_reduce_add_ps(acc[r][1]);
+    }
+}
+
+}  // namespace
+
+void qwen_i16_gemm_k256_vnni512(
+    const std::int16_t* weights, const float* scales, int rows,
+    const std::int16_t* const* activations, const float* const* activation_scales, int count,
+    int elements, float* out
+) {
+    const int blocks = elements / 256;
+    if (rows % 4 == 0) {
+        for (int r0 = 0; r0 < rows; r0 += 4) {
+            const std::int16_t* const row_ptrs[4] = {
+                weights + static_cast<std::size_t>(r0) * elements,
+                weights + static_cast<std::size_t>(r0 + 1) * elements,
+                weights + static_cast<std::size_t>(r0 + 2) * elements,
+                weights + static_cast<std::size_t>(r0 + 3) * elements};
+            const float* const scale_ptrs[4] = {
+                scales + static_cast<std::size_t>(r0) * blocks, scales + static_cast<std::size_t>(r0 + 1) * blocks,
+                scales + static_cast<std::size_t>(r0 + 2) * blocks, scales + static_cast<std::size_t>(r0 + 3) * blocks};
+            float* const base = out + static_cast<std::size_t>(r0) * count;
+            int t = 0;
+            for (; t + 2 <= count; t += 2) {
+                float* const outs[4] = {
+                    base + t, base + count + t, base + 2 * count + t, base + 3 * count + t};
+                i16_gemm_k256_rows4(row_ptrs, scale_ptrs, blocks, activations + t,
+                                    activation_scales + t, outs);
+            }
+            for (; t < count; ++t)
+                for (int r = 0; r < 4; ++r)
+                    i16_gemm_k256_tile<1>(row_ptrs[r], scale_ptrs[r], blocks, activations + t,
+                                          activation_scales + t, base + static_cast<std::size_t>(r) * count + t);
+        }
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        const std::int16_t* row = weights + static_cast<std::size_t>(r) * elements;
+        const float* row_scales = scales + static_cast<std::size_t>(r) * blocks;
+        float* row_out = out + static_cast<std::size_t>(r) * count;
+        int t = 0;
+        for (; t + 8 <= count; t += 8)
+            i16_gemm_k256_tile<8>(row, row_scales, blocks, activations + t,
+                                  activation_scales + t, row_out + t);
+        for (; t + 4 <= count; t += 4)
+            i16_gemm_k256_tile<4>(row, row_scales, blocks, activations + t,
+                                  activation_scales + t, row_out + t);
+        for (; t < count; ++t)
+            i16_gemm_k256_tile<1>(row, row_scales, blocks, activations + t,
+                                  activation_scales + t, row_out + t);
+    }
+}

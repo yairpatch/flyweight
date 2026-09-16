@@ -259,6 +259,7 @@ std::uint64_t gguf_row_bytes(std::uint32_t type,std::uint64_t columns,std::uint3
         case 22:block_elements=256;block_bytes=82;break;  // IQ2_S
         case 23:block_elements=256;block_bytes=136;break; // IQ4_XS
         case 29:block_elements=256;block_bytes=56;break;  // IQ1_M
+        case 42:block_elements=64;block_bytes=18;break;   // Q2_0
         default: block_elements=0;return 0;
     }
     return columns/block_elements*block_bytes;
@@ -1587,6 +1588,12 @@ constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 byt
 constexpr std::uint32_t kIq1sBlockSize = kIq1sBlockBytes;
 constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
 constexpr std::uint32_t kMxfp4BlockElements = 32;
+// Q2_0 (ggml type 42): d[f16] then qs[16], 64 two-bit codes with element j at
+// bits 2*(j%4) of byte j/4. Code q decodes to (q-1)*d, so the levels are
+// {-d, 0, d, 2d}. ISTA DASLab's GSQ-RCO qwen4exp builds ship ffn_down_exps in
+// it on most layers.
+constexpr int kQ20BlockBytes = 18;
+constexpr int kQ20BlockElements = 64;
 // The FP4 codebook, doubled -- which is why the scale is halved to match.
 constexpr float kMxfp4Lut[16] = {
     0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
@@ -4138,6 +4145,14 @@ float ue4m3_to_float(std::uint8_t bits){
 // weight_scale_2 runs ~3e-5, far below E4M3's smallest subnormal (2^-9), so
 // folding it back into the block scales flushes ~56% of them to zero. The scale
 // is carried in f32 to the kernels instead.
+float qwen_q2_0_value(const std::uint8_t*packed,std::uint64_t absolute){
+    const auto*base=packed+absolute/kQ20BlockElements*kQ20BlockBytes;
+    const int within=static_cast<int>(absolute%kQ20BlockElements);
+    std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
+    const int code=(base[2+within/4]>>((within&3)*2))&3;
+    return qwen_half_value(scale_bits)*static_cast<float>(code-1);
+}
+
 float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
     const std::uint64_t block=absolute/kNvfp4BlockElements;
     const int offset=static_cast<int>(absolute%kNvfp4BlockElements);
@@ -4267,6 +4282,25 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         result+=qwen_iq1s_dot_row(packed,input,elements,row);
     }else if(type==29){
         result+=qwen_iq1m_dot_row(packed,input,elements,row);
+    }else if(type==42){
+        // Q2_0, see kQ20BlockBytes. The AVX kernels fold the per-lane bit
+        // shift into the scale; here the codes are just walked.
+        if((flyweight_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+        if((flyweight_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+        const int blocks=elements/kQ20BlockElements;
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(blocks)*kQ20BlockBytes;
+        for(int block=0;block<blocks;++block){
+            const auto*base=row_data+block*kQ20BlockBytes;
+            std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
+            const float d=qwen_half_value(scale_bits);
+            const float*vector=input+block*kQ20BlockElements;
+            float block_sum=0.0f;
+            for(int lane=0;lane<kQ20BlockElements;++lane){
+                const int code=(base[2+lane/4]>>((lane&3)*2))&3;
+                block_sum+=static_cast<float>(code-1)*vector[lane];
+            }
+            result+=d*block_sum;
+        }
     }else if(type==39){
         // MXFP4: one E8M0 exponent per 32 values, then 16 packed nibbles where
         // byte j holds element j in the low half and element j+16 in the high.
@@ -5677,10 +5711,13 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
         qwen_iq1s_dequant_row_vnni512(packed,elements,row,output);return;}
     if(type==21&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
         qwen_iq3s_dequant_row_vnni512(packed,elements,row,output);return;}
-    if((type==16||type==17||type==18||type==19||type==21||type==23)&&
+    // 22 (IQ2_S) joined 2026-09-16 for the GSQ-RCO mix, where the tripwire
+    // named it on 20 gate/up stacks.
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(type==42&&(flyweight_cpu_features()&1u)!=0&&elements%kQ20BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // Q8_0's native block is 32, so a 640-wide expert down row fails the
     // super-block gate above and sat scalar for exactly the widths the UD mix
     // promotes to Q8_0.
@@ -5726,6 +5763,15 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
             for(int lane=0;lane<16;++lane){const auto byte=base_ptr[2+lane];dst[lane]=scale*static_cast<float>((byte&15)-8);dst[lane+16]=scale*static_cast<float>((byte>>4)-8);}
         }
     }
+    else if(type==42){
+        const int blocks=elements/kQ20BlockElements;
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(blocks)*kQ20BlockBytes;
+        for(int block=0;block<blocks;++block){
+            const auto*base=row_data+block*kQ20BlockBytes;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
+            const float d=qwen_half_value(scale_bits);float*dst=output+block*kQ20BlockElements;
+            for(int lane=0;lane<kQ20BlockElements;++lane)dst[lane]=d*static_cast<float>(((base[2+lane/4]>>((lane&3)*2))&3)-1);
+        }
+    }
     else if(type==39){
         const int blocks=elements/kMxfp4BlockElements;
         const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kMxfp4BlockSize;
@@ -5752,6 +5798,14 @@ void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int e
 
 // Register-blocked expert GEMM over a block of <=4 weight rows: out[i*count+j].
 void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,int elements,float*out){
+    // The SIMD kernels' fast path is the 4-row register tile; a taller block
+    // is that tile repeated, with the same arithmetic per tile.
+    if(mr>4&&mr%4==0){
+        for(int r=0;r<mr;r+=4)
+            qwen_f32_gemm_rows(weights+static_cast<std::size_t>(r)*elements,4,inputs,count,elements,
+                               out+static_cast<std::size_t>(r)*count);
+        return;
+    }
     if((flyweight_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_gemm_rows_avx512(weights,mr,inputs,count,elements,out);return;}
     if((flyweight_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_gemm_rows_avx2(weights,mr,inputs,count,elements,out);return;}
     for(int i=0;i<mr;++i){
@@ -6742,6 +6796,20 @@ void qwen_cpu_moe(
     }
 }
 
+// Power of two the IQ decoder divides the f16 block scale by, for the formats
+// whose every value is (d / this) times an integer under 4000 -- the exact
+// int16 fold of the batched prefill (qwen_cpu_iq1s_vnni512.cpp). Zero for
+// formats without that property (k-quants carry per-sub-block minimums,
+// IQ4_NL and Q2_0 carry a scale per 32 or 64 rather than per 256).
+int qwen_i16_fold_multiplier(std::uint32_t type) {
+    switch (type) {
+        case 16: case 17: case 22: case 19: return 8;  // IQ2_XXS IQ2_XS IQ2_S IQ1_S
+        case 18: return 4;                             // IQ3_XXS
+        case 21: case 23: return 1;                    // IQ3_S IQ4_XS
+        default: return 0;
+    }
+}
+
 bool qwen_prefill_direct_quant_enabled(
     const FlyweightV2QwenRuntime& runtime
 ) {
@@ -6932,13 +7000,21 @@ void qwen_cpu_moe_rows(
     // of pointing at the GEMM they feed.
     const auto scalar_types_before=
         g_scalar_dequant_types.load(std::memory_order_relaxed);
+    // GEMM register tile height (the f32 4x5 and int16 4x2 kernels) and the
+    // task height: a task decodes and multiplies kTaskRows rows in kRowBlock
+    // sub-blocks, then stores kTaskRows contiguous floats per token -- one
+    // cache line instead of four 16-byte pieces of four lines, and a quarter
+    // of the dynamic-schedule grabs. Measured 2026-09-16 on the 2048-token
+    // GSQ-RCO prefill (16 threads): the down stage's store was 8 s of 100 s
+    // task time and ~3 s of the 9.3 s wall sat outside the task bodies.
     constexpr int kRowBlock=4;
+    constexpr int kTaskRows=16;
     // Direct IQ rows are already grouped by expert and have thousands of tasks
     // available. Larger hand-out chunks avoid making OpenMP's dynamic scheduler
     // a measurable part of short prompts; keep the finer balance for the f32
     // fallback, whose per-task cost varies much more with route count.
     const int schedule_chunk=direct_quant?32:4;
-    const int gate_blocks=(intermediate+kRowBlock-1)/kRowBlock;
+    const int gate_blocks=(intermediate+kTaskRows-1)/kTaskRows;
     // Experts routed one or two tokens take single-row dots rather than the
     // dequant-and-GEMM below; for IQ1_S gate/up those go through the Q8_K
     // VNNI kernel the single-token path uses (qwen_cpu_iq1s_vnni512.cpp), on
@@ -7000,10 +7076,45 @@ void qwen_cpu_moe_rows(
     const std::uint8_t* input_u8_data=input_u8.data();
     const float* input_u8_scale_data=input_u8_scales.data();
     const float* input_u8_sum_data=input_u8_sums.data();
+    // Exact int16 rows path for the IQ codebook gate/up stacks that have no
+    // int8 fold (the GSQ-RCO mix: IQ2_XXS/XS/S, IQ3_XXS, IQ3_S; also IQ4_XS
+    // and IQ1_S where rows_q8 does not apply). Weights fold to their integer
+    // codes exactly; activations are 14-bit per 256 -- finer than the f32
+    // GEMM's inputs are worth, and 128x finer than the Q8 paths. Measured
+    // 2026-09-16 on the 2048-token GSQ-RCO prefill: see the memory note.
+    // FLYWEIGHT_ROWS_I16=0 restores dequant-and-f32-GEMM for A/B.
+    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
+    const bool rows_i16=(flyweight_cpu_features()&8u)!=0&&!direct_quant&&!rows_q8
+        &&qwen_i16_fold_multiplier(gate_type)!=0&&qwen_i16_fold_multiplier(up_type)!=0
+        &&hidden%256==0
+        &&!(rows_i16_setting&&rows_i16_setting[0]=='0');
+    thread_local std::vector<std::int16_t> tl_input_i16;
+    thread_local std::vector<float> tl_input_i16_scales;
+    auto& input_i16=tl_input_i16;
+    auto& input_i16_scales=tl_input_i16_scales;
+    if(rows_i16){
+        input_i16.resize(static_cast<std::size_t>(rows)*hidden);
+        input_i16_scales.resize(static_cast<std::size_t>(rows)*q8_blocks);
+#pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+        for(int token=0;token<rows;++token)
+            qwen_quantize_i16_k256_vnni512(input+static_cast<std::size_t>(token)*hidden,hidden,
+                input_i16.data()+static_cast<std::size_t>(token)*hidden,
+                input_i16_scales.data()+static_cast<std::size_t>(token)*q8_blocks);
+    }
+    const std::int16_t* input_i16_data=input_i16.data();
+    const float* input_i16_scale_data=input_i16_scales.data();
+    std::uint32_t gate_block_bytes=0,up_block_bytes=0;
+    if(rows_i16){
+        std::uint32_t block_elements=0;
+        gate_block_bytes=static_cast<std::uint32_t>(gguf_row_bytes(gate_type,256,block_elements));
+        up_block_bytes=static_cast<std::uint32_t>(gguf_row_bytes(up_type,256,block_elements));
+    }
+    const float gate_fold_multiplier=static_cast<float>(qwen_i16_fold_multiplier(gate_type));
+    const float up_fold_multiplier=static_cast<float>(qwen_i16_fold_multiplier(up_type));
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*gate_blocks;++task){
-        const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
-        const int mr=std::min(kRowBlock,intermediate-row0);
+        const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kTaskRows;
+        const int mr=std::min(kTaskRows,intermediate-row0);
         const int expert=group_experts[group];
         const int begin=offsets[expert],count=counts[expert];
         const auto*gate_data=expert_data(0,expert);
@@ -7074,23 +7185,108 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
-        gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        gate_values.resize(static_cast<std::size_t>(kTaskRows)*count);up_values.resize(static_cast<std::size_t>(kTaskRows)*count);
         std::uint64_t t_dq0=0,t_gemm0=0;
-        if(rows_q8){
+        if(rows_i16){
+            thread_local std::vector<std::int16_t> fold_gate_i16,fold_up_i16;
+            thread_local std::vector<float> fold_gate_scale_i16,fold_up_scale_i16,
+                fold_gate_inverse,fold_up_inverse;
+            thread_local std::vector<const std::int16_t*> act_i16_ptrs;
+            thread_local std::vector<const float*> act_i16_scale_ptrs;
+            gate_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            up_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_gate_i16.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_up_i16.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_gate_scale_i16.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_up_scale_i16.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_gate_inverse.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_up_inverse.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            act_i16_ptrs.resize(count);act_i16_scale_ptrs.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence){
+                const std::size_t token=static_cast<std::size_t>(
+                    occurrences[begin+occurrence]/routed_count);
+                act_i16_ptrs[occurrence]=input_i16_data+token*hidden;
+                act_i16_scale_ptrs[occurrence]=input_i16_scale_data+token*q8_blocks;
+            }
+            // Per (row, block): the f16 scale at the block's first two bytes
+            // gives both the fold's inverse and the GEMM's float scale.
+            auto block_scales=[&](const std::uint8_t*data,std::uint32_t block_bytes,float multiplier,
+                                  float*scales,float*inverse){
+                const std::uint64_t row_bytes=static_cast<std::uint64_t>(q8_blocks)*block_bytes;
+                for(int i=0;i<mr;++i)for(int block=0;block<q8_blocks;++block){
+                    const auto*base=data+(row0+static_cast<std::uint64_t>(i))*row_bytes+
+                        static_cast<std::uint64_t>(block)*block_bytes;
+                    std::uint16_t bits=0;std::memcpy(&bits,base,2);
+                    const float d=qwen_half_value(bits);
+                    scales[i*q8_blocks+block]=d/multiplier;
+                    inverse[i*q8_blocks+block]=d!=0.0f?multiplier/d:0.0f;
+                }
+            };
+            t_dq0=moe_profile?qwen_moe_now():0;
+            block_scales(gate_data,gate_block_bytes,gate_fold_multiplier,
+                         fold_gate_scale_i16.data(),fold_gate_inverse.data());
+            block_scales(up_data,up_block_bytes,up_fold_multiplier,
+                         fold_up_scale_i16.data(),fold_up_inverse.data());
+            // Fold each row straight after its decode, while the 10 KB of
+            // floats are still in L1; folding all eight rows afterwards
+            // re-read them from L2 and cost a third of the decode again.
+            for(int i=0;i<mr;++i){
+                float*gate_row=gate_block.data()+static_cast<std::size_t>(i)*hidden;
+                float*up_row=up_block.data()+static_cast<std::size_t>(i)*hidden;
+                qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_row);
+                qwen_fold_rows_i16_vnni512(gate_row,fold_gate_inverse.data()+static_cast<std::size_t>(i)*q8_blocks,1,hidden,
+                    fold_gate_i16.data()+static_cast<std::size_t>(i)*hidden);
+                qwen_dequant_row(up_data,up_type,hidden,row0+i,up_row);
+                qwen_fold_rows_i16_vnni512(up_row,fold_up_inverse.data()+static_cast<std::size_t>(i)*q8_blocks,1,hidden,
+                    fold_up_i16.data()+static_cast<std::size_t>(i)*hidden);
+            }
+            t_gemm0=moe_profile?qwen_moe_now():0;
+            qwen_i16_gemm_k256_vnni512(fold_gate_i16.data(),fold_gate_scale_i16.data(),mr,
+                act_i16_ptrs.data(),act_i16_scale_ptrs.data(),count,hidden,gate_values.data());
+            qwen_i16_gemm_k256_vnni512(fold_up_i16.data(),fold_up_scale_i16.data(),mr,
+                act_i16_ptrs.data(),act_i16_scale_ptrs.data(),count,hidden,up_values.data());
+            // FLYWEIGHT_ROWS_I16=2: verify against the f32 GEMM on the same
+            // dequantized rows, report the first material mismatch once.
+            if(rows_i16_setting&&rows_i16_setting[0]=='2'){
+                thread_local std::vector<float> check;
+                check.resize(static_cast<std::size_t>(kTaskRows)*count);
+                static std::atomic<int> reported{0};
+                for(int role=0;role<2;++role){
+                    const float*rows_f32=role==0?gate_block.data():up_block.data();
+                    const float*got=role==0?gate_values.data():up_values.data();
+                    qwen_f32_gemm_rows(rows_f32,mr,&vectors[begin],count,hidden,check.data());
+                    for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence){
+                        const float a=got[static_cast<std::size_t>(i)*count+occurrence];
+                        const float b=check[static_cast<std::size_t>(i)*count+occurrence];
+                        if(std::fabs(a-b)>1e-3f*(std::fabs(b)+1.0f)&&reported.fetch_add(1)<8){
+                            const auto*base=(role==0?gate_data:up_data)+(row0+static_cast<std::uint64_t>(i))*
+                                static_cast<std::uint64_t>(q8_blocks)*(role==0?gate_block_bytes:up_block_bytes);
+                            std::uint16_t bits=0;std::memcpy(&bits,base,2);
+                            std::fprintf(stderr,"[rows_i16] mismatch role=%d type=%u expert=%d row=%d occ=%d/%d token=%d got=%g f32=%g d0=%g inv0=%g scale0=%g act_scale0=%g\n",
+                                role,role==0?gate_type:up_type,expert,row0+i,occurrence,count,
+                                occurrences[begin+occurrence]/routed_count,a,b,qwen_half_value(bits),
+                                (role==0?fold_gate_inverse:fold_up_inverse)[i*q8_blocks],
+                                (role==0?fold_gate_scale_i16:fold_up_scale_i16)[i*q8_blocks],
+                                act_i16_scale_ptrs[occurrence][0]);
+                        }
+                    }
+                }
+            }
+        }else if(rows_q8){
             thread_local std::vector<std::int8_t> fold_gate,fold_up;
             thread_local std::vector<float> fold_gate_scales,fold_up_scales;
             thread_local std::vector<float> fold_gate_deltas,fold_up_deltas;
             thread_local std::vector<std::int32_t> fold_gate_corr,fold_up_corr;
             thread_local std::vector<const std::uint8_t*> act_ptrs;
             thread_local std::vector<const float*> act_scale_ptrs,act_sum_ptrs;
-            fold_gate.resize(static_cast<std::size_t>(kRowBlock)*hidden);
-            fold_up.resize(static_cast<std::size_t>(kRowBlock)*hidden);
-            fold_gate_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
-            fold_up_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
-            fold_gate_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
-            fold_up_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
-            fold_gate_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
-            fold_up_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_gate.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_up.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_gate_scales.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_up_scales.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_gate_deltas.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks*8);
+            fold_up_deltas.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks*8);
+            fold_gate_corr.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_up_corr.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
             act_ptrs.resize(count);act_scale_ptrs.resize(count);act_sum_ptrs.resize(count);
             for(int occurrence=0;occurrence<count;++occurrence){
                 const std::size_t token=static_cast<std::size_t>(
@@ -7112,7 +7308,7 @@ void qwen_cpu_moe_rows(
                 fold_up_corr.data(),fold_up_deltas.data(),mr,act_ptrs.data(),
                 act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,up_values.data());
         }else{
-        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+        gate_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);up_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);
         t_dq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i){
             qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_block.data()+static_cast<std::size_t>(i)*hidden);
@@ -7173,11 +7369,11 @@ void qwen_cpu_moe_rows(
             activated_u8_scale_vectors[slot]=scales;
         }
     }
-    const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
+    const int down_blocks=(hidden+kTaskRows-1)/kTaskRows;
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*down_blocks;++task){
-        const int group=task/down_blocks;const int row0=(task%down_blocks)*kRowBlock;
-        const int mr=std::min(kRowBlock,hidden-row0);
+        const int group=task/down_blocks;const int row0=(task%down_blocks)*kTaskRows;
+        const int mr=std::min(kTaskRows,hidden-row0);
         const int expert=group_experts[group];
         const int begin=offsets[expert],count=counts[expert];
         const auto*down_data=expert_data(2,expert);
@@ -7213,15 +7409,15 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> down_block,values;
-        values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        values.resize(static_cast<std::size_t>(kTaskRows)*count);
         std::uint64_t t_ddq0=0,t_dgemm0=0;
         if(rows_q8_down){
             thread_local std::vector<std::int8_t> fold_down;
             thread_local std::vector<float> fold_down_scales;
             thread_local std::vector<std::int32_t> fold_down_init;
-            fold_down.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
-            fold_down_scales.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
-            fold_down_init.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
+            fold_down.resize(static_cast<std::size_t>(kTaskRows)*intermediate);
+            fold_down_scales.resize(static_cast<std::size_t>(kTaskRows)*down_pair_floats);
+            fold_down_init.resize(static_cast<std::size_t>(kTaskRows)*down_pair_floats);
             t_ddq0=moe_profile?qwen_moe_now():0;
             qwen_iq4nl_fold_rows_vnni512(down_data,intermediate,row0,mr,fold_down.data(),
                 fold_down_scales.data(),fold_down_init.data());
@@ -7230,7 +7426,7 @@ void qwen_cpu_moe_rows(
                 fold_down_init.data(),mr,&activated_u8_vectors[begin],
                 &activated_u8_scale_vectors[begin],count,intermediate,values.data());
         }else{
-        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
+        down_block.resize(static_cast<std::size_t>(kTaskRows)*intermediate);
         t_ddq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i)qwen_dequant_row(down_data,down_type,intermediate,row0+i,down_block.data()+static_cast<std::size_t>(i)*intermediate);
         t_dgemm0=moe_profile?qwen_moe_now():0;
@@ -7243,7 +7439,7 @@ void qwen_cpu_moe_rows(
         // Token-outermost so each token's mr results land contiguously. The
         // transposed order wrote one 4-byte value per 8 KB-strided cache line
         // of a 67 MB buffer -- a full line fetched, and read-for-owned, per
-        // store. `values` is only kRowBlock*count floats, so the strided read
+        // store. `values` is only kTaskRows*count floats, so the strided read
         // it leaves behind stays in L1. Arithmetic is unchanged: the original
         // already grouped as (weights*down_scale)*values, left to right.
         for(int occurrence=0;occurrence<count;++occurrence){
@@ -13355,7 +13551,7 @@ inline float qwen_q5_0_value(const uint8_t* data, uint64_t index) {
            (static_cast<float>(low | fifth) - 16.0f);
 }
 
-float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==6)return qwen_q5_0_value(data,index);if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==29)return qwen_iq1m_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
+float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==6)return qwen_q5_0_value(data,index);if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==42)return qwen_q2_0_value(data,index);if(type==20)return qwen_iq4nl_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==29)return qwen_iq1m_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
 int flyweight_v2_dspark_encode(const FlyweightV2Model*m,const float*features,uint64_t elements,float*output,uint64_t output_elements){return guarded([&]{
     if(!m||!features||!output)throw std::runtime_error("DSpark encoder arguments are required");
     if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
@@ -15683,15 +15879,27 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // flip then undoes, and report a "MiB freed" figure the arena
         // contradicts.
         std::vector<std::uint64_t> conv_f32_tensors;
+        auto ends_with=[](const std::string& name,const char* suffix){
+            const auto length=std::strlen(suffix);
+            return name.size()>=length&&
+                name.compare(name.size()-length,length,suffix)==0;
+        };
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index){
             const auto& name=runtime->model->tensors[index].name;
-            static constexpr char kConvWeight[]="conv1d.weight";
-            constexpr std::size_t kConvWeightLength=sizeof(kConvWeight)-1;
-            if(name.size()<kConvWeightLength)continue;
-            if(name.compare(name.size()-kConvWeightLength,
-                            kConvWeightLength,kConvWeight)!=0)continue;
-            conv_f32_tensors.push_back(index);
-            preserve_bf16[index]=true;
+            if(ends_with(name,"conv1d.weight")){
+                conv_f32_tensors.push_back(index);
+                preserve_bf16[index]=true;
+            }
+            // The shared-expert gate is read by qwen_shared_scale{,_rows}
+            // {,_bf16}: f32 and bf16 kernels only, chosen by type, with no
+            // Q8_0 form. The unsloth conversions store it as f32, so the
+            // bf16 requant never touched it; ISTA DASLab's GSQ-RCO builds
+            // store it as bf16, and requantizing it fed Q8_0 bytes to the
+            // f32 kernel -- every shared expert scaled by noise, and the
+            // output was garbage in exactly the modes whose budget chose
+            // to requant. It is one vector of hidden values per layer.
+            if(ends_with(name,"ffn_gate_inp_shexp.weight"))
+                preserve_bf16[index]=true;
         }
         if(!runtime->embeddings_host_resident)
             persistent[runtime->token_embeddings]=true;
@@ -15891,6 +16099,46 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 std::fprintf(stderr,
                     "[flyweight] NVFP4 head requant: %llu tensor to Q8_0 "
                     "(%llu MiB added)\n",
+                    static_cast<unsigned long long>(converted),
+                    static_cast<unsigned long long>(growth/(1024ull*1024)));
+            }
+        }
+        // Static tensors in a format that only the CPU expert path and the
+        // prefill expert GEMM decode: Q2_0 (type 42) and IQ4_NL (type 20).
+        // ISTA DASLab's GSQ-RCO qwen4exp builds store the shared-expert down
+        // projection in one or the other on every layer, and the decode
+        // matvec dispatch has no kernel for either (the unsloth builds only
+        // ever put IQ4_NL on the routed experts and the PLE table). Convert
+        // to Q8_0 here, like the IQ1_M head above; the tensors are small
+        // (640x2560) and Q8_0 holds either codebook to within one int8 step.
+        // The PLE table is host row-gathered from the mapping and keeps its
+        // type.
+        {
+            std::uint64_t converted=0,growth=0;
+            for(std::uint64_t index=0;index<persistent.size();++index){
+                if(!persistent[index])continue;
+                if(index==runtime->ple_table)continue;
+                const auto type=runtime->device_tensor_types[index];
+                if(type!=42&&type!=20)continue;
+                const auto&tensor=runtime->model->tensors[index];
+                std::uint64_t elements=1;
+                for(auto dimension:tensor.shape)elements*=dimension;
+                const std::uint64_t block=type==42?64:32;
+                if(elements==0||elements%block)
+                    throw std::runtime_error(
+                        (type==42?"Q2_0 tensor \"":"IQ4_NL tensor \"")+tensor.name+
+                        "\" is not a whole number of "+std::to_string(block)+
+                        "-value blocks and cannot be converted to Q8_0, which "
+                        "is the only form its consumer can read");
+                runtime->device_tensor_types[index]=8;
+                ++converted;
+                growth+=(elements/32)*kQ8BlockSize-tensor.size;
+            }
+            if(converted){
+                runtime->static_tensor_bytes+=growth;
+                std::fprintf(stderr,
+                    "[flyweight] Q2_0/IQ4_NL dense requant: %llu tensors to "
+                    "Q8_0 (%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
             }

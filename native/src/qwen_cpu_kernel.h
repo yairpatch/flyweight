@@ -239,6 +239,19 @@ void qwen_u8_gemm_k32_vnni512(
     const std::uint8_t* const* activations, const float* const* activation_pair_scales, int count,
     int elements, float* out);
 
+// int16 rows path (AVX512-VNNI, dpwssd): weights are the codebook's integer
+// codes recovered exactly from the float decode (one float scale per 256),
+// activations are 14-bit per 256. See the comment block in the .cpp.
+void qwen_quantize_i16_k256_vnni512(
+    const float* input, int elements, std::int16_t* output, float* scales);
+void qwen_fold_rows_i16_vnni512(
+    const float* rows_f32, const float* block_inverse, int rows, int elements,
+    std::int16_t* out);
+void qwen_i16_gemm_k256_vnni512(
+    const std::int16_t* weights, const float* scales, int rows,
+    const std::int16_t* const* activations, const float* const* activation_scales, int count,
+    int elements, float* out);
+
 void qwen_quantize_q8_k_avx2(
     const float* input,
     int elements,
