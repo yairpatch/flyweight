@@ -9239,9 +9239,17 @@ extern "C" __global__ void kv_store_turbo4_v(const float* current, unsigned char
 // its query into shared memory once and amortizes it over the whole token tile.
 // The head guard is uniform across the block; the token guard has to wait until
 // after the last __syncthreads or the cooperative transform would deadlock.
-template<int BITS, bool RING>
+//
+// MODE picks how a token maps to a cache slot: 0 = linear from slot 0, 1 = the
+// ring starting at `first`, 2 = an explicit slot list (QSA selection, the same
+// contract as kv_attention_scores_q8_indexed). The per-token arithmetic is
+// identical across modes, so an ascending identity list is bit-exact with 0.
+#define TURBO_SLOT_LINEAR 0
+#define TURBO_SLOT_RING 1
+#define TURBO_SLOT_INDEXED 2
+template<int BITS, int MODE>
 __device__ void kv_scores_turbo_impl(
-    const float* query, const unsigned char* keys, float* scores,
+    const float* query, const unsigned char* keys, const int* slots, float* scores,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const int first, const float scale
 ) {
@@ -9256,7 +9264,8 @@ __device__ void kv_scores_turbo_impl(
     if (token >= tokens) return;
     const int kv_head = head / (heads / kv_heads);
     const int blocks = head_dim / 32, bytes = turbo_block_bytes<BITS>();
-    const int slot = RING ? (first + token) % capacity : token;
+    const int slot = MODE == TURBO_SLOT_RING ? (first + token) % capacity
+        : MODE == TURBO_SLOT_INDEXED ? slots[token] : token;
     const unsigned char* k = keys + ((long long)kv_head * capacity + slot) * blocks * bytes;
     float sum = 0.0f;
     for (int d = 0; d < head_dim; ++d) sum += rq[d] * kv_ld_turbo<BITS>(k, d);
@@ -9266,18 +9275,31 @@ __device__ void kv_scores_turbo_impl(
 extern "C" __global__ void name(const float* query, const unsigned char* keys, float* scores, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const float scale) { \
-    kv_scores_turbo_impl<BITS, false>(query, keys, scores, heads, kv_heads, head_dim, \
-        tokens, capacity, 0, scale); \
+    kv_scores_turbo_impl<BITS, TURBO_SLOT_LINEAR>(query, keys, (const int*)0, scores, \
+        heads, kv_heads, head_dim, tokens, capacity, 0, scale); \
 }
 KV_SCORES_TURBO(kv_attention_scores_turbo3, 3)
 KV_SCORES_TURBO(kv_attention_scores_turbo4, 4)
 #undef KV_SCORES_TURBO
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(// QSA selection over a turbo cache: `slots` lists the cache rows to attend, the
+// same signature the f32/f16/bf16/q8 indexed kernels take.
+#define KV_SCORES_TURBO_INDEXED(name, BITS) \
+extern "C" __global__ void name(const float* query, const unsigned char* keys, \
+    const int* slots, float* scores, const int heads, const int kv_heads, \
+    const int head_dim, const int tokens, const int capacity, const float scale) { \
+    kv_scores_turbo_impl<BITS, TURBO_SLOT_INDEXED>(query, keys, slots, scores, \
+        heads, kv_heads, head_dim, tokens, capacity, 0, scale); \
+}
+KV_SCORES_TURBO_INDEXED(kv_attention_scores_turbo3_indexed, 3)
+KV_SCORES_TURBO_INDEXED(kv_attention_scores_turbo4_indexed, 4)
+#undef KV_SCORES_TURBO_INDEXED
 #define KV_SCORES_TURBO_RING(name, BITS) \
 extern "C" __global__ void name(const float* query, const unsigned char* keys, float* scores, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const int first, const float scale) { \
-    kv_scores_turbo_impl<BITS, true>(query, keys, scores, heads, kv_heads, head_dim, \
-        tokens, capacity, first, scale); \
+    kv_scores_turbo_impl<BITS, TURBO_SLOT_RING>(query, keys, (const int*)0, scores, \
+        heads, kv_heads, head_dim, tokens, capacity, first, scale); \
 }
 KV_SCORES_TURBO_RING(kv_attention_scores_turbo3_ring, 3)
 KV_SCORES_TURBO_RING(kv_attention_scores_turbo4_ring, 4)
@@ -9287,9 +9309,9 @@ KV_SCORES_TURBO_RING(kv_attention_scores_turbo4_ring, 4)
 R"FLYWEIGHT_CUDA(// One block per head, so the weighted sum is accumulated in the rotated domain
 // in shared memory and inverse-rotated once at the end: R^-1 = R^T = S*H, i.e.
 // Walsh-Hadamard first, then the sign flip.
-template<int BITS, bool RING>
+template<int BITS, int MODE>
 __device__ void kv_values_turbo_impl(
-    float* scores, const unsigned char* values, float* output,
+    float* scores, const unsigned char* values, const int* slots, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const int first
 ) {
@@ -9349,18 +9371,32 @@ __device__ void kv_values_turbo_impl(
         const int spill = (shift + BITS > 8) ? 1 : 0;
         constexpr unsigned mask = (1u << BITS) - 1u;
         float result = 0.0f;
-        int token = 0, slot = RING ? first : 0;
-        while (token < tokens) {
-            const int run = RING ? min(tokens - token, capacity - slot) : tokens - token;
-            const unsigned char* row = cache_base + (long long)slot * row_bytes;
-            for (int i = 0; i < run; ++i, row += row_bytes) {
+        if (MODE == TURBO_SLOT_INDEXED) {
+            // Selected rows are scattered, so no contiguous runs: one gather per
+            // token. The slot read is uniform across the block (one list per
+            // launch), so it broadcasts rather than diverges.
+            for (int token = 0; token < tokens; ++token) {
+                const unsigned char* row = cache_base + (long long)slots[token] * row_bytes;
                 const float scale = __half2float(*(const __half*)(row + block_offset));
                 const unsigned low = row[byte_offset], high = row[byte_offset + spill];
-                result += head_scores[token + i] * scale
+                result += head_scores[token] * scale
                     * codebook[((low | (high << 8)) >> shift) & mask];
             }
-            token += run;
-            slot = 0;
+        } else {
+            int token = 0, slot = MODE == TURBO_SLOT_RING ? first : 0;
+            while (token < tokens) {
+                const int run = MODE == TURBO_SLOT_RING
+                    ? min(tokens - token, capacity - slot) : tokens - token;
+                const unsigned char* row = cache_base + (long long)slot * row_bytes;
+                for (int i = 0; i < run; ++i, row += row_bytes) {
+                    const float scale = __half2float(*(const __half*)(row + block_offset));
+                    const unsigned low = row[byte_offset], high = row[byte_offset + spill];
+                    result += head_scores[token + i] * scale
+                        * codebook[((low | (high << 8)) >> shift) & mask];
+                }
+                token += run;
+                slot = 0;
+            }
         }
         accumulated[d] = result;
     }
@@ -9373,12 +9409,22 @@ __device__ void kv_values_turbo_impl(
 extern "C" __global__ void name(float* scores, const unsigned char* values, float* output, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity) { \
-    kv_values_turbo_impl<BITS, false>(scores, values, output, heads, kv_heads, head_dim, \
-        tokens, capacity, 0); \
+    kv_values_turbo_impl<BITS, TURBO_SLOT_LINEAR>(scores, values, (const int*)0, output, \
+        heads, kv_heads, head_dim, tokens, capacity, 0); \
 }
 KV_VALUES_TURBO(kv_attention_values_turbo3, 3)
 KV_VALUES_TURBO(kv_attention_values_turbo4, 4)
 #undef KV_VALUES_TURBO
+#define KV_VALUES_TURBO_INDEXED(name, BITS) \
+extern "C" __global__ void name(float* scores, const unsigned char* values, \
+    const int* slots, float* output, const int heads, const int kv_heads, \
+    const int head_dim, const int tokens, const int capacity) { \
+    kv_values_turbo_impl<BITS, TURBO_SLOT_INDEXED>(scores, values, slots, output, \
+        heads, kv_heads, head_dim, tokens, capacity, 0); \
+}
+KV_VALUES_TURBO_INDEXED(kv_attention_values_turbo3_indexed, 3)
+KV_VALUES_TURBO_INDEXED(kv_attention_values_turbo4_indexed, 4)
+#undef KV_VALUES_TURBO_INDEXED
 // Expand a turbo cache window into contiguous f16 so the cuBLAS attention path
 // can run on it. The rotation is deliberately NOT undone: keys stay rotated and
 // are matched against a rotated query, and values stay rotated with the single
@@ -9480,8 +9526,8 @@ extern "C" __global__ void turbo_unrotate_rows(
 extern "C" __global__ void name(float* scores, const unsigned char* values, float* output, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const int first) { \
-    kv_values_turbo_impl<BITS, true>(scores, values, output, heads, kv_heads, head_dim, \
-        tokens, capacity, first); \
+    kv_values_turbo_impl<BITS, TURBO_SLOT_RING>(scores, values, (const int*)0, output, \
+        heads, kv_heads, head_dim, tokens, capacity, first); \
 }
 KV_VALUES_TURBO_RING(kv_attention_values_turbo3_ring, 3)
 KV_VALUES_TURBO_RING(kv_attention_values_turbo4_ring, 4)

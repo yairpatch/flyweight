@@ -720,6 +720,8 @@ class V2RuntimeTests(unittest.TestCase):
                 f"kv_attention_scores_{width}_ring",
                 f"kv_attention_values_{width}",
                 f"kv_attention_values_{width}_ring",
+                f"kv_attention_scores_{width}_indexed",
+                f"kv_attention_values_{width}_indexed",
                 f"kv_dequant_{width}_f16",
             ):
                 with self.subTest(symbol=symbol):
