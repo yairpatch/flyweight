@@ -1512,7 +1512,9 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_scores_indexed", "kv_attention_scores_f16_indexed",
              "kv_attention_scores_bf16_indexed", "kv_attention_scores_q8_indexed",
              "kv_attention_values_indexed", "kv_attention_values_f16_indexed",
-             "kv_attention_values_bf16_indexed", "kv_attention_values_q8_indexed"
+             "kv_attention_values_bf16_indexed", "kv_attention_values_q8_indexed",
+             "kv_attention_scores_turbo3_indexed", "kv_attention_scores_turbo4_indexed",
+             "kv_attention_values_turbo3_indexed", "kv_attention_values_turbo4_indexed"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)

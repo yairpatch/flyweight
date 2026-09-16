@@ -18720,11 +18720,13 @@ inline bool swa_snapshot_is_resident(const FlyweightV2QwenRuntime& runtime,
 // budget; the selection itself is a no-op until (position+1)/ratio exceeds
 // top_k/ratio complete blocks, which keeps the dense path -- and its
 // phase-2 bit-exactness -- untouched below 2051 visible tokens.
-// Sparse attention reads the cache through kv_ld like the ring kernels; the
-// turbo codecs rotate rows and keep their own staged path, so a turbo cache
-// stays on the dense fallback (announced once).
-inline const char* kv_scores_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
-inline const char* kv_values_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
+// Sparse attention reads the cache through kv_ld like the ring kernels. The
+// turbo codecs keep rows rotated, so their indexed kernels are the turbo
+// score/value kernels with a slot list (TURBO_SLOT_INDEXED): the query is
+// rotated once per block and the value fold is inverse-rotated once at the
+// end, exactly as on the dense turbo path.
+inline const char* kv_scores_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_indexed":t==4?"kv_attention_scores_turbo3_indexed":t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
+inline const char* kv_values_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_indexed":t==4?"kv_attention_values_turbo3_indexed":t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
 // A layer selects when it carries indexer tensors AND a compress ratio. The
 // window exclusion is structural, not incidental: QSA selects in POSITION
 // space and hands the attention kernels those positions as cache slots, which
@@ -18752,11 +18754,14 @@ inline bool qwen_qsa_selecting(const FlyweightV2QwenRuntime& r,const QwenLayerPl
     if(!ratio||!qwen_qsa_in_range(layer,position))return false;
     if((position+1)/ratio<=r.model->config.indexer_top_k/ratio)return false;
     if(kv_scores_indexed_kernel(r)&&kv_values_indexed_kernel(r))return true;
+    // Every shipped cache type has an indexed kernel; this is the guard for
+    // the next codec, so it stays loud rather than silently attending dense.
     static bool announced=false;
     if(!announced){
         announced=true;
-        std::fprintf(stderr,"[flyweight] QSA selection needs a f32/f16/bf16/q8 KV cache; "
-            "turbo caches keep the dense fallback (approximate past the indexer budget)\n");
+        std::fprintf(stderr,"[flyweight] QSA selection has no indexed kernel for KV cache "
+            "type %d; keeping the dense fallback (approximate past the indexer budget)\n",
+            r.options.cache_type_k);
     }
     return false;
 }

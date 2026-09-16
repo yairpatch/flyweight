@@ -384,11 +384,14 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
             os.environ["FLYWEIGHT_QSA"] = cls._qsa_previous
         cls._directory.cleanup()
 
-    def _decode(self, backend: str, tokens: list[int]) -> list[int]:
+    def _decode(self, backend: str, tokens: list[int],
+                cache_type: str = "f16") -> list[int]:
         V2Model.select_backend(backend)
         try:
             with V2Model(str(self.path)) as model:
-                with model.native_qwen_runtime(context_limit=256) as runtime:
+                with model.native_qwen_runtime(
+                        context_limit=256, cache_type_k=cache_type,
+                        cache_type_v=cache_type) as runtime:
                     runtime.prepare()
                     return [runtime.decode(token) for token in tokens]
         finally:
@@ -398,6 +401,29 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
         if not V2Model.gpu_info()["available"]:
             raise unittest.SkipTest("native CUDA runtime is unavailable")
         self.assertEqual(self._decode("cuda", TOKENS), self._decode("cpu", TOKENS))
+
+    def test_turbo_cache_selects(self) -> None:
+        """A turbo cache used to drop QSA to the dense fallback because the
+        indexed kernels had no rotated-row variant. Now the turbo score/value
+        kernels take the slot list themselves. Two gates: the CUDA and CPU
+        executions of the indexed turbo path agree bit for bit, and the
+        sparse run diverges from the dense one once the budget (8 at ratio 4)
+        prunes blocks -- the dense fallback would make the two identical."""
+        for cache_type in ("turbo3", "turbo4"):
+            with self.subTest(cache_type=cache_type):
+                sparse_cpu = self._decode("cpu", TOKENS, cache_type)
+                if V2Model.gpu_info()["available"]:
+                    self.assertEqual(
+                        self._decode("cuda", TOKENS, cache_type), sparse_cpu)
+                os.environ["FLYWEIGHT_QSA"] = "0"
+                try:
+                    dense_cpu = self._decode("cpu", TOKENS, cache_type)
+                finally:
+                    os.environ["FLYWEIGHT_QSA"] = "1"
+                # 11 visible tokens: 2 complete blocks, under the budget, so
+                # the prefix is the dense path on both runs.
+                self.assertEqual(sparse_cpu[:11], dense_cpu[:11])
+                self.assertNotEqual(sparse_cpu, dense_cpu)
 
     def test_interleaved_matches_solo(self) -> None:
         """Two sequences batched through qwen_decode_multi must each decode
@@ -458,7 +484,9 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
         try:
             without = self._decode("cpu", short)
         finally:
-            del os.environ["FLYWEIGHT_QSA"]
+            # Restore, not delete: the class runs with QSA on, and dropping
+            # the flag here left every later test in the class dense.
+            os.environ["FLYWEIGHT_QSA"] = "1"
         self.assertEqual(with_qsa, without)
 
 
