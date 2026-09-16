@@ -6445,6 +6445,32 @@ __device__ __forceinline__ void iq3s_octet(
     }
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(// IQ2_S by octet: the same 82-byte layout iq2s_value walks -- d(2) qs[32]
+// signs[32] qh[8] scales[8] -- one grid entry and one literal sign byte per
+// octet, two extra index bits from qh, a nibble scale per 16 values.
+__device__ __forceinline__ void iq2s_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 82;
+    const float d = __half2float(*((const __half*)base));
+    const unsigned char* quants = base + 2;
+    const unsigned char* signs = base + 34;
+    const unsigned char* high = base + 66;
+    const unsigned char* scales = base + 74;
+    const int group = octet >> 1;
+    const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+    const float db = d * (0.5f + (float)scale) * 0.25f;
+    const int entry = quants[octet] |
+        (((high[octet >> 2] >> (2 * (octet & 3))) & 3) << 8);
+    const unsigned long long pattern = kIq2sGrid[entry];
+    const unsigned int sign_byte = signs[octet];
+    for (int k = 0; k < 8; ++k) {
+        const float value = (float)((pattern >> (8 * k)) & 0xffULL);
+        out[k] = ((sign_byte >> k) & 1) ? -db * value : db * value;
+    }
+}
+
 // Q2_K by octet. Same 84-byte layout q2k_value walks, hoisting everything the
 // eight elements share: an octet cannot straddle a half (128), a group (32) or
 // a sub-block (16) because all three are multiples of 8, so only the quant byte
@@ -6488,6 +6514,32 @@ __device__ __forceinline__ void q40_octet(
         const unsigned char byte = quants[k];
         out[k] = d * (float)((high ? (byte >> 4) : (byte & 15)) - 8);
     }
+}
+
+// Q2_0 (ggml type 42): 18-byte flat blocks of 64 -- an f16 scale then 16
+// bytes of two-bit codes, element j at bits 2*(j%4) of byte j/4, code q
+// meaning (q-1)*d. An octet is two consecutive bytes. Indexed in 256-element
+// terms like iq4nl_octet, so the 64-block is re-derived from the absolute
+// octet; rows need only be a multiple of 64 (qwen4exp's 640-wide down rows).
+__device__ __forceinline__ void q20_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const int absolute_octet = block * 32 + octet;
+    const unsigned char* base = packed + (absolute_octet >> 3) * 18;
+    const float d = __half2float(*((const __half*)base));
+    const unsigned char* codes = base + 2 + (absolute_octet & 7) * 2;
+    for (int k = 0; k < 8; ++k)
+        out[k] = d * (float)(((codes[k >> 2] >> (2 * (k & 3))) & 3) - 1);
+}
+
+// Q2_0 by element, for the reconstruct-in-float rows matmul.
+__device__ __forceinline__ float q20_value(
+    const unsigned char* packed, long long absolute
+) {
+    const unsigned char* base = packed + (absolute >> 6) * 18;
+    const int within = (int)(absolute & 63);
+    const float d = __half2float(*((const __half*)base));
+    return d * (float)(((base[2 + (within >> 2)] >> (2 * (within & 3))) & 3) - 1);
 }
 
 #define FLYWEIGHT_GROUPED_EXPERTS(prefix, octet_at)                                    \
@@ -6626,6 +6678,9 @@ FLYWEIGHT_GROUPED_EXPERTS(iq2xxs, iq2xxs_octet)
 // The K-quant/flat pair a Q2_K MoE checkpoint needs: Q2_K gate/up, Q4_0 down.
 FLYWEIGHT_GROUPED_EXPERTS(q2k, q2k_octet)
 FLYWEIGHT_GROUPED_EXPERTS(q40, q40_octet)
+// GSQ-RCO qwen4exp: IQ2_S gate/up stacks and Q2_0 down stacks.
+FLYWEIGHT_GROUPED_EXPERTS(iq2s, iq2s_octet)
+FLYWEIGHT_GROUPED_EXPERTS(q20, q20_octet)
 
 #undef FLYWEIGHT_GROUPED_EXPERTS
 )FLYWEIGHT_CUDA"
@@ -10542,6 +10597,7 @@ FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq1m_matmul_rows, iq1m_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq1s_matmul_rows, iq1s_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows, iq4nl_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(q40_matmul_rows, ggml_q4_0_load)
+FLYWEIGHT_LOWBIT_MATMUL_ROWS(q20_matmul_rows, q20_value)
 #undef FLYWEIGHT_LOWBIT_MATMUL_ROWS
 
 #define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \

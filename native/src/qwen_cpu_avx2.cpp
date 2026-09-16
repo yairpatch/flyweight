@@ -630,6 +630,77 @@ float q40_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return horizontal_sum(_mm256_add_ps(sum0, sum1));
 }
 
+// Q2_0: an f16 scale then 16 bytes of 64 two-bit codes, byte b holding
+// elements 4b..4b+3 at bit offsets 0,2,4,6; code q is (q-1)*d. Replicating
+// each byte four times with a shuffle and masking each lane's own two bits
+// leaves lane 4b+k holding code<<2k, so the shift folds into a per-lane scale
+// d/4^k (exact: powers of two) and the codebook's -1 into a final -d. No
+// integer shifts at all; the codes reach f32 through cvtepu8 (192 = 3<<6 is
+// not an int8).
+namespace q20 {
+inline __m128i replicate(int quad) {
+    const char b = static_cast<char>(quad * 4);
+    return _mm_setr_epi8(b, b, b, b, b + 1, b + 1, b + 1, b + 1,
+                         b + 2, b + 2, b + 2, b + 2, b + 3, b + 3, b + 3, b + 3);
+}
+inline __m128i lane_mask() {
+    return _mm_setr_epi8(3, 12, 48, -64, 3, 12, 48, -64,
+                         3, 12, 48, -64, 3, 12, 48, -64);
+}
+inline __m256 lane_scale(float d) {
+    return _mm256_mul_ps(_mm256_set1_ps(d), _mm256_setr_ps(
+        1.0f, 0.25f, 0.0625f, 0.015625f, 1.0f, 0.25f, 0.0625f, 0.015625f));
+}
+}  // namespace q20
+
+float q20_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    const __m128i mask = q20::lane_mask();
+    const __m128i rep[4] = {q20::replicate(0), q20::replicate(1),
+                            q20::replicate(2), q20::replicate(3)};
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 18;
+        const float d = half_value(base);
+        const __m256 scale = q20::lane_scale(d), offset = _mm256_set1_ps(d);
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        for (int quad = 0; quad < 4; ++quad) {
+            const __m128i codes = _mm_and_si128(_mm_shuffle_epi8(bytes, rep[quad]), mask);
+            const __m256 w0 = _mm256_fmsub_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes)), scale, offset);
+            const __m256 w1 = _mm256_fmsub_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(codes, 8))),
+                scale, offset);
+            const float* in = input + block * 64 + quad * 16;
+            sum0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(in), sum0);
+            sum1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(in + 8), sum1);
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
+void q20_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i mask = q20::lane_mask();
+    const __m128i rep[4] = {q20::replicate(0), q20::replicate(1),
+                            q20::replicate(2), q20::replicate(3)};
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 18;
+        const float d = half_value(base);
+        const __m256 scale = q20::lane_scale(d), offset = _mm256_set1_ps(d);
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        for (int quad = 0; quad < 4; ++quad) {
+            const __m128i codes = _mm_and_si128(_mm_shuffle_epi8(bytes, rep[quad]), mask);
+            float* out = output + block * 64 + quad * 16;
+            _mm256_storeu_ps(out, _mm256_fmsub_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes)), scale, offset));
+            _mm256_storeu_ps(out + 8, _mm256_fmsub_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(codes, 8))),
+                scale, offset));
+        }
+    }
+}
+
 void q4_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
     __m256 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm256_setzero_ps();const __m128i nibble_mask=_mm_set1_epi8(15);
     for(int block=0;block<elements/256;++block){const auto*base=row_data+block*144;const float d=half_value(base),dmin=half_value(base+2);const auto*scales=base+4;const auto*quants=base+16;
@@ -1302,6 +1373,7 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==1)return f16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
     if(type==30)return bf16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
     if(type==2)return q40_dot(packed+row*static_cast<std::uint64_t>(elements/32)*18,input,elements);
+    if(type==42)return q20_dot(packed+row*static_cast<std::uint64_t>(elements/64)*18,input,elements);
     if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
@@ -1587,6 +1659,37 @@ void iq2xs_dequant(const std::uint8_t* row_data, float* output, int elements) {
     }
 }
 
+// IQ2_S: 82 bytes per 256 values -> d(2) qs[32] signs[32] qh[8] scales[8].
+// The row form of iq2s_dot above: eight signed grid values per octet, the
+// group scale on the weights, the block scale folded into the same multiply.
+// ISTA DASLab's GSQ-RCO qwen4exp mix puts IQ2_S on 20 gate/up expert
+// stacks; without this they were the scalar tripwire's whole prefill cost.
+void iq2s_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2sBlockBytes;
+        const auto* quants = base + 2;
+        const auto* signs = base + 34;
+        const auto* high = base + 66;
+        const auto* scales = base + 74;
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+            const __m256 weight =
+                _mm256_set1_ps(d * (0.5f + static_cast<float>(scale)) * 0.25f);
+            for (int half = 0; half < 2; ++half) {
+                const int index = group * 2 + half;
+                const int entry = quants[index] |
+                    (((high[index >> 2] >> (2 * (index & 3))) & 3) << 8);
+                const __m256 magnitudes =
+                    iq_signed_octet(kIq2sGrid[entry], signs[index]);
+                _mm256_storeu_ps(out + group * 16 + half * 8,
+                                 _mm256_mul_ps(magnitudes, weight));
+            }
+        }
+    }
+}
+
 void iq3xxs_dequant(const std::uint8_t* row_data, float* output, int elements) {
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq3xxsBlockBytes;
@@ -1728,9 +1831,11 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==17)iq2xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,output,elements);
     else if(type==18)iq3xxs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,output,elements);
     else if(type==21)iq3s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3sBlockBytes,output,elements);
+    else if(type==22)iq2s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2sBlockBytes,output,elements);
     else if(type==23)iq4xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,output,elements);
     else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
+    else if(type==42)q20_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*18,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
     else if(type==8)q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
     else std::fill(output,output+elements,0.0f); // unknown type: never walk it as Q8_0

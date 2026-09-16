@@ -243,7 +243,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "iq2s_lm_head_argmax_warp",
      .embedding = "qwen_iq2s_embedding",
      .embedding_rows = "qwen_iq2s_embedding_rows",
-     .cpu_expert = true},
+     // Grouped family since 2026-09-16: the GSQ-RCO qwen4exp mix puts IQ2_S
+     // on 20 gate/up expert stacks, and one unsupported stack keeps the
+     // whole model's routed experts on the CPU.
+     .grouped_expert_prefix = "iq2s", .cpu_expert = true},
     {.type = 23, .family = "iq4xs",
      .matvec_q8_warp = "iq4xs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq4xs_q8_matvec_transposed_rows",
@@ -286,6 +289,15 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     // MXFP4 experts run through dedicated paths (grouped/cuBLASLt); only the
     // CPU expert support is recorded here.
     {.type = 39, .family = "mxfp4", .cpu_expert = true},
+    // Q2_0 (ggml type 42, 2026-09): f16 scale + 64 two-bit codes per 18-byte
+    // block. ISTA DASLab's GSQ-RCO qwen4exp builds put ffn_down_exps in it on
+    // 30 layers and ffn_down_shexp on 8. Routed experts: the grouped family
+    // and the rows matmul (prefill streaming). Dense: no decode matvec, so
+    // prepare requantizes a static Q2_0 tensor to Q8_0.
+    {.type = 42, .family = "q20",
+     .matmul_rows = "q20_matmul_rows",
+     .matmul_rows_grid = RowsMatmulGrid::quad_pack,
+     .grouped_expert_prefix = "q20", .cpu_expert = true},
     // NVFP4 experts likewise run the dedicated grouped/cuBLASLt paths (the
     // expert stream short-circuits on type 40 before consulting this table,
     // because the expert kernels carry weight_scale_2). The entries below are

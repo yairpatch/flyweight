@@ -658,6 +658,40 @@ float q40_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
 }
 
+// Q2_0: see the AVX2 kernel for the layout and the replicate/mask/scale trick;
+// here one shuffle yields 16 codes, which is a full zmm of f32.
+float q20_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m512 sum0 = _mm512_setzero_ps(), sum1 = _mm512_setzero_ps();
+    const __m128i mask = _mm_setr_epi8(3, 12, 48, -64, 3, 12, 48, -64,
+                                       3, 12, 48, -64, 3, 12, 48, -64);
+    __m128i rep[4];
+    for (int quad = 0; quad < 4; ++quad) {
+        const char b = static_cast<char>(quad * 4);
+        rep[quad] = _mm_setr_epi8(b, b, b, b, b + 1, b + 1, b + 1, b + 1,
+                                  b + 2, b + 2, b + 2, b + 2, b + 3, b + 3, b + 3, b + 3);
+    }
+    const __m512 lane_scale = _mm512_set_ps(
+        0.015625f, 0.0625f, 0.25f, 1.0f, 0.015625f, 0.0625f, 0.25f, 1.0f,
+        0.015625f, 0.0625f, 0.25f, 1.0f, 0.015625f, 0.0625f, 0.25f, 1.0f);
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 18;
+        const float d = half_value(base);
+        const __m512 scale = _mm512_mul_ps(_mm512_set1_ps(d), lane_scale);
+        const __m512 offset = _mm512_set1_ps(d);
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        for (int quad = 0; quad < 4; ++quad) {
+            const __m128i codes = _mm_and_si128(_mm_shuffle_epi8(bytes, rep[quad]), mask);
+            const __m512 w = _mm512_fmsub_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes)), scale, offset);
+            const __m512 in = _mm512_loadu_ps(input + block * 64 + quad * 16);
+            if (quad & 1) sum1 = _mm512_fmadd_ps(w, in, sum1);
+            else sum0 = _mm512_fmadd_ps(w, in, sum0);
+        }
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
+}
+
 // IQ4_NL: the same 18-byte/32-element shape as Q4_0, differing only in how a
 // nibble becomes a weight -- Q4_0 subtracts 8, IQ4_NL indexes a 16-entry
 // non-uniform codebook. `_mm_shuffle_epi8` does that lookup for 16 nibbles in
@@ -1250,6 +1284,11 @@ float qwen_quant_dot_avx512(
     if (type == 2) {
         return q40_dot(
             packed + row * static_cast<std::uint64_t>(elements / 32) * 18,
+            input, elements);
+    }
+    if (type == 42) {
+        return q20_dot(
+            packed + row * static_cast<std::uint64_t>(elements / 64) * 18,
             input, elements);
     }
     if (type == 20) {
