@@ -1,5 +1,6 @@
 #include "flyweight_gpu_driver.h"
 #include "q4_kernel.h"
+#include "flyweight_cpu_topology.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -21,36 +22,19 @@
 namespace {
 
 #if defined(_OPENMP)
-// One thread per PHYSICAL core, detected from Linux's topology rather than
-// assumed. SMT siblings fight over the shared load ports and the spin
-// barriers between phases (measured ~50x slower at 32 threads than 16 on a
-// 16C/32T part) -- but blindly halving omp_get_num_procs() idled half the
-// cores on machines without SMT. Same logic as matvec_threads() in
-// flyweight_v2_bailing.hpp; cached, so the OMP_NUM_THREADS getenv that used to
-// run per MoE call per layer happens once.
+// One thread per PHYSICAL core, counted from the host topology
+// (flyweight_cpu_topology.hpp) rather than assumed. SMT siblings fight over the
+// shared load ports and the spin barriers between phases (measured ~50x slower
+// at 32 threads than 16 on a 16C/32T part) -- but blindly halving
+// omp_get_num_procs() idled half the cores on machines without SMT, and
+// dividing by cpu0's sibling count undercounts hybrid parts, whose efficiency
+// cores have none. Cached, so the OMP_NUM_THREADS getenv that used to run per
+// MoE call per layer happens once.
 int moe_team_threads() {
     static const int threads = [] {
-        if (std::getenv("OMP_NUM_THREADS")) return omp_get_max_threads();
-        int siblings = 1;
-#if defined(__linux__)
-        if (std::FILE* file = std::fopen(
-                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
-                "r")) {
-            char line[256] = {};
-            if (std::fgets(line, sizeof(line), file)) {
-                // "0,16" or "0-1": one entry per hardware thread on this core.
-                siblings = 1;
-                for (const char* c = line; *c; ++c)
-                    if (*c == ',') ++siblings;
-                    else if (*c == '-') siblings = 2;
-            }
-            std::fclose(file);
-        }
-#endif
-        const int procs = omp_get_num_procs();
-        const int physical = siblings > 1 ? procs / siblings : procs;
-        const int team = physical > 0 ? physical : 1;
         const int limit = omp_get_max_threads();
+        if (std::getenv("OMP_NUM_THREADS")) return limit;
+        const int team = flyweight::cpu_topology::batch_threads();
         return team < limit ? team : limit;
     }();
     return threads;

@@ -7,6 +7,8 @@
 #include <limits>
 #include <vector>
 
+#include "flyweight_cpu_topology.hpp"
+
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -24,19 +26,16 @@ namespace flyweight::v2::deepseek4 {
 // One thread per core, not per hardware thread. Measured on this checkpoint:
 // the default team on a 16-core/32-thread part runs the expert weights at
 // 9.3 GiB/s where a 16-wide team reaches 24.6, because two threads sharing a
-// core contend for one L1 and one set of decode units. An explicit
-// OMP_NUM_THREADS still wins, which is how a part without SMT gets its cores
-// back. The rule matches `qwen_cpu_thread_count`; this is the copy the kernels
-// can see.
+// core contend for one L1 and one set of decode units. The cores are counted
+// from the host topology (flyweight_cpu_topology.hpp) rather than as logical
+// processors / 2, which undercounts hybrid parts. An explicit OMP_NUM_THREADS
+// still wins.
 inline int thread_count() {
 #if defined(_OPENMP)
     static const int team = [] {
-        int chosen = omp_get_max_threads();
-        if (std::getenv("OMP_NUM_THREADS") == nullptr) {
-            const int physical = omp_get_num_procs() / 2;
-            if (physical >= 1 && chosen > physical) chosen = physical;
-        }
-        return chosen;
+        const int limit = omp_get_max_threads();
+        if (std::getenv("OMP_NUM_THREADS") != nullptr) return limit;
+        return std::max(1, std::min(::flyweight::cpu_topology::batch_threads(), limit));
     }();
     return team;
 #else

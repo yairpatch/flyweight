@@ -63,6 +63,55 @@ std::int64_t iq_sign_bytes(std::uint8_t pattern) {
 
 } // namespace
 
+// IQ1_S row against Q8_K activations: the 256-bit VEX form of
+// qwen_iq1s_dot_q8_k_vnni512, for parts with AVX-VNNI and no AVX-512 (the
+// hybrid Intel consumer parts since Alder Lake), which otherwise take the float
+// AVX2 dot that walks the grid an octet at a time. A group of 32 weights is
+// exactly one ymm: four grid octets, one dpbusd, one group scale. The octets are
+// table loads rather than a gather -- a gather is microcoded and slow on the
+// Gracemont E-cores these parts put half the team on. The lift by one and the
+// +-delta ride the Q8_K group sums, exactly as in the 512-bit kernel.
+float qwen_iq1s_dot_q8_k_avx_vnni(
+    const std::uint8_t* packed, const QwenQ8KBlock* input, int elements, std::uint64_t row
+) {
+    const int blocks = elements / 256;
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
+    const __m256i one = _mm256_set1_epi8(1);
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq1sBlockBytes;
+        const auto& q8 = input[block];
+        std::uint16_t qh[8];
+        std::memcpy(qh, base + 34, sizeof(qh));
+        __m256i sum = _mm256_setzero_si256();
+        float side = 0.0f;
+        for (int group = 0; group < 8; ++group) {
+            const std::uint32_t high = qh[group];
+            const auto* qs = base + 2 + group * 4;
+            // Grid index: the qs byte, plus the part's three bits of qh above it.
+            const auto octet = [&](int part) {
+                return static_cast<long long>(kIq1sGrid[
+                    static_cast<std::uint32_t>(qs[part]) | (((high >> (3 * part)) & 7u) << 8)]);
+            };
+            const __m256i octets = _mm256_set_epi64x(octet(3), octet(2), octet(1), octet(0));
+            const __m256i activation = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(q8.values + group * 32));
+            const __m256i dots = _mm256_dpbusd_epi32(
+                _mm256_setzero_si256(), _mm256_add_epi8(octets, one), activation);
+            const int scale = 2 * static_cast<int>((high >> 12) & 7u) + 1;
+            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(dots, _mm256_set1_epi32(scale)));
+            // sum((w + 1) x) - sum(x) + delta * sum(x) = sum(w x) + delta * sum(x).
+            const int group_sum = q8.sums[group * 2] + q8.sums[group * 2 + 1];
+            side += static_cast<float>(scale * group_sum)
+                * ((high & 0x8000u) ? -kIq1sDelta - 1.0f : kIq1sDelta - 1.0f);
+        }
+        result += half_value(base) * q8.scale
+            * (static_cast<float>(horizontal_sum(sum)) + side);
+    }
+    return result;
+}
+
 void qwen_quantize_q8_0(
     const float* input, int elements, QwenQ80Block* output
 ) {
