@@ -15687,6 +15687,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             break;
         }
         runtime->delta_value_heads=static_cast<std::uint32_t>(delta_value_heads);
+        // The widest attention head, for the cuBLAS prefill tile floor in the
+        // layout; the per-layer value comes from the tensor shapes, the config
+        // field only from the families that declare one.
+        std::uint64_t attention_head_dim=0;
+        for(const auto&layer:runtime->layers)
+            if(layer.attention)
+                attention_head_dim=std::max<std::uint64_t>(attention_head_dim,layer.head_dim);
         runtime->rows_workspace_layout=flyweight::v2::workspace::qwen_rows(
             rows,hidden,runtime->scratch_elements,top_k,
             runtime->moe_intermediate,runtime->model->config.expert_count,
@@ -15696,7 +15703,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
             runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
-            qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
+            qsa_heads,qsa_key_len,qsa_budget,qsa_ratio,
+            attention_head_dim);
         runtime->rows_host_layout=
             flyweight::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
