@@ -453,6 +453,19 @@ a `tile=0` there is correct rather than a dormant path. And a branch cut
 before pass 4 merged still carries the old 4096 threshold, so reading the
 constant off the wrong branch invents a bug that is not there.
 
+**Standing after the move**, three interleaved passes, nine repeats each,
+same session:
+
+| engine | TTFT | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| llama.cpp f3a33dff2 | 2.166 s | 891 | 39.0 |
+| flyweight | 2.473 s | 780 | 37.7 |
+
+87.5% of llama.cpp on prefill, against 85.6% before. Both engines read
+slower in absolute terms than the pass-8 session on the same builds, which
+is the machine and not the code -- another reason only same-session
+interleaved pairs are quoted anywhere in this report.
+
 **What the remaining 346 ms is.** Not tuning. The timeline accounts for
 essentially all of the prefill as GPU-busy, the GEMMs are 76% of it and
 already beat llama.cpp's standalone on these shapes, so the balance sits in
