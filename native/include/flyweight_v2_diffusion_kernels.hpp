@@ -154,8 +154,9 @@ void diff_rope_axes_rows(float* qkv, const int* positions, const double* frequen
         const int head = index / pairs, pair = index % pairs;
         const int axis = pair < pairs0 ? 0 : pair < pairs0 + pairs1 ? 1 : 2;
         const float angle = (float)((double)positions[row * 3 + axis] * frequencies[pair]);
-        float s, c;
-        sincosf(angle, &s, &c);
+        // sinf/cosf, not sincosf: the corpus is also compiled for the CPU
+        // backend, and MSVC has no sincosf.
+        const float s = sinf(angle), c = cosf(angle);
         float* vector = base + head * head_dim + 2 * pair;
         const float re = vector[0], im = vector[1];
         vector[0] = re * c - im * s;
@@ -177,8 +178,8 @@ void diff_rope_half_rows(float* x, const int* positions, const double* frequenci
     const double position = (double)positions[row];
     for (int index = threadIdx.x; index < heads * half; index += blockDim.x) {
         const int head = index / half, j = index % half;
-        float s, c;
-        sincosf((float)(position * frequencies[j]), &s, &c);
+        const float angle = (float)(position * frequencies[j]);
+        const float s = sinf(angle), c = cosf(angle);
         float* vector = base + head * head_dim;
         const float first = vector[j], second = vector[j + half];
         vector[j] = first * c - second * s;
