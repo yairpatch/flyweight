@@ -2707,6 +2707,11 @@ R"FLYWEIGHT_CUDA(
 #ifndef FLYWEIGHT_MMQ_ROW_WARPS
 #define FLYWEIGHT_MMQ_ROW_WARPS 2
 #endif
+// Minimum resident blocks per SM the compiler must fit (registers per thread
+// = 65536 / (threads * blocks)). Injected with the shape; see qwen_mmq_shape.
+#ifndef FLYWEIGHT_MMQ_MIN_BLOCKS
+#define FLYWEIGHT_MMQ_MIN_BLOCKS 1
+#endif
 #ifndef FLYWEIGHT_MMQ_ROW_FRAGS
 #define FLYWEIGHT_MMQ_ROW_FRAGS 4
 #endif
@@ -2762,7 +2767,8 @@ R"FLYWEIGHT_CUDA(
 /* the default 256 threads (no change), 128 at the wide shape's 512, which   */\
 /* is what makes 16 warps launchable at all. The CPU shim defines this away. */\
 extern "C" __global__                                                          \
-__launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32, 1)     \
+__launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32,        \
+                  FLYWEIGHT_MMQ_MIN_BLOCKS)                                     \
 void name(                                                                     \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
@@ -2925,7 +2931,8 @@ R"FLYWEIGHT_CUDA(
 /* the default 256 threads (no change), 128 at the wide shape's 512, which   */\
 /* is what makes 16 warps launchable at all. The CPU shim defines this away. */\
 extern "C" __global__                                                          \
-__launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32, 1)     \
+__launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32,        \
+                  FLYWEIGHT_MMQ_MIN_BLOCKS)                                     \
 void name(                                                                     \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
@@ -3067,6 +3074,7 @@ void name(                                                                     \
                         acc[rf][tf][item];                                \
             }                                                             \
 }
+
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
@@ -4248,6 +4256,7 @@ __device__ __forceinline__ void iq2xxs_q8_decode(
     *scale_low = scale;
     *scale_high = scale;
 }
+
 
 FLYWEIGHT_Q8_MATVEC_ROWS(iq2xxs_q8_matvec_transposed_rows, iq2xxs_q8_decode, 66)
 FLYWEIGHT_Q8_MATMUL_TILED(iq2xxs_q8_matmul_tiled, iq2xxs_q8_decode, 66)
