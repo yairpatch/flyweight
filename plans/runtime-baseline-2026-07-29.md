@@ -1,5 +1,7 @@
 # Native runtime baseline — 2026-07-29
 
+> **STATUS 2026-09-18**: REFERENCE snapshot: the numbers are the 2026-07-29 baseline for runtime-simplification-roadmap.md and are long superseded; `flyweight.runtime_benchmark` captures current ones.
+
 ## Configuration
 
 - Source revision: `ddc036d92e9fa2d5896f2af7989bfc03ac7a0d10`

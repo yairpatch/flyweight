@@ -1,5 +1,7 @@
 # Prompt-lookup drafting for qwen4exp decode
 
+> **STATUS 2026-09-18**: SHIPPED to main 2026-09-10 (PR #44/#45), opt-in via `FLYWEIGHT_LOOKUP_DRAFTS=N`; not default-on because prose is neutral and the verify row caps the gain near 1.8x.
+
 > **Goal**: decode speed on Qwen3.8-Flash-Next without touching the weights or the
 > sampler's distribution. The checkpoint has no draft block, so the only speculation
 > available is self-speculation: draft from the sequence's own history and verify

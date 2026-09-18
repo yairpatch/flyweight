@@ -1,5 +1,7 @@
 # Decode device dispatch: removing the per-layer host round-trip
 
+> **STATUS 2026-09-18**: CLOSED (2026-08-27): phase 1 shipped (register expert tensors, decode ~17 -> ~30 tok/s); the device-dispatch centrepiece was measured dead and dropped. Kept as the record of why. Decode work continued in decode-expert-kernels.md and lookup-drafts.md.
+
 > **Goal**: qwen4exp decode from 26 tok/s toward 60. The token is not bandwidth-bound;
 > it is bound by 48 serialized host round-trips, one per MoE layer.
 > **Status 2026-08-27**: **Phase 1 SHIPPED — decode ~17 -> ~30 tok/s** by registering

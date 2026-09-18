@@ -1,5 +1,7 @@
 # Configurable KV cache precision (llama.cpp `-ctk`/`-ctv` parity)
 
+> **STATUS 2026-09-18**: SHIPPED, beyond the plan: `--cache-type-k/-v` accept f32, f16, bf16, q8_0, turbo3, turbo4. The q4_0/q5_x/iq4_nl phases were superseded by the turbo formats.
+
 ## Context
 
 The v2 native runtime stores its attention KV cache in **f32**, which is 2× heavier

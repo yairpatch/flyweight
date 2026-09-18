@@ -1,5 +1,7 @@
 # Prefill expert streaming — GPU takes a measured share of the routed experts
 
+> **STATUS 2026-09-18**: CLOSED (verdict at the end): streaming experts to the GPU with decode-shaped kernels cannot win. Superseded by prefill-expert-gemm.md.
+
 ## Motivation (measured 2026-08-22)
 
 Qwen3.6-35B Q5_K_M, hybrid auto-fit, 4096-token prompt, 5000 MiB cache,

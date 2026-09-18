@@ -1,5 +1,7 @@
 # Z-Image-Turbo image generation
 
+> **STATUS 2026-09-18**: SHIPPED 2026-09-15 (PR #59): Z-Image-Turbo text-to-image on the native engine, parity table below. Next steps at the end (Q8 GEMM, fusions).
+
 Started 2026-09-14. The first diffusion model on the engine, chosen because
 every component is already the engine's shape: the text encoder is a plain
 Qwen3-4B, the DiT is one block type (single-stream, RMSNorm, SwiGLU, qk-norm,

@@ -1,5 +1,7 @@
 # Prefill expert GEMM — the grouped kernels stop re-decoding weights per token
 
+> **STATUS 2026-09-18**: SHIPPED, default-on since 2026-08-22 (`a1ae272`): `prefill_expert_stream_mib` runtime option, -1 auto = 48 MiB, 0 = old bit-exact path.
+
 ## Motivation (measured 2026-08-22)
 
 plans/prefill-expert-stream.md closed on this wall: the grouped expert

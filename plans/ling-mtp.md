@@ -1,5 +1,7 @@
 # Ling (bailingmoe3) MTP with fold-style rollback
 
+> **STATUS 2026-09-18**: PARTIAL: step 1 native round exists (`flyweight_v2_bailing_mtp_round` plus Python bindings) but the server never calls it, so served Ling runs without speculation. Steps 2 (device verify) and 3 (server driver, A/B) open.
+
 Decided 2026-08-24: Ling should get speculative decode. Status today: the
 `nextn` draft block loads (blk.N.nextn.* since the GGUF work) and is **never
 executed** — the bailing runtime has no draft loop, no verify, no rollback.

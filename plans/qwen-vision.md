@@ -1,5 +1,7 @@
 # Qwen vision (image input) for the qwen35 / qwen35moe family
 
+> **STATUS 2026-09-18**: SHIPPED: tower, mrope decoder integration, and the OpenAI/Responses/Anthropic image inputs; workspace reserved at load since PR #50-52 (2026-09-12). Open items at the end (deepstack injection, tensor-core tower GEMMs, MTP pad rows).
+
 Target: serve Qwen 3.5-family GGUF checkpoints with their llama.cpp-style
 `mmproj-*.gguf` vision tower (projector type `qwen3vl_merger`), so an OpenAI
 `image_url` part or an Anthropic `image` block reaches the model as image

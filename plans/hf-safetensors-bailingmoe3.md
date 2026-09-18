@@ -1,5 +1,7 @@
 # HF safetensors loading + the BailingMoE3 hybrid architecture
 
+> **STATUS 2026-09-18**: SHIPPED stages 1-3: safetensors loading with K-quantization at load, and the bailingmoe3 (Ling) architecture on host and device; Ling 3.0 Flash loads, generates and serves. This file is the build log. MTP execution for Ling is in ling-mtp.md.
+
 ## Context
 
 Two goals that are usually conflated but are almost entirely independent:

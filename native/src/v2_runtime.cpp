@@ -435,7 +435,7 @@ struct QwenLayerPlan {
     std::uint64_t hc_ffn_inject = std::numeric_limits<std::uint64_t>::max();
     // QSA indexer projections (full-attention layers). Loaded and resident from
     // phase 1 so residency accounting is stable, exercised only once the
-    // sparse selection lands (plans/floating-dreaming-moore.md phase 3).
+    // sparse selection lands (plans/qwen4exp-flash-next.md phase 3).
     std::uint64_t indexer_q = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t indexer_k = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t indexer_q_norm = std::numeric_limits<std::uint64_t>::max();

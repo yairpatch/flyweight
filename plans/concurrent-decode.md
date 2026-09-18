@@ -1,5 +1,7 @@
 # Concurrent decode (close the last llama.cpp gap)
 
+> **STATUS 2026-09-18**: SHIPPED phases A and B (2026-07-22): cooperative multi-sequence decode through `qwen_decode_multi`, one engine cycle interleaving the ready slots. Phase C (continuous admission, fairness weights, queue timing in `/health`) is open.
+
 ## Context
 
 flyweight now matches llama.cpp on prefix reuse (LCP slot routing, spread checkpoints,

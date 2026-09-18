@@ -1,5 +1,7 @@
 # Parallel KV-cache slots (llama.cpp `--parallel` parity)
 
+> **STATUS 2026-09-18**: SHIPPED: `--parallel N` per-slot arenas, LCP slot routing, host spill and prefix donation. Concurrent decode was split out into concurrent-decode.md.
+
 ## Context
 
 The v2 native runtime is **single-sequence**: one attention KV cache + one DeltaNet
