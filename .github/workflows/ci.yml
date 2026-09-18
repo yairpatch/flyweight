@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # A branch push and its pull request used to start two identical runs of this
+  # whole matrix, and merging the PR cancelled the PR's copy -- which `gh pr
+  # checks` reports as a failure, so a green merge looked red. Pushes are
+  # watched on main only; branches are covered by their pull request.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -36,7 +41,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test tooling
-        run: python -m pip install --upgrade pip build mypy pytest pytest-xdist ruff wheel
+        # numpy is a TEST dependency only -- 30 test modules import it at module
+        # scope for their reference implementations -- and is deliberately not a
+        # dependency of the package, which installs with none. Without it here
+        # every one of those modules is a collection error, which is what the
+        # test job had been failing on.
+        run: python -m pip install --upgrade pip build mypy numpy pytest pytest-xdist ruff wheel
       # The install is what a first-time user runs, so CI runs exactly that and
       # nothing else to obtain the runtime. It used to build via native_build
       # with PYTHONPATH=src, which is why `pip install -e .` was free to stop
