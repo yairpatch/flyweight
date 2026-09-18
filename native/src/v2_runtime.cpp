@@ -16120,8 +16120,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         {
             FlyweightV2GpuInfo probe{};
             if(gpu_probe(probe,runtime->options.device)==0){
+                // sm_80: the int8 m16n8k16 mma the MMQ kernels issue is not
+                // a Turing instruction (its int8 shape is m8n8k16), and the
+                // corpus guards it the same way (#70, Tesla T4).
                 runtime->int8_tensor_cores=
-                    probe.compute_major*10+probe.compute_minor>=75;
+                    probe.compute_major*10+probe.compute_minor>=80;
                 runtime->fp4_tensor_cores=probe.compute_major>=10;
             }
         }
