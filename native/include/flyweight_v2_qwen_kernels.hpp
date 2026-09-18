@@ -2365,14 +2365,16 @@ R"FLYWEIGHT_CUDA(
 // A's four consecutive K per register is exactly how *_q8_decode already packs
 // words[k] (elements 4k..4k+3), so fragments come straight out of the decoder.
 //
-// The PTX form needs sm_75 or newer. NVRTC compiles this corpus for whatever
-// the device actually reports (--gpu-architecture=compute_XY), so an
-// unguarded mma here does not degrade on an older part -- it fails to compile,
-// and every kernel in the corpus goes with it. Below sm_75 the emulation is
-// taken instead, and the host-side dispatch prefers the dp4a tile kernel there
-// so the emulation is never actually the hot path.
+// The PTX form needs sm_80 or newer: Turing has int8 tensor cores, but only
+// the m8n8k16 shape, and ptxas refuses m16n8k16 for sm_75 (issue #70, a Tesla
+// T4: NVRTC compiled the corpus, the driver rejected the PTX at load, and
+// every kernel went with it). NVRTC compiles for whatever the device reports
+// (--gpu-architecture=compute_XY), so the floor is a guard here and the
+// matching host test (int8_tensor_cores, v2_runtime.cpp); below it the
+// emulation compiles and the host prefers the dp4a tile kernel, so the
+// emulation is never the hot path.
 __device__ __forceinline__ void mma_m16n8k16_s8(int* d, const int* a, int b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
@@ -11721,7 +11723,7 @@ __device__ __forceinline__ unsigned int kv_mma_movmatrix(unsigned int source) {
 __device__ __forceinline__ void kv_mma_m16n8k16(
     float* d, const unsigned int* a, const unsigned int* b, const __half*
 ) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -11845,7 +11847,7 @@ __device__ void kv_attention_gqa_mma_impl(
     const int first,
     const float scale
 ) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int warp_count = 8;
     constexpr int keys_per_step = 16;
     constexpr int chunk_dims = 64;
@@ -12086,8 +12088,9 @@ extern "C" __global__ __launch_bounds__(256, 1) void name( \
 }
 // Defined only where the instructions exist, so a device below the floor
 // simply does not have the kernel and the host falls back by name lookup
-// rather than by an architecture test it could get wrong.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+// rather than by an architecture test it could get wrong. The floor is
+// sm_80: the m16n8k16 f16 mma these use is not a Turing instruction (#70).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 KV_ATTENTION_GQA_MMA(
     kv_attention_gqa_mma_f16_256_s8_t512, __half, __half, __half, 256, 8, 512)
 KV_ATTENTION_GQA_MMA(
