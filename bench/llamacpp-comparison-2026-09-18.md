@@ -249,3 +249,22 @@ DeltaNet path at 256 rows, and the odd/even warp order under k32.
 
 Final on the 27B, 1929-token prompt: 2.33 s, 828 tok/s, against llama.cpp's
 894. Decode 41.7 vs 41 at f16 KV.
+
+### Fifth pass: llama.cpp's kernel, measured, and split-K
+
+llama.cpp's own GEMM benchmark (`test-backend-ops perf`) against flyweight's
+per-kernel time on the same prefill, in TFLOPS: IQ2_XXS 72 vs 65, IQ1_S 65
+vs 61, IQ3_XXS 68 vs 57, IQ2_S 52 vs 48, IQ2_XS 52 vs 37, IQ1_M 55 vs 54.
+Weighted by the 27B's MACs the kernels are 8% behind, which is the whole
+remaining prefill gap. llama.cpp's configuration for these types (8 warps,
+one block per SM, 128x128 tile, 256 of K per iteration, stream-K) was
+tried in this kernel and measured 3.5 s: at 128 registers our per-warp
+state spills. Stream-K's target, wave quantization, is real here: 14% of
+MMQ time by the launch list. A deterministic split-K (grid.y carries the
+splits, fixed-order reduction) recovered 1.5% of it, changed Flash-Next's
+greedy output through the partials' summation order, and its partials
+region tipped the f16 configuration past its VRAM fit. Reverted.
+
+Final: 27B 2.33 s, 828 tok/s, 41.7 tok/s decode at f16 KV; llama.cpp 894
+and 41. Closing the last 7% means adopting llama.cpp's MMQ register and
+tile layout, which is a port, not a pass.
