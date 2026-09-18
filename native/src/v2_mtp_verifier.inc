@@ -53,6 +53,7 @@ static constexpr int kQ8MmqWideThreads=
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 
 // FLYWEIGHT_PREFILL_TIMELINE=1: every launch gets a start and stop event
+// (=2 additionally lists every kernel in the per-chunk report, not the top 8)
 // recorded on the stream with no synchronization, and the chunk's end reads
 // them all back: per-kernel busy time, the idle gaps between consecutive
 // kernels (host-side pacing the serializing launch timer cannot see), and the
@@ -60,7 +61,7 @@ static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 // show up as gaps; the attention profile gives their size separately.
 struct QwenTimelineEntry{const char*name;std::uint64_t start,stop;};
 inline bool qwen_timeline_enabled(){
-    static const bool on=[]{const char*v=std::getenv("FLYWEIGHT_PREFILL_TIMELINE");return v&&v[0]=='1';}();
+    static const bool on=[]{const char*v=std::getenv("FLYWEIGHT_PREFILL_TIMELINE");return v&&(v[0]=='1'||v[0]=='2');}();
     return on;
 }
 inline std::vector<QwenTimelineEntry>& qwen_timeline(){static std::vector<QwenTimelineEntry> t;return t;}
@@ -97,7 +98,12 @@ inline void qwen_timeline_report(std::uint64_t stream){
         t.size(),wall,busy,gaps,big,big_gaps,since>0?since-wall:0.0);
     std::vector<std::pair<std::string,double>> ordered(by_name.begin(),by_name.end());
     std::sort(ordered.begin(),ordered.end(),[](const auto&a,const auto&b){return a.second>b.second;});
-    for(std::size_t i=0;i<ordered.size()&&i<8;++i)
+    // FLYWEIGHT_PREFILL_TIMELINE=2 lists every kernel, not just the heaviest.
+    static const std::size_t shown=[]{
+        const char*setting=std::getenv("FLYWEIGHT_PREFILL_TIMELINE");
+        return setting&&setting[0]=='2'?static_cast<std::size_t>(512):static_cast<std::size_t>(8);
+    }();
+    for(std::size_t i=0;i<ordered.size()&&i<shown;++i)
         std::fprintf(stderr,"[timeline]   %-34s %7.2f ms\n",ordered[i].first.c_str(),ordered[i].second);
     t.clear();
 }
