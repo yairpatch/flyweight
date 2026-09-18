@@ -366,8 +366,8 @@ void qwen_forward_rows(
                 if(rows>1){
                     void*quant_args[]={&input,&all_q8,&all_scales,
                         &input_size,&scale_stride};
-                    launch("quantize_q8_blocks_rows",(input_size+31)/32,
-                           static_cast<std::uint32_t>(rows),32,quant_args);
+                    launch("quantize_q8_blocks_rows",(input_size+255)/256,
+                           static_cast<std::uint32_t>(rows),256,quant_args);
                 }else{
                     void*quant_args[]={&input,&all_q8,&all_scales,&input_size};
                     launch("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
@@ -2394,8 +2394,8 @@ void qwen_forward_rows(
                                      std::uint64_t scales,int width,int count){
                 int scale_stride=(width/32)*2;
                 void*args[]={&input,&q8,&scales,&width,&scale_stride};
-                launch("quantize_q8_blocks_rows",(width+31)/32,
-                       static_cast<std::uint32_t>(count),32,args);
+                launch("quantize_q8_blocks_rows",(width+255)/256,
+                       static_cast<std::uint32_t>(count),256,args);
             };
             const bool gate_up_q8=stream_needs_q8(gate_type,hidden_size)||
                 stream_needs_q8(up_type,hidden_size);

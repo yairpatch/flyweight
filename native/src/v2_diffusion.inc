@@ -767,8 +767,8 @@ struct DiffLaunch {
             int scale_stride = (in / 32) * 2;
             {
                 void* arguments[] = {&input, &q8, &q8_scales, &in, &scale_stride};
-                run("quantize_q8_blocks_rows", static_cast<std::uint32_t>((in + 31) / 32),
-                    static_cast<std::uint32_t>(rows), 32, arguments);
+                run("quantize_q8_blocks_rows", static_cast<std::uint32_t>((in + 255) / 256),
+                    static_cast<std::uint32_t>(rows), 256, arguments);
             }
             const auto mmq_shape=qwen_mmq_shape();
             const int mmq_rows=format->mmq_min?kQ8MmqMinRows:mmq_shape.rows();
