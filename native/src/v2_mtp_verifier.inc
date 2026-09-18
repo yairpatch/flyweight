@@ -417,7 +417,9 @@ void qwen_forward_rows(
                 if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d tiles=%u pos=%llu\n",
                     mmq_kernel,index,input_size,output_size,rows,token_tiles,
                     (unsigned long long)(runtime.position+span_begin));
-                launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args);
+                const std::uint32_t mmq_shared=(format&&format->mmq_dynamic_shared&&!mmq_min)
+                    ?qwen_mmq_dynamic_shared(mmq_shape):0u;
+                launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
                 dense_trace(mmq_kernel);
                 return;
             }
@@ -1288,18 +1290,21 @@ void qwen_forward_rows(
             const std::uint64_t max_tokens=
                 runtime.position+static_cast<std::uint64_t>(span_begin)+
                 static_cast<std::uint64_t>(rows);
-            // The warp-online kernel wins for short prefixes because it needs
-            // one launch and no materialized score tile.  Once the visible
-            // prefix reaches 4K, tensor-core QK/PV amortize the tiled cuBLAS
-            // setup and pull progressively farther ahead.  1/0 force either
-            // side for benchmarking and machine-specific tuning.
+            // The warp-online kernel needs one launch and no materialized
+            // score tile, so it was kept for prefixes under 4K. Measured on
+            // Qwen3.8-27B (RTX 5070 Ti, 2026-09-18) the tensor-core QK/PV
+            // path is level with it at 512 tokens and ahead from there: +4%
+            // prefill at 1024, +11% at 2048, +21% at 4096 -- and since
+            // max_tokens is the visible prefix, a 4K threshold only ever
+            // reached the tail chunk of a 4K prompt. 1/0 force either side
+            // for benchmarking and machine-specific tuning.
             const bool cublas_prefill_forced=
                 cublas_prefill_env&&cublas_prefill_env[0]=='1';
             const bool cublas_prefill_disabled=
                 cublas_prefill_env&&cublas_prefill_env[0]=='0';
             const bool cublas_prefill_requested=
                 !cublas_prefill_disabled&&
-                (cublas_prefill_forced||max_tokens>=4096);
+                (cublas_prefill_forced||max_tokens>=1024);
             // Flash-blocked: the score tile is bounded by a KV position block
             // rather than the whole visible prefix, so the 16-row query tile
             // no longer shrinks as the context grows (it collapsed to 3 rows
@@ -2371,7 +2376,9 @@ void qwen_forward_rows(
                             format->matmul_q8_mmq,in_size,out_size,count,start,batch,
                             (unsigned long long)(runtime.position+span_begin));
                         launch(format->matmul_q8_mmq,
-                               (out_size+mmq_rows-1)/mmq_rows,1,mmq_threads,args);
+                               (out_size+mmq_rows-1)/mmq_rows,1,mmq_threads,args,
+                               (format->mmq_dynamic_shared&&!format->mmq_min)
+                                   ?qwen_mmq_dynamic_shared(mmq_shape):0u);
                     }
                     return;
                 }

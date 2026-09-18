@@ -15297,6 +15297,15 @@ static QwenMmqShape qwen_mmq_shape(){
     static const QwenMmqShape narrow{2,4,4,4};
     return qwen_mmq_wide()?wide:narrow;
 }
+// Dynamic shared bytes of the double-buffered MMQ tile for this shape: two
+// copies each of the weight units, activation units, weight scales and
+// activation scales. Must match the carve-up in FLYWEIGHT_Q8_MMQ_ONE.
+static std::uint32_t qwen_mmq_dynamic_shared(const QwenMmqShape& shape){
+    const std::uint32_t units=9u*16u;   // FLYWEIGHT_MMQ_ROW_UNITS int4 per row
+    const std::uint32_t rows=static_cast<std::uint32_t>(shape.rows());
+    const std::uint32_t tokens=static_cast<std::uint32_t>(shape.tokens());
+    return 2u*(rows+tokens)*units+2u*(rows+tokens)*4u*sizeof(float);
+}
 static std::string qwen_cuda_corpus(){
     const auto shape=qwen_mmq_shape();
     char defines[256];

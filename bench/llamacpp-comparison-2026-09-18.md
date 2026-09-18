@@ -151,3 +151,37 @@ specialization over a double-buffered tile, which needs more than 48 KB of
 shared memory per block and a driver-side opt-in for dynamic shared memory
 that the launcher does not have yet. Ceiling if the pipe ran flat out:
 about 2.5x on the GEMMs, which would put the 27B near 1000 tok/s.
+
+### Second pass, same day: the tensor pipe and the attention path
+
+Nsight had shown the int8 tensor pipe saturated at about 46% of its peak
+rate while it ran. That number was the answer, misread the first time: on
+Ampere and later the `m16n8k16` int8 MMA shape runs at half the rate of the
+native `m16n8k32` shape, so a kernel issuing k16 pairs tops out near 50%.
+Three more overlap designs were tried first and all measured identical to
+the baseline (a double-buffered tile with one barrier per k-step, the same
+with odd and even warps in opposite stage/compute order, and the register
+prefetch), which is what pointed at the pipe rate rather than the phases.
+
+| change | 27B prefill, 1929 tokens, turbo4 KV | tok/s |
+| --- | --- | --- |
+| after the first pass (above) | 3.09 s | 624 |
+| single-scale kernel on `m16n8k32` (one MMA per 32-group) | 2.88 s | 670 |
+| IQ1_S moved to the single-scale kernel (its decoder is single-scale) | 2.73 s | 707 |
+| cuBLAS attention prefill from 1024 visible tokens instead of 4096 | 2.47 s | 781 |
+
+The cuBLAS attention path already existed and was the default only once the
+visible prefix reached 4K, which for a 4K prompt is its last chunk. Measured
+here it is level with the warp kernel at 512 tokens and ahead from there
+(+4% at 1024, +11% at 2048, +21% at 4096 prompt tokens). Under turbo4 KV
+the greedy output is unchanged; under f16 KV, where cuBLAS reads the cache
+in place, one word of the 48-token continuation changes, the same numerics
+the path has always had above 4K. Flash-Next output is byte-identical with
+experts on the CPU, short and long prompts.
+
+The double-buffered tile stayed (it costs nothing and the kernel now needs
+the dynamic-shared opt-in the launcher gained for it); the warp-order and
+prefetch variants did not.
+
+llama.cpp on the same file: 894 tok/s. The gap is now 1.14x, from 1.9x at
+the start of the day.

@@ -472,9 +472,18 @@ int check_tiled(const char* kernel, const Format& format,
         // blockIdx.x * FLYWEIGHT_Q8_TILE_ROWS and returns early past the last
         // row, so output_size blocks covers any tile height without this test
         // having to track the macro.
+        // The single-scale MMQ kernels double-buffer their tile in dynamic
+        // shared memory: two copies each of 128 rows and 128 tokens of
+        // 9 int4 units, plus the two [128][4] float scale arrays. Sized here
+        // for the corpus defaults the CPU build compiles with; the runtime
+        // sizes its launches from qwen_mmq_dynamic_shared. The two-scale and
+        // tiled kernels ignore it.
+        constexpr std::uint32_t kMmqDynamicShared =
+            2u * (128u + 128u) * 9u * 16u + 2u * (128u + 128u) * 4u * sizeof(float);
         flyweight_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1,
-                                 threads, 0, 0, arguments);
+                                 threads, threads == 256 ? kMmqDynamicShared : 0, 0,
+                                 arguments);
 
         const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
         for (int token = 0; token < rows; ++token) {

@@ -617,8 +617,8 @@ struct DiffLaunch {
     FlyweightV2Diffusion& d;
 
     void run(const char* name, std::uint32_t grid_x, std::uint32_t grid_y, std::uint32_t block,
-             void** arguments) const {
-        if (flyweight_gpu_launch_named(name, grid_x, grid_y, block, 0, d.stream, arguments) != 0)
+             void** arguments, std::uint32_t shared_bytes = 0) const {
+        if (flyweight_gpu_launch_named(name, grid_x, grid_y, block, shared_bytes, d.stream, arguments) != 0)
             throw std::runtime_error(std::string("diffusion CUDA kernel failed: ") + name);
         // FLYWEIGHT_DIFF_SYNC=1 names the kernel a fault belongs to; launches
         // are asynchronous, so without it every fault surfaces at the next
@@ -779,7 +779,8 @@ struct DiffLaunch {
                                  &output, &in, &out, &count, &scale_stride};
             run(format->matmul_q8_mmq, static_cast<std::uint32_t>((out + mmq_rows - 1) / mmq_rows),
                 static_cast<std::uint32_t>((count + mmq_tokens - 1) / mmq_tokens),
-                static_cast<std::uint32_t>(mmq_threads), arguments);
+                static_cast<std::uint32_t>(mmq_threads), arguments,
+                (format->mmq_dynamic_shared && !format->mmq_min) ? qwen_mmq_dynamic_shared(mmq_shape) : 0u);
         } else {
             if (!format->matmul_rows)
                 throw std::runtime_error("diffusion GEMM: weight type " + std::to_string(m.type) +
