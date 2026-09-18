@@ -111,6 +111,13 @@ A few things specific to this repo:
   it is not something you did wrong.
 - **One topic per PR.** A kernel change and a server change in the same branch
   are two PRs.
+- **Bump the version when you change what ships.** A PR that touches `src/`,
+  `native/` (outside its tests, benches and tools), `web/src/` or the packaging
+  files raises `version` in `pyproject.toml`: patch for a fix, minor for a
+  feature or a kernel that changes numbers. Docs, plans, `bench/`, `tools/`
+  and CI do not need a bump. A number that already has a `v*` tag is spent.
+  CI enforces this with `tools/check_version_bump.py`, and pushing the tag
+  `v<version>` is what publishes the release.
 - Say what hardware and which model you tested on. For this runtime that is
   not boilerplate — behaviour genuinely differs across architectures,
   quantization formats and cards.
