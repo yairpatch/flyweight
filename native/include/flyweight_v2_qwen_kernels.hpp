@@ -2398,6 +2398,28 @@ __device__ __forceinline__ void mma_m16n8k16_s8(int* d, const int* a, int b) {
 #endif
 }
 
+// The k32 shape: one instruction per 32-wide group where the k16 shape needs
+// two. On Ampere and later the int8 tensor pipe runs m16n8k16 at half the
+// rate of m16n8k32, so a kernel saturating it with k16 MMAs tops out near
+// 50% of peak -- which is where Nsight found the MMQ kernel. The A fragment
+// is the two k16 fragments back to back (rows g, g+8 at k 0-15, then the same
+// rows at k 16-31) and B likewise, so the operands the kernel already loads
+// with ldmatrix are reused unchanged. Below sm_80, or on the CPU corpus, two
+// k16 steps give the same sum.
+__device__ __forceinline__ void mma_m16n8k32_s8(
+    int* d, const int* a_lo, const int* a_hi, int b_lo, int b_hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a_lo[0]), "r"(a_lo[1]), "r"(a_hi[0]), "r"(a_hi[1]), "r"(b_lo), "r"(b_hi));
+#else
+    mma_m16n8k16_s8(d, a_lo, b_lo);
+    mma_m16n8k16_s8(d, a_hi, b_hi);
+#endif
+}
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 // Two 8x8 b16 tiles out of shared memory in one instruction.
@@ -2919,17 +2941,14 @@ void name(                                                                     \
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
-// The single-scale twin of FLYWEIGHT_Q8_MMQ, for families whose decoder gives
+// The single-scale, double-buffered twin of FLYWEIGHT_Q8_MMQ, for families whose decoder gives
 // both k16 halves of a 32-group the same scale (IQ2_XXS, IQ3_XXS, IQ3_S,
-// IQ4_XS, Q8_0). The two-scale fold above was the kernel's bound, not the
+// IQ4_XS, IQ1_S, Q8_0). The two-scale fold above was the kernel's bound, not the
 // MMAs or the decode: per fragment pair and group it spent ~28 scalar float
 // ops against two tensor-core instructions. Here the halves accumulate in
 // one int32 and the scale product is applied once per output. Results differ
 // from the two-scale kernel only in float rounding order.
-#define FLYWEIGHT_Q8_MMQ_ONE(name, decode_fn, stride)                                \
-/* The bound caps registers at what the block's thread count leaves: 255 at  */\
-/* the default 256 threads (no change), 128 at the wide shape's 512, which   */\
-/* is what makes 16 warps launchable at all. The CPU shim defines this away. */\
+#define FLYWEIGHT_Q8_MMQ_ONE(name, decode_fn, stride)                            \
 extern "C" __global__                                                          \
 __launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32,        \
                   FLYWEIGHT_MMQ_MIN_BLOCKS)                                     \
@@ -2941,9 +2960,6 @@ void name(                                                                     \
 ) {                                                                            \
     const int row_base = blockIdx.x * FLYWEIGHT_MMQ_ROWS;                        \
     if (row_base >= output_size) return;                                       \
-    /* grid.y batches tokens in tiles: a launch may carry every row of a     */\
-    /* GEMM instead of one tile, which fills the GPU on the diffusion tower's */\
-    /* 4096-row batches. With grid.y == 1 this is exactly the old kernel.    */\
     const int token_base = blockIdx.y * FLYWEIGHT_MMQ_TOKENS;                    \
     if (token_base >= rows_total) return;                                      \
     const int rows = min(FLYWEIGHT_MMQ_TOKENS, rows_total - token_base);         \
@@ -2952,12 +2968,25 @@ void name(                                                                     \
     outputs += (long long)token_base * output_size;                            \
     const int blocks_per_row = input_size >> 8;                                \
     const int groups_per_row = blocks_per_row << 3;                            \
-    /* Staged in 16-byte units -- one k16 half of one (row, group), which is */\
-    /* one ldmatrix row. See FLYWEIGHT_MMQ_ROW_UNITS for the padding.          */\
-    __shared__ int4 w_units[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_ROW_UNITS];          \
-    __shared__ float w_low[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_GROUPS];              \
-    __shared__ int4 a_units[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_ROW_UNITS];        \
-    __shared__ float a_scale[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_GROUPS];          \
+    /* Two copies of the tile in dynamic shared memory (sized by the host   */\
+    /* from the same shape: qwen_mmq_dynamic_shared). Staging step s+1 into */\
+    /* one copy while the MMAs read the other needs one barrier per step    */\
+    /* instead of two, and lets a warp still waiting on its loads overlap   */\
+    /* a warp already on the tensor pipe. The layout: weight units, then    */\
+    /* activation units, then the two scale arrays, each [2][...].          */\
+    extern __shared__ int4 mmq_dynamic[];                                      \
+    typedef int4 WUnits[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_ROW_UNITS];             \
+    typedef int4 AUnits[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_ROW_UNITS];           \
+    typedef float WLow[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_GROUPS];                 \
+    typedef float AScale[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_GROUPS];             \
+    WUnits* w_units = (WUnits*)mmq_dynamic;                                     \
+    AUnits* a_units = (AUnits*)(mmq_dynamic                                     \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_ROW_UNITS);                       \
+    WLow* w_low = (WLow*)(mmq_dynamic                                           \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_ROW_UNITS                         \
+        + 2 * FLYWEIGHT_MMQ_TOKENS * FLYWEIGHT_MMQ_ROW_UNITS);                     \
+    AScale* a_scale = (AScale*)((float*)w_low                                   \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_GROUPS);                          \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
     const int warp_row =                                                  \
@@ -2973,16 +3002,13 @@ void name(                                                                     \
         for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf)              \
             _Pragma("unroll")                                             \
             for (int i = 0; i < 4; ++i) acc[rf][tf][i] = 0.0f;            \
-    for (int base = 0; base < groups_per_row; base += FLYWEIGHT_MMQ_GROUPS) {    \
-        __syncthreads();                                                       \
+    auto stage = [&](const int base, const int buf) {                          \
         for (int i = threadIdx.x;                                              \
              i < FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_GROUPS; i += blockDim.x) {     \
             const int r = i / FLYWEIGHT_MMQ_GROUPS;                              \
             const int g = i - r * FLYWEIGHT_MMQ_GROUPS;                          \
             float low = 0.0f, high = 0.0f;                                     \
-            /* The two k16 halves are adjacent units, so this is still the    */\
-            /* eight contiguous ints every decoder writes.                    */\
-            int* const decoded = (int*)&w_units[r][g * 2];                     \
+            int* const decoded = (int*)&w_units[buf][r][g * 2];                \
             if (row_base + r < output_size && base + g < groups_per_row) {     \
                 decode_fn(packed + (long long)(row_base + r)                   \
                               * blocks_per_row * stride,                       \
@@ -2991,7 +3017,7 @@ void name(                                                                     \
                 _Pragma("unroll")                                              \
                 for (int k = 0; k < 8; ++k) decoded[k] = 0;                    \
             }                                                                  \
-            w_low[r][g] = low;                                                 \
+            w_low[buf][r][g] = low;                                            \
         }                                                                      \
         for (int i = threadIdx.x;                                              \
              i < FLYWEIGHT_MMQ_TOKENS * FLYWEIGHT_MMQ_GROUPS; i += blockDim.x) {   \
@@ -3001,22 +3027,27 @@ void name(                                                                     \
                 const int4* source = (const int4*)(                            \
                     vectors + (long long)t * input_size                        \
                     + (long long)(base + g) * 32);                             \
-                a_units[t][g * 2] = source[0];                                 \
-                a_units[t][g * 2 + 1] = source[1];                             \
-                a_scale[t][g] = __half2float(                                  \
+                a_units[buf][t][g * 2] = source[0];                            \
+                a_units[buf][t][g * 2 + 1] = source[1];                        \
+                a_scale[buf][t][g] = __half2float(                             \
                     vector_scales[(long long)t * scale_stride + base + g]);    \
             } else {                                                           \
-                a_units[t][g * 2] = make_int4(0, 0, 0, 0);                     \
-                a_units[t][g * 2 + 1] = make_int4(0, 0, 0, 0);                 \
-                a_scale[t][g] = 0.0f;                                          \
+                a_units[buf][t][g * 2] = make_int4(0, 0, 0, 0);                \
+                a_units[buf][t][g * 2 + 1] = make_int4(0, 0, 0, 0);            \
+                a_scale[buf][t][g] = 0.0f;                                     \
             }                                                                  \
         }                                                                      \
-        __syncthreads();                                                       \
+    };                                                                         \
+    stage(0, 0);                                                               \
+    __syncthreads();                                                           \
+    int buf = 0;                                                               \
+    for (int base = 0; base < groups_per_row;                                  \
+         base += FLYWEIGHT_MMQ_GROUPS, buf ^= 1) {                               \
+        /* Next step's tile goes into the other copy while this one is read. */\
+        if (base + FLYWEIGHT_MMQ_GROUPS < groups_per_row)                      \
+            stage(base + FLYWEIGHT_MMQ_GROUPS, buf ^ 1);                       \
         _Pragma("unroll")                                                 \
         for (int g = 0; g < FLYWEIGHT_MMQ_GROUPS; ++g) {                    \
-            /* Activation fragment and its two output-column scales, out */\
-            /* of the row loop: every row fragment reuses them. Scalar,  */\
-            /* not ldmatrix -- see the header comment.                   */\
             int a_low[FLYWEIGHT_MMQ_TOKEN_FRAGS];                           \
             int a_high[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
             float a_s0[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
@@ -3024,34 +3055,27 @@ void name(                                                                     \
             _Pragma("unroll")                                             \
             for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf) {        \
                 const int tb = warp_token + tf * 8;                       \
-                a_low[tf] = ((const int*)&a_units[tb + quad][g * 2])[slot];\
+                a_low[tf] = ((const int*)&a_units[buf][tb + quad][g * 2])[slot];\
                 a_high[tf] =                                              \
-                    ((const int*)&a_units[tb + quad][g * 2 + 1])[slot];   \
-                a_s0[tf] = a_scale[tb + slot * 2][g];                     \
-                a_s1[tf] = a_scale[tb + slot * 2 + 1][g];                 \
+                    ((const int*)&a_units[buf][tb + quad][g * 2 + 1])[slot];\
+                a_s0[tf] = a_scale[buf][tb + slot * 2][g];                \
+                a_s1[tf] = a_scale[buf][tb + slot * 2 + 1][g];            \
             }                                                             \
             _Pragma("unroll")                                             \
             for (int rf = 0; rf < FLYWEIGHT_MMQ_ROW_FRAGS; ++rf) {          \
                 const int rb = warp_row + rf * 16;                        \
-                /* Weight fragment and its two output-row scales, loaded */\
-                /* once and reused across every token fragment. One      */\
-                /* ldmatrix per k16 half: its two tiles are the two row  */\
-                /* halves the MMA wants, so lane l hands it row l & 15.  */\
                 int frag_low[2], frag_high[2];                            \
                 ldmatrix_x2_b16(                                          \
-                    frag_low, &w_units[rb + (lane & 15)][g * 2]);         \
+                    frag_low, &w_units[buf][rb + (lane & 15)][g * 2]);    \
                 ldmatrix_x2_b16(                                          \
-                    frag_high, &w_units[rb + (lane & 15)][g * 2 + 1]);    \
-                const float wl0 = w_low[rb + quad][g];                    \
-                const float wl1 = w_low[rb + quad + 8][g];                \
+                    frag_high, &w_units[buf][rb + (lane & 15)][g * 2 + 1]);\
+                const float wl0 = w_low[buf][rb + quad][g];               \
+                const float wl1 = w_low[buf][rb + quad + 8][g];           \
                 _Pragma("unroll")                                         \
                 for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf) {    \
-                    /* One scale per 32-group: both k16 halves accumulate */\
-                    /* in int32 and take one multiply, four products per  */\
-                    /* (row, token) pair instead of the two-scale fold.   */\
                     int dot[4] = {0, 0, 0, 0};                            \
-                    mma_m16n8k16_s8(dot, frag_low, a_low[tf]);            \
-                    mma_m16n8k16_s8(dot, frag_high, a_high[tf]);          \
+                    mma_m16n8k32_s8(dot, frag_low, frag_high,             \
+                                    a_low[tf], a_high[tf]);               \
                     acc[rf][tf][0] += (float)dot[0] * (wl0 * a_s0[tf]);   \
                     acc[rf][tf][1] += (float)dot[1] * (wl0 * a_s1[tf]);   \
                     acc[rf][tf][2] += (float)dot[2] * (wl1 * a_s0[tf]);   \
@@ -3059,6 +3083,7 @@ void name(                                                                     \
                 }                                                         \
             }                                                             \
         }                                                                 \
+        __syncthreads();                                                       \
     }                                                                          \
     _Pragma("unroll")                                                     \
     for (int rf = 0; rf < FLYWEIGHT_MMQ_ROW_FRAGS; ++rf)                    \
@@ -6221,7 +6246,7 @@ __device__ __forceinline__ void iq1s_q8_decode(
 
 FLYWEIGHT_Q8_MATVEC_ROWS(iq1s_q8_matvec_transposed_rows, iq1s_q8_decode, 50)
 FLYWEIGHT_Q8_MATMUL_TILED(iq1s_q8_matmul_tiled, iq1s_q8_decode, 50)
-FLYWEIGHT_Q8_MMQ(iq1s_q8_mmq, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_MMQ_ONE(iq1s_q8_mmq, iq1s_q8_decode, 50)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq1s_q8_mmq_routed, iq1s_q8_decode, 50, 8, 3)
 
 )FLYWEIGHT_CUDA"

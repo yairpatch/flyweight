@@ -85,6 +85,11 @@ struct CudaApi {
         unsigned int, unsigned int, unsigned int,
         unsigned int, CUstream, void**, void**
     ) = nullptr;
+    // Optional: only needed by kernels asking for more than 48 KB of dynamic
+    // shared memory (the double-buffered MMQ). Missing on no driver this
+    // runtime supports, but a null here degrades to a launch error, not a
+    // load failure.
+    CUresult (*cuFuncSetAttribute)(CUfunction, int, int) = nullptr;
     CUresult (*cuMemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
     CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
@@ -422,6 +427,7 @@ bool load_apis() {
     ok &= load_symbol(cuda, "cuModuleLoadDataEx", g_api.cuModuleLoadDataEx);
     ok &= load_symbol(cuda, "cuModuleGetFunction", g_api.cuModuleGetFunction);
     ok &= load_symbol(cuda, "cuLaunchKernel", g_api.cuLaunchKernel);
+    load_symbol(cuda, "cuFuncSetAttribute", g_api.cuFuncSetAttribute);
     ok &= load_symbol(cuda, "cuMemcpyDtoH_v2", g_api.cuMemcpyDtoH);
     ok &= load_symbol(cuda, "cuMemcpyHtoD_v2", g_api.cuMemcpyHtoD);
     ok &= load_symbol(cuda, "cuMemcpyDtoHAsync_v2", g_api.cuMemcpyDtoHAsync);
@@ -639,6 +645,20 @@ int launch(
             reinterpret_cast<std::uint64_t>(stream), args);
     }
     if (!driver_ready()) return -1;
+    // Above 48 KB a kernel must opt into its dynamic shared allocation, once
+    // per function for the largest size it has been launched with.
+    if (shared_bytes > 48u * 1024u) {
+        static std::unordered_map<CUfunction, unsigned int> granted;
+        auto& limit = granted[function];
+        if (limit < shared_bytes) {
+            constexpr int kMaxDynamicSharedSizeBytes = 8;  // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            if (g_api.cuFuncSetAttribute == nullptr
+                || g_api.cuFuncSetAttribute(function, kMaxDynamicSharedSizeBytes,
+                                            static_cast<int>(shared_bytes)) != 0)
+                return -1;
+            limit = shared_bytes;
+        }
+    }
     return g_api.cuLaunchKernel(
         function,
         grid_x, grid_y, 1,

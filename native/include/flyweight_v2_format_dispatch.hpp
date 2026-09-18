@@ -51,6 +51,9 @@ struct QwenFormatKernels {
     const char* matmul_q8_tiled = nullptr;
     const char* matmul_q8_mmq = nullptr;
     bool mmq_min = false;
+    // The MMQ kernel double-buffers its tile in dynamic shared memory (the
+    // single-scale families); the host sizes the launch from the tile shape.
+    bool mmq_dynamic_shared = false;
 
     // Reconstruct-in-float batch fallback and its grid shape.
     const char* matmul_rows = nullptr;
@@ -117,7 +120,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 8, .family = "q8",
      .matvec_q8_warp = "q80_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "q80_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "q80_q8_matmul_tiled", .matmul_q8_mmq = "q80_q8_mmq",
+     .matmul_q8_tiled = "q80_q8_matmul_tiled", .matmul_q8_mmq = "q80_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "q8_matmul_tiled",
      .matmul_rows_grid = RowsMatmulGrid::tiled32,
      .lm_head_argmax = "q8_lm_head_argmax_warp",
@@ -182,7 +185,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 16, .family = "iq2xxs",
      .matvec_q8_warp = "iq2xxs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq2xxs_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "iq2xxs_q8_matmul_tiled", .matmul_q8_mmq = "iq2xxs_q8_mmq",
+     .matmul_q8_tiled = "iq2xxs_q8_matmul_tiled", .matmul_q8_mmq = "iq2xxs_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq2xxs_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "iq2xxs_lm_head_argmax_warp",
@@ -203,7 +206,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 18, .family = "iq3xxs",
      .matvec_q8_warp = "iq3xxs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq3xxs_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "iq3xxs_q8_matmul_tiled", .matmul_q8_mmq = "iq3xxs_q8_mmq",
+     .matmul_q8_tiled = "iq3xxs_q8_matmul_tiled", .matmul_q8_mmq = "iq3xxs_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq3xxs_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "iq3xxs_lm_head_argmax_warp",
@@ -214,7 +217,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 19, .family = "iq1s",
      .matvec_q8_warp = "iq1s_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq1s_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq",
+     .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .grouped_expert_prefix = "iq1s", .cpu_expert = true},
@@ -226,7 +229,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 21, .family = "iq3s",
      .matvec_q8_warp = "iq3s_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq3s_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "iq3s_q8_matmul_tiled", .matmul_q8_mmq = "iq3s_q8_mmq",
+     .matmul_q8_tiled = "iq3s_q8_matmul_tiled", .matmul_q8_mmq = "iq3s_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq3s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "iq3s_lm_head_argmax_warp",
@@ -250,7 +253,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 23, .family = "iq4xs",
      .matvec_q8_warp = "iq4xs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq4xs_q8_matvec_transposed_rows",
-     .matmul_q8_tiled = "iq4xs_q8_matmul_tiled", .matmul_q8_mmq = "iq4xs_q8_mmq",
+     .matmul_q8_tiled = "iq4xs_q8_matmul_tiled", .matmul_q8_mmq = "iq4xs_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq4xs_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "iq4xs_lm_head_argmax_warp",
