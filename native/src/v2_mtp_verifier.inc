@@ -84,8 +84,17 @@ inline void qwen_timeline_report(std::uint64_t stream){
                 gaps+=gap;if(gap>0.02f){big_gaps+=gap;++big;}}}
     }
     float wall=0.0f;flyweight_gpu_event_elapsed(t.front().start,t.back().stop,&wall);
-    std::fprintf(stderr,"[timeline] %zu launches: wall %.1f ms, kernels %.1f ms, gaps %.1f ms (%zu gaps >20us: %.1f ms)\n",
-        t.size(),wall,busy,gaps,big,big_gaps);
+    // Host time between chunks: this report runs right after the chunk's
+    // last kernel retired, so (now - previous report) - this chunk's GPU
+    // wall is what the host spent before this chunk's first launch.
+    static auto previous=std::chrono::steady_clock::now();
+    static bool have_previous=false;
+    const auto now=std::chrono::steady_clock::now();
+    const double since=have_previous
+        ?std::chrono::duration<double,std::milli>(now-previous).count():0.0;
+    previous=now;have_previous=true;
+    std::fprintf(stderr,"[timeline] %zu launches: wall %.1f ms, kernels %.1f ms, gaps %.1f ms (%zu gaps >20us: %.1f ms); host before chunk %.1f ms\n",
+        t.size(),wall,busy,gaps,big,big_gaps,since>0?since-wall:0.0);
     std::vector<std::pair<std::string,double>> ordered(by_name.begin(),by_name.end());
     std::sort(ordered.begin(),ordered.end(),[](const auto&a,const auto&b){return a.second>b.second;});
     for(std::size_t i=0;i<ordered.size()&&i<8;++i)
@@ -446,7 +455,11 @@ void qwen_forward_rows(
             // handful of rows and stays on the rows kernel; chunked prefill
             // runs prefill_rows (64 on a dense checkpoint) and takes this.
             // mmq_kernel and tiled_kernel are resolved above the gate.
-            if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
+            // rows > 1: the 32-token MMQ variant also takes small batches
+            // whole (2..kQ8TailRows rows) -- the per-row kernels below cost a
+            // launch per row per projection, 80 ms for a 7-token prompt on
+            // the 27B against ~40 for one narrow tile per projection.
+            if(rows>1&&mmq_kernel&&runtime.int8_tensor_cores){
                 const auto mmq_shape=qwen_mmq_shape();
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
                 const int mmq_threads=mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
@@ -468,12 +481,15 @@ void qwen_forward_rows(
                 // tile. The tile is exact either way; only the schedule moves.
                 const int full_rows=(rows/mmq_tokens)*mmq_tokens;
                 const int remainder=rows-full_rows;
+                // Below a full tile with no narrow twin (the K-quant MIN
+                // families), the per-row kernels keep small batches.
+                if(full_rows==0&&(remainder>kQ8TailRows||mmq_min))goto per_row_paths;
                 // The narrow (32-token) variant exists for the single-scale
                 // families; the others keep the full tile for their remainder.
                 // The narrow name outlives the launch (the timeline keeps the
                 // pointer), so it is interned once per kernel.
                 const char* narrow_name=nullptr;
-                if(full_rows>0&&remainder>0&&remainder<=kQ8TailRows&&!mmq_min){
+                if(remainder>0&&remainder<=kQ8TailRows&&!mmq_min){
                     static std::map<std::string,std::string> interned;
                     auto it=interned.find(mmq_kernel);
                     if(it==interned.end())
@@ -481,6 +497,7 @@ void qwen_forward_rows(
                     if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                         narrow_name=it->second.c_str();
                 }
+                if(full_rows==0&&!narrow_name)goto per_row_paths;
                 const bool split_tail=narrow_name!=nullptr;
                 int batch=split_tail?full_rows:rows;
                 const std::uint32_t token_tiles=
@@ -495,7 +512,8 @@ void qwen_forward_rows(
                     (unsigned long long)(runtime.position+span_begin));
                 const std::uint32_t mmq_shared=(format&&format->mmq_dynamic_shared&&!mmq_min)
                     ?qwen_mmq_dynamic_shared(mmq_shape):0u;
-                launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
+                if(full_rows>0)
+                    launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
                 if(split_tail){
                     int tail=remainder;
                     auto tail_q8=small_q8+static_cast<std::uint64_t>(full_rows)*input_size;
@@ -514,8 +532,10 @@ void qwen_forward_rows(
                 dense_trace(mmq_kernel);
                 return;
             }
+            per_row_paths:
             // Reached when the device predates sm_75, where the MMQ kernels
-            // would run their emulation instead of real tensor cores.
+            // would run their emulation instead of real tensor cores, and by
+            // small batches of the families without a narrow MMQ twin.
             if(rows>kQ8RowBatch&&tiled_kernel){
                 for(int first=0;first<rows;first+=kQ8TileTokens){
                     int batch=std::min(kQ8TileTokens,rows-first);
