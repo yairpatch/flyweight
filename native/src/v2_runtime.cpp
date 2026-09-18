@@ -15276,6 +15276,7 @@ static bool qwen_mmq_wide(){
 // corpus compiles with its own defaults and this returns them.
 struct QwenMmqShape{
     int row_warps,row_frags,token_warps,token_frags;
+    int min_blocks=1;
     int rows()const{return row_warps*row_frags*16;}
     int tokens()const{return token_warps*token_frags*8;}
     int threads()const{return row_warps*token_warps*32;}
@@ -15285,9 +15286,10 @@ static QwenMmqShape qwen_mmq_shape(){
         QwenMmqShape shape{4,2,4,4};
         if(const char*env=std::getenv("FLYWEIGHT_MMQ_SHAPE")){
             int rw=0,rf=0,tw=0,tf=0;
-            if(std::sscanf(env,"%d,%d,%d,%d",&rw,&rf,&tw,&tf)==4&&
-               rw>0&&rf>0&&tw>0&&tf>0&&rw*tw*32<=1024)
-                shape=QwenMmqShape{rw,rf,tw,tf};
+            int mb=1;
+            const int fields=std::sscanf(env,"%d,%d,%d,%d,%d",&rw,&rf,&tw,&tf,&mb);
+            if(fields>=4&&rw>0&&rf>0&&tw>0&&tf>0&&rw*tw*32<=1024&&mb>=1)
+                shape=QwenMmqShape{rw,rf,tw,tf,mb};
             else std::fprintf(stderr,"[flyweight] FLYWEIGHT_MMQ_SHAPE=%s ignored (want rw,rf,tw,tf)\n",env);
         }
         return shape;
@@ -15300,8 +15302,9 @@ static std::string qwen_cuda_corpus(){
     char defines[256];
     std::snprintf(defines,sizeof(defines),
         "#define FLYWEIGHT_MMQ_ROW_WARPS %d\n#define FLYWEIGHT_MMQ_ROW_FRAGS %d\n"
-        "#define FLYWEIGHT_MMQ_TOKEN_WARPS %d\n#define FLYWEIGHT_MMQ_TOKEN_FRAGS %d\n",
-        shape.row_warps,shape.row_frags,shape.token_warps,shape.token_frags);
+        "#define FLYWEIGHT_MMQ_TOKEN_WARPS %d\n#define FLYWEIGHT_MMQ_TOKEN_FRAGS %d\n"
+        "#define FLYWEIGHT_MMQ_MIN_BLOCKS %d\n",
+        shape.row_warps,shape.row_frags,shape.token_warps,shape.token_frags,shape.min_blocks);
     return (qwen_mmq_wide()?std::string(defines):std::string())+
         std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source+
         flyweight::v2::diffusion_cuda_source;
