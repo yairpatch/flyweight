@@ -314,3 +314,13 @@ greedy output identical on the 27B and Flash-Next. The remainder's decode
 floor, about 45 ms per prompt on the 27B, is what stands between this and
 llama.cpp's 894, plus some 40 ms of fixed per-request work before the
 first chunk.
+
+The timeline also reports the host time between chunks (about 1 ms), the
+mid-prefill checkpoints and the prompt cache together cost about 1%, and
+tokenizing the prompt takes 3 ms; the 50 ms or so between the chunks' GPU
+wall and the client's first token is request admission and the first
+sampling step, not the prefill. Small batches of 2 to 32 rows now take the
+narrow tile in the rows driver too (a 26-row chunk was measured on it).
+Prompts of 8 tokens or fewer still go through the runtime's per-row path,
+80 ms for a 7-token prompt on the 27B, which is a short-prompt latency
+item of its own.
