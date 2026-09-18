@@ -267,6 +267,14 @@ class _NativeEngine:
                     # clear can be lost, leaving shutdown stuck in wait().
                     self._wake.clear()
             if idle:
+                # Nothing to run: do the work admission would otherwise pay for
+                # in front of the next prompt (spilling displaced slots to the
+                # host prompt cache -- 77 ms of TTFT on the 27B). A request
+                # arriving mid-copy waits no longer than it used to.
+                try:
+                    self.runtime.engine_idle_maintenance()
+                except Exception:  # housekeeping must never fail a server
+                    pass
                 self._wake.wait()
                 continue
             try:
