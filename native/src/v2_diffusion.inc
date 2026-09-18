@@ -770,10 +770,10 @@ struct DiffLaunch {
                 run("quantize_q8_blocks_rows", static_cast<std::uint32_t>((in + 31) / 32),
                     static_cast<std::uint32_t>(rows), 32, arguments);
             }
-            const int mmq_rows = format->mmq_min ? kQ8MmqMinRows : kQ8MmqRows;
-            const int mmq_threads = format->mmq_min ? kQ8MmqMinThreads
-                : qwen_mmq_wide() ? kQ8MmqWideThreads : kQ8MmqThreads;
-            const int mmq_tokens = format->mmq_min ? kQ8MmqMinTokens : kQ8MmqTokens;
+            const auto mmq_shape=qwen_mmq_shape();
+            const int mmq_rows=format->mmq_min?kQ8MmqMinRows:mmq_shape.rows();
+            const int mmq_threads=format->mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
+            const int mmq_tokens=format->mmq_min?kQ8MmqMinTokens:mmq_shape.tokens();
             // One launch for every token tile: grid.y walks the batches.
             void* arguments[] = {const_cast<std::uint64_t*>(&m.device), &q8, &q8_scales,
                                  &output, &in, &out, &count, &scale_stride};

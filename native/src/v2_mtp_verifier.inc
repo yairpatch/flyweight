@@ -394,27 +394,30 @@ void qwen_forward_rows(
             // runs prefill_rows (64 on a dense checkpoint) and takes this.
             // mmq_kernel and tiled_kernel are resolved above the gate.
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
-                const int mmq_rows=mmq_min?kQ8MmqMinRows:kQ8MmqRows;
-                const int mmq_threads=mmq_min?kQ8MmqMinThreads
-                    :qwen_mmq_wide()?kQ8MmqWideThreads:kQ8MmqThreads;
-                const int mmq_tokens=mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
-                for(int first=0;first<rows;first+=mmq_tokens){
-                    int batch=std::min(mmq_tokens,rows-first);
-                    auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
-                    auto batch_scales=small_q8_scales+
-                        static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
-                    auto batch_output=output+
-                        static_cast<std::uint64_t>(first)*output_size*sizeof(float);
-                    void*mmq_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
-                        &input_size,&output_size,&batch,&scale_stride};
-                    // FLYWEIGHT_MMQ_TRACE=1: every launch, for pinning a fault
-                    // under CUDA_LAUNCH_BLOCKING to its arguments.
-                    static const bool mmq_trace=std::getenv("FLYWEIGHT_MMQ_TRACE")!=nullptr;
-                    if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d first=%d batch=%d pos=%llu\n",
-                        mmq_kernel,index,input_size,output_size,rows,first,batch,
-                        (unsigned long long)(runtime.position+span_begin));
-                    launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,1,mmq_threads,mmq_args);
-                }
+                const auto mmq_shape=qwen_mmq_shape();
+                const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
+                const int mmq_threads=mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
+                const int mmq_tokens=mmq_min?kQ8MmqMinTokens:mmq_shape.tokens();
+                // One launch per projection, token tiles on grid.y (the
+                // kernel indexes them by blockIdx.y; the diffusion tower
+                // already launches it this way). Launching one 128-token
+                // tile at a time put output_size/128 blocks on the card per
+                // launch -- 80 for a 5120x10240 projection on 46 SMs, two
+                // waves with the second mostly empty -- and serialized the
+                // tiles behind each other. Same tiles, same arithmetic, so
+                // the outputs are bit-identical; only the schedule changes.
+                const std::uint32_t token_tiles=
+                    static_cast<std::uint32_t>((rows+mmq_tokens-1)/mmq_tokens);
+                int batch=rows;
+                void*mmq_args[]={&matrix,&small_q8,&small_q8_scales,&output,
+                    &input_size,&output_size,&batch,&scale_stride};
+                // FLYWEIGHT_MMQ_TRACE=1: every launch, for pinning a fault
+                // under CUDA_LAUNCH_BLOCKING to its arguments.
+                static const bool mmq_trace=std::getenv("FLYWEIGHT_MMQ_TRACE")!=nullptr;
+                if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d tiles=%u pos=%llu\n",
+                    mmq_kernel,index,input_size,output_size,rows,token_tiles,
+                    (unsigned long long)(runtime.position+span_begin));
+                launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args);
                 dense_trace(mmq_kernel);
                 return;
             }
@@ -1158,7 +1161,34 @@ void qwen_forward_rows(
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
             int capacity=static_cast<int>(layer.cache_capacity);
             phase(layer_number,"qkvproj");
-            for(int token=0;token<rows;++token){
+            // Qwen text prompts take the batched rope and store: four launches
+            // per layer per chunk instead of four per token. The row kernels
+            // derive each token's position as base + row, which is what
+            // qwen_rope_args returns when no image span is in play; prompts
+            // with images keep the per-token loop and its per-token M-RoPE
+            // positions. The query launch completes before the key launch
+            // (same stream), so the keys' reuse of `first` never races the
+            // query reads. FLYWEIGHT_ROPE_ROWS=0 forces the loop for A/B.
+            static const bool rope_rows_enabled=[]{
+                const char*s=std::getenv("FLYWEIGHT_ROPE_ROWS");
+                return !s||s[0]!='0';}();
+            const bool rope_rows=rope_rows_enabled&&!laguna&&!muse&&!k2horizon&&
+                (runtime.image_spans.empty()||!runtime.model->config.has_rope_sections());
+            if(rope_rows){
+                auto rope=qwen_rope_args(runtime,runtime.image_spans,
+                    runtime.position+static_cast<std::uint64_t>(span_begin));
+                int position=static_cast<int>(runtime.position)+span_begin;
+                int q_stride=q_size,query_stride=query_elements,kv_stride=kv_size;
+                void*q_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&qnorm),const_cast<std::uint64_t*>(&queries),const_cast<std::uint64_t*>(&gates),const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope),&q_stride,&query_stride,&query_stride};
+                launch("qwen_attention_query_mrope_rows",heads,static_cast<std::uint32_t>(rows),256,q_args);
+                void*k_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&knorm),const_cast<std::uint64_t*>(&first),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope),&kv_stride,&kv_stride};
+                launch("qwen_attention_key_mrope_rows",kv_heads,static_cast<std::uint32_t>(rows),256,k_args);
+                void*k_store_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&cache_keys),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity,&kv_stride};
+                launch((std::string(kv_store_kernel(runtime.options.cache_type_k,true))+"_rows").c_str(),kv_heads,static_cast<std::uint32_t>(rows),256,k_store_args);
+                void*v_store_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&cache_values),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity,&kv_stride};
+                launch((std::string(kv_store_kernel(runtime.options.cache_type_v,false))+"_rows").c_str(),kv_heads,static_cast<std::uint32_t>(rows),256,v_store_args);
+            }
+            for(int token=0;token<(rope_rows?0:rows);++token){
                 auto projected=first+static_cast<std::uint64_t>(token)*q_size*sizeof(float);
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 auto gate=gates+static_cast<std::uint64_t>(token)*
@@ -2322,10 +2352,10 @@ void qwen_forward_rows(
                 }
                 const auto*format=flyweight::v2::qwen_format(type);
                 if(stream_needs_q8(type,in_size)){
-                    const int mmq_rows=format->mmq_min?kQ8MmqMinRows:kQ8MmqRows;
-                    const int mmq_threads=format->mmq_min?kQ8MmqMinThreads
-                        :qwen_mmq_wide()?kQ8MmqWideThreads:kQ8MmqThreads;
-                    const int mmq_tokens=format->mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
+                    const auto mmq_shape=qwen_mmq_shape();
+                    const int mmq_rows=format->mmq_min?kQ8MmqMinRows:mmq_shape.rows();
+                    const int mmq_threads=format->mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
+                    const int mmq_tokens=format->mmq_min?kQ8MmqMinTokens:mmq_shape.tokens();
                     int scale_stride=(in_size/32)*2;
                     for(int start=0;start<count;start+=mmq_tokens){
                         int batch=std::min(mmq_tokens,count-start);

@@ -4240,8 +4240,7 @@ __device__ __forceinline__ float qwen_mrope_position(
     return (float)position_t;
 }
 
-extern "C" __global__
-void qwen_attention_query_mrope(
+__device__ __forceinline__ void qwen_attention_query_mrope_body(
     const float* projected, const float* norm_weights,
     float* queries, float* gates, const int heads,
     const int head_dim, const int rotary_dim, const int position,
@@ -4279,9 +4278,38 @@ void qwen_attention_query_mrope(
         gates[head * head_dim + index] = source[head_dim + index];
     }
 }
-
 extern "C" __global__
-void qwen_attention_key_mrope(
+void qwen_attention_query_mrope(
+    const float* projected, const float* norm_weights,
+    float* queries, float* gates, const int heads,
+    const int head_dim, const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e
+) {
+    qwen_attention_query_mrope_body(projected, norm_weights, queries, gates, heads, head_dim, rotary_dim, position, theta, epsilon, position_h, position_w, sections_t, sections_h, sections_w, sections_e);
+}
+// Batched twin for text prompts: blockIdx.y is the token, and its three
+// M-RoPE positions all equal `position + row` (what qwen_rope_args returns
+// without image spans). Prompts with images keep the per-token launch.
+extern "C" __global__
+void qwen_attention_query_mrope_rows(
+    const float* projected, const float* norm_weights,
+    float* queries, float* gates, const int heads,
+    const int head_dim, const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e,
+    const int projected_stride, const int query_stride, const int gate_stride
+) {
+    const int row = blockIdx.y;
+    projected += (long long)row * projected_stride;
+    queries += (long long)row * query_stride;
+    gates += (long long)row * gate_stride;
+    qwen_attention_query_mrope_body(projected, norm_weights, queries, gates, heads, head_dim, rotary_dim, position + row, theta, epsilon, position + row, position + row, sections_t, sections_h, sections_w, sections_e);
+}
+
+__device__ __forceinline__ void qwen_attention_key_mrope_body(
     const float* projected, const float* norm_weights,
     float* keys, const int heads, const int head_dim,
     const int rotary_dim, const int position,
@@ -4317,6 +4345,35 @@ void qwen_attention_key_mrope(
         }
         keys[head * head_dim + index] = value;
     }
+}
+extern "C" __global__
+void qwen_attention_key_mrope(
+    const float* projected, const float* norm_weights,
+    float* keys, const int heads, const int head_dim,
+    const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e
+) {
+    qwen_attention_key_mrope_body(projected, norm_weights, keys, heads, head_dim, rotary_dim, position, theta, epsilon, position_h, position_w, sections_t, sections_h, sections_w, sections_e);
+}
+// Batched twin for text prompts: blockIdx.y is the token, and its three
+// M-RoPE positions all equal `position + row` (what qwen_rope_args returns
+// without image spans). Prompts with images keep the per-token launch.
+extern "C" __global__
+void qwen_attention_key_mrope_rows(
+    const float* projected, const float* norm_weights,
+    float* keys, const int heads, const int head_dim,
+    const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e,
+    const int projected_stride, const int key_stride
+) {
+    const int row = blockIdx.y;
+    projected += (long long)row * projected_stride;
+    keys += (long long)row * key_stride;
+    qwen_attention_key_mrope_body(projected, norm_weights, keys, heads, head_dim, rotary_dim, position + row, theta, epsilon, position + row, position + row, sections_t, sections_h, sections_w, sections_e);
 }
 
 )FLYWEIGHT_CUDA"
