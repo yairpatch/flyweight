@@ -29,3 +29,31 @@ inside the k-loop's staging and barriers and needs Nsight Compute to see,
 which this machine does not have.
 
 llama.cpp on the same file: 894 tok/s. The gap is now 1.43x, from 1.9x.
+
+### What Nsight Compute says about the remaining MMQ gap
+
+Profiled `iq2xxs_q8_mmq` on a 5120-wide projection at 256 rows (one launch,
+full metric set, `FLYWEIGHT_NVRTC_LINEINFO=1`):
+
+- The int8 tensor pipe is at 40% of its sustained peak over the kernel and
+  saturated whenever it runs: 40% of stall samples sit on the `IMMA`
+  instructions themselves (math-pipe throttle). The other stalls are
+  long-scoreboard on the decode's byte-wide global loads (20%), `wait`
+  (11%), scheduler selection (17%) and barriers (7%).
+- Occupancy is one 512-thread block per SM (128 registers, 41 KB shared),
+  so the decode and staging phases between the two barriers never overlap
+  another block's MMAs. On this 80-block launch the second wave is half
+  empty.
+- Register spills are small (96 bytes).
+
+Tried against that picture, all measured on the 27B and all no better than
+the 128x128 tile over 16 warps at one block per SM: every shape that fits
+two or three blocks per SM (worse, 3.4 to 5.8 s, because the smaller
+per-warp tile loses fragment reuse), and a register-prefetch pipeline that
+issues the next k-step's weight and activation loads before the MMA phase
+(3.10 s, no change: the expand and staging work between the barriers still
+serializes against the MMAs). The design that would close the gap is warp
+specialization over a double-buffered tile, which needs more than 48 KB of
+shared memory per block and a driver-side opt-in for dynamic shared memory
+that the launcher does not have yet. Ceiling if the pipe ran flat out:
+about 2.5x on the GEMMs, which would put the 27B near 1000 tok/s.

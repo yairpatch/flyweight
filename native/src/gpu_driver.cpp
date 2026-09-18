@@ -1017,6 +1017,16 @@ extern "C" int flyweight_gpu_compile(
     );
     std::vector<const char*> all_options;
     all_options.push_back(arch);
+    // FLYWEIGHT_NVRTC_LINEINFO=1 compiles with -lineinfo so Nsight Compute can
+    // attribute stalls to corpus lines; FLYWEIGHT_NVRTC_DUMP=PATH writes the
+    // corpus text those line numbers refer to. Profiling aids, off by default.
+    if (std::getenv("FLYWEIGHT_NVRTC_LINEINFO") != nullptr) all_options.push_back("-lineinfo");
+    if (const char* dump = std::getenv("FLYWEIGHT_NVRTC_DUMP")) {
+        if (FILE* file = std::fopen(dump, "wb")) {
+            std::fwrite(source, 1, std::strlen(source), file);
+            std::fclose(file);
+        }
+    }
     // nvrtc has no default header search path for the CUDA toolkit headers
     // (cuda_fp16.h etc.). Point it at CUDA_PATH\include so the kernels compile.
     std::vector<std::string> include_flags;
