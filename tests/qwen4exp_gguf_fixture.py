@@ -154,8 +154,10 @@ def pack_iq2_s(matrix: np.ndarray) -> tuple[bytes, np.ndarray]:
         amax = float(np.abs(block).max())
         d = np.float16(amax / (43.0 * 15.5 * 0.25)) if amax > 0 else np.float16(0)
         d32 = float(d)
-        qs = np.zeros(32, np.uint8); signs = np.zeros(32, np.uint8)
-        qh = np.zeros(8, np.uint8); scales = np.zeros(8, np.uint8)
+        qs = np.zeros(32, np.uint8)
+        signs = np.zeros(32, np.uint8)
+        qh = np.zeros(8, np.uint8)
+        scales = np.zeros(8, np.uint8)
         for group in range(16):
             values = block[group * 16:(group + 1) * 16]
             gmax = float(np.abs(values).max())
