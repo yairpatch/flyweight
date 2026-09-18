@@ -108,8 +108,8 @@ int main() {
     constexpr std::uint64_t heads = 32;
     constexpr std::uint64_t context = 32768;
 
-    if (ws::use_chunked_delta(1023, 128, 32, 32) ||
-        !ws::use_chunked_delta(1024, 128, 32, 32) ||
+    if (ws::use_chunked_delta(511, 128, 32, 32) ||
+        !ws::use_chunked_delta(512, 128, 32, 32) ||
         ws::use_chunked_delta(1024, 64, 32, 32) ||
         ws::use_chunked_delta(1024, 128, 32, 48) ||
         ws::use_chunked_delta(1024, 128, 0, 0)) return 6;
