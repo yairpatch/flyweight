@@ -343,3 +343,16 @@ item of its own.
 
 Final on the 27B: 2.30 s, 839 tok/s; llama.cpp 894. Greedy output
 identical to main on the 27B and on Flash-Next, short and long.
+
+### Aside: Turing (issue #70)
+
+Assembling the dumped corpus with ptxas for sm_75 showed the `mma.sync.m16n8k16`
+int8 and f16 instructions need sm_80; the corpus guarded them at 7.5, so a
+Tesla T4 compiled the PTX and had it rejected at load. Guards and the host's
+tensor-core test now sit at sm_80. Unrelated to the comparison above, but
+found with the same offline-ptxas method.
+
+The final timings in this report were taken on a laptop GPU that reaches its
+power cap after an hour of continuous test runs; late-evening re-measurements
+of the same build read 5-10% slower on prefill and decode alike, with the
+throttle reason set. The 2.30 s / 839 tok/s figure is from the cooler runs.
