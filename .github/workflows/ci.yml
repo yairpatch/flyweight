@@ -8,6 +8,21 @@ permissions:
   contents: read
 
 jobs:
+  # A change to what ships must bump the version, and a released number is
+  # spent. Docs, plans, tools and CI change freely. See CONTRIBUTING.md.
+  version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Version bumped for shipped changes
+        run: python tools/check_version_bump.py origin/${{ github.base_ref }}
+
   test:
     strategy:
       fail-fast: false
@@ -76,7 +91,9 @@ jobs:
           packages = {name.split("/")[0] for name in names}
           # setuptools normalises the distribution name flyweight-llm to
           # flyweight_llm in the dist-info directory.
-          assert packages <= {"flyweight", "flyweight_llm-0.2.0.dist-info"}, packages
+          import tomllib
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          assert packages <= {"flyweight", f"flyweight_llm-{version}.dist-info"}, packages
           # Contract tests and benchmarks belong in the build tree, never in
           # the shipped package.
           strays = [

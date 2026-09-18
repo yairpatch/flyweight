@@ -120,6 +120,16 @@ jobs:
           # No GPU on this runner, so doctor reports no usable device and still
           # exits 0. A non-zero exit means a blocking problem with the install.
           flyweight doctor
+      - name: The tag names the version the wheel carries
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          wheel_version="$(ls wheelhouse/*.whl | sed -E 's|.*/flyweight_llm-([^-]+)-.*|\1|')"
+          if [ "${tag_version}" != "${wheel_version}" ]; then
+            echo "tag v${tag_version} but pyproject.toml builds ${wheel_version}; bump pyproject.toml first"
+            exit 1
+          fi
 
   github-release:
     name: GitHub release
