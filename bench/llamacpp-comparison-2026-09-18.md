@@ -223,3 +223,29 @@ off and the prompt cache off (no host time between chunks to recover).
 
 llama.cpp on the same file: 894 tok/s. The gap is 1.08x on prefill and
 closed on decode.
+
+### Fourth pass: what the attention path and the k32 kernel are made of
+
+Timing each piece of the cuBLAS attention routine with events (the
+`FLYWEIGHT_ATTN_PROFILE=1` switch added for it) put the whole routine at
+0.42 ms per layer-chunk, 2.4% of the prefill; the rest of that phase was
+the attention layers' output projection, an MMQ. So attention was never the
+lever it looked like. Two things came out of it anyway: the query tile
+now takes the largest of 64, 32 or 16 rows whose buffers fit (6% on the
+routine), and the workspace region those buffers live in is floored for
+the 64-row tile instead of scaling with the context alone -- at
+`--context 4096` it could not hold even the 16-row tile, every prefill fell
+back to the warp kernel, and the 27B ran 12% slower than at 32K. Both
+contexts now prefill at the same 2.33 s.
+
+The k32 kernel's SASS (offline `nvcc -cubin` of the dumped corpus) issues
+about 1,300 instructions per k-step for 32 MMAs: 12 per MMA of epilogue by
+design, the rest integer address math, bounds checks and the decode. A
+version hoisting the per-thread staging pointers and validity out of the
+k-loop measured 3% slower, so the compiler was already doing better than
+the static count suggests. Also measured and dropped on this pass: single
+buffering, 2- and 8-group k-steps, a four-tile `ldmatrix`, the chunked
+DeltaNet path at 256 rows, and the odd/even warp order under k32.
+
+Final on the 27B, 1929-token prompt: 2.33 s, 828 tok/s, against llama.cpp's
+894. Decode 41.7 vs 41 at f16 KV.

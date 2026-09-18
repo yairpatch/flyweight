@@ -3610,7 +3610,26 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
         static_cast<long long>(capacity) * head_dim;
     const float zero = 0.0f;
     const float one = 1.0f;
-    const int tile_limit = std::min(16, tile_rows_limit);
+    // The host sizes the packed query/output and flash-state buffers for
+    // tile_rows_limit rows (v2_mtp_verifier.inc, cublas_tile_rows_setting);
+    // the routine is otherwise generic in the tile height.
+    const int tile_limit = tile_rows_limit;
+    // FLYWEIGHT_ATTN_PROFILE=1: event-bracket each piece of the routine and
+    // print the split every 256 calls. Serializes the stream, so only the
+    // relative split is meaningful.
+    static const bool attn_profile = std::getenv("FLYWEIGHT_ATTN_PROFILE") != nullptr;
+    static double attn_ms[6] = {0, 0, 0, 0, 0, 0};
+    static int attn_calls = 0;
+    static CUevent attn_ev[2] = {nullptr, nullptr};
+    auto attn_mark = [&](int piece, bool begin) {
+        if (!attn_profile) return;
+        if (!attn_ev[0]) { g_api.cuEventCreate(&attn_ev[0], 0); g_api.cuEventCreate(&attn_ev[1], 0); }
+        if (begin) { g_api.cuEventRecord(attn_ev[0], cuda_stream); return; }
+        g_api.cuEventRecord(attn_ev[1], cuda_stream);
+        g_api.cuEventSynchronize(attn_ev[1]);
+        float ms = 0.0f; g_api.cuEventElapsedTime(&ms, attn_ev[0], attn_ev[1]);
+        attn_ms[piece] += ms;
+    };
     // The rescale factors live behind the (M, S) pairs in the state buffer.
     const std::uint64_t rescale_buffer =
         flash_state + static_cast<std::uint64_t>(tile_limit) * heads * 2
@@ -3623,9 +3642,11 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
             &queries, &packed_queries, &tile_start, &tile_rows,
             &heads, &kv_heads, &head_dim
         };
+        attn_mark(0, true);
         if (launch(pack->second, (query_elements + 255) / 256, 1, 256,
                    pack_args, 0, cuda_stream) != 0)
             return -4;
+        attn_mark(0, false);
         // The visible prefix is walked in position blocks so the materialized
         // score tile is bounded by `block_tokens` rather than the context.
         // The un-blocked form shrank the query tile to fit `tokens` in the
@@ -3648,6 +3669,7 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
             const std::uint64_t block_values = values
                 + static_cast<std::uint64_t>(block_start) * head_dim
                     * sizeof(std::uint16_t);
+            attn_mark(1, true);
             if (g_cublas.gemm_strided_batched_ex(
                     g_cublas_handle, kCublasOpT, kCublasOpN,
                     block, columns, head_dim, &scale,
@@ -3658,6 +3680,8 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
                     reinterpret_cast<void*>(scores_f32), kCudaR32F, block,
                     score_stride, kv_heads, kCompute32F, kTensorOp) != 0)
                 return -5;
+            attn_mark(1, false);
+            attn_mark(2, true);
             void* softmax_args[] = {
                 &scores_f32, &probabilities_f16,
                 const_cast<std::uint64_t*>(&flash_state),
@@ -3669,6 +3693,7 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
             if (launch(softmax->second, heads, tile_rows, 256, softmax_args, 0,
                        cuda_stream) != 0)
                 return -6;
+            attn_mark(2, false);
             const bool first = block_start == 0;
             if (!first) {
                 void* rescale_args[] = {
@@ -3680,6 +3705,7 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
                            256, rescale_args, 0, cuda_stream) != 0)
                     return -7;
             }
+            attn_mark(4, true);
             if (g_cublas.gemm_strided_batched_ex(
                     g_cublas_handle, kCublasOpN, kCublasOpN,
                     head_dim, columns, block, &one,
@@ -3691,15 +3717,22 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
                     reinterpret_cast<void*>(packed_output), kCudaR32F, head_dim,
                     output_stride, kv_heads, kCompute32F, kTensorOp) != 0)
                 return -8;
+            attn_mark(4, false);
         }
         void* unpack_args[] = {
             &packed_output, &gates, const_cast<std::uint64_t*>(&flash_state),
             &output, &tile_start, &tile_rows,
             &heads, &kv_heads, &head_dim
         };
+        attn_mark(5, true);
         if (launch(unpack->second, (query_elements + 255) / 256, 1, 256,
                    unpack_args, 0, cuda_stream) != 0)
             return -9;
+        attn_mark(5, false);
+    }
+    if (attn_profile && ++attn_calls % 32 == 0) {
+        std::fprintf(stderr, "[attn-profile] %d calls: pack %.1f  qk-gemm %.1f  softmax %.1f  rescale %.1f  pv-gemm %.1f  unpack %.1f ms\n",
+                     attn_calls, attn_ms[0], attn_ms[1], attn_ms[2], attn_ms[3], attn_ms[4], attn_ms[5]);
     }
     return 0;
 }

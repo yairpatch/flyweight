@@ -1323,25 +1323,55 @@ void qwen_forward_rows(
             // attention came back NaN, the router picked expert 0 at every
             // rank and the streamed expert GEMM wrote 1024 rows into a
             // 128-row tile -- an illegal address that poisoned the context.
+            // Query rows per cuBLAS tile. 16 made every 256-row chunk sixteen
+            // tiles of pack, QK GEMM, softmax, PV GEMM and unpack -- about a
+            // hundred launches of small GEMMs per layer, 1.6 ms per layer-chunk
+            // on the 27B at 2K, ~5 TFLOPS on a tensor-core path. The packed
+            // query/output and flash-state buffers below are sized from it;
+            // FLYWEIGHT_CUBLAS_TILE_ROWS overrides for measurement.
+            // The largest of 64/32/16 whose packed buffers fit the workspace
+            // (heads * context_limit floats), so a short --context keeps the
+            // tensor-core path at 16 rows instead of falling back to the
+            // warp kernel. Measured on the 27B at 2K: 64 rows is 6% faster
+            // than 16 on the routine itself, which is ~2% of the prefill.
+            static const int cublas_tile_rows_env=[]{
+                const char*s=std::getenv("FLYWEIGHT_CUBLAS_TILE_ROWS");
+                const int v=s?std::atoi(s):0;
+                return v>=16&&v<=256?v:0;}();
+            // The region's own size: the layout floors it for a 64-row tile
+            // (flyweight_v2_workspace.hpp), so a short context still fits one.
+            const std::uint64_t attention_workspace=
+                runtime.rows_workspace_layout.attention_scores.size;
+            auto tile_buffers=[&](int tile_rows){
+                return device_align(static_cast<std::uint64_t>(tile_rows)*heads*head_dim*sizeof(std::uint16_t))
+                    +device_align(static_cast<std::uint64_t>(tile_rows)*heads*head_dim*sizeof(float))
+                    +device_align(static_cast<std::uint64_t>(tile_rows)*heads*3*sizeof(float));
+            };
+            int cublas_tile_rows_setting=cublas_tile_rows_env;
+            if(!cublas_tile_rows_setting){
+                cublas_tile_rows_setting=16;
+                for(int candidate:{64,32})
+                    if(tile_buffers(candidate)<=attention_workspace){cublas_tile_rows_setting=candidate;break;}
+            }
             const std::uint64_t block_capacity=cublas_group
                 ?score_workspace_bytes/
-                    (16ULL*static_cast<std::uint64_t>(heads)*sizeof(float)):0;
+                    (static_cast<std::uint64_t>(cublas_tile_rows_setting)*
+                     static_cast<std::uint64_t>(heads)*sizeof(float)):0;
             const int cublas_block_tokens=static_cast<int>(
                 std::min<std::uint64_t>(block_capacity,max_tokens));
-            const int cublas_tile_rows=cublas_block_tokens>=256?16:0;
+            const int cublas_tile_rows=cublas_block_tokens>=256?cublas_tile_rows_setting:0;
             const std::uint64_t packed_query_bytes=device_align(
-                static_cast<std::uint64_t>(16)*heads*head_dim*
+                static_cast<std::uint64_t>(cublas_tile_rows_setting)*heads*head_dim*
                 sizeof(std::uint16_t));
             const std::uint64_t packed_output_bytes=device_align(
-                static_cast<std::uint64_t>(16)*heads*head_dim*sizeof(float));
+                static_cast<std::uint64_t>(cublas_tile_rows_setting)*heads*head_dim*sizeof(float));
             const std::uint64_t flash_state_bytes=device_align(
-                static_cast<std::uint64_t>(16)*heads*3*sizeof(float));
+                static_cast<std::uint64_t>(cublas_tile_rows_setting)*heads*3*sizeof(float));
             const auto flash_state=
                 attention_scores+packed_query_bytes+packed_output_bytes;
             const bool cublas_workspace_ok=
                 packed_query_bytes+packed_output_bytes+flash_state_bytes<=
-                static_cast<std::uint64_t>(heads)*
-                    runtime.options.context_limit*sizeof(float);
+                attention_workspace;
             // The tensor-core prefill routines fold Qwen's per-channel sigmoid
             // gate in themselves, so Laguna, whose gate is a per-head softplus,
             // cannot use them and takes the warp path with its own gate kernel.

@@ -234,7 +234,8 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     std::uint64_t hc_count = 0, std::uint64_t hc_low_rank = 0,
     bool ple = false,
     std::uint64_t qsa_heads = 0, std::uint64_t qsa_key_len = 0,
-    std::uint64_t qsa_budget = 0, std::uint64_t qsa_ratio = 0
+    std::uint64_t qsa_budget = 0, std::uint64_t qsa_ratio = 0,
+    std::uint64_t attention_head_dim = 0
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
@@ -270,8 +271,22 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     layout.gpu_count_table = builder.add(rows * sizeof(std::int32_t));
     layout.token_device = builder.add(rows * sizeof(std::uint32_t));
     layout.winners = builder.add(rows * sizeof(std::uint64_t));
-    layout.attention_scores =
-        builder.add(attention_heads * context * sizeof(float));
+    // The cuBLAS attention prefill packs its query tile, output tile and
+    // flash state here (v2_mtp_verifier.inc, cublas_tile_rows_setting): a
+    // 64-row tile needs 64 * heads * head_dim * (2 + 4) bytes plus the
+    // state. Sized from the context alone, a --context of 4096 could not
+    // hold even the 16-row tile and every prefill fell back to the warp
+    // kernel, 12% slower on the 27B. The floor only applies when the caller
+    // passes the head dimension, so the contract's legacy formula still
+    // describes the layout it was written for.
+    const std::uint64_t attention_tile_floor = attention_head_dim
+        ? align(64 * attention_heads * attention_head_dim * sizeof(std::uint16_t))
+            + align(64 * attention_heads * attention_head_dim * sizeof(float))
+            + align(64 * attention_heads * 3 * sizeof(float))
+        : 0;
+    layout.attention_scores = builder.add(
+        attention_heads * context * sizeof(float) > attention_tile_floor
+            ? attention_heads * context * sizeof(float) : attention_tile_floor);
     {
         // Sized so a partial trailing chunk still gets a full 64x64 pair of score
         // matrices. The `core` output is not here: it aliases `first`, which is
