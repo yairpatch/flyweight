@@ -822,6 +822,10 @@ typedef struct FlyweightV2QwenImage {
 } FlyweightV2QwenImage;
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t* task_id);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime* runtime, FlyweightV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
+/* Work the engine can do while it has nothing to run: spill unowned slots to
+   the host prompt cache, which admission would otherwise do in front of the
+   next prompt. Call from the engine thread when a step produced no work. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_idle_maintenance(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime* runtime, uint64_t task_id);
 /* Why a task reported kind 2 (error): the native exception text, retained
    until read. `length` receives the byte count without the NUL; a null or

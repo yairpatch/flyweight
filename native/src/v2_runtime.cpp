@@ -22795,6 +22795,8 @@ static void qwen_evict_host_lru(FlyweightV2QwenRuntime& runtime) {
 // checkpoints to host RAM, so a later request that continues this conversation
 // restores from RAM instead of reprefilling ~30k tokens cold. Only substantial
 // conversations are worth caching; short side-requests are skipped.
+static bool qwen_admit_trace_enabled();
+static void qwen_admit_mark(const char* tag,std::chrono::steady_clock::time_point& t0);
 static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t slot) {
     if (!runtime.host_cache_limit_bytes || !runtime.state_bytes) return;
     const QwenSequence& seq = runtime.sequences[slot];
@@ -22853,6 +22855,8 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
         cursor += r.second;
     }
     if (copy_failed || flyweight_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
+    if(qwen_admit_trace_enabled())std::fprintf(stderr,"[admit-native]   spill ranges %llu MiB\n",(unsigned long long)(packed_bytes>>20));
+    auto spill_t0=std::chrono::steady_clock::now();
     QwenHostPrompt e;
     e.tokens = tokens;
     e.image_spans = spans;
@@ -22886,6 +22890,12 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
         e.snapshots.push_back({s.tokens, s.image_spans, sbuf, s.last_output, s.last_output_greedy});
         e.bytes += runtime.prefill_snapshot_bytes;
         ++copied_snapshots;
+    }
+    if(qwen_admit_trace_enabled()){
+        std::fprintf(stderr,"[admit-native]   spill snapshots %llu x %llu MiB\n",
+            (unsigned long long)copied_snapshots,
+            (unsigned long long)(runtime.prefill_snapshot_bytes>>20));
+        qwen_admit_mark("  snapshot copies",spill_t0);
     }
     e.clock = ++runtime.host_cache_clock;
     runtime.host_cache_used_bytes += e.bytes;
@@ -26008,12 +26018,28 @@ static void qwen_poison_slot(FlyweightV2QwenRuntime& runtime, std::size_t slot) 
 // slot ownership: a slot owned by another running task is untouchable, and if
 // the busiest match for this prompt IS an owned slot (same conversation already
 // generating), the task waits instead of duplicating the conversation elsewhere.
+// FLYWEIGHT_ADMIT_TRACE=1: where the host time before a prompt's first chunk
+// goes (slot matching, host-cache spill/restore, prompt admission). A
+// profiling aid; the marks cost a clock read each when off.
+static bool qwen_admit_trace_enabled(){
+    static const bool on=std::getenv("FLYWEIGHT_ADMIT_TRACE")!=nullptr;
+    return on;
+}
+static void qwen_admit_mark(const char* tag,std::chrono::steady_clock::time_point& t0){
+    if(!qwen_admit_trace_enabled())return;
+    const auto now=std::chrono::steady_clock::now();
+    const double ms=std::chrono::duration<double,std::milli>(now-t0).count();
+    if(ms>=0.05)std::fprintf(stderr,"[admit-native] %s %.2f ms\n",tag,ms);
+    t0=now;
+}
 static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTask& task) {
+    auto admit_t0 = std::chrono::steady_clock::now();
     const auto* prompt = task.prompt.data();
     const std::uint64_t prompt_count = task.prompt.size();
     // Images are encoded once, here on the engine thread, whether or not a
     // slot is free yet: their spans take part in the prefix matching below.
     qwen_task_encode_images(runtime, task);
+    qwen_admit_mark("encode_images",admit_t0);
     runtime.pending_spans = task.encoded.spans;
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     auto tokens_of = [&](std::size_t i) -> const std::vector<std::uint32_t>& {
@@ -26052,6 +26078,7 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
         }
         return v;
     };
+    qwen_admit_mark("slot_match",admit_t0);
     const std::size_t free_lru = smallest_free(kNone);
     if (free_lru == kNone) return false;  // no free slot big enough: wait
     const bool host_cache = runtime.host_cache_limit_bytes != 0;
@@ -26089,8 +26116,10 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
                 qwen_donate_prefix(runtime, best, target, prompt, prompt_count))
                 chosen = target;
         }
-        if (chosen == best && host_cache && best_match < cached)
+        if (chosen == best && host_cache && best_match < cached){
             qwen_spill_slot_to_host(runtime, chosen);
+            qwen_admit_mark("spill(reuse)",admit_t0);
+        }
     } else if (best_host != kNone) {
         qwen_spill_slot_to_host(runtime, free_lru);
         best_host=kNone;
@@ -26105,12 +26134,15 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
             }
         }
         if(best_host!=kNone)qwen_restore_host_to_slot(runtime,best_host,free_lru);
+        qwen_admit_mark("restore_host",admit_t0);
         chosen = free_lru;
     } else {
         if (host_cache) qwen_spill_slot_to_host(runtime, free_lru);
+        qwen_admit_mark("spill(lru)",admit_t0);
         chosen = free_lru;
     }
     qwen_switch_sequence(runtime, chosen);
+    qwen_admit_mark("switch_sequence",admit_t0);
     runtime.sequences[chosen].clock = ++runtime.sequence_clock;
     runtime.slot_owner[chosen] = static_cast<long long>(task.id);
     task.slot = chosen;
@@ -26120,6 +26152,7 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     if (qwen_prompt_begin(&runtime, prompt, prompt_count, task.plan,
                           task.sampling.active()) != 0)
         throw std::runtime_error("native Qwen prompt admission failed");
+    qwen_admit_mark("prompt_begin",admit_t0);
     task.index = task.plan.prompt_start;
     task.next_token = task.plan.next_token;
     if (task.index >= prompt_count) {  // full reuse: nothing to prefill
@@ -26406,6 +26439,35 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
     }
     if(runtime->engine_tasks.empty())
         qwen_unfreeze_expert_residency(*runtime);
+    return 0;
+});}
+
+/* Housekeeping for an engine with nothing left to run: spill the slots no task
+   owns into the host prompt cache.
+
+   That copy used to happen at admission, in front of the next prompt's first
+   chunk, because the arriving prompt is what displaces the conversation the
+   slot still holds. On the 27B it is 878 MiB -- the packed live KV plus four
+   full checkpoint arenas -- and 77 ms of a cold request's time to first token,
+   spent building a cache entry that only a LATER turn can read. Here it costs
+   the same bandwidth while nothing is waiting on it, and admission finds the
+   entry already present and returns on the token compare.
+
+   Nothing changes under sustained load: with tasks still queued the engine
+   never reaches its idle branch, and the admission-time spill runs as before.
+   Safe to call from the engine thread only, which is where the caller sits:
+   the copy shares runtime->stream with the forward. */
+int flyweight_v2_qwen_engine_idle_maintenance(FlyweightV2QwenRuntime*runtime){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid native Qwen runtime handle");
+    if(!runtime->host_cache_limit_bytes)return 0;
+    {
+        std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+        if(!runtime->engine_tasks.empty())return 0;
+    }
+    for(std::size_t slot=0;slot<runtime->slot_owner.size();++slot){
+        if(runtime->slot_owner[slot]>=0)continue;
+        qwen_spill_slot_to_host(*runtime,slot);
+    }
     return 0;
 });}
 

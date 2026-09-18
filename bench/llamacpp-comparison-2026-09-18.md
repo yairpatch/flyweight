@@ -344,6 +344,88 @@ item of its own.
 Final on the 27B: 2.30 s, 839 tok/s; llama.cpp 894. Greedy output
 identical to main on the 27B and on Flash-Next, short and long.
 
+## Pass 8: the request's host time, and where the kernels go
+
+The per-kernel timeline says the GPU is busy essentially all of the prefill,
+so anything left is either host time around the request or kernel time
+itself. Both were measured rather than guessed.
+
+**Host time.** `FLYWEIGHT_ADMIT_TRACE=1` timestamps the stages between the
+POST arriving and the first chunk launching. On a cold 1929-token request:
+
+| stage | ms |
+|---|---|
+| body read, tokenize, submit | 4.2 |
+| task admission | 77.3 |
+| eight prefill chunks | 2354 |
+| last chunk to the first token out | 24.1 |
+
+All 77 ms of the admission was one item: spilling the conversation the
+arriving prompt displaces into the host prompt cache. On this model that is
+878 MiB of device-to-host copying, 274 MiB of packed live KV plus four
+151 MiB checkpoint arenas, and none of it is work the arriving request
+needs -- the entry it builds can only be read by a later turn. The engine
+now does it in its idle branch instead (`engine_idle_maintenance`), which
+took a cold request from 2.35 to 2.27 s. Recall is unaffected and still
+exact: a conversation displaced and then asked for again restores in 0.63 s
+against 2.80 s cold, with identical greedy text.
+
+Under sustained load the engine never idles, so the spill still happens at
+admission exactly as before. The win is real for a chat client and absent
+for a benchmark that hammers requests back to back.
+
+**Kernel time.** `FLYWEIGHT_PREFILL_TIMELINE=2` lists every kernel in a
+chunk. For one 256-row chunk, 287 ms of kernel time:
+
+| group | ms | share |
+|---|---|---|
+| quantized GEMMs | 216.9 | 76% |
+| DeltaNet recurrence and conv | 31.5 | 11% |
+| attention | 23.0 | 8% |
+| elementwise (quantize, SiLU, norm, add) | 15.6 | 5% |
+
+Two things this settled:
+
+- **The DeltaNet's parallel form is not a win here.** Forcing the chunked WY
+  path at 256 rows (`FLYWEIGHT_DELTA_CHUNKED_MIN_ROWS`) replaces a 25.4 ms
+  recurrence with 27.7 ms across four kernels and 144 more launches, and
+  time to first token goes 2.28 -> 2.31 s. The 512-row floor is right.
+- **The half-rate MMQ families cannot be converted.** IQ2_XS, IQ2_S and
+  IQ1_M carry a separate 4-bit scale for each 16-element half of a 32-group,
+  so the k32 int8 MMA cannot apply one scale to the pair; the k16 pair is
+  arithmetic, not an omission. Those families are 21% of a chunk. llama.cpp
+  has the same constraint for the same formats.
+
+**Chunk size.** A dense model has no routed-expert cache to churn, so the
+256-row prefill chunk (tuned on a MoE) is not obviously right for it. Three
+runs of 512 in a row read 1.3% faster, which did not survive interleaving:
+over three interleaved passes 512 is +0.4% on prefill and -1.2% on decode.
+Left alone. 1024 needs 718 MiB of row workspace and does not fit beside a
+32K f16 KV cache on a 12 GB card.
+
+**Where the comparison stands.** Three interleaved passes, nine repeats
+each, same session, 1929-token prompt, 32K f16 KV:
+
+| engine | TTFT | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| llama.cpp f3a33dff2 | 2.044 s | 944 | 40.8 |
+| flyweight | 2.390 s | 808 | 40.4 |
+
+Decode is level. Prefill is 86% of llama.cpp back to back, and 90% when
+requests arrive with the gap a chat client leaves, where the deferred spill
+applies (2.27 s, 850 tok/s). Note llama.cpp measures 944 here against 894 in
+the first report; the machine, not the build, moved, which is why only
+same-session interleaved pairs are quoted.
+
+**What is left is kernel time.** The timeline accounts for essentially all
+of the prefill as GPU-busy. The GEMMs are 76% of it and already beat
+llama.cpp's standalone on this model's shapes, so the remaining ~300 ms is
+in the other 24%: the DeltaNet recurrence at 11% of a chunk is the largest
+single item, and it runs as a serial walk over the chunk on a
+(value_heads x 128) grid. Its parallel form as written is not faster.
+Making that recurrence genuinely parallel is the next real lever and is a
+kernel project, not a tuning pass.
+
 ### Aside: Turing (issue #70)
 
 Assembling the dumped corpus with ptxas for sm_75 showed the `mma.sync.m16n8k16`

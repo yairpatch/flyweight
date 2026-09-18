@@ -1148,6 +1148,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint64),
                 ]
                 lib.flyweight_v2_qwen_engine_step.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_engine_idle_maintenance.argtypes = [
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_qwen_engine_idle_maintenance.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_task_cancel.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_uint64,
@@ -3321,6 +3325,17 @@ class V2QwenRuntime:
             (int(e.task_id), int(e.token), int(e.kind))
             for e in events[: count.value]
         ]
+
+    def engine_idle_maintenance(self) -> None:
+        """Do the deferrable housekeeping while no task is waiting on the GPU.
+
+        Spilling a displaced conversation to the host prompt cache is 878 MiB
+        of copying on the 27B. Admission used to pay it in front of the next
+        prompt; doing it here moves it into the gap between requests.
+        """
+        self.model._check(
+            self._lib.flyweight_v2_qwen_engine_idle_maintenance(self._handle)
+        )
 
     def task_cancel(self, task_id: int) -> None:
         self.model._check(self._lib.flyweight_v2_qwen_task_cancel(self._handle, task_id))
