@@ -15807,12 +15807,18 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     // bitwise-identity and transformers parity among them,
                     // changed their tokens. The residual disagreement is what
                     // the context clamp below absorbs.
-                    std::uint64_t margin=std::max<std::uint64_t>(384ull*1024*1024,gi.total_memory/32);
-                    // A context the caller chose is not going to yield below,
-                    // so the shortfall it would have absorbed lands here: use
-                    // the auto-fit margin and spill enough blocks to cover it.
-                    if(runtime->options.context_explicit)
-                        margin=std::max<std::uint64_t>(2048ull*1024*1024,gi.total_memory/8);
+                    // The same margin whether or not the caller chose the
+                    // context. An explicit context used to switch this to the
+                    // auto-fit margin (2 GiB on a 12 GB card) on the theory
+                    // that the shortfall the context clamp would have absorbed
+                    // had to land somewhere -- but the KV state is subtracted
+                    // explicitly in reserved_base below, so that reservation
+                    // was counted twice, and a 27B at 32K f16 KV spilled three
+                    // dense blocks (a quarter of its decode) with 1.6 GB of
+                    // VRAM left unused. Measured 2026-09-18: no spill, decode
+                    // 32 -> 41 tok/s, and the later allocation check still
+                    // stands to refuse a plan that truly does not fit.
+                    const std::uint64_t margin=std::max<std::uint64_t>(384ull*1024*1024,gi.total_memory/32);
                     budget=gi.free_memory>margin?gi.free_memory-margin:0;
                 }
             }

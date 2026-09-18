@@ -185,3 +185,41 @@ prefetch variants did not.
 
 llama.cpp on the same file: 894 tok/s. The gap is now 1.14x, from 1.9x at
 the start of the day.
+
+### Third pass, same day: the decode phase, the quantizer, and the spill
+
+With the tensor math halved, skipping each phase of the single-scale kernel
+in turn put the codebook decode first: it read its packed bytes one at a
+time (a 66-byte block aligns to two bytes, so the compiler could not widen
+the loads) and looked the codebook up in global memory four times per
+group. IQ2_XXS, IQ3_XXS and IQ1_S now decode from 16-bit loads with the
+codebook copied once per block into shared memory. The activation
+quantizer, one 32-thread block per 32-element group (40,000 blocks per
+chunk), runs eight warps per block. And the planner's headroom no longer
+doubles to 2 GiB when the context is set explicitly: the KV state it was
+guarding against is already subtracted, and the double count is what
+spilled three dense blocks with 1.6 GB of VRAM unused.
+
+| change | 27B prefill, turbo4 KV | tok/s |
+| --- | --- | --- |
+| after the second pass | 2.47 s | 781 |
+| quantizer in 256-thread blocks | 2.42 s | 797 |
+| 16-bit-load decoders with shared codebooks | 2.34 s | 824 |
+
+| 27B, f16 KV (the matched configuration) | prefill | decode |
+| --- | --- | --- |
+| llama.cpp | 894 tok/s | 41 tok/s |
+| flyweight, before (3 of 64 blocks spilled) | 740 tok/s | 32 tok/s |
+| flyweight, after (nothing spilled) | 824 tok/s | 41.7 tok/s |
+
+Greedy output identical throughout, and under f16 KV it now matches the
+exact GPU path rather than the host-re-encoded one the spill produced.
+
+Tried and dropped on this pass: the same decoder treatment for the
+two-scale families (no change), the odd/even warp order again on top of
+k32 (no change), three more tile shapes under k32 (all slower), 512- and
+1024-row chunks (within noise, and 1024 loses), mid-prefill checkpoints
+off and the prompt cache off (no host time between chunks to recover).
+
+llama.cpp on the same file: 894 tok/s. The gap is 1.08x on prefill and
+closed on decode.
