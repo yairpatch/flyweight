@@ -1420,20 +1420,36 @@ void qwen_forward_rows(
                 runtime.position+static_cast<std::uint64_t>(span_begin)+
                 static_cast<std::uint64_t>(rows);
             // The warp-online kernel needs one launch and no materialized
-            // score tile, so it was kept for prefixes under 4K. Measured on
+            // score tile, so it was kept for short prefixes. Measured on
             // Qwen3.8-27B (RTX 5070 Ti, 2026-09-18) the tensor-core QK/PV
-            // path is level with it at 512 tokens and ahead from there: +4%
-            // prefill at 1024, +11% at 2048, +21% at 4096 -- and since
-            // max_tokens is the visible prefix, a 4K threshold only ever
-            // reached the tail chunk of a 4K prompt. 1/0 force either side
-            // for benchmarking and machine-specific tuning.
+            // path is level with it at 512 visible tokens and ahead from
+            // there, so 512 is the crossover and not the 1024 this asked for.
+            // Forcing each side, six repeats a point over two interleaved
+            // passes, client time to first token:
+            //
+            //   prompt   warp     tensor-core
+            //      256    432 ms    438 ms   +1.2%
+            //      512    812       808      -0.6%
+            //     1024   1230      1163      -5.4%
+            //     2048   2543      2221     -12.7%
+            //     4096   5143      3834     -25.5%
+            //
+            // and the threshold itself, 1024 against 512 on the same builds:
+            // a 1024-token prompt 1289 -> 1203 ms (-6.7%), a 2048-token one
+            // 1797 -> 1768 (-1.7%). Below 512 the warp kernel is still ahead,
+            // which is why this is a crossover and not an always-on.
+            // Output is untouched: the two paths agree token for token at
+            // 1000 and 1900 tokens, and the greedy 64-token generation is
+            // md5-identical across the change.
+            // 1/0 force either side for benchmarking and machine-specific
+            // tuning.
             const bool cublas_prefill_forced=
                 cublas_prefill_env&&cublas_prefill_env[0]=='1';
             const bool cublas_prefill_disabled=
                 cublas_prefill_env&&cublas_prefill_env[0]=='0';
             const bool cublas_prefill_requested=
                 !cublas_prefill_disabled&&
-                (cublas_prefill_forced||max_tokens>=1024);
+                (cublas_prefill_forced||max_tokens>=512);
             // Flash-blocked: the score tile is bounded by a KV position block
             // rather than the whole visible prefix, so the 16-row query tile
             // no longer shrinks as the context grows (it collapsed to 3 rows
