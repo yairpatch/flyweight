@@ -268,3 +268,17 @@ region tipped the f16 configuration past its VRAM fit. Reverted.
 Final: 27B 2.33 s, 828 tok/s, 41.7 tok/s decode at f16 KV; llama.cpp 894
 and 41. Closing the last 7% means adopting llama.cpp's MMQ register and
 tile layout, which is a port, not a pass.
+
+### Port checkpoint: llama.cpp's warp layout in this kernel
+
+A kernel in llama.cpp's MMQ layout for IQ2_XXS, IQ1_S and IQ3_XXS -- eight
+warps at one block per SM, each warp owning 16 rows and all 128 tokens so
+one weight fragment feeds sixteen k32 MMAs, a 256-wide k-step, single
+buffered in 78 KB of dynamic shared -- with our decoders and epilogue,
+behind `FLYWEIGHT_MMQ_LC=1`. Greedy output identical; 2.72 s against 2.33,
+17% slower end to end. ptxas: 255 registers. With one row fragment per
+warp every MMA needs its own activation loads (four LDS per MMA against
+two in the current tile), and eight warps hide less of that latency than
+sixteen. llama.cpp's layout works with its swizzled tile loader and its
+Q8_1 activation format, not on its own; the port is all of those together
+or nothing. Reverted.
