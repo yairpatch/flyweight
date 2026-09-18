@@ -455,11 +455,24 @@ void qwen_forward_rows(
             // handful of rows and stays on the rows kernel; chunked prefill
             // runs prefill_rows (64 on a dense checkpoint) and takes this.
             // mmq_kernel and tiled_kernel are resolved above the gate.
-            // rows > 1: the 32-token MMQ variant also takes small batches
-            // whole (2..kQ8TailRows rows) -- the per-row kernels below cost a
-            // launch per row per projection, 80 ms for a 7-token prompt on
-            // the 27B against ~40 for one narrow tile per projection.
-            if(rows>1&&mmq_kernel&&runtime.int8_tensor_cores){
+            // The 32-token MMQ variant also takes small batches whole
+            // (2..kQ8TailRows rows) where the family has one and the device
+            // is a real GPU: the per-row kernels below cost a launch per row
+            // per projection. A family without the narrow twin, or the CPU
+            // backend (whose MMQ is a shuffle-emulated MMA, minutes per draft
+            // step on the q6k head test), keeps the per-row paths below
+            // kQ8RowBatch rows exactly as before.
+            const char* small_narrow=nullptr;
+            if(rows>1&&rows<=kQ8RowBatch&&mmq_kernel&&!mmq_min&&
+               runtime.int8_tensor_cores&&!flyweight_backend_is_cpu()){
+                static std::map<std::string,std::string> interned_small;
+                auto it=interned_small.find(mmq_kernel);
+                if(it==interned_small.end())
+                    it=interned_small.emplace(mmq_kernel,std::string(mmq_kernel)+"_n").first;
+                if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
+                    small_narrow=it->second.c_str();
+            }
+            if((rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&runtime.int8_tensor_cores){
                 const auto mmq_shape=qwen_mmq_shape();
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
                 const int mmq_threads=mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
@@ -479,11 +492,8 @@ void qwen_forward_rows(
                 // remainder takes the per-row kernel instead, eight rows per
                 // launch over the matrix -- two launches against an empty
                 // tile. The tile is exact either way; only the schedule moves.
-                const int full_rows=(rows/mmq_tokens)*mmq_tokens;
-                const int remainder=rows-full_rows;
-                // Below a full tile with no narrow twin (the K-quant MIN
-                // families), the per-row kernels keep small batches.
-                if(full_rows==0&&(remainder>kQ8TailRows||mmq_min))goto per_row_paths;
+                int full_rows=(rows/mmq_tokens)*mmq_tokens;
+                int remainder=rows-full_rows;
                 // The narrow (32-token) variant exists for the single-scale
                 // families; the others keep the full tile for their remainder.
                 // The narrow name outlives the launch (the timeline keeps the
@@ -497,7 +507,11 @@ void qwen_forward_rows(
                     if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                         narrow_name=it->second.c_str();
                 }
-                if(full_rows==0&&!narrow_name)goto per_row_paths;
+                // No narrow twin (the K-quant MIN families, or a remainder past
+                // kQ8TailRows): the batch runs as one full tile, as it always
+                // has; the per-row kernels are never a substitute for a tile
+                // the family can run, since they accumulate in another order.
+                if(!narrow_name){full_rows=rows;remainder=0;}
                 const bool split_tail=narrow_name!=nullptr;
                 int batch=split_tail?full_rows:rows;
                 const std::uint32_t token_tiles=
@@ -532,10 +546,8 @@ void qwen_forward_rows(
                 dense_trace(mmq_kernel);
                 return;
             }
-            per_row_paths:
             // Reached when the device predates sm_75, where the MMQ kernels
-            // would run their emulation instead of real tensor cores, and by
-            // small batches of the families without a narrow MMQ twin.
+            // would run their emulation instead of real tensor cores.
             if(rows>kQ8RowBatch&&tiled_kernel){
                 for(int first=0;first<rows;first+=kQ8TileTokens){
                     int batch=std::min(kQ8TileTokens,rows-first);

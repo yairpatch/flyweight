@@ -324,3 +324,22 @@ narrow tile in the rows driver too (a 26-row chunk was measured on it).
 Prompts of 8 tokens or fewer still go through the runtime's per-row path,
 80 ms for a 7-token prompt on the 27B, which is a short-prompt latency
 item of its own.
+
+### Seventh pass: the three itemized remainders
+
+- **The 48-wide DeltaNet heads.** A one-thread-per-(token, output) kernel
+  with the same group order and epilogue expression as the tile measured
+  slower: it re-decodes each weight row once per token where the tile
+  decodes it once per 128. Dropped. The exact fix is to fuse the two
+  48-wide projections into one 96-wide GEMM at load, which touches the
+  recurrence kernel's operand strides on both backends; not done here.
+- **Small-batch routing.** Routing 2..32-row batches to the narrow tile had
+  silently moved the K-quant MIN families, which have no narrow twin, from
+  their MMQ tile to the tiled dp4a kernel, and Flash-Next's short-prompt
+  greedy hash changed. Families without a narrow variant now keep their
+  full tile; both Flash-Next hashes are back to baseline.
+- The remainder's decode floor and the ~50 ms of request admission stand
+  as described above.
+
+Final on the 27B: 2.30 s, 839 tok/s; llama.cpp 894. Greedy output
+identical to main on the 27B and on Flash-Next, short and long.
