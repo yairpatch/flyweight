@@ -15267,11 +15267,42 @@ static bool qwen_mmq_wide(){
 // identical text means the driver's module cache hands them the same module,
 // so a chat model and an image model in one process do not evict each other's
 // kernels.
+// The GPU tile of the tensor-core MMQ kernel, as (row warps, row frags,
+// token warps, token frags): rows = rw*rf*16, tokens = tw*tf*8, threads =
+// rw*tw*32. The wide default is 4,2,4,4 -- 128x128 over 16 warps.
+// FLYWEIGHT_MMQ_SHAPE=rw,rf,tw,tf overrides it for measurement; the same
+// values feed the compile (below) and every launch (kQ8Mmq* in the
+// verifier), so the two cannot disagree. Off the wide path (CPU backend) the
+// corpus compiles with its own defaults and this returns them.
+struct QwenMmqShape{
+    int row_warps,row_frags,token_warps,token_frags;
+    int rows()const{return row_warps*row_frags*16;}
+    int tokens()const{return token_warps*token_frags*8;}
+    int threads()const{return row_warps*token_warps*32;}
+};
+static QwenMmqShape qwen_mmq_shape(){
+    static const QwenMmqShape wide=[]{
+        QwenMmqShape shape{4,2,4,4};
+        if(const char*env=std::getenv("FLYWEIGHT_MMQ_SHAPE")){
+            int rw=0,rf=0,tw=0,tf=0;
+            if(std::sscanf(env,"%d,%d,%d,%d",&rw,&rf,&tw,&tf)==4&&
+               rw>0&&rf>0&&tw>0&&tf>0&&rw*tw*32<=1024)
+                shape=QwenMmqShape{rw,rf,tw,tf};
+            else std::fprintf(stderr,"[flyweight] FLYWEIGHT_MMQ_SHAPE=%s ignored (want rw,rf,tw,tf)\n",env);
+        }
+        return shape;
+    }();
+    static const QwenMmqShape narrow{2,4,4,4};
+    return qwen_mmq_wide()?wide:narrow;
+}
 static std::string qwen_cuda_corpus(){
-    return (qwen_mmq_wide()
-             ?std::string("#define FLYWEIGHT_MMQ_ROW_WARPS 4\n"
-                          "#define FLYWEIGHT_MMQ_ROW_FRAGS 2\n")
-             :std::string())+
+    const auto shape=qwen_mmq_shape();
+    char defines[256];
+    std::snprintf(defines,sizeof(defines),
+        "#define FLYWEIGHT_MMQ_ROW_WARPS %d\n#define FLYWEIGHT_MMQ_ROW_FRAGS %d\n"
+        "#define FLYWEIGHT_MMQ_TOKEN_WARPS %d\n#define FLYWEIGHT_MMQ_TOKEN_FRAGS %d\n",
+        shape.row_warps,shape.row_frags,shape.token_warps,shape.token_frags);
+    return (qwen_mmq_wide()?std::string(defines):std::string())+
         std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source+
         flyweight::v2::diffusion_cuda_source;
 }
