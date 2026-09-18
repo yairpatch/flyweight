@@ -223,3 +223,136 @@ off and the prompt cache off (no host time between chunks to recover).
 
 llama.cpp on the same file: 894 tok/s. The gap is 1.08x on prefill and
 closed on decode.
+
+### Fourth pass: what the attention path and the k32 kernel are made of
+
+Timing each piece of the cuBLAS attention routine with events (the
+`FLYWEIGHT_ATTN_PROFILE=1` switch added for it) put the whole routine at
+0.42 ms per layer-chunk, 2.4% of the prefill; the rest of that phase was
+the attention layers' output projection, an MMQ. So attention was never the
+lever it looked like. Two things came out of it anyway: the query tile
+now takes the largest of 64, 32 or 16 rows whose buffers fit (6% on the
+routine), and the workspace region those buffers live in is floored for
+the 64-row tile instead of scaling with the context alone -- at
+`--context 4096` it could not hold even the 16-row tile, every prefill fell
+back to the warp kernel, and the 27B ran 12% slower than at 32K. Both
+contexts now prefill at the same 2.33 s.
+
+The k32 kernel's SASS (offline `nvcc -cubin` of the dumped corpus) issues
+about 1,300 instructions per k-step for 32 MMAs: 12 per MMA of epilogue by
+design, the rest integer address math, bounds checks and the decode. A
+version hoisting the per-thread staging pointers and validity out of the
+k-loop measured 3% slower, so the compiler was already doing better than
+the static count suggests. Also measured and dropped on this pass: single
+buffering, 2- and 8-group k-steps, a four-tile `ldmatrix`, the chunked
+DeltaNet path at 256 rows, and the odd/even warp order under k32.
+
+Final on the 27B, 1929-token prompt: 2.33 s, 828 tok/s, against llama.cpp's
+894. Decode 41.7 vs 41 at f16 KV.
+
+### Fifth pass: llama.cpp's kernel, measured, and split-K
+
+llama.cpp's own GEMM benchmark (`test-backend-ops perf`) against flyweight's
+per-kernel time on the same prefill, in TFLOPS: IQ2_XXS 72 vs 65, IQ1_S 65
+vs 61, IQ3_XXS 68 vs 57, IQ2_S 52 vs 48, IQ2_XS 52 vs 37, IQ1_M 55 vs 54.
+Weighted by the 27B's MACs the kernels are 8% behind, which is the whole
+remaining prefill gap. llama.cpp's configuration for these types (8 warps,
+one block per SM, 128x128 tile, 256 of K per iteration, stream-K) was
+tried in this kernel and measured 3.5 s: at 128 registers our per-warp
+state spills. Stream-K's target, wave quantization, is real here: 14% of
+MMQ time by the launch list. A deterministic split-K (grid.y carries the
+splits, fixed-order reduction) recovered 1.5% of it, changed Flash-Next's
+greedy output through the partials' summation order, and its partials
+region tipped the f16 configuration past its VRAM fit. Reverted.
+
+Final: 27B 2.33 s, 828 tok/s, 41.7 tok/s decode at f16 KV; llama.cpp 894
+and 41. Closing the last 7% means adopting llama.cpp's MMQ register and
+tile layout, which is a port, not a pass.
+
+### Port checkpoint: llama.cpp's warp layout in this kernel
+
+A kernel in llama.cpp's MMQ layout for IQ2_XXS, IQ1_S and IQ3_XXS -- eight
+warps at one block per SM, each warp owning 16 rows and all 128 tokens so
+one weight fragment feeds sixteen k32 MMAs, a 256-wide k-step, single
+buffered in 78 KB of dynamic shared -- with our decoders and epilogue,
+behind `FLYWEIGHT_MMQ_LC=1`. Greedy output identical; 2.72 s against 2.33,
+17% slower end to end. ptxas: 255 registers. With one row fragment per
+warp every MMA needs its own activation loads (four LDS per MMA against
+two in the current tile), and eight warps hide less of that latency than
+sixteen. llama.cpp's layout works with its swizzled tile loader and its
+Q8_1 activation format, not on its own; the port is all of those together
+or nothing. Reverted.
+
+### Sixth pass: the standalone kernel, the GPU timeline, and the tail
+
+Two measurements that were missing all day. First, our kernels on
+llama.cpp's own benchmark shape (4096 x 14336, 512 tokens, repeated
+launches, nothing else on the stream), against `test-backend-ops perf`:
+
+| kernel | llama.cpp | flyweight |
+| --- | --- | --- |
+| IQ2_XXS | 72 TFLOPS | 78 |
+| IQ1_S | 65 | 73 |
+| IQ3_XXS | 68 | 74 |
+
+The kernels were never behind; the in-situ figures earlier in this report
+carried the serializing launch timer's overhead. The port would have gained
+nothing. Second, a GPU timeline (`FLYWEIGHT_PREFILL_TIMELINE=1`: events
+around every launch, read back at chunk end) showed the GPU busy 97% of the
+prefill's wall time and the full 256-row chunks running at 889 tok/s, level
+with llama.cpp's overall rate. The whole remaining gap was the 137-row tail
+chunk: its 9 rows past the last 128-token tile cost a second full tile,
+244 ms for a chunk that should take 150.
+
+Every kernel decodes the matrix once regardless of row count (the per-row
+and tiled dp4a kernels cost the same as the empty tile they were tried
+against), so the only reducible part is the MMA phase: a 32-token variant
+of each MMQ kernel (`*_q8_mmq_n`, one token fragment per warp, the thing
+llama.cpp's J-templates do) now takes remainders of up to 32 rows. Tail
+chunk 244 -> 210 ms; prefill 2.33 -> 2.30 s, 839 tok/s at both KV types;
+greedy output identical on the 27B and Flash-Next. The remainder's decode
+floor, about 45 ms per prompt on the 27B, is what stands between this and
+llama.cpp's 894, plus some 40 ms of fixed per-request work before the
+first chunk.
+
+The timeline also reports the host time between chunks (about 1 ms), the
+mid-prefill checkpoints and the prompt cache together cost about 1%, and
+tokenizing the prompt takes 3 ms; the 50 ms or so between the chunks' GPU
+wall and the client's first token is request admission and the first
+sampling step, not the prefill. Small batches of 2 to 32 rows now take the
+narrow tile in the rows driver too (a 26-row chunk was measured on it).
+Prompts of 8 tokens or fewer still go through the runtime's per-row path,
+80 ms for a 7-token prompt on the 27B, which is a short-prompt latency
+item of its own.
+
+### Seventh pass: the three itemized remainders
+
+- **The 48-wide DeltaNet heads.** A one-thread-per-(token, output) kernel
+  with the same group order and epilogue expression as the tile measured
+  slower: it re-decodes each weight row once per token where the tile
+  decodes it once per 128. Dropped. The exact fix is to fuse the two
+  48-wide projections into one 96-wide GEMM at load, which touches the
+  recurrence kernel's operand strides on both backends; not done here.
+- **Small-batch routing.** Routing 2..32-row batches to the narrow tile had
+  silently moved the K-quant MIN families, which have no narrow twin, from
+  their MMQ tile to the tiled dp4a kernel, and Flash-Next's short-prompt
+  greedy hash changed. Families without a narrow variant now keep their
+  full tile; both Flash-Next hashes are back to baseline.
+- The remainder's decode floor and the ~50 ms of request admission stand
+  as described above.
+
+Final on the 27B: 2.30 s, 839 tok/s; llama.cpp 894. Greedy output
+identical to main on the 27B and on Flash-Next, short and long.
+
+### Aside: Turing (issue #70)
+
+Assembling the dumped corpus with ptxas for sm_75 showed the `mma.sync.m16n8k16`
+int8 and f16 instructions need sm_80; the corpus guarded them at 7.5, so a
+Tesla T4 compiled the PTX and had it rejected at load. Guards and the host's
+tensor-core test now sit at sm_80. Unrelated to the comparison above, but
+found with the same offline-ptxas method.
+
+The final timings in this report were taken on a laptop GPU that reaches its
+power cap after an hour of continuous test runs; late-evening re-measurements
+of the same build read 5-10% slower on prefill and decode alike, with the
+throttle reason set. The 2.30 s / 839 tok/s figure is from the cooler runs.
