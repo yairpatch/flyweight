@@ -23727,6 +23727,7 @@ static int qwen_prefill_unit(FlyweightV2QwenRuntime* runtime, const uint32_t* pr
         }
         qwen_prefill_rows(*runtime,prompt+index,static_cast<int>(rows));
         if(std::getenv("FLYWEIGHT_PREFILL_LAUNCHES"))qwen_prefill_launch_report();
+        if(qwen_timeline_enabled())qwen_timeline_report(runtime->stream);
         index+=rows;
         qwen_prompt_checkpoints(runtime,prompt,plan);
         if(index+3<=prompt_count&&!runtime->cancelled)return 0; // more chunks pending

@@ -11,6 +11,9 @@
 // and shared reduction slots are sized by it, and a larger batch would be read
 // past silently.
 static constexpr int kQ8RowBatch=8;
+// Rows past the last full MMQ token tile that the per-row kernel serves
+// instead of an almost empty tile (three launches at most).
+static constexpr int kQ8TailRows=32;
 
 // Tokens per launch of the tiled prefill matmul. Must match
 // FLYWEIGHT_Q8_TILE_TOKENS in native/include/flyweight_v2_qwen_kernels.hpp -- the
@@ -49,6 +52,46 @@ static constexpr int kQ8MmqWideThreads=
 // The _MIN variant still runs one fragment per warp.
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 
+// FLYWEIGHT_PREFILL_TIMELINE=1: every launch gets a start and stop event
+// recorded on the stream with no synchronization, and the chunk's end reads
+// them all back: per-kernel busy time, the idle gaps between consecutive
+// kernels (host-side pacing the serializing launch timer cannot see), and the
+// chunk's GPU wall time. cuBLAS calls are not launched through here, so they
+// show up as gaps; the attention profile gives their size separately.
+struct QwenTimelineEntry{const char*name;std::uint64_t start,stop;};
+inline bool qwen_timeline_enabled(){
+    static const bool on=[]{const char*v=std::getenv("FLYWEIGHT_PREFILL_TIMELINE");return v&&v[0]=='1';}();
+    return on;
+}
+inline std::vector<QwenTimelineEntry>& qwen_timeline(){static std::vector<QwenTimelineEntry> t;return t;}
+inline std::vector<std::uint64_t>& qwen_timeline_pool(){static std::vector<std::uint64_t> p;return p;}
+inline std::uint64_t qwen_timeline_event(std::size_t index){
+    auto&pool=qwen_timeline_pool();
+    while(pool.size()<=index){std::uint64_t e=0;flyweight_gpu_timed_event_create(&e);pool.push_back(e);}
+    return pool[index];
+}
+inline void qwen_timeline_report(std::uint64_t stream){
+    auto&t=qwen_timeline();
+    if(t.empty())return;
+    flyweight_gpu_stream_sync(stream);
+    double busy=0,gaps=0,big_gaps=0;std::size_t big=0;
+    std::map<std::string,double> by_name;
+    for(std::size_t i=0;i<t.size();++i){
+        float ms=0.0f;
+        if(flyweight_gpu_event_elapsed(t[i].start,t[i].stop,&ms)==0){busy+=ms;by_name[t[i].name]+=ms;}
+        if(i){float gap=0.0f;
+            if(flyweight_gpu_event_elapsed(t[i-1].stop,t[i].start,&gap)==0&&gap>0){
+                gaps+=gap;if(gap>0.02f){big_gaps+=gap;++big;}}}
+    }
+    float wall=0.0f;flyweight_gpu_event_elapsed(t.front().start,t.back().stop,&wall);
+    std::fprintf(stderr,"[timeline] %zu launches: wall %.1f ms, kernels %.1f ms, gaps %.1f ms (%zu gaps >20us: %.1f ms)\n",
+        t.size(),wall,busy,gaps,big,big_gaps);
+    std::vector<std::pair<std::string,double>> ordered(by_name.begin(),by_name.end());
+    std::sort(ordered.begin(),ordered.end(),[](const auto&a,const auto&b){return a.second>b.second;});
+    for(std::size_t i=0;i<ordered.size()&&i<8;++i)
+        std::fprintf(stderr,"[timeline]   %-34s %7.2f ms\n",ordered[i].first.c_str(),ordered[i].second);
+    t.clear();
+}
 // Launch tally for FLYWEIGHT_PREFILL_LAUNCHES; see the `launch` lambda below.
 struct QwenLaunchStat { std::uint64_t calls=0, blocks=0; double milliseconds=0.0; };
 inline std::map<std::string,QwenLaunchStat>& qwen_launch_stats(){
@@ -243,6 +286,16 @@ void qwen_forward_rows(
             if(!trace_launches)qwen_note_launch(name,gx,gy);
             return;
         }
+        if(qwen_timeline_enabled()){
+            auto&t=qwen_timeline();
+            const std::uint64_t start=qwen_timeline_event(t.size()*2),stop=qwen_timeline_event(t.size()*2+1);
+            flyweight_gpu_event_record(start,runtime.stream);
+            if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+                throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
+            flyweight_gpu_event_record(stop,runtime.stream);
+            t.push_back(QwenTimelineEntry{name,start,stop});
+            return;
+        }
         if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
     };
@@ -406,9 +459,32 @@ void qwen_forward_rows(
                 // waves with the second mostly empty -- and serialized the
                 // tiles behind each other. Same tiles, same arithmetic, so
                 // the outputs are bit-identical; only the schedule changes.
+                // A chunk whose row count is not a multiple of the token tile
+                // pays a whole tile for its remainder: the 137-row tail of a
+                // 1929-token prompt ran a second 128-token tile for 9 rows,
+                // 87% of a full chunk's time for 54% of its tokens. A small
+                // remainder takes the per-row kernel instead, eight rows per
+                // launch over the matrix -- two launches against an empty
+                // tile. The tile is exact either way; only the schedule moves.
+                const int full_rows=(rows/mmq_tokens)*mmq_tokens;
+                const int remainder=rows-full_rows;
+                // The narrow (32-token) variant exists for the single-scale
+                // families; the others keep the full tile for their remainder.
+                // The narrow name outlives the launch (the timeline keeps the
+                // pointer), so it is interned once per kernel.
+                const char* narrow_name=nullptr;
+                if(full_rows>0&&remainder>0&&remainder<=kQ8TailRows&&!mmq_min){
+                    static std::map<std::string,std::string> interned;
+                    auto it=interned.find(mmq_kernel);
+                    if(it==interned.end())
+                        it=interned.emplace(mmq_kernel,std::string(mmq_kernel)+"_n").first;
+                    if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
+                        narrow_name=it->second.c_str();
+                }
+                const bool split_tail=narrow_name!=nullptr;
+                int batch=split_tail?full_rows:rows;
                 const std::uint32_t token_tiles=
-                    static_cast<std::uint32_t>((rows+mmq_tokens-1)/mmq_tokens);
-                int batch=rows;
+                    static_cast<std::uint32_t>((batch+mmq_tokens-1)/mmq_tokens);
                 void*mmq_args[]={&matrix,&small_q8,&small_q8_scales,&output,
                     &input_size,&output_size,&batch,&scale_stride};
                 // FLYWEIGHT_MMQ_TRACE=1: every launch, for pinning a fault
@@ -420,6 +496,21 @@ void qwen_forward_rows(
                 const std::uint32_t mmq_shared=(format&&format->mmq_dynamic_shared&&!mmq_min)
                     ?qwen_mmq_dynamic_shared(mmq_shape):0u;
                 launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
+                if(split_tail){
+                    int tail=remainder;
+                    auto tail_q8=small_q8+static_cast<std::uint64_t>(full_rows)*input_size;
+                    auto tail_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(full_rows)*(input_size/32)*sizeof(float);
+                    auto tail_output=output+
+                        static_cast<std::uint64_t>(full_rows)*output_size*sizeof(float);
+                    void*tail_args[]={&matrix,&tail_q8,&tail_scales,&tail_output,
+                        &input_size,&output_size,&tail,&scale_stride};
+                    const std::uint32_t narrow_shared=(format&&format->mmq_dynamic_shared)
+                        ?static_cast<std::uint32_t>(
+                            2u*(mmq_shape.rows()+32u)*9u*16u+2u*(mmq_shape.rows()+32u)*4u*sizeof(float))
+                        :0u;
+                    launch(narrow_name,(output_size+mmq_rows-1)/mmq_rows,1,mmq_threads,tail_args,narrow_shared);
+                }
                 dense_trace(mmq_kernel);
                 return;
             }
