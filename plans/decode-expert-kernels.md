@@ -1,5 +1,7 @@
 # Routed expert kernels: the decode token's biggest GPU term
 
+> **STATUS 2026-09-18**: SHIPPED: 4-weight amortized q5_K/q6_K routed-expert decode kernels, +11-14% decode at the server boundary. Open: warp-cooperative decoding past 4x, the `_rows` variants for prefill. Other quantizations landed piecemeal since (see git log for q4_0, Q2_K, IQ kernels).
+
 ## How this got here
 
 Phase 1b of [paged-kv-cache.md] measured a decode token on the device and found

@@ -1,5 +1,7 @@
 # qwen4exp: Qwen3.8-Flash-Next support
 
+> **STATUS 2026-09-18**: SHIPPED: Qwen3.8-Flash-Next serves on main; phases 0-3 done by 2026-08-27 (dated status blocks below). Later perf work lives in prefill-qwen4exp-headroom.md, lookup-drafts.md, and the qwen4exp commits from 2026-09.
+
 > **STATUS 2026-08-26 end of day**: Phases 0, 1 DONE; phase 2 DONE except the
 > multi-sequence hooks. The real UD-IQ1_S checkpoint SERVES: coherent text, decode
 > 7.0 tok/s, prefill ~16 tok/s (expert-scalar-decode-bound — GPU IQ1_S/IQ4_NL expert

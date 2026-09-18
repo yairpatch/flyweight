@@ -1,5 +1,7 @@
 # qwen4exp forward semantics — extracted from transformers (merged PR #48337) + llama.cpp PR #27739
 
+> **STATUS 2026-09-18**: REFERENCE, not a plan: the forward semantics of the qwen4exp family as extracted from transformers and llama.cpp. Re-fetch upstream if a number here is in doubt.
+
 Sources: `transformers/models/qwen4_exp/{modular,modeling,configuration}_qwen4_exp.py` on
 transformers main (PR merged 2026-08-26, head b61b98be), llama.cpp conversion
 `JJJYmmm/llama.cpp@add_qwen4exp:conversion/qwen4exp.py` (head dfa0c0fe), and the unsloth

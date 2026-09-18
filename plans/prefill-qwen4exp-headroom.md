@@ -1,5 +1,7 @@
 # qwen4exp prefill headroom — four levers, measured in ranking order
 
+> **STATUS 2026-09-18**: SHIPPED 2026-09-08/09 (PR #39, #40): routed MMQ auto, 256 MiB auto budget, 512-row delta floor, block_reduce_sum race fix. Defaults went 229 -> ~475 tok/s on Flash-Next IQ1_S.
+
 ## Motivation (measured 2026-09-08)
 
 Qwen3.8-Flash-Next UD-IQ1_S, 2048-token prompt, warm page cache,

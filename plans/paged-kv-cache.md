@@ -1,5 +1,7 @@
 # Paged KV cache (vLLM-style)
 
+> **STATUS 2026-09-18**: PHASE 0 ONLY: `kv_peak_live_bytes` telemetry in `/health` shipped and measured 9.5% reservation occupancy, which makes the case. Phases 1-5 (block tables, shared pool, retiring the per-slot reservation) not started.
+
 ## Where the runtime is today
 
 Each of the `--parallel N` slots owns one **contiguous** device arena of

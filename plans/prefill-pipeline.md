@@ -1,5 +1,7 @@
 # Prefill chunk pipelining — CPU experts overlapped with GPU dense work
 
+> **STATUS 2026-09-18**: SHIPPED: two-half chunk schedule overlapping CPU experts with GPU dense work. `FLYWEIGHT_PREFILL_ROWS=2048` datum left as non-default (costs expert-cache slots).
+
 ## Motivation (measured 2026-08-21)
 
 Qwen3.6-35B Q5_K_M, hybrid auto-fit, 4096-token prompt, RTX 5070 Ti Laptop,

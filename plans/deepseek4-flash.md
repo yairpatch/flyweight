@@ -1,5 +1,7 @@
 # DeepSeek-V4-Flash (`deepseek4`) support, targeting UD-IQ3_XXS
 
+> **STATUS 2026-09-18**: SHIPPED stages A-D: text path verified on the real UD checkpoint 2026-09-11, hybrid execution and the lightning indexer in, DSpark drafter sidecar and DSML tool-call parsing in the server. Open: vision (the VL tensors load but nothing wires an image token).
+
 ## Context
 
 We want `flyweight` to serve `unsloth/DeepSeek-V4-Flash-0731-GGUF`, primarily the

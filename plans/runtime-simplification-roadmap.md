@@ -1,5 +1,7 @@
 # Native CUDA runtime simplification roadmap
 
+> **STATUS 2026-09-18**: PARTIAL: Changes 0-5 complete (2026-07-29/30, marked inline). Changes 6-9 (public modes, forward orchestration, scheduler token budget, flag removal) open. The deferred-ideas list at the end is still the deferred list.
+
 ## Goal
 
 Reduce native Qwen CPU/GPU orchestration complexity without giving up the
