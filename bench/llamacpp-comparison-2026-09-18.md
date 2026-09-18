@@ -282,3 +282,35 @@ two in the current tile), and eight warps hide less of that latency than
 sixteen. llama.cpp's layout works with its swizzled tile loader and its
 Q8_1 activation format, not on its own; the port is all of those together
 or nothing. Reverted.
+
+### Sixth pass: the standalone kernel, the GPU timeline, and the tail
+
+Two measurements that were missing all day. First, our kernels on
+llama.cpp's own benchmark shape (4096 x 14336, 512 tokens, repeated
+launches, nothing else on the stream), against `test-backend-ops perf`:
+
+| kernel | llama.cpp | flyweight |
+| --- | --- | --- |
+| IQ2_XXS | 72 TFLOPS | 78 |
+| IQ1_S | 65 | 73 |
+| IQ3_XXS | 68 | 74 |
+
+The kernels were never behind; the in-situ figures earlier in this report
+carried the serializing launch timer's overhead. The port would have gained
+nothing. Second, a GPU timeline (`FLYWEIGHT_PREFILL_TIMELINE=1`: events
+around every launch, read back at chunk end) showed the GPU busy 97% of the
+prefill's wall time and the full 256-row chunks running at 889 tok/s, level
+with llama.cpp's overall rate. The whole remaining gap was the 137-row tail
+chunk: its 9 rows past the last 128-token tile cost a second full tile,
+244 ms for a chunk that should take 150.
+
+Every kernel decodes the matrix once regardless of row count (the per-row
+and tiled dp4a kernels cost the same as the empty tile they were tried
+against), so the only reducible part is the MMA phase: a 32-token variant
+of each MMQ kernel (`*_q8_mmq_n`, one token fragment per warp, the thing
+llama.cpp's J-templates do) now takes remainders of up to 32 rows. Tail
+chunk 244 -> 210 ms; prefill 2.33 -> 2.30 s, 839 tok/s at both KV types;
+greedy output identical on the 27B and Flash-Next. The remainder's decode
+floor, about 45 ms per prompt on the 27B, is what stands between this and
+llama.cpp's 894, plus some 40 ms of fixed per-request work before the
+first chunk.

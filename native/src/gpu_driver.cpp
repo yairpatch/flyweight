@@ -1335,6 +1335,8 @@ extern "C" int flyweight_gpu_compile(
              "iq3s_q8_matvec_transposed_rows",
              "iq3s_q8_matmul_tiled", "iq3s_q8_mmq",
              "quantize_q8_blocks_rows",
+             "iq2xxs_q8_mmq_n", "iq1s_q8_mmq_n", "iq3xxs_q8_mmq_n",
+             "iq2s_q8_mmq_n", "iq2xs_q8_mmq_n", "iq1m_q8_mmq_n",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
              // Grouped routed-expert kernels: the IQ codebook formats, plus
              // Q2_K gate/up and Q4_0 down for a Q2_K-packed MoE checkpoint.
