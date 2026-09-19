@@ -76,23 +76,30 @@ class Qwen35SampledMtpTest(unittest.TestCase):
         self.assertNotEqual(plain, bare)
 
     def test_accepted_rows_commit_like_the_one_token_path(self) -> None:
-        # The random-weight fixture's draft head rarely agrees with its target
-        # (about one draft in 150), so most rounds exercise only rejection.
-        # This configuration deterministically accepts a draft, which is the
-        # path where the accepted row's commit has to match.
+        # `drafted == plain` is the claim, and it holds on every build. An
+        # acceptance is the precondition that makes it cover the accepted row's
+        # commit rather than only the rejection path -- and this fixture cannot
+        # promise one. Its draft head is random weights against a 512-token
+        # vocabulary, so agreement runs at about one draft in five hundred:
+        # 142 drafts here is 0.28 expected acceptances, and the one this build
+        # gets is a coincidence rather than a rate. Measured: still exactly 1
+        # over the 462 drafts of a run three times as long, and 0 under every
+        # response_format grammar tried. Any build that rounds differently
+        # re-rolls it, which is what Windows and then an ubuntu runner did.
+        #
+        # Asserting it therefore pins a ~1-in-4 coin that happened to land on
+        # the machine it was written on. Making this path genuinely covered
+        # needs a fixture whose draft head correlates with its target; until
+        # then, say what went unchecked instead of failing for it.
         sampling = dict(forbid_tool_calls=True)
         plain, _ = self._engine_tokens(0, **sampling)
         drafted, draft_info = self._engine_tokens(4, **sampling)
-        # The equality is the claim and is checked everywhere. The acceptance
-        # is the precondition that makes it cover the accepted-row commit, and
-        # whether one happens at all is a property of these random weights'
-        # exact arithmetic -- which the MSVC host build does not reproduce from
-        # the GCC one, for the reason on test_fold_state_is_bitwise_identical.
-        accepted = int(draft_info["mtp_accepted_tokens"])
         self.assertEqual(drafted, plain)
-        if accepted < 1 and os.name == "nt":
-            self.skipTest("this fixture accepts no draft on the MSVC build")
-        self.assertGreaterEqual(accepted, 1)
+        if int(draft_info["mtp_accepted_tokens"]) < 1:
+            self.skipTest(
+                "this build accepted no draft, so the accepted row's commit "
+                "went unchecked -- see the note above"
+            )
 
     def test_sampled_task_drafts_and_matches_seed_for_seed(self) -> None:
         sampling = dict(
