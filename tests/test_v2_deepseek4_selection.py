@@ -41,8 +41,8 @@ if CHECKPOINT and "IQ3_XXS" not in CHECKPOINT:
     CHECKPOINT = None
 
 
-def fixture(directory: str, **spec) -> Path:
-    path = Path(directory) / "ds4.gguf"
+def fixture(directory: str, name: str, **spec) -> Path:
+    path = Path(directory) / name
     build_deepseek4_gguf(path, DeepSeek4Spec(layers=6, hash_layers=3, **spec))
     return path
 
@@ -51,9 +51,16 @@ class SelectionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="flyweight-ds4sel-")
         self.addCleanup(self.directory.cleanup)
+        self._opened = 0
 
     def open(self, **spec) -> V2Model:
-        model = V2Model(fixture(self.directory.name, **spec))
+        # A file per open. The tests that compare two configurations used to
+        # rebuild the fixture over the same path, and on Windows the first
+        # model still has it mapped -- which is a write to an open mapping, not
+        # a delete, so it fails inside the test rather than at cleanup.
+        self._opened += 1
+        name = f"ds4-{self._opened}.gguf"
+        model = V2Model(fixture(self.directory.name, name, **spec))
         self.addCleanup(model.close)
         return model
 

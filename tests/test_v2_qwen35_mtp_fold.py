@@ -70,9 +70,22 @@ class Qwen35MtpFoldTest(unittest.TestCase):
         self.assertGreater(int(fold_info["mtp_rejected_tokens"]), 0)
         self.assertEqual(folded, replayed)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "the host forward is row-count-stable on the GCC build, not the MSVC one",
+    )
     def test_fold_state_is_bitwise_identical(self) -> None:
         # The native check re-runs the full replay after every fold and throws
         # unless the conv and recurrent state match byte for byte.
+        #
+        # Byte-for-byte holds where the forward is row-count-stable. The note
+        # on qwen_mtp_fold_check explains why the GPU backend is not -- kernel
+        # selection turns on row count -- and the MSVC host build is not
+        # either: it compiles cpu_native_kernels.cpp /arch:AVX2 where GCC
+        # builds it at baseline, and the check reports 1.67e-6 on the first
+        # delta layer's conv state, the same ulp order as the 4e-6 measured on
+        # the GPU. test_fold_matches_full_replay is the guarantee that does
+        # hold everywhere, and it runs on Windows.
         _, info = self._generate({"FLYWEIGHT_MTP_FOLD_CHECK": "1"})
         self.assertGreater(int(info["mtp_rejected_tokens"]), 0)
 

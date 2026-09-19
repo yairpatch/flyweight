@@ -80,6 +80,14 @@ jobs:
         run: ruff check src tests bench tools native/tools setup.py
       - name: Type check
         run: mypy src/flyweight
+      # The POSIX-only calls (os.sysconf, POSIX_FADV_DONTNEED) are guarded at
+      # runtime, but mypy checks against the stubs of the platform it is
+      # running on, so only the Windows job saw them -- and that job spent a
+      # month failing at an earlier step, so it never did. Asking the question
+      # on Linux too costs seconds and is reproducible on a developer's box.
+      - name: Type check as Windows
+        if: runner.os == 'Linux'
+        run: mypy --platform win32 src/flyweight
       - name: Test
         # CI runs everything, including the tests marked slow, in parallel:
         # they are the parity checks worth having a machine wait for.

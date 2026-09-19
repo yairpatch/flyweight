@@ -14,7 +14,17 @@ from tests.k2_horizon_gguf_fixture import K2HorizonSpec, build_k2_horizon_gguf
 _WORKSPACES: list[tempfile.TemporaryDirectory] = []
 
 
+_MODELS: list[V2Model] = []
+
+
 def tearDownModule():
+    # Windows refuses to delete a file that is still mapped, so every model
+    # opened here is closed before its workspace goes -- a test that forgets
+    # its own close() would otherwise take the module's teardown down with it.
+    # close() is idempotent, so closing early costs nothing here.
+    for model in _MODELS:
+        model.close()
+    _MODELS.clear()
     for holder in _WORKSPACES:
         holder.cleanup()
     _WORKSPACES.clear()
@@ -30,7 +40,9 @@ def _model(**kwargs) -> tuple[V2Model, K2HorizonSpec]:
     directory = _workspace("flyweight-k2-horizon-")
     path = directory / "k2_horizon.gguf"
     spec = build_k2_horizon_gguf(path, **kwargs)
-    return V2Model(path), spec
+    model = V2Model(path)
+    _MODELS.append(model)
+    return model, spec
 
 
 def _native(model: V2Model, **options):

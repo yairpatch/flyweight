@@ -17,9 +17,20 @@ SPILL_BUDGET_BYTES = 32 * 1024 * 1024
 _WORKSPACES: list[tempfile.TemporaryDirectory] = []
 
 
+_MODELS: list[V2Model] = []
+
+
 def tearDownModule():
     # /tmp is often a RAM-backed tmpfs and these fixtures are megabytes each,
     # so a directory per test adds up fast across repeated runs.
+    #
+    # Windows refuses to delete a file that is still mapped, so every model
+    # opened here is closed before its workspace goes -- a test that forgets
+    # its own close() would otherwise take the module's teardown down with it.
+    # close() is idempotent, so closing early costs nothing here.
+    for model in _MODELS:
+        model.close()
+    _MODELS.clear()
     for holder in _WORKSPACES:
         holder.cleanup()
     _WORKSPACES.clear()
@@ -31,7 +42,9 @@ def _model(**kwargs) -> tuple[V2Model, DenseQwenSpec, Path]:
     directory = Path(holder.name)
     path = directory / "dense.gguf"
     spec = build_dense_qwen35_gguf(path, **kwargs)
-    return V2Model(path), spec, path
+    model = V2Model(path)
+    _MODELS.append(model)
+    return model, spec, path
 
 
 def _native(model: V2Model, **options):

@@ -53,8 +53,12 @@ describe("docxToMarkdown", () => {
 describe("pdfText", () => {
   beforeAll(() => {
     // In the browser the worker is a Vite-emitted asset URL. Node has no
-    // origin to fetch that from, so point pdf.js at the file on disk.
-    pdfjs.GlobalWorkerOptions.workerSrc = resolve("node_modules/pdfjs-dist/build/pdf.worker.mjs");
+    // origin to fetch that from, so point pdf.js at the file on disk -- the
+    // legacy worker, to match the legacy API build vite.config.ts aliases in
+    // for tests. The two builds are not interchangeable across that boundary.
+    pdfjs.GlobalWorkerOptions.workerSrc = resolve(
+      "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs",
+    );
   });
 
   it("returns one entry per page from the text layer", async () => {

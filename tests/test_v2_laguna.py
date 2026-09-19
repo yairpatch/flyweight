@@ -17,9 +17,20 @@ from tests.laguna_gguf_fixture import LagunaSpec, build_laguna_gguf
 _WORKSPACES: list[tempfile.TemporaryDirectory] = []
 
 
+_MODELS: list[V2Model] = []
+
+
 def tearDownModule():
     # These fixtures are megabytes each and /tmp is usually a RAM-backed
     # tmpfs, so a directory per test adds up fast across repeated runs.
+    #
+    # Every model opened here is closed first: Windows refuses to delete a file
+    # that is still mapped, so a test that forgets its own close() takes the
+    # whole module's teardown down with it. close() is idempotent, so a test
+    # that does close early costs nothing here.
+    for model in _MODELS:
+        model.close()
+    _MODELS.clear()
     for holder in _WORKSPACES:
         holder.cleanup()
     _WORKSPACES.clear()
@@ -35,7 +46,9 @@ def _model(**kwargs) -> tuple[V2Model, LagunaSpec]:
     directory = _workspace("flyweight-laguna-")
     path = directory / "laguna.gguf"
     spec = build_laguna_gguf(path, **kwargs)
-    return V2Model(path), spec
+    model = V2Model(path)
+    _MODELS.append(model)
+    return model, spec
 
 
 def _native(model: V2Model, **options):

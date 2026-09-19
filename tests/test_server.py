@@ -3017,6 +3017,10 @@ class HTTPServerTests(unittest.TestCase):
             }
         )
         captured = StringIO()
+        # The request row's `out` and `tok/s` columns. The stub streams two
+        # tokens 0.5 s apart, so the honest rate is one interval over 0.5 s =
+        # 2.0 tok/s; dividing tokens by the same span would print 4.0.
+        pattern = re.compile(r"chat\s.*?\s(\d+)\s+([\d.]+)\s")
         with patch("time.perf_counter", lambda: next(ticks)):
             with redirect_stderr(captured):
                 self.connection.request(
@@ -3026,10 +3030,18 @@ class HTTPServerTests(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                 )
                 self.connection.getresponse().read()
-        # The request row's `out` and `tok/s` columns. The stub streams two
-        # tokens 0.5 s apart, so the honest rate is one interval over 0.5 s =
-        # 2.0 tok/s; dividing tokens by the same span would print 4.0.
-        row = re.search(r"chat\s.*?\s(\d+)\s+([\d.]+)\s", captured.getvalue())
+                # The row is written by the handler thread after it has
+                # finished sending the body, so the client's read() returning
+                # is not proof that it has happened. Waiting inside the
+                # redirect is the difference between reading the row and
+                # reading an empty buffer while the row goes to the real
+                # stderr -- which is what a loaded Windows runner did.
+                # monotonic, because perf_counter is the patched one.
+                deadline = time.monotonic() + 5.0
+                row = pattern.search(captured.getvalue())
+                while row is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    row = pattern.search(captured.getvalue())
         self.assertIsNotNone(row, captured.getvalue())
         tokens, rate = int(row.group(1)), float(row.group(2))
         self.assertEqual(tokens, 2)

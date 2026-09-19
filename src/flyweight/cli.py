@@ -140,7 +140,10 @@ def _drop_file_cache(path: Path) -> None:
         raise RuntimeError("--cold-cache requires POSIX_FADV_DONTNEED support")
     descriptor = os.open(path, os.O_RDONLY)
     try:
-        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+        # The hasattr above is the guard; mypy does not narrow module
+        # attributes through it, and on a Windows runner the os stub has
+        # neither name.
+        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)  # type: ignore[attr-defined]
     finally:
         os.close(descriptor)
 
