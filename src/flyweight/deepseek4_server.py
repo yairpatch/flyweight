@@ -412,6 +412,9 @@ class Deepseek4Engine:
                 task.logits = slot.runtime.forward_target(current)
                 slot.tokens.append(current)
             logits = task.logits
+            # forward_target only returns None for logits=False, which is the
+            # prefill call above, not this one.
+            assert logits is not None
         else:
             logits = slot.runtime.forward(current)
             slot.tokens.append(current)

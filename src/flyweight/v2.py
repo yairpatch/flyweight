@@ -19,7 +19,7 @@ from typing import Any, ClassVar, Iterator, Mapping, Sequence
 try:  # optional: only used to keep the logits path off the Python interpreter
     import numpy as _numpy
 except ImportError:  # pragma: no cover - numpy is normally present
-    _numpy = None
+    _numpy = None  # type: ignore[assignment]
 
 
 class V2Error(RuntimeError):

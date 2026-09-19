@@ -400,6 +400,10 @@ if(NOT MSVC)
     target_compile_options(
         flyweight_hf_quantize_tiling_contract PRIVATE -ffp-contract=off
     )
+else()
+    target_compile_options(
+        flyweight_hf_quantize_tiling_contract PRIVATE /fp:strict
+    )
 endif()
 if(BUILD_TESTING)
     add_test(
@@ -451,6 +455,8 @@ if(BUILD_TESTING)
         NAME flyweight_cpu_parity_contract
         COMMAND flyweight_cpu_parity_contract
     )
+    # See the note beside flyweight_iq_kernel_contract's timeout.
+    set_tests_properties(flyweight_cpu_parity_contract PROPERTIES TIMEOUT 3600)
 endif()
 
 # Shares the CPU backend sources with the parity contract: it runs the emulated
@@ -526,6 +532,12 @@ if(BUILD_TESTING)
         NAME flyweight_iq_kernel_contract
         COMMAND flyweight_iq_kernel_contract
     )
+    # The two corpus-emulating tests run every case one fiber per CUDA thread,
+    # which is roughly a thousand times slower than the GPU and puts this one at
+    # ten to sixteen minutes on a CI Linux runner. ctest's default 1500 s is
+    # within a factor of two of that on the faster of the two platforms, which
+    # is not a margin -- say the budget instead of discovering it.
+    set_tests_properties(flyweight_iq_kernel_contract PROPERTIES TIMEOUT 3600)
 endif()
 
 add_executable(flyweight_turboquant_bench tools/bench_turboquant.cpp)
@@ -564,6 +576,13 @@ add_dependencies(flyweight_v2 flyweight_cpu_kernel_sources)
 # quantizes to, and changes it differently on machines with and without FMA.
 # Applied per source rather than per target, so the rest of the runtime keeps
 # its FMAs.
+#
+# MSVC needs the same statement and had none, which is why the golden hashes
+# only ever held on GCC: /fp:precise leaves the compiler free to contract and
+# to reassociate the scale searches' reductions, and `src/qwen_kquant_pack_avx2
+# .cpp` is handed /arch:AVX2 below, so it has an FMA to fuse into. /fp:strict
+# is the switch that forbids both. It costs some speed in two translation
+# units that only run while a safetensors checkpoint is being quantized.
 if(NOT MSVC)
     set_source_files_properties(
         src/qwen_kquant_pack.cpp
@@ -573,6 +592,11 @@ if(NOT MSVC)
     set_source_files_properties(
         src/qwen_kquant_pack_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off"
+    )
+else()
+    set_source_files_properties(
+        src/qwen_kquant_pack.cpp
+        PROPERTIES COMPILE_OPTIONS "/fp:strict"
     )
 endif()
 set_source_files_properties(
@@ -620,7 +644,12 @@ if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/cpu_q8_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/cpu_q8_dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-    set_source_files_properties(src/qwen_kquant_pack_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    # /fp:strict for the same reason the GCC branch above says -mfma: the
+    # scale search's mul+add pairs must not become FMAs.
+    set_source_files_properties(
+        src/qwen_kquant_pack_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict"
+    )
     # Native kernels contain hot loops (dot_f32, rms_norm, route_topk) that
     # benefit from AVX2 vectorisation.  Without this flag MSVC targets SSE2.
     set_source_files_properties(src/cpu_native_kernels.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
