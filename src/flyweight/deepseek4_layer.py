@@ -190,7 +190,7 @@ class DeepSeek4Block:
         attn_mix = [self._mix(streams[p], self.hc_attn) for p in range(positions)]
         collapsed = np.stack([m.collapsed for m in attn_mix])
 
-        queries, latents = [], []
+        queries, per_position_latents = [], []
         for position in range(positions):
             normed = rms_norm(collapsed[position], self.attn_norm, epsilon=self.epsilon)
             low_rank = matvec(self.model, prefix + "attn_q_a.weight", normed, self.q_lora)
@@ -207,11 +207,11 @@ class DeepSeek4Block:
                 self.kv_a_norm, epsilon=self.epsilon,
             )
             # The cache holds f16, and the reference's own numbers reflect that.
-            latents.append(
+            per_position_latents.append(
                 rope(latent, position, self.rope_dim, **self.rope_kwargs)
                 .astype(np.float16).astype(np.float32)
             )
-        latents = np.stack(latents)
+        latents = np.stack(per_position_latents)
 
         # A compressed layer summarizes completed blocks; below its ratio there
         # are none, which is why a short prompt runs a 128:1 layer as a plain

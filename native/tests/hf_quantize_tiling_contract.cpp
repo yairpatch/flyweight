@@ -109,6 +109,14 @@ void check(const Packer& packer, std::uint64_t elements, std::uint64_t tile) {
 // is the whole point: without it the failure is a fraction of a bit of
 // perplexity, which no test would have caught.
 //
+// The same statement has to be made to every compiler, and MSVC had never been
+// told: /fp:precise leaves it free to contract and to reassociate, and five of
+// the nine formats packed differently on Windows for a month. Not the four that
+// have no iterative scale search (q8_0, iq2_xs, q3_K, iq3_xxs) -- and q8_0
+// matching over 128 Ki values is also what rules out the inputs differing, so
+// `sample`'s std::sin agrees across the two libms. The CMake note beside
+// src/qwen_kquant_pack.cpp carries the flag.
+//
 // If a deliberate change to the packers lands, re-measure these AND bump
 // kPackerVersion in flyweight_v2_hf_cache.hpp. They travel together.
 struct Golden {

@@ -49,19 +49,18 @@ flyweight = [
 select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
+# 3.12 rather than requires-python's 3.11: numpy 2.5's stubs are written with
+# `type` statements, which mypy parses with the grammar of this setting. CI's
+# matrix still RUNS 3.11, so a real incompatibility is caught by the tests.
 python_version = "3.12"
 ignore_missing_imports = true
 # ctypes field declarations may contain a third bit-width element, and values
 # returned from C-backed metadata dictionaries are necessarily runtime-typed.
 disable_error_code = ["misc", "call-overload"]
+# numpy is checked normally. A `follow_imports = "skip"` override on it used to
+# sit here as a second belt beside the 3.12 floor above, and it was worse than
+# nothing: skipping types the module as Any, which makes every
+# `x = np.zeros(...)` an un-inferrable assignment. That was invisible while CI
+# had no numpy installed and ignore_missing_imports covered it, and became 23
+# spurious var-annotated errors the moment the test job started installing it.
 
-# numpy 2.5's stubs are written in 3.12 syntax (`type` statements), which mypy
-# parses with the grammar of `python_version` above -- so checking our code
-# against the oldest Python we support failed inside a dependency before it
-# reached a line of ours. Skipping the import types numpy as Any, which is all
-# `ignore_missing_imports` was already giving it here anyway.
-[[tool.mypy.overrides]]
-# Both spellings: "numpy.*" does not match the top-level `numpy` module, which
-# is the one whose __init__.pyi carries the 3.12 syntax.
-module = ["numpy", "numpy.*"]
-follow_imports = "skip"

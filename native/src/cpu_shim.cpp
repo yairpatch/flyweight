@@ -89,24 +89,11 @@ void BlockScheduler::run(unsigned int threads, unsigned int shared_bytes,
     void* const converted = ConvertThreadToFiber(nullptr);
     scheduler_handle_ = converted != nullptr ? converted : GetCurrentFiber();
 
-    // Reuse existing fibers when the thread count has not grown.  Creating and
-    // deleting fibers on every block launch was the single most expensive CPU
-    // backend operation; the handles are one-shot on Windows (a fiber that has
-    // been entered cannot be re-entered), but the trampoline never returns --
-    // it switches back to the scheduler via SwitchToFiber -- so the handle is
-    // still valid and can be re-entered on the *next* block launch.
-    static thread_local unsigned int prev_threads = 0;
-    if (threads > prev_threads) {
-        for (unsigned int t = prev_threads; t < threads; ++t) {
-            Fiber& fiber = fibers_[t];
-            fiber.alive = false;
-            fiber.releasable = false;
-            fiber.waiting = Waiting::none;
-            if (fiber.handle != nullptr) DeleteFiber(fiber.handle);
-            fiber.handle = nullptr;
-        }
-        prev_threads = threads;
-    }
+    // Fibers are kept across block launches: creating and deleting one per
+    // thread per launch was the single most expensive CPU backend operation.
+    // A kept handle is parked at the top of fiber_trampoline's loop, which is
+    // what makes re-entering it run the *next* launch's body rather than
+    // falling out of the start routine and taking the OS thread with it.
 #endif
 
     for (unsigned int thread = 0; thread < threads; ++thread) {
@@ -261,25 +248,53 @@ void BlockScheduler::return_to_scheduler() {
 #endif
 }
 
+#if defined(_WIN32)
+BlockScheduler::~BlockScheduler() {
+    // Every fiber here is parked at the top of the trampoline's loop and none
+    // of them is the running one -- scheduler_handle_ is, and it belongs to the
+    // thread rather than to this vector.
+    for (Fiber& fiber : fibers_) {
+        if (fiber.handle != nullptr) DeleteFiber(fiber.handle);
+        fiber.handle = nullptr;
+    }
+}
+#endif
+
 namespace {
 
 void fiber_trampoline() {
-    const FiberEntry entry = t_entry;
-    BlockScheduler* const scheduler = entry.scheduler;
+    // Windows reuses a fiber handle across block launches, so the trampoline
+    // has to be a loop. A Win32 fiber resumes where it last switched away --
+    // inside return_to_scheduler() -- and a fiber start routine that RETURNS
+    // exits the whole OS thread. Falling off the end here therefore killed the
+    // thread on the second launch that reused the handle: a worker thread
+    // vanished mid-kernel (the CPU parity contract then waited on it forever),
+    // and on the main thread it was ExitThread on the last thread, so the
+    // process left with status 0 and the IQ kernel contract "passed" in 20 ms
+    // without running its cases.
+#if defined(_WIN32)
+    for (;;) {
+#endif
+        const FiberEntry entry = t_entry;
+        BlockScheduler* const scheduler = entry.scheduler;
 
-    t_scheduler = scheduler;
-    t_thread_index = Dim3{entry.thread, 0, 0};
+        t_scheduler = scheduler;
+        t_thread_index = Dim3{entry.thread, 0, 0};
 
-    entry.body(entry.payload);
+        entry.body(entry.payload);
 
-    // Lane exit: stop counting toward barriers so survivors are not waiting on
-    // a thread that has already returned.
-    scheduler->retire(entry.thread);
+        // Lane exit: stop counting toward barriers so survivors are not waiting
+        // on a thread that has already returned.
+        scheduler->retire(entry.thread);
 
 #if defined(_WIN32)
-    scheduler->return_to_scheduler();
+        // Parks here until run() hands this fiber the next launch's entry.
+        scheduler->return_to_scheduler();
+    }
 #endif
-    // POSIX returns to uc_link, which is the scheduler context.
+    // POSIX returns to uc_link, which is the scheduler context. Its contexts
+    // are rebuilt by makecontext on every launch, so there is nothing to reuse
+    // and no loop to run.
 }
 
 }  // namespace

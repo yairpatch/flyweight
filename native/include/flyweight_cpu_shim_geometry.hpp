@@ -119,6 +119,12 @@ public:
 
     void return_to_scheduler();
 
+#if defined(_WIN32)
+    // Frees the kept fibers. There is exactly one scheduler per worker thread
+    // and it is never copied, so this runs at thread exit and nowhere else.
+    ~BlockScheduler();
+#endif
+
     unsigned char* dynamic_shared() { return shared_.data(); }
 
     // Scratch for emulating register exchange between lanes. Indexed by
