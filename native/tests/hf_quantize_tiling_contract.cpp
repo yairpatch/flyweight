@@ -61,11 +61,34 @@ const Packer kPackers[] = {
 // Values with structure rather than noise: the K-quant scale search behaves
 // differently on a block that is nearly uniform than on one with an outlier,
 // and both should appear across a run this long.
+//
+// Deliberately libm-free, which it was not: this was a sine, and the golden
+// hashes below therefore only ever held on glibc. MSVC's sinf is
+// `(float)sin((double)x)` and disagrees with glibc's by an ulp on many inputs.
+// That is invisible to q8_0's 8-bit rounding and to the codebook formats, and
+// it reliably flips a comparison inside the five iterative scale searches --
+// q2_K, iq4_xs, q4_K, q5_K and q6_K packed differently on Windows for a month
+// because of it, and the failure named the encoder, which was innocent.
+//
+// Every operation below is exact or a single correct rounding on any IEEE
+// machine, so the inputs are now the same everywhere. Keep it that way: a
+// golden-byte test may not call a function whose result is a quality-of-
+// implementation choice.
 std::vector<float> sample(std::uint64_t count) {
     std::vector<float> out(count);
     for (std::uint64_t i = 0; i < count; ++i) {
-        const float base = std::sin(static_cast<float>(i) * 0.0007f);
-        const float ramp = 1.0f + static_cast<float>(i % 97) * 0.01f;
+        // A triangle wave of period 8192, squared and re-signed: smooth, and
+        // nearly flat for long stretches either side of the turning points.
+        // 4096 is a power of two, so the scaling is exact.
+        const float phase =
+            static_cast<float>(static_cast<std::int64_t>(i % 8192) - 4096);
+        const float triangle = phase * (1.0f / 4096.0f);
+        const float squared = triangle * triangle;
+        const float base = phase < 0.0f ? -squared : squared;
+        // 100 + (i % 97) is an integer well below 2^24, so the sum is exact and
+        // the scaling is one rounding -- and there is no multiply-add here for
+        // a compiler to contract.
+        const float ramp = (100.0f + static_cast<float>(i % 97)) * 0.01f;
         // One outlier per 4096, which is what stretches a block's scale.
         out[i] = base * ramp * (i % 4096 == 17 ? 40.0f : 1.0f);
     }
@@ -109,16 +132,14 @@ void check(const Packer& packer, std::uint64_t elements, std::uint64_t tile) {
 // is the whole point: without it the failure is a fraction of a bit of
 // perplexity, which no test would have caught.
 //
-// The same statement has to be made to every compiler, and MSVC had never been
-// told: /fp:precise leaves it free to contract and to reassociate, and five of
-// the nine formats packed differently on Windows for a month. Not the four that
-// have no iterative scale search (q8_0, iq2_xs, q3_K, iq3_xxs) -- and q8_0
-// matching over 128 Ki values is also what rules out the inputs differing, so
-// `sample`'s std::sin agrees across the two libms. The CMake note beside
-// src/qwen_kquant_pack.cpp carries the flag.
+// MSVC needs no equivalent flag: /fp:strict was measured against the default
+// here and produced byte-identical output, so it is not contracting these. The
+// Windows divergence this test did report came from `sample` below.
 //
 // If a deliberate change to the packers lands, re-measure these AND bump
-// kPackerVersion in flyweight_v2_hf_cache.hpp. They travel together.
+// kPackerVersion in flyweight_v2_hf_cache.hpp. They travel together. Changing
+// `sample` re-measures these and does NOT bump it: the arena on disk is keyed
+// by what the encoders do, and this file's inputs are not that.
 struct Golden {
     const char* name;
     void (*pack)(const float*, std::uint64_t, std::uint8_t*);
@@ -128,15 +149,15 @@ struct Golden {
 };
 
 const Golden kGolden[] = {
-    {"q8_0", qwen_kpack::pack_q8_0, 32, 34, 0x2c01736abd78f494ull},
-    {"iq2_xs", qwen_kpack::pack_iq2_xs, 256, 74, 0x2d5a8e5462add072ull},
-    {"q2_K", qwen_kpack::pack_q2_k, 256, 84, 0x73f68a8976f06085ull},
-    {"q3_K", qwen_kpack::pack_q3_k, 256, 110, 0x0874546bd7fc0665ull},
-    {"iq3_xxs", qwen_kpack::pack_iq3_xxs, 256, 98, 0x3fc952552f2e3d49ull},
-    {"iq4_xs", qwen_kpack::pack_iq4_xs, 256, 136, 0xe114716bcc53707bull},
-    {"q4_K", qwen_kpack::pack_q4_k, 256, 144, 0xd1d80e944961a86aull},
-    {"q5_K", qwen_kpack::pack_q5_k, 256, 176, 0x8f750028afb2771eull},
-    {"q6_K", qwen_kpack::pack_q6_k, 256, 210, 0x62da10453f32c722ull},
+    {"q8_0", qwen_kpack::pack_q8_0, 32, 34, 0xa85b41ac2d9ca1a9ull},
+    {"iq2_xs", qwen_kpack::pack_iq2_xs, 256, 74, 0x430064f31f5a5a1bull},
+    {"q2_K", qwen_kpack::pack_q2_k, 256, 84, 0x635bc71a24e8085cull},
+    {"q3_K", qwen_kpack::pack_q3_k, 256, 110, 0x77c3b5e34898bcc6ull},
+    {"iq3_xxs", qwen_kpack::pack_iq3_xxs, 256, 98, 0xf95674cd48a1f632ull},
+    {"iq4_xs", qwen_kpack::pack_iq4_xs, 256, 136, 0xd319fd00b201c17eull},
+    {"q4_K", qwen_kpack::pack_q4_k, 256, 144, 0x23eced7c2f5d2cecull},
+    {"q5_K", qwen_kpack::pack_q5_k, 256, 176, 0x65d6977eba8b3cf1ull},
+    {"q6_K", qwen_kpack::pack_q6_k, 256, 210, 0x1f18bed7969d390bull},
 };
 
 std::uint64_t fnv1a(const std::vector<std::uint8_t>& bytes) {
