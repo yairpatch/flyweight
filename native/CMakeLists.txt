@@ -400,10 +400,6 @@ if(NOT MSVC)
     target_compile_options(
         flyweight_hf_quantize_tiling_contract PRIVATE -ffp-contract=off
     )
-else()
-    target_compile_options(
-        flyweight_hf_quantize_tiling_contract PRIVATE /fp:strict
-    )
 endif()
 if(BUILD_TESTING)
     add_test(
@@ -577,12 +573,9 @@ add_dependencies(flyweight_v2 flyweight_cpu_kernel_sources)
 # Applied per source rather than per target, so the rest of the runtime keeps
 # its FMAs.
 #
-# MSVC needs the same statement and had none, which is why the golden hashes
-# only ever held on GCC: /fp:precise leaves the compiler free to contract and
-# to reassociate the scale searches' reductions, and `src/qwen_kquant_pack_avx2
-# .cpp` is handed /arch:AVX2 below, so it has an FMA to fuse into. /fp:strict
-# is the switch that forbids both. It costs some speed in two translation
-# units that only run while a safetensors checkpoint is being quantized.
+# MSVC gets no equivalent. /fp:strict was tried on both of these sources and on
+# the contract test, and CI packed bytes identical to the default build, so its
+# /fp:precise is not contracting them and the flag would only cost speed.
 if(NOT MSVC)
     set_source_files_properties(
         src/qwen_kquant_pack.cpp
@@ -592,11 +585,6 @@ if(NOT MSVC)
     set_source_files_properties(
         src/qwen_kquant_pack_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off"
-    )
-else()
-    set_source_files_properties(
-        src/qwen_kquant_pack.cpp
-        PROPERTIES COMPILE_OPTIONS "/fp:strict"
     )
 endif()
 set_source_files_properties(
@@ -644,12 +632,7 @@ if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/cpu_q8_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/cpu_q8_dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-    # /fp:strict for the same reason the GCC branch above says -mfma: the
-    # scale search's mul+add pairs must not become FMAs.
-    set_source_files_properties(
-        src/qwen_kquant_pack_avx2.cpp
-        PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict"
-    )
+    set_source_files_properties(src/qwen_kquant_pack_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     # Native kernels contain hot loops (dot_f32, rms_norm, route_topk) that
     # benefit from AVX2 vectorisation.  Without this flag MSVC targets SSE2.
     set_source_files_properties(src/cpu_native_kernels.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
