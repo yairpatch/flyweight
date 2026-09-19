@@ -1200,7 +1200,58 @@ void qwen_forward_rows(
                     static_cast<std::uint32_t>(value_heads),
                     static_cast<std::uint32_t>(flyweight::v2::workspace::kDeltaDim),
                     gate_args);
-            }else if(head_dim==128)launch("qwen_delta_recurrent_chunk",value_heads,1,128,recurrent_args);
+            }else if(head_dim==128){
+                // Hoist the scan's per-token scalar work into a parallel
+                // prologue. The scan derived the query/key normalizers and the
+                // two gate scalars on lane 0 of every block while the other 127
+                // waited, once per token, and every value head recomputed the
+                // normalizers of the key head it shares. 436.8 -> 315.4 us per
+                // layer chunk on the 27B, and bit-identical: same expressions,
+                // same reduction order, and a float survives a store and a load.
+                //
+                // The two vector buffers borrow delta_w and delta_u and the two
+                // scalar buffers borrow delta_qinv and delta_kinv. Those belong
+                // to the chunked path, which is the alternative to this branch
+                // and never live at the same time, and they are sized
+                // rows*delta_value_heads*(128) and rows*delta_value_heads --
+                // both at least what this needs, since key_heads <= value_heads.
+                // The guard is the condition that sizes them, so a checkpoint
+                // whose head count differs from the prepared one falls back.
+                static const bool prologue_enabled=[]{
+                    const char*setting=std::getenv("FLYWEIGHT_DELTA_PROLOGUE");
+                    return !setting||setting[0]!='0';
+                }();
+                const bool prologue_ok=prologue_enabled&&
+                    !flyweight_backend_is_cpu()&&
+                    static_cast<std::uint64_t>(value_heads)==runtime.delta_value_heads&&
+                    key_heads>0&&key_heads<=value_heads&&
+                    workspace_layout.delta_w.size&&workspace_layout.delta_u.size&&
+                    workspace_layout.delta_qinv.size&&workspace_layout.delta_kinv.size;
+                if(prologue_ok){
+                    const auto norm_q=workspace_layout.delta_w.address(runtime.workspace);
+                    const auto norm_k=workspace_layout.delta_u.address(runtime.workspace);
+                    const auto beta_pre=workspace_layout.delta_qinv.address(runtime.workspace);
+                    const auto decay_pre=workspace_layout.delta_kinv.address(runtime.workspace);
+                    void*prologue_args[]={const_cast<std::uint64_t*>(&fourth),
+                        &beta_logits,const_cast<std::uint64_t*>(&decay_logits),
+                        &decay,&dt,
+                        const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                        const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                        &rows,&key_heads,&value_heads};
+                    launch("qwen_delta_scan_prologue",static_cast<std::uint32_t>(rows),
+                           static_cast<std::uint32_t>(key_heads),128,prologue_args);
+                    void*pre_args[]={const_cast<std::uint64_t*>(&fourth),
+                        const_cast<std::uint64_t*>(&second),
+                        const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                        const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                        &norm,&recurrent_state,const_cast<std::uint64_t*>(&first),
+                        &rows,&key_heads,&value_heads,&head_dim,
+                        const_cast<float*>(&epsilon),&gate_sigmoid};
+                    launch("qwen_delta_recurrent_chunk_pre",value_heads,1,128,pre_args);
+                }else{
+                    launch("qwen_delta_recurrent_chunk",value_heads,1,128,recurrent_args);
+                }
+            }
             else launch("qwen_delta_recurrent_rows",value_heads,1,256,recurrent_args);
             phase(layer_number,"recurrent");
             dense(3,first,residual,value_dim,hidden_size);

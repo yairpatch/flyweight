@@ -1169,6 +1169,74 @@ void delta_conv_chunk(
         channel_state[index] = window[index];
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+extern "C" __global__
+void qwen_delta_scan_prologue(
+    const float* convolved, const float* beta_logits, const float* decay_logits,
+    const float* decay_coefficients, const float* dt_bias,
+    float* norm_query, float* norm_key, float* beta_out, float* decay_out,
+    const int rows, const int key_heads, const int value_heads
+) {
+    // Per-token work hoisted out of the scan below. In the scan these ran on
+    // lane 0 of every block -- two rsqrtf, an expf, a log1pf and another expf --
+    // while the other 127 threads sat at a barrier, once per token per value
+    // head. Two thirds of that was redundant on top: the normalizers belong to
+    // a KEY head, and every value head sharing it recomputed them, which is 2x
+    // at 32 value heads over 16 key heads. Here each key head does it once, in
+    // parallel over tokens, and the scan reads the answers.
+    //
+    // The expressions and the reduction order are copied exactly, and a float
+    // survives a store and a load unchanged, so the scan's output is
+    // bit-identical with or without this. Worth 436.8 -> 315.4 us per layer
+    // chunk on the 27B, measured standalone.
+    //
+    // Grid (rows, key_heads), block 128.
+    const int token = blockIdx.x;
+    const int key_head = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int total_key_dim = key_heads * 128;
+    const int key_offset = key_head * 128;
+    const float* row = convolved
+        + (long long)token * (total_key_dim * 2 + value_heads * 128);
+    const float query_raw = row[key_offset + lane];
+    const float key_raw = row[total_key_dim + key_offset + lane];
+    float query_partial = query_raw * query_raw;
+    float key_partial = key_raw * key_raw;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        query_partial += __shfl_down_sync(0xffffffff, query_partial, offset);
+        key_partial += __shfl_down_sync(0xffffffff, key_partial, offset);
+    }
+    __shared__ float query_sums[4], key_sums[4];
+    __shared__ float query_inverse_norm, key_inverse_norm;
+    if ((lane & 31) == 0) {
+        query_sums[lane >> 5] = query_partial;
+        key_sums[lane >> 5] = key_partial;
+    }
+    __syncthreads();
+    if (lane == 0) {
+        const float query_square = query_sums[0] + query_sums[1] + query_sums[2] + query_sums[3];
+        const float key_square = key_sums[0] + key_sums[1] + key_sums[2] + key_sums[3];
+        query_inverse_norm = rsqrtf(query_square + 1.0e-6f) * rsqrtf(128.0f);
+        key_inverse_norm = rsqrtf(key_square + 1.0e-6f);
+    }
+    __syncthreads();
+    const long long vector_index =
+        (long long)token * total_key_dim + key_offset + lane;
+    norm_query[vector_index] = query_raw * query_inverse_norm;
+    norm_key[vector_index] = key_raw * key_inverse_norm;
+    // The two gate scalars are per value head, so one block does all of them.
+    if (key_head == 0)
+        for (int head = lane; head < value_heads; head += 128) {
+            const long long index = (long long)token * value_heads + head;
+            beta_out[index] = 1.0f / (1.0f + expf(-beta_logits[index]));
+            const float softplus_input = decay_logits[index] + dt_bias[head];
+            const float softplus = softplus_input > 20.0f
+                ? softplus_input : log1pf(expf(softplus_input));
+            decay_out[index] = expf(decay_coefficients[head] * softplus);
+        }
+}
+
 extern "C" __global__
 void qwen_delta_recurrent_chunk(
     const float* convolved, const float* gates,
@@ -1228,6 +1296,85 @@ R"FLYWEIGHT_CUDA(            const float softplus_input = decay_logits[token * v
         __syncthreads();
         shared_key[lane] = key_raw * key_inverse_norm;
         shared_query[lane] = query_raw * query_inverse_norm;
+        __syncthreads();
+        const float value = row[total_key_dim * 2 + head * 128 + lane];
+        float memory = 0.0f;
+        #pragma unroll
+        for (int key = 0; key < 128; ++key) {
+            local_state[key] *= decay_scale;
+            memory += local_state[key] * shared_key[key];
+        }
+        const float delta = (value - memory) * beta;
+        float core = 0.0f;
+        #pragma unroll
+        for (int key = 0; key < 128; ++key) {
+            local_state[key] += shared_key[key] * delta;
+            core += local_state[key] * shared_query[key];
+        }
+        float core_partial = core * core;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            core_partial += __shfl_down_sync(0xffffffff, core_partial, offset);
+        if ((lane & 31) == 0) core_sums[lane >> 5] = core_partial;
+        __syncthreads();
+        if (lane == 0) {
+            const float square = core_sums[0] + core_sums[1] + core_sums[2] + core_sums[3];
+            inverse_rms = rsqrtf(square / 128.0f + epsilon);
+        }
+        __syncthreads();
+        const int output_index = token * value_heads * 128 + head * 128 + lane;
+        const float gate = gates[output_index];
+        const float logistic =
+            1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+        output[output_index] = core * inverse_rms * norm_weights[lane]
+            * (gate_sigmoid ? logistic : gate * logistic);
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int key = 0; key < 128; ++key)
+        state[(head * 128 + key) * 128 + lane] = local_state[key];
+}
+
+extern "C" __global__
+void qwen_delta_recurrent_chunk_pre(
+    const float* convolved, const float* gates,
+    const float* beta_pre, const float* decay_pre,
+    const float* norm_query, const float* norm_key,
+    const float* norm_weights, float* state, float* output,
+    const int rows, const int key_heads, const int value_heads,
+    const int head_dim, const float epsilon,
+    const int gate_sigmoid  // see qwen_delta_recurrent
+) {
+    // The twin of qwen_delta_recurrent_chunk that reads what
+    // qwen_delta_scan_prologue computed instead of deriving it on lane 0 once
+    // per token. Identical arithmetic in the same order, so identical output;
+    // it just stops 127 threads waiting on one for five transcendentals and
+    // two cross-lane reductions per token. Both kernels are kept: the host
+    // takes this pair only where the workspace regions it borrows are sized.
+    // The per-head state stays in registers exactly as in the original.
+    // Requires head_dim == 128. Launch: grid value_heads, block 128.
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= value_heads || head_dim != 128) return;
+    const int key_head = head % key_heads;
+    const int total_key_dim = key_heads * 128;
+    const int key_offset = key_head * 128;
+    float local_state[128];
+    #pragma unroll
+    for (int key = 0; key < 128; ++key)
+        local_state[key] = state[(head * 128 + key) * 128 + lane];
+    __shared__ float shared_key[128], shared_query[128];
+    __shared__ float core_sums[4];
+    __shared__ float inverse_rms;
+    for (int token = 0; token < rows; ++token) {
+        const float* row = convolved
+            + (long long)token * (total_key_dim * 2 + value_heads * 128);
+        const long long vector_index =
+            (long long)token * total_key_dim + key_offset + lane;
+        shared_key[lane] = norm_key[vector_index];
+        shared_query[lane] = norm_query[vector_index];
+        const long long scalar_index = (long long)token * value_heads + head;
+        const float beta = beta_pre[scalar_index];
+        const float decay_scale = decay_pre[scalar_index];
         __syncthreads();
         const float value = row[total_key_dim * 2 + head * 128 + lane];
         float memory = 0.0f;
