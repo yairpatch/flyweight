@@ -30,5 +30,20 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    // pdf.js ships two builds and asks Node to use the legacy one; the
+    // warning it prints under vitest is not advisory. Its default build is
+    // compiled for current browsers and calls Promise.try (V8 13.1, node 24)
+    // and Uint8Array.prototype.toHex (node 26) -- on CI's node 22 the first
+    // of those rejects inside the worker's message handler, which nothing
+    // awaits, so pdfText simply never settles and the two cases time out at
+    // five seconds. A developer on node 26 sees them pass.
+    //
+    // Only the test build is aliased. The browser keeps the default build,
+    // which is the point of shipping it.
+    // Anchored, because a bare string alias matches as a prefix and would
+    // rewrite the `pdfjs-dist/build/pdf.worker.mjs?url` import too.
+    alias: [
+      { find: /^pdfjs-dist$/, replacement: "pdfjs-dist/legacy/build/pdf.mjs" },
+    ],
   },
 });
