@@ -426,6 +426,73 @@ single item, and it runs as a serial walk over the chunk on a
 Making that recurrence genuinely parallel is the next real lever and is a
 kernel project, not a tuning pass.
 
+## Pass 9: the attention crossover, and what the last 346 ms actually is
+
+**The attention threshold was half a step off.** The prefill picks between a
+warp-online attention kernel and a tensor-core QK/PV path on a visible-prefix
+threshold, which pass 4 had set to 1024. Forcing each side and sweeping the
+prompt shows they cross at 512:
+
+| prompt tokens | warp | tensor-core | delta |
+|---|---|---|---|
+| 256 | 432 ms | 438 ms | +1.2% |
+| 512 | 812 | 808 | -0.6% |
+| 1024 | 1230 | 1163 | -5.4% |
+| 2048 | 2543 | 2221 | -12.7% |
+| 4096 | 5143 | 3834 | -25.5% |
+
+Moving it to 512 takes a 1024-token prompt from 1289 to 1203 ms and a
+2048-token one from 1797 to 1768, with greedy output md5-identical. It stays
+a crossover and not an always-on: below 512 the warp kernel is genuinely
+ahead, and forcing the tensor path everywhere costs 1.2% at 256 tokens.
+
+Two traps worth writing down, both of which cost time here. The
+`[attn-prefill]` trace only prints for the first four layers ever, which are
+all inside the opening chunk where a couple of hundred tokens are visible, so
+a `tile=0` there is correct rather than a dormant path. And a branch cut
+before pass 4 merged still carries the old 4096 threshold, so reading the
+constant off the wrong branch invents a bug that is not there.
+
+**Standing after the move**, three interleaved passes, nine repeats each,
+same session:
+
+| engine | TTFT | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| llama.cpp f3a33dff2 | 2.166 s | 891 | 39.0 |
+| flyweight | 2.473 s | 780 | 37.7 |
+
+87.5% of llama.cpp on prefill, against 85.6% before. Both engines read
+slower in absolute terms than the pass-8 session on the same builds, which
+is the machine and not the code -- another reason only same-session
+interleaved pairs are quoted anywhere in this report.
+
+**What the remaining 346 ms is.** Not tuning. The timeline accounts for
+essentially all of the prefill as GPU-busy, the GEMMs are 76% of it and
+already beat llama.cpp's standalone on these shapes, so the balance sits in
+two kernels. Both were measured against a ceiling rather than guessed, by
+timing the same algebra as batched bf16 tensor-core GEMMs in isolation
+(`nvcc -lcublas`, about 20 MB of VRAM, so these run beside a live server):
+
+| path | now | as batched GEMMs | over the prefill |
+|---|---|---|---|
+| DeltaNet recurrence | 437 us/layer-chunk | 76.9 us | ~168 ms |
+| attention | 1370 us/layer-chunk | 61 us | ~165 ms |
+
+That is 333 ms of the 346. Both are rewrites: the DeltaNet's serial token
+scan re-expressed as the chunked form's batched matmuls, and the existing
+tensor-core attention routine brought closer to its own ceiling. Neither is
+a threshold or a tile shape, and both change summation order, so both need
+the quality bench rather than the greedy oracle alone.
+
+**One more dead end, recorded so it is not retried.** The recurrence kernel
+sits at the 255-register cap and spills (96 B stored, 128 B loaded per
+thread). Removing the spill by limiting the unroll on its two 128-key loops
+makes it **three times slower** -- 437 us becomes 1350 -- because any partial
+unroll moves the 128-float state array out of the register file into local
+memory. Every unroll factor from 4 to 32 produces the identical 138
+registers and 512-byte stack frame. The spill is cheap; the register-resident
+state is the whole point of the kernel.
+
 ### Aside: Turing (issue #70)
 
 Assembling the dumped corpus with ptxas for sm_75 showed the `mma.sync.m16n8k16`
