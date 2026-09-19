@@ -138,6 +138,13 @@ class HfLoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / "broken"
             shutil.copytree(self.path, broken)
+            # copytree brings any sidecar an earlier test left beside the
+            # fixture, and this test only means anything if the checkpoint is
+            # actually read. Invalidating it by touching a shard is not enough
+            # to rely on: Windows does not promise a rewritten file's mtime is
+            # visible to the next stat, so the copy could still validate.
+            for stale in self.cache_files(broken):
+                stale.unlink()
             index_path = broken / "model.safetensors.index.json"
             index = json.loads(index_path.read_text(encoding="utf-8"))
             # Rename one KDA tensor so its bytes are still present and readable
@@ -167,6 +174,10 @@ class HfLoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / "broken"
             shutil.copytree(self.path, broken)
+            # See the sibling test above: the copied sidecar has to go, or the
+            # load can be served from it and never look at the tensor names.
+            for stale in self.cache_files(broken):
+                stale.unlink()
             index_path = broken / "model.safetensors.index.json"
             index = json.loads(index_path.read_text(encoding="utf-8"))
             victim = "model.layers.0.attention.dt_bias"
