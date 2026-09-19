@@ -1,12 +1,19 @@
 name: Release
 
 # Wheels are cheap to build and expensive to get wrong, so build them on every
-# push to a release tag AND on demand. `workflow_dispatch` publishes nothing --
-# it exists so the manylinux build can be exercised without minting a tag.
+# push to a release tag AND on demand. A plain `workflow_dispatch` publishes
+# nothing -- it exists so the manylinux build can be exercised without minting
+# a tag. Ticking `publish` on the dispatch form uploads to PyPI as a tag would,
+# for the case where the tag build failed somewhere PyPI cannot be retried from.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the built wheels to PyPI (version comes from pyproject.toml)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -177,8 +184,10 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [verify]
-    # Tags publish; a manual run stops at the artifacts above.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Tags publish. A manual run stops at the artifacts above unless it was
+    # started with `publish` ticked, which is deliberately not the default:
+    # PyPI refuses a second upload of a version, so a stray run costs a bump.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

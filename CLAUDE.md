@@ -6,6 +6,9 @@
   tools and CI do not. `python tools/check_version_bump.py origin/main` is the
   check CI runs; run it before opening the PR.
 - Releases are tag-driven: pushing `v<version>` builds the wheels, creates the
-  GitHub release and publishes to PyPI. Nothing publishes without a tag.
+  GitHub release and publishes to PyPI. The one escape hatch is running the
+  Release workflow by hand with `publish` ticked, which uploads the wheels for
+  whatever version `pyproject.toml` carries and creates no GitHub release; a
+  plain manual run still publishes nothing.
 - The native library in `src/flyweight/_native` is installed by
   `python -m flyweight.native_build`, never by copying over it.
