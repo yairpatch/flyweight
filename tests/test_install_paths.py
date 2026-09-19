@@ -43,7 +43,17 @@ class NativeBuildTests(unittest.TestCase):
         self.assertIn("no native sources", message)
         self.assertIn("wheel", message)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX rename-over-an-open-file semantics; Windows has no equivalent",
+    )
     def test_installing_the_library_does_not_reuse_the_old_inode(self) -> None:
+        # Windows is excluded because the property under test does not exist
+        # there: a file that is open cannot be renamed over at all, so
+        # _replace_library raises and tells the reader to stop whatever holds
+        # the DLL. That refusal is the Windows answer to the same hazard, and
+        # st_ino is not meaningful there either.
+        #
         # A running server has the library mmap'd. Copying onto it in place
         # truncates the inode those mappings point at, and the server's next
         # call into the runtime dies with SIGBUS or SEGV_ACCERR in a frame with
@@ -207,10 +217,15 @@ class DoctorTests(unittest.TestCase):
         user_scheme = sysconfig.get_preferred_scheme("user")
         user_directory = Path(sysconfig.get_path("scripts", user_scheme))
         name = "flyweight.exe" if os.name == "nt" else "flyweight"
-        real_is_file = Path.is_file
 
+        # Only the user copy exists -- deliberately not "or the real one does".
+        # Deferring to the filesystem made the outcome depend on whether this
+        # interpreter happens to have a console script in the default scheme,
+        # which the Windows runner does and the Linux one does not: there
+        # _console_script found the real one first and never reached the user
+        # scheme this test is about.
         def only_the_user_copy(self: Path) -> bool:
-            return self == user_directory / name or real_is_file(self)
+            return self == user_directory / name
 
         with patch.object(Path, "is_file", only_the_user_copy):
             from flyweight.cli import _console_script

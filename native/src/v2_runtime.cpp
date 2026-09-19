@@ -8235,6 +8235,21 @@ std::vector<std::string> hf_shard_files(const std::string& directory) {
     return files;
 }
 
+// The last separator in a path, or npos.
+//
+// Conditional rather than always find_last_of("/\\"): a backslash is a legal
+// character *inside* a POSIX filename, so splitting on it there would cut a
+// name in half. Splitting on '/' alone is what left `model.info["name"]` as
+// the whole `C:\...\checkpoint` on Windows, and put an absolute path into the
+// HF cache identity, where it defeats the cache it is supposed to key.
+inline std::size_t last_path_separator(const std::string& path) {
+#if defined(_WIN32)
+    return path.find_last_of("/\\");
+#else
+    return path.find_last_of('/');
+#endif
+}
+
 // Fingerprint inputs from metadata alone: every shard is stat'd, none is read.
 // Hashing 15.8 GB of content to decide whether to avoid re-quantizing it would
 // cost more than the packing it saves.
@@ -8246,7 +8261,7 @@ std::vector<hf::cache::SourceFile> hf_cache_sources(
     for(const auto& file:files){
         struct stat st{};
         if(stat(file.c_str(),&st)!=0)throw std::runtime_error("cannot stat "+file);
-        const auto cut=file.find_last_of('/');
+        const auto cut=last_path_separator(file);
         sources.push_back({cut==std::string::npos?file:file.substr(cut+1),
                            static_cast<std::uint64_t>(st.st_size),modified_ns(st)});
     }
@@ -8280,7 +8295,7 @@ std::string hf_imatrix_path(const std::string& directory,
                                      ", which cannot be read");
         return {};
     }
-    const auto cut=path.find_last_of('/');
+    const auto cut=last_path_separator(path);
     identity={cut==std::string::npos?path:path.substr(cut+1),
               static_cast<std::uint64_t>(st.st_size),modified_ns(st)};
     return path;
@@ -8334,7 +8349,7 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     m.architecture=m.config.architecture;
     // The directory name is the closest thing an HF checkpoint has to a model
     // name; config.json carries no equivalent of general.name.
-    const auto slash=directory.find_last_of('/');
+    const auto slash=last_path_separator(directory);
     m.name=slash==std::string::npos?directory:directory.substr(slash+1);
     m.chat_template=hf_tokenizer_file(directory,"chat_template.jinja");
     // Checkpoints published before chat_template.jinja existed keep the
