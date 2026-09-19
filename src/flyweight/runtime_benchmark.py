@@ -222,7 +222,10 @@ def _process_memory() -> dict[str, int]:
     rss_bytes = 0
     try:
         fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
-        rss_bytes = int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+        # os.sysconf is POSIX-only and so is the `resource` import guarding
+        # this branch, but mypy cannot see that the two go together -- and on a
+        # Windows runner it is checking against a stub that has neither.
+        rss_bytes = int(fields[1]) * os.sysconf("SC_PAGE_SIZE")  # type: ignore[attr-defined]
     except (OSError, IndexError, ValueError):
         pass
     maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
