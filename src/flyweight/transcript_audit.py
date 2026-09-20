@@ -328,6 +328,11 @@ class ToolCall:
     kind: str  # "read" | "edit" | "write" | "other"
     path: str | None
     old: str | None
+    # What the call puts in `old`'s place, or a whole file's new contents for
+    # a write. The audit never reads it -- it only asks what was replaced, not
+    # what with -- but replaying a session's edits to reconstruct a file does,
+    # and the four spellings of the field are already tabulated here.
+    new: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,19 +385,24 @@ def classify_call(name: str, arguments: Mapping[str, Any]) -> ToolCall | None:
     path = _first_string(arguments, _PATH_KEYS)
     old = _first_string(arguments, _OLD_KEYS)
     has_new = any(key in arguments for key in _NEW_KEYS)
+    # An edit that deletes writes an empty replacement, and so does a write
+    # that truncates, so these two read the value rather than test it for
+    # truth the way a path or a replaced string is tested.
+    new = _first_present(arguments, _NEW_KEYS)
+    content = _first_present(arguments, _CONTENT_KEYS)
     lowered = name.lower()
     command = arguments.get("command")
     if isinstance(command, str):
         if command == "view":
             return ToolCall(0, None, name, "read", path, None)
         if command in ("create", "insert"):
-            return ToolCall(0, None, name, "write", path, None)
+            return ToolCall(0, None, name, "write", path, None, content)
     if old is not None and (has_new or "replace" in lowered or "edit" in lowered):
-        return ToolCall(0, None, name, "edit", path, old)
+        return ToolCall(0, None, name, "edit", path, old, new)
     if path is not None and any(key in arguments for key in _CONTENT_KEYS):
         # A whole-file write. Nothing to match against the file's prior text,
         # so only the weaker "was it ever read" question applies.
-        return ToolCall(0, None, name, "write", path, None)
+        return ToolCall(0, None, name, "write", path, None, content)
     if path is not None and any(word in lowered for word in _READ_NAMES):
         return ToolCall(0, None, name, "read", path, None)
     return ToolCall(0, None, name, "other", path, None)
@@ -402,6 +412,15 @@ def _first_string(arguments: Mapping[str, Any], keys: Iterable[str]) -> str | No
     for key in keys:
         value = arguments.get(key)
         if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_present(arguments: Mapping[str, Any], keys: Iterable[str]) -> str | None:
+    """As `_first_string`, but an empty string is a value and not an absence."""
+    for key in keys:
+        value = arguments.get(key)
+        if isinstance(value, str):
             return value
     return None
 
@@ -420,7 +439,7 @@ def _calls(record: Mapping[str, Any]) -> Iterator[ToolCall]:
                 continue
             yield ToolCall(
                 index, call.get("id"), classified.name, classified.kind,
-                classified.path, classified.old,
+                classified.path, classified.old, classified.new,
             )
 
 
@@ -478,7 +497,7 @@ def _judge(
         prior.kind == "read"
         and prior.path is not None
         and call.path is not None
-        and _same_path(prior.path, call.path)
+        and same_path(prior.path, call.path)
         for prior in _calls({"turns": before})
     )
     failed = _call_failed(turns, call)
@@ -540,7 +559,7 @@ def _judge(
     )
 
 
-def _same_path(left: str, right: str) -> bool:
+def same_path(left: str, right: str) -> bool:
     if left == right:
         return True
     # Harnesses mix absolute and workspace-relative spellings of one file
