@@ -191,9 +191,30 @@ inline ModelConfig config_from_qwen3(const json::Value& config) {
     return out;
 }
 
+// Qwen3-VL (`Qwen3VLForConditionalGeneration`), loaded here as Qwen-Image-2.1's
+// text encoder. The decoder is a plain Qwen3 stack under `text_config`, spelled
+// with Qwen3.5's `model.language_model.` prefix; the vision tower beside it is
+// dropped. Text-to-image conditioning carries no image tokens, so the
+// checkpoint's interleaved mrope degenerates to plain rope and the sections are
+// not read.
+inline bool is_qwen3_vl(const std::string& model_type,
+                        const std::string& architecture) {
+    return model_type == "qwen3_vl" || model_type == "qwen3_vl_text" ||
+           architecture == "Qwen3VLForConditionalGeneration" ||
+           architecture == "Qwen3VLForCausalLM";
+}
+
+inline ModelConfig config_from_qwen3_vl(const json::Value& config) {
+    const auto& text = config.contains("text_config") ? config["text_config"] : config;
+    ModelConfig out = config_from_qwen3(text);
+    out.architecture = "qwen3vl";
+    return out;
+}
+
 // Diffusers components carry `_class_name` instead of `model_type`, and no
-// tokenizer. Two are recognised: Z-Image's single-stream DiT and the FLUX
-// 16-channel KL autoencoder it renders through.
+// tokenizer. Four are recognised: Z-Image's single-stream DiT and the FLUX
+// 16-channel KL autoencoder it renders through, and Qwen-Image-2.1's DiT and
+// its 64-channel RGBA autoencoder.
 inline bool is_zimage_transformer(const json::Value& config) {
     return config["_class_name"].as_string() == "ZImageTransformer2DModel";
 }
@@ -202,10 +223,19 @@ inline bool is_autoencoder_kl(const json::Value& config) {
     return config["_class_name"].as_string() == "AutoencoderKL";
 }
 
+inline bool is_qwenimage21_transformer(const json::Value& config) {
+    return config["_class_name"].as_string() == "QwenImage21Transformer2DModel";
+}
+
+inline bool is_qwenimage21_autoencoder(const json::Value& config) {
+    return config["_class_name"].as_string() == "AutoencoderKLQwenImage21";
+}
+
 // True for the diffusion components, which have no vocabulary and whose open
 // must not look for tokenizer.json.
 inline bool is_diffusion_architecture(const std::string& architecture) {
-    return architecture == "zimage-dit" || architecture == "autoencoder-kl";
+    return architecture == "zimage-dit" || architecture == "autoencoder-kl" ||
+           architecture == "qwenimage21-dit" || architecture == "qwenimage21-vae";
 }
 
 inline ModelConfig config_from_zimage_transformer(const json::Value& config) {
@@ -278,6 +308,104 @@ inline ModelConfig config_from_autoencoder_kl(const json::Value& config) {
     for (std::size_t level = 0; level < 4; ++level)
         if (config["up_block_types"][level].as_string() != "UpDecoderBlock2D")
             throw std::runtime_error("AutoencoderKL decoder block type is not UpDecoderBlock2D");
+    return out;
+}
+
+inline ModelConfig config_from_qwenimage21_transformer(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "qwenimage21-dit";
+    out.layer_count = static_cast<std::uint32_t>(config["num_layers"].as_uint(32));
+    out.attention_heads =
+        static_cast<std::uint32_t>(config["num_attention_heads"].as_uint(32));
+    out.attention_kv_heads = out.attention_heads;
+    out.attention_head_dim =
+        static_cast<std::uint32_t>(config["attention_head_dim"].as_uint(128));
+    out.hidden_size = out.attention_heads * out.attention_head_dim;
+    out.key_length = out.value_length = out.attention_head_dim;
+    if (!out.hidden_size || !out.layer_count)
+        throw std::runtime_error("QwenImage21Transformer2DModel config is incomplete");
+    out.intermediate_size =
+        out.hidden_size * static_cast<std::uint32_t>(config["mlp_ratio"].as_uint(3));
+    out.dense_intermediate_size = out.intermediate_size;
+    out.rms_norm_epsilon = static_cast<float>(config["eps"].as_double(1e-6));
+    // QwenImage21Rope hard-codes theta; the timestep embedding's time_factor
+    // is likewise fixed at 1000 in QwenImage21TemporalTimesteps.
+    out.rope_freq_base = 10000.0f;
+    out.time_scale = 1000.0f;
+    out.caption_dim = static_cast<std::uint32_t>(config["context_in_dim"].as_uint(4096));
+    out.in_channels = static_cast<std::uint32_t>(config["in_channels"].as_uint(64));
+    out.patch_size = static_cast<std::uint32_t>(config["patch_size"].as_uint(1));
+    if (out.patch_size != 1)
+        throw std::runtime_error("QwenImage21Transformer2DModel with patch_size != 1 "
+                                 "is not supported");
+    if (config.contains("out_channels") &&
+        static_cast<std::uint32_t>(config["out_channels"].as_uint(out.in_channels)) !=
+            out.in_channels)
+        throw std::runtime_error("QwenImage21Transformer2DModel with out_channels != "
+                                 "in_channels is not supported");
+    out.causal_condition = config["causal_condition"].as_bool(true);
+    const auto& dims = config["axes_dims_rope"];
+    if (dims.size() != 3)
+        throw std::runtime_error("QwenImage21Transformer2DModel rope must have three axes");
+    std::uint32_t total = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        out.rope_sections[axis] = static_cast<std::uint32_t>(dims[axis].as_uint());
+        total += out.rope_sections[axis];
+    }
+    if (total != out.attention_head_dim)
+        throw std::runtime_error("QwenImage21Transformer2DModel axes_dims_rope do not "
+                                 "sum to attention_head_dim");
+    // to_q/to_k/to_v are stacked into one matrix at load, as Z-Image's are.
+    out.expert_count = 3;
+    return out;
+}
+
+inline ModelConfig config_from_qwenimage21_autoencoder(const json::Value& config) {
+    ModelConfig out;
+    out.architecture = "qwenimage21-vae";
+    out.latent_channels = static_cast<std::uint32_t>(config["z_dim"].as_uint(64));
+    out.in_channels = static_cast<std::uint32_t>(config["out_channels"].as_uint(4));
+    out.vae_layers_per_block =
+        static_cast<std::uint32_t>(config["num_res_blocks"].as_uint(2));
+    out.vae_spatial_scale =
+        static_cast<std::uint32_t>(config["scale_factor_spatial"].as_uint(16));
+    out.vae_mid_attention = true;
+    if (!config["is_residual"].as_bool(false))
+        throw std::runtime_error("AutoencoderKLQwenImage21 without residual up blocks "
+                                 "is not supported");
+    if (config.contains("patch_size") && config["patch_size"].as_uint(0))
+        throw std::runtime_error("AutoencoderKLQwenImage21 with a patch size is not supported");
+    if (config["attn_scales"].size() != 0)
+        throw std::runtime_error("AutoencoderKLQwenImage21 with attention scales is not supported");
+    const std::uint32_t base = static_cast<std::uint32_t>(
+        config["decoder_base_dim"].as_uint(config["base_dim"].as_uint(96)));
+    out.vae_decoder_base_dim = base;
+    const auto& multipliers = config["dim_mult"];
+    out.vae_level_count = static_cast<std::uint32_t>(multipliers.size());
+    if (!out.vae_level_count || out.vae_level_count > 5)
+        throw std::runtime_error("AutoencoderKLQwenImage21 must have one to five levels");
+    for (std::size_t level = 0; level < out.vae_level_count; ++level)
+        out.vae_level_channels[level] =
+            base * static_cast<std::uint32_t>(multipliers[level].as_uint());
+    // temperal_upsample is temperal_downsample reversed, and indexes the up
+    // blocks that actually upsample (every level but the last).
+    const auto& downsample = config["temperal_downsample"];
+    for (std::size_t level = 0; level + 1 < out.vae_level_count; ++level) {
+        const std::size_t source = downsample.size() - 1 - level;
+        out.vae_temporal_upsample[level] =
+            source < downsample.size() && downsample[source].as_bool(false) ? 1u : 0u;
+    }
+    const auto& mean = config["latents_mean"];
+    const auto& deviation = config["latents_std"];
+    if (mean.size() != out.latent_channels || deviation.size() != out.latent_channels)
+        throw std::runtime_error("AutoencoderKLQwenImage21 latent statistics do not cover "
+                                 "z_dim channels");
+    out.latents_mean.reserve(out.latent_channels);
+    out.latents_std.reserve(out.latent_channels);
+    for (std::uint32_t channel = 0; channel < out.latent_channels; ++channel) {
+        out.latents_mean.push_back(static_cast<float>(mean[channel].as_double(0.0)));
+        out.latents_std.push_back(static_cast<float>(deviation[channel].as_double(1.0)));
+    }
     return out;
 }
 
@@ -399,8 +527,17 @@ inline ModelConfig config_from_json(const json::Value& config) {
 
     if (is_zimage_transformer(config)) return config_from_zimage_transformer(config);
     if (is_autoencoder_kl(config)) return config_from_autoencoder_kl(config);
+    if (is_qwenimage21_transformer(config))
+        return config_from_qwenimage21_transformer(config);
+    if (is_qwenimage21_autoencoder(config))
+        return config_from_qwenimage21_autoencoder(config);
     if (is_qwen3_5(model_type, architecture))
         return config_from_qwen3_5(config);
+    // Before is_qwen3: Qwen3-VL's text_config says model_type "qwen3_vl_text",
+    // but its decoder needs the vision tower dropped, which translate_qwen3
+    // does not do.
+    if (is_qwen3_vl(model_type, architecture))
+        return config_from_qwen3_vl(config);
     if (is_qwen3(model_type, architecture))
         return config_from_qwen3(config);
 
@@ -787,6 +924,42 @@ inline ParsedName translate_zimage(const std::string& name) {
     return parsed;
 }
 
+// Qwen-Image-2.1's DiT. As Z-Image's, `attn.to_q/to_k/to_v` stack into one
+// `attn.qkv.weight`; the rest pass through.
+inline ParsedName translate_qwenimage21(const std::string& name) {
+    ParsedName parsed;
+    parsed.matched = true;
+    parsed.gguf = name;
+    static const char* const pieces[] = {"to_q", "to_k", "to_v"};
+    for (std::uint32_t piece = 0; piece < 3; ++piece) {
+        const std::string suffix = std::string(".attn.") + pieces[piece] + ".weight";
+        if (name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            parsed.is_expert = true;
+            parsed.expert = piece;
+            parsed.gguf = name.substr(0, name.size() - suffix.size()) + ".attn.qkv.weight";
+            return parsed;
+        }
+    }
+    return parsed;
+}
+
+// AutoencoderKLQwenImage21: the decoder half only, and within it only what a
+// single frame reaches. `time_conv` belongs to the temporal upsample, which is
+// skipped outright at T = 1 (its feature cache is empty on the first chunk), so
+// it is recognised and dropped rather than uploaded and never used.
+inline ParsedName translate_qwenimage21_autoencoder(const std::string& name) {
+    ParsedName parsed;
+    parsed.matched = true;
+    if (name.rfind("encoder.", 0) == 0 || name.rfind("quant_conv.", 0) == 0 ||
+        name.find(".time_conv.") != std::string::npos) {
+        parsed.skip = true;
+        return parsed;
+    }
+    parsed.gguf = name;
+    return parsed;
+}
+
 // AutoencoderKL: only the decoder half is executed, so the encoder and the
 // quant convs are recognised and dropped; everything else keeps its name.
 inline ParsedName translate_autoencoder_kl(const std::string& name) {
@@ -805,9 +978,15 @@ inline ParsedName translate_autoencoder_kl(const std::string& name) {
 inline ParsedName translate(const std::string& name,
                             const ModelConfig& config) {
     if (config.architecture == "qwen35") return translate_qwen3_5(name, config);
+    // Qwen3-VL spells its decoder exactly as Qwen3.5 does, vision tower and
+    // all; it just has no MTP block for that path to look for.
+    if (config.architecture == "qwen3vl") return translate_qwen3_5(name, config);
     if (config.architecture == "qwen3") return translate_qwen3(name);
     if (config.architecture == "zimage-dit") return translate_zimage(name);
     if (config.architecture == "autoencoder-kl") return translate_autoencoder_kl(name);
+    if (config.architecture == "qwenimage21-dit") return translate_qwenimage21(name);
+    if (config.architecture == "qwenimage21-vae")
+        return translate_qwenimage21_autoencoder(name);
     const auto& linear_layer = config.sliding_window_pattern;
     ParsedName parsed;
     const auto& globals = global_names();

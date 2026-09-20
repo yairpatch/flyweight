@@ -531,14 +531,23 @@ def _add_runtime_options(
     )
     add(
         placement, "--image-model", type=Path, metavar="DIR",
-        help="image generation: a Z-Image-Turbo diffusers snapshot directory "
-             "(text_encoder/, transformer/, vae/), served at "
+        help="image generation: a Z-Image-Turbo or Qwen-Image-2.1 diffusers "
+             "snapshot directory (text_encoder/, transformer/, vae/), served at "
              "/v1/images/generations beside the chat model",
     )
     add(
-        placement, "--image-max-size", type=int, default=1024, metavar="N",
-        help="largest image side the image model renders; its workspace is "
-             "reserved for NxN at startup (default 1024, the model's native size)",
+        placement, "--image-max-size", type=int, default=0, metavar="N",
+        help="largest image side a request may ask the image model for "
+             "(default 0: the model's own, 1024 for Z-Image and 2048 for "
+             "Qwen-Image-2.1). The workspace starts sized for 1024 and grows "
+             "when a request needs more; a request the card cannot fit fails "
+             "on its own",
+    )
+    add(
+        placement, "--image-reserve", action="store_true",
+        help="allocate the image model's workspace for --image-max-size at "
+             "startup instead of growing it on demand, so a large render "
+             "cannot lose the memory to the chat model later",
     )
     add(
         placement, "--image-weights", choices=("auto", "device", "host"), default="auto",
@@ -1628,9 +1637,10 @@ def _serve(args: argparse.Namespace) -> int:
         image_max_tokens=getattr(args, "image_max_tokens", 1024),
         image_urls=getattr(args, "image_urls", "allow"),
         image_model_path=getattr(args, "image_model", None),
-        image_max_size=getattr(args, "image_max_size", 1024),
+        image_max_size=getattr(args, "image_max_size", 0),
         image_weights=getattr(args, "image_weights", "auto"),
         image_precision=getattr(args, "image_precision", "balanced"),
+        image_reserve=getattr(args, "image_reserve", False),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,

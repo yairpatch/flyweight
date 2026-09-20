@@ -1,10 +1,14 @@
-"""Image generation served beside the chat model: Z-Image-Turbo on the native tower.
+"""Image generation served beside the chat model, on the native tower.
 
 ``ImageGenerator`` owns the three component models of a diffusers snapshot
 (``text_encoder``, ``transformer``, ``vae``) and the tower built over them,
 turns an OpenAI-style ``/v1/images/generations`` request into a run, and
 returns the picture as base64 PNG. One image renders at a time: the tower
 has one workspace and the GPU is shared with the chat runtime.
+
+Two models are recognised, and which one a snapshot holds decides the prompt
+template, the size grid, the step count and whether the picture has an alpha
+channel -- so everything here reads those off the tower rather than assuming.
 
 Pillow encodes the PNG and is an optional dependency (``pip install
 flyweight-llm[vision]``); without it the endpoint reports why.
@@ -23,8 +27,17 @@ from .server import APIError
 from .v2 import V2Diffusion, V2Error, V2Model
 
 # The Qwen3 chat template with add_generation_prompt=True and thinking left
-# enabled, which is how the reference pipeline conditions the DiT.
+# enabled, which is how Z-Image's reference pipeline conditions the DiT.
 _PROMPT_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+# Qwen-Image-2.1 conditions on the same template behind a fixed system turn.
+# Its pipeline builds this as a raw string rather than through
+# apply_chat_template -- the two tokenize differently and the checkpoint
+# expects this one -- and then drops the system turn's rows from the
+# conditioning, which `caption_drop` below does.
+_QWENIMAGE_SYSTEM = (
+    "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+)
 
 DEFAULT_STEPS = 8
 DEFAULT_SHIFT = 3.0
@@ -41,8 +54,10 @@ def _int_option(payload: Mapping[str, Any], name: str, default: int, low: int, h
     return value
 
 
-def parse_size(value: Any, default: tuple[int, int], limit: tuple[int, int]) -> tuple[int, int]:
-    """``"WxH"`` (or ``"auto"``) into pixels: multiples of 16, within the tower's limits."""
+def parse_size(
+    value: Any, default: tuple[int, int], limit: tuple[int, int], multiple: int = 16
+) -> tuple[int, int]:
+    """``"WxH"`` (or ``"auto"``) into pixels: on the model's grid, within the tower's limits."""
     if value is None or value == "auto":
         return default
     if not isinstance(value, str) or "x" not in value:
@@ -52,8 +67,12 @@ def parse_size(value: Any, default: tuple[int, int], limit: tuple[int, int]) -> 
         width, height = int(width_text), int(height_text)
     except ValueError as error:
         raise APIError(400, "size must look like 1024x1024", parameter="size") from error
-    if width <= 0 or height <= 0 or width % 16 or height % 16:
-        raise APIError(400, "size sides must be positive multiples of 16", parameter="size")
+    if width <= 0 or height <= 0 or width % multiple or height % multiple:
+        raise APIError(
+            400,
+            f"size sides must be positive multiples of {multiple}",
+            parameter="size",
+        )
     if width > limit[0] or height > limit[1]:
         raise APIError(
             400,
@@ -89,34 +108,46 @@ class ImageGenerator:
         snapshot: Path | str,
         *,
         device: int = 0,
-        max_width: int = 1024,
-        max_height: int = 1024,
+        max_width: int = 0,
+        max_height: int = 0,
         weights: str = "auto",
         precision: str = "balanced",
+        reserve: bool = False,
         model_name: str | None = None,
     ) -> None:
         root = Path(snapshot)
         for part in ("text_encoder", "transformer", "vae"):
             if not (root / part / "config.json").is_file():
                 raise FileNotFoundError(
-                    f"{root} is not a Z-Image snapshot: missing {part}/config.json"
+                    f"{root} is not a diffusers image snapshot: missing {part}/config.json"
                 )
         self.path = root
         self.model_name = model_name or snapshot_model_name(root)
-        self.max_width = int(max_width)
-        self.max_height = int(max_height)
         self.encoder = V2Model(root / "text_encoder")
         self.transformer = V2Model(root / "transformer")
         self.vae = V2Model(root / "vae")
         try:
             self.tower = V2Diffusion(
                 self.encoder, self.transformer, self.vae,
-                device=device, max_width=self.max_width, max_height=self.max_height,
+                device=device, max_width=int(max_width), max_height=int(max_height),
                 max_prompt_tokens=MAX_PROMPT_TOKENS, weights=weights, precision=precision,
+                reserve=reserve,
             )
         except BaseException:
             self.close()
             raise
+        # Zero asked for the model's own maximum; the tower says what that is.
+        self.max_width = self.tower.max_width
+        self.max_height = self.tower.max_height
+        # Qwen-Image-2.1 is the model with a system turn in front of the prompt
+        # and an alpha channel out of the decoder; Z-Image has neither.
+        self.qwenimage = self.transformer.config["architecture"] == "qwenimage21-dit"
+        self.caption_drop = (
+            len(self.encoder.tokenize(_QWENIMAGE_SYSTEM)) if self.qwenimage else 0
+        )
+        self.default_steps = self.tower.default_steps
+        self.size_multiple = self.tower.size_multiple
+        self.pixel_mode = "RGBA" if self.tower.output_channels == 4 else "RGB"
         self._lock = threading.Lock()
         self.busy = False
         self.generated = 0
@@ -138,7 +169,9 @@ class ImageGenerator:
             "model": self.model_name,
             "path": str(self.path),
             "max_size": f"{self.max_width}x{self.max_height}",
-            "default_steps": DEFAULT_STEPS,
+            "default_steps": self.default_steps,
+            "size_multiple": self.size_multiple,
+            "alpha": self.pixel_mode == "RGBA",
             "weights": "host" if info["host_weights"] else "device",
             "precision": "exact" if info["exact"] else "balanced" if info["balanced"] else "fast",
             "device_mib": int(info["device_bytes"]) // (1024 * 1024),
@@ -148,7 +181,10 @@ class ImageGenerator:
         }
 
     def tokenize(self, prompt: str) -> list[int]:
-        tokens = list(self.encoder.tokenize(_PROMPT_TEMPLATE.format(prompt=prompt)))
+        template = _PROMPT_TEMPLATE
+        if self.qwenimage:
+            template = _QWENIMAGE_SYSTEM + template
+        tokens = list(self.encoder.tokenize(template.format(prompt=prompt)))
         if len(tokens) > MAX_PROMPT_TOKENS:
             raise APIError(
                 400,
@@ -216,9 +252,10 @@ class ImageGenerator:
                 400, "only response_format b64_json is available", parameter="response_format"
             )
         width, height = parse_size(
-            payload.get("size"), (self.max_width, self.max_height), (self.max_width, self.max_height)
+            payload.get("size"), (self.max_width, self.max_height),
+            (self.max_width, self.max_height), self.size_multiple,
         )
-        steps = _int_option(payload, "steps", DEFAULT_STEPS, 1, MAX_STEPS)
+        steps = _int_option(payload, "steps", self.default_steps, 1, MAX_STEPS)
         seed_value = payload.get("seed")
         if seed_value is None:
             seed = int(time.time_ns()) & 0xFFFFFFFFFFFF
@@ -226,9 +263,11 @@ class ImageGenerator:
             raise APIError(400, "seed must be a non-negative integer", parameter="seed")
         else:
             seed = seed_value
-        shift = payload.get("shift", DEFAULT_SHIFT)
-        if isinstance(shift, bool) or not isinstance(shift, (int, float)) or shift <= 0:
-            raise APIError(400, "shift must be a positive number", parameter="shift")
+        # Zero is the tower's "use the model's own schedule", which is how
+        # Qwen-Image-2.1 samples: its shift follows the image's token count.
+        shift = payload.get("shift", self.tower.default_shift)
+        if isinstance(shift, bool) or not isinstance(shift, (int, float)) or shift < 0:
+            raise APIError(400, "shift must be a non-negative number", parameter="shift")
         try:
             from PIL import Image
         except ImportError as error:
@@ -257,7 +296,8 @@ class ImageGenerator:
                 try:
                     rgb = self.tower.generate(
                         tokens, width, height, steps=steps, shift=float(shift),
-                        seed=seed + index, progress=on_progress,
+                        seed=seed + index, caption_drop=self.caption_drop,
+                        progress=on_progress,
                     )
                 except V2Error as error:
                     # The tower reports a cancel from the callback as an error.
@@ -265,7 +305,7 @@ class ImageGenerator:
                         raise _Cancelled() from None
                     raise
                 elapsed = time.monotonic() - started
-                picture = Image.frombytes("RGB", (width, height), rgb)
+                picture = Image.frombytes(self.pixel_mode, (width, height), rgb)
                 buffer = io.BytesIO()
                 picture.save(buffer, format="PNG")
                 item = {

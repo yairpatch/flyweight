@@ -8313,11 +8313,14 @@ std::string hf_imatrix_path(const std::string& directory,
 // change, so the arena is written to a sidecar on the way out and mapped on the
 // way back in. A hit skips the shard mappings entirely -- the 15.8 GB of bf16
 // is never opened, let alone read.
-// A tokenizer file beside the checkpoint, or in the `tokenizer/` sibling a
-// diffusers pipeline keeps it in (`text_encoder/` holds only the weights).
+// A tokenizer file beside the checkpoint, or in the sibling a diffusers
+// pipeline keeps it in (`text_encoder/` holds only the weights). Z-Image calls
+// that sibling `tokenizer/`; a pipeline whose encoder is vision-language, as
+// Qwen-Image-2.1's is, calls it `processor/`.
 static std::string hf_tokenizer_file(const std::string& directory,const char* name){
     auto text=read_text_file(directory+"/"+name);
     if(text.empty())text=read_text_file(directory+"/../tokenizer/"+name);
+    if(text.empty())text=read_text_file(directory+"/../processor/"+name);
     return text;
 }
 
@@ -8416,15 +8419,18 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     // not what decides whether an image model fits. The VAE decoder is 50M
     // parameters of convolutions and stays f32 outright, as diffusers runs it
     // (force_upcast).
-    if(m.architecture=="zimage-dit")policy=hf::policy_for_weights(hf::Target::Q8_0);
-    // The plain-Qwen3 text encoder conditions the DiT with its hidden state,
-    // and Q8_0 halves that state's error against Q6_K (0.9% vs 2.1% rms on
-    // Z-Image's encoder) for 1.1 GB more, which lives in host memory anyway
-    // once the tower streams its weights.
-    if(m.architecture=="qwen3")policy=hf::policy_for_weights(hf::Target::Q8_0);
-    if(m.architecture=="autoencoder-kl")policy=hf::policy_for_weights(hf::Target::F32);
+    if(m.architecture=="zimage-dit"||m.architecture=="qwenimage21-dit")
+        policy=hf::policy_for_weights(hf::Target::Q8_0);
+    // The text encoder conditions the DiT with its hidden state, and Q8_0
+    // halves that state's error against Q6_K (0.9% vs 2.1% rms on Z-Image's
+    // encoder) for 1.1 GB more, which lives in host memory anyway once the
+    // tower streams its weights.
+    if(m.architecture=="qwen3"||m.architecture=="qwen3vl")
+        policy=hf::policy_for_weights(hf::Target::Q8_0);
+    const bool vae=m.architecture=="autoencoder-kl"||m.architecture=="qwenimage21-vae";
+    if(vae)policy=hf::policy_for_weights(hf::Target::F32);
     if(const char* requested=std::getenv("FLYWEIGHT_HF_QUANT");
-       requested&&m.architecture!="autoencoder-kl"&&!hf_policy_for(requested,policy))
+       requested&&!vae&&!hf_policy_for(requested,policy))
         throw std::runtime_error("FLYWEIGHT_HF_QUANT must be one of "
             "IQ2_XS, Q2_K, IQ3_XXS, Q3_K, IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, "
             "F32");
@@ -14779,7 +14785,8 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     const bool k2horizon=m->config.architecture=="k2-horizon";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
-    if(m->config.architecture=="qwen3"&&m->format_name=="safetensors")throw std::runtime_error(
+    if((m->config.architecture=="qwen3"||m->config.architecture=="qwen3vl")&&
+       m->format_name=="safetensors")throw std::runtime_error(
         "a plain Qwen3 safetensors checkpoint is loaded as a diffusion text encoder only; "
         "the Qwen decode runtime does not run it (its attention has no query gate)");
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
@@ -19445,6 +19452,7 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
 #include "v2_mtp_verifier.inc"
 #include "v2_vision.inc"
 #include "v2_diffusion.inc"
+#include "v2_qwenimage.inc"
 
 // Layer-synchronous chunked prefill. Attention stays a per-row pass with the
 // decode kernels -- a row's attention at layer L needs only earlier rows' KV

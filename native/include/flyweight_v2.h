@@ -431,6 +431,13 @@ typedef struct FlyweightV2Diffusion FlyweightV2Diffusion;
    dequantizes the Q8_0 weights in place, bf16 attention and convolutions.
    Ignored when EXACT is set. */
 #define FLYWEIGHT_V2_DIFFUSION_BALANCED 16u
+/* OR-ed into `weights`: allocate the workspace for max_width x max_height at
+   create. Without it max_width/max_height are a cap: the workspace starts
+   sized for 1024x1024 (or the cap, if smaller) and grows on demand when a
+   request needs more, failing that request -- not the tower -- when the card
+   cannot give it. A max_width or max_height of 0 means the model's own
+   largest side (1024 for Z-Image, 2048 for Qwen-Image-2.1). */
+#define FLYWEIGHT_V2_DIFFUSION_RESERVE 32u
 typedef struct FlyweightV2DiffusionInfo {
     uint32_t host_weights;
     uint32_t exact;
@@ -438,6 +445,15 @@ typedef struct FlyweightV2DiffusionInfo {
     uint32_t max_width, max_height;
     uint64_t device_bytes;   /* resident weights + workspace + staging */
     uint64_t host_bytes;     /* pinned host memory, zero when resident */
+    /* Geometry the caller cannot guess, because it follows from which image
+       model the tower opened. `latent_stride` is pixels per latent row (8 for
+       Z-Image, 16 for Qwen-Image-2.1), `size_multiple` what a side must divide
+       by, `output_channels` 3 for RGB or 4 for RGBA, and `default_shift` the
+       sampler shift to pass when the caller has no opinion -- zero meaning the
+       model's own resolution-dependent schedule. */
+    uint32_t latent_stride, size_multiple, output_channels, default_steps;
+    uint32_t latent_channels;
+    float default_shift;
 } FlyweightV2DiffusionInfo;
 /* Called after the text encoder (step 0) and after every denoising step; a
    non-zero return cancels the generation. */
@@ -458,9 +474,14 @@ FLYWEIGHT_V2_API int flyweight_v2_diffusion_transformer_step(FlyweightV2Diffusio
                                                              float time, float* velocity);
 FLYWEIGHT_V2_API int flyweight_v2_diffusion_decode_latents(FlyweightV2Diffusion* tower, const float* latents,
                                                            uint32_t latent_h, uint32_t latent_w, uint8_t* rgb);
-/* The whole pipeline. `initial_latents` may be null (drawn from `seed`). */
+/* The whole pipeline. `initial_latents` may be null (drawn from `seed`).
+   `caption_drop` is how many leading encoder rows the transformer does not
+   see: Qwen-Image-2.1 conditions on a prompt whose system-role prefix is
+   encoded but then dropped, so those tokens still shape the rows that follow.
+   Zero for a model that conditions on everything it encoded. */
 FLYWEIGHT_V2_API int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* tower, const uint32_t* tokens,
-                                                     uint64_t count, uint32_t width, uint32_t height,
+                                                     uint64_t count, uint32_t caption_drop,
+                                                     uint32_t width, uint32_t height,
                                                      uint32_t steps, float shift, uint64_t seed,
                                                      const float* initial_latents,
                                                      FlyweightV2DiffusionProgress progress, void* user_data,
