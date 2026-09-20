@@ -312,7 +312,16 @@ def build(directory: Path) -> Path:
     # `tokenizer/` a text-only one uses.
     processor = directory / "processor"
     processor.mkdir(parents=True, exist_ok=True)
-    (processor / "tokenizer.json").write_text(json.dumps(_tokenizer()))
+    tokenizer_doc = _tokenizer()
+    for token_id, token_str in (
+        (261, "<|im_start|>"),
+        (262, "<|im_end|>"),
+        (263, "<|image_pad|>"),
+        (264, "<|vision_start|>"),
+        (265, "<|vision_end|>"),
+    ):
+        tokenizer_doc["added_tokens"].append({"id": token_id, "content": token_str, "special": True})
+    (processor / "tokenizer.json").write_text(json.dumps(tokenizer_doc))
     (processor / "tokenizer_config.json").write_text(json.dumps({
         "chat_template": "{% for message in messages %}<|im_start|>{{ message.role }}\n"
                          "{{ message.content }}<|im_end|>\n{% endfor %}"

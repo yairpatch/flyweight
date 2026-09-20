@@ -373,11 +373,11 @@ class ImageGenerator:
         token_side = self.tower.latent_stride * 2   # pixels per vision token
         image_tokens = [(w // token_side) * (h // token_side) for _, w, h in conditions]
         tokens = self.tokenize(prompt, image_tokens)
-        images = []
+        references = []
         if conditions:
             pad = self.encoder.tokenize("<|image_pad|>")[0]
             offsets = image_token_offsets(tokens, pad, image_tokens)
-            images = [(rgba, w, h, offset) for (rgba, w, h), offset in zip(conditions, offsets)]
+            references = [(rgba, w, h, offset) for (rgba, w, h), offset in zip(conditions, offsets)]
         if not self._lock.acquire(timeout=0.0):
             raise APIError(
                 429, "an image is already rendering; retry shortly", "rate_limit_error"
@@ -396,9 +396,9 @@ class ImageGenerator:
 
                 started = time.monotonic()
                 try:
-                    if images:
+                    if references:
                         rgb = self.tower.edit(
-                            tokens, images, width, height, steps=steps, shift=float(shift),
+                            tokens, references, width, height, steps=steps, shift=float(shift),
                             seed=seed + index, caption_drop=self.caption_drop,
                             progress=on_progress,
                         )

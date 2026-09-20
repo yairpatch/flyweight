@@ -254,6 +254,51 @@ class QwenImage21LoaderTests(unittest.TestCase):
         finally:
             generator.close()
 
+    @unittest.skipUnless(_gpu_available(), "needs a CUDA device")
+    def test_the_generator_edits_with_reference_images(self) -> None:
+        import base64
+        import io
+        from unittest.mock import patch
+        from PIL import Image
+
+        generator = ImageGenerator(self.snapshot, max_width=64, max_height=64, weights="device")
+        try:
+            buf = io.BytesIO()
+            Image.new("RGBA", (64, 32), (255, 0, 0, 255)).save(buf, format="PNG")
+            data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+            with patch.object(generator.tower, "edit", wraps=generator.tower.edit) as mock_edit, \
+                 patch.object(generator.tower, "generate", wraps=generator.tower.generate) as mock_gen:
+                result = generator.generate({
+                    "prompt": "make it green",
+                    "images": [data_url],
+                    "size": "64x64",
+                    "steps": 1,
+                    "seed": 42,
+                    "n": 2,
+                })
+                self.assertEqual(mock_edit.call_count, 2)
+                self.assertEqual(mock_gen.call_count, 0)
+                self.assertEqual(result["size"], "64x64")
+                self.assertEqual(len(result["data"]), 2)
+                for item in result["data"]:
+                    pic = Image.open(io.BytesIO(base64.b64decode(item["b64_json"])))
+                    self.assertEqual((pic.mode, pic.size), ("RGBA", (64, 64)))
+
+            events = list(generator.stream({
+                "prompt": "make it green",
+                "images": [data_url],
+                "size": "64x64",
+                "steps": 1,
+                "seed": 42,
+            }))
+            types = [e["type"] for e in events]
+            self.assertIn("progress", types)
+            self.assertIn("image", types)
+            self.assertIn("done", types)
+        finally:
+            generator.close()
+
 
 class RequestShapingTests(unittest.TestCase):
     def test_sizes_follow_the_models_grid(self) -> None:
