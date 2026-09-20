@@ -180,6 +180,21 @@ namespace {
 void qi_destroy(QwenImage21Tower* tower);
 void qi_upload_transformer(FlyweightV2Diffusion& d);   // also allocates the tower
 void qi_upload_vae(FlyweightV2Diffusion& d);
+void qi_upload_vision(FlyweightV2Diffusion& d);        // after the text encoder
+void qi_edit(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std::uint64_t count,
+             std::uint32_t caption_drop, const FlyweightV2DiffusionImage* images,
+             std::uint32_t image_count, std::uint32_t width, std::uint32_t height,
+             std::uint32_t steps, float shift, std::uint64_t seed, const float* initial_latents,
+             FlyweightV2DiffusionProgress progress, void* user_data, std::uint8_t* pixels);
+void qi_encode_prompt_images(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std::uint64_t count,
+                             const FlyweightV2DiffusionImage* images, std::uint32_t image_count,
+                             float* output);
+void qi_encode_image(FlyweightV2Diffusion& d, const std::uint8_t* rgba, std::uint32_t width,
+                     std::uint32_t height, float* output);
+std::uint32_t qi_encode_vision(FlyweightV2Diffusion& d, const std::uint8_t* rgba, std::uint32_t width,
+                               std::uint32_t height, float* output, std::uint64_t capacity);
+void qi_check_images(const FlyweightV2Diffusion& d, const FlyweightV2DiffusionImage* images,
+                     std::uint32_t image_count);
 int qi_caption_dim(const FlyweightV2Diffusion& d);
 int qi_spatial_scale(const FlyweightV2Diffusion& d);
 int qi_output_channels(const FlyweightV2Diffusion& d);
@@ -1767,6 +1782,7 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
             // Conditioning is the last layer's output with the encoder's final
             // norm hooked off, so every layer runs.
             diff_upload_encoder(*d, 0, qi_caption_dim(*d));
+            qi_upload_vision(*d);
             qi_upload_vae(*d);
         } else {
             diff_upload_transformer(*d);
@@ -1810,6 +1826,65 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
         throw;
     }
     *out = d.release();
+    return 0;
+}); }
+
+int flyweight_v2_diffusion_edit(FlyweightV2Diffusion* d, const uint32_t* tokens, uint64_t count,
+                                uint32_t caption_drop, const FlyweightV2DiffusionImage* images,
+                                uint32_t image_count, uint32_t width, uint32_t height,
+                                uint32_t steps, float shift, uint64_t seed, const float* initial_latents,
+                                FlyweightV2DiffusionProgress progress, void* user_data,
+                                uint8_t* rgb) { return guarded([&]{
+    if (!d || !tokens || !rgb || (image_count && !images))
+        throw std::runtime_error("invalid diffusion edit arguments");
+    if (!d->qwenimage) throw std::runtime_error("this image model has no editing path");
+    if (caption_drop >= count) throw std::runtime_error("caption_drop covers the whole prompt");
+    if (!width || !height || width % 32 || height % 32)
+        throw std::runtime_error("width and height must be positive multiples of 32");
+    if (width > d->max_width || height > d->max_height)
+        throw std::runtime_error("image exceeds the tower's " + std::to_string(d->max_width) + "x" +
+                                 std::to_string(d->max_height) + " limit (--image-max-size)");
+    if (!steps) throw std::runtime_error("steps must be positive");
+    qi_check_images(*d, images, image_count);
+    qi_edit(*d, tokens, count, caption_drop, images, image_count, width, height, steps, shift, seed,
+            initial_latents, progress, user_data, rgb);
+    return 0;
+}); }
+
+int flyweight_v2_diffusion_encode_prompt(FlyweightV2Diffusion* d, const uint32_t* tokens, uint64_t count,
+                                         const FlyweightV2DiffusionImage* images, uint32_t image_count,
+                                         float* output, uint64_t capacity) { return guarded([&]{
+    if (!d || !tokens || !output || (image_count && !images))
+        throw std::runtime_error("invalid diffusion encode arguments");
+    if (!d->qwenimage) throw std::runtime_error("this image model has no image-conditioned encoder");
+    if (capacity < count * static_cast<std::uint64_t>(d->encoder_hidden))
+        throw std::runtime_error("diffusion encode output buffer is too small");
+    qi_check_images(*d, images, image_count);
+    qi_encode_prompt_images(*d, tokens, count, images, image_count, output);
+    return 0;
+}); }
+
+int flyweight_v2_diffusion_encode_vision(FlyweightV2Diffusion* d, const uint8_t* rgba, uint32_t width,
+                                         uint32_t height, float* output, uint64_t capacity,
+                                         uint32_t* planes) { return guarded([&]{
+    if (!d || !rgba || !output || !planes) throw std::runtime_error("invalid diffusion encode arguments");
+    if (!d->qwenimage) throw std::runtime_error("this image model has no vision tower");
+    FlyweightV2DiffusionImage image{rgba, width, height, 0};
+    qi_check_images(*d, &image, 1);
+    *planes = qi_encode_vision(*d, rgba, width, height, output, capacity);
+    return 0;
+}); }
+
+int flyweight_v2_diffusion_encode_image(FlyweightV2Diffusion* d, const uint8_t* rgba, uint32_t width,
+                                        uint32_t height, float* output, uint64_t capacity) { return guarded([&]{
+    if (!d || !rgba || !output) throw std::runtime_error("invalid diffusion encode arguments");
+    if (!d->qwenimage) throw std::runtime_error("this image model has no autoencoder encoder");
+    FlyweightV2DiffusionImage image{rgba, width, height, 0};
+    qi_check_images(*d, &image, 1);
+    const std::uint64_t stride = qi_spatial_scale(*d);
+    if (capacity < static_cast<std::uint64_t>(qi_latent_channels(*d)) * (width / stride) * (height / stride))
+        throw std::runtime_error("diffusion encode output buffer is too small");
+    qi_encode_image(*d, rgba, width, height, output);
     return 0;
 }); }
 

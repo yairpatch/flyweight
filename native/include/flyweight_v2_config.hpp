@@ -129,7 +129,7 @@ struct ModelConfig {
     // scale/shift, and a temporal-upsample flag per level. The temporal path
     // itself is inert on a single frame, but the flag still decides the
     // duplicating shortcut's channel fan-out, so it has to survive the load.
-    std::uint32_t vae_level_count=0, vae_decoder_base_dim=0, vae_spatial_scale=0;
+    std::uint32_t vae_level_count=0, vae_decoder_base_dim=0, vae_encoder_base_dim=0, vae_spatial_scale=0;
     std::uint32_t vae_level_channels[5]={0,0,0,0,0};
     std::uint8_t vae_temporal_upsample[5]={0,0,0,0,0};
     std::vector<float> latents_mean, latents_std;

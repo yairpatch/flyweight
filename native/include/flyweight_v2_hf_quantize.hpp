@@ -176,6 +176,12 @@ inline Target target_for(const HfTensor& tensor, const Policy& policy) {
     // pad tokens are [1][dim]); nothing multiplies by it.
     if (tensor.shape.size() == 2 && tensor.shape[1] == 1) return policy.small;
 
+    // A vision tower riding along with a text encoder (Qwen3-VL as
+    // Qwen-Image-2.1's) stays unquantized: 27 pre-LN blocks with biases and
+    // GELU compound Q8_0 error to 11% rms at the merged tokens, against
+    // ~3% for the decoder's 36 layers, and it is 410M parameters read once
+    // per image rather than once per step.
+    if (tensor.name.rfind("v.", 0) == 0 || tensor.name.rfind("mm.", 0) == 0) return policy.small;
     // The embedding table and the head each take their own target.
     const Target wanted = tensor.name == "token_embd.weight" ? policy.embedding
         : tensor.name == "output.weight" ? policy.head

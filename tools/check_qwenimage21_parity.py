@@ -38,7 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref", required=True)
     parser.add_argument("--model", required=True, help="Qwen-Image-2.1 snapshot directory")
-    parser.add_argument("--stages", default="text,step,decode,generate")
+    parser.add_argument("--stages", default="text,encode,step,decode,generate")
     parser.add_argument("--max-size", type=int, default=0)
     parser.add_argument("--weights", default="auto", choices=("device", "host", "auto"))
     parser.add_argument("--precision", default="balanced", choices=("fast", "balanced", "exact"))
@@ -62,20 +62,51 @@ def main() -> None:
     ids = [int(t) for t in ref["input_ids"]]
     drop = int(ref["drop_idx"])
     caption = ref["prompt_embeds"]
+    # The editing dump carries the condition images and where their tokens sit.
+    conditions = []
+    index = 0
+    while f"condition{index}_rgba" in ref.files:
+        rgba = ref[f"condition{index}_rgba"]
+        conditions.append((rgba, rgba.shape[1], rgba.shape[0]))
+        index += 1
+    pad_mask = ref["image_pad_mask"] if "image_pad_mask" in ref.files else None
+    offsets = []
+    if conditions:
+        full = np.concatenate([np.zeros(drop, dtype=bool), pad_mask.astype(bool)])
+        starts = np.flatnonzero(full & ~np.concatenate([[False], full[:-1]]))
+        offsets = [int(s) for s in starts]
+        assert len(offsets) == len(conditions), (offsets, len(conditions))
+    images = [(rgba.tobytes(), w, h, offset) for (rgba, w, h), offset in zip(conditions, offsets)]
 
     if "text" in stages:
         started = time.time()
-        rows = np.array(tower.encode_text(ids), dtype=np.float32).reshape(len(ids), -1)
+        if images:
+            rows = np.array(tower.encode_prompt(ids, images), dtype=np.float32).reshape(len(ids), -1)
+        else:
+            rows = np.array(tower.encode_text(ids), dtype=np.float32).reshape(len(ids), -1)
         got = rows[drop:]
         print(f"text encoder {time.time() - started:.2f}s")
         compare("prompt_embeds", got, caption)
         # A row-by-row view: the later rows accumulate the most error.
         for row in (0, len(got) // 2, len(got) - 1):
             compare(f"  row {row}", got[row], caption[row])
+        if pad_mask is not None and pad_mask.any():
+            compare("  image rows", got[pad_mask.astype(bool)], caption[pad_mask.astype(bool)])
+            compare("  text rows", got[~pad_mask.astype(bool)], caption[~pad_mask.astype(bool)])
     else:
         got = caption
 
-    if "step" in stages:
+    if "encode" in stages and images:
+        for index, (rgba, w, h) in enumerate(conditions):
+            started = time.time()
+            latents = np.array(tower.encode_image(rgba.tobytes(), w, h), dtype=np.float32)
+            print(f"vae encode {w}x{h} {time.time() - started:.2f}s")
+            want = ref[f"condition{index}_latents"]
+            compare(f"condition{index}_latents", latents.reshape(want.shape), want)
+
+    if "step" in stages and images:
+        print("  (step stage skipped: the text-only transformer_step has no condition images)")
+    if "step" in stages and not images:
         sigma = float(ref["sigmas"][0])
         started = time.time()
         out = tower.transformer_step(ref["latents_0"].reshape(-1), latent, latent,
@@ -102,10 +133,16 @@ def main() -> None:
     if "generate" in stages:
         steps = sum(1 for k in ref.files if k.startswith("step") and k.endswith("_latents"))
         started = time.time()
-        pixels = np.frombuffer(
-            tower.generate(ids, size, size, steps=steps, caption_drop=drop,
+        if images:
+            pixels = np.frombuffer(
+                tower.edit(ids, images, size, size, steps=steps, caption_drop=drop,
                            initial_latents=ref["latents_0"].reshape(-1)),
-            dtype=np.uint8)
+                dtype=np.uint8)
+        else:
+            pixels = np.frombuffer(
+                tower.generate(ids, size, size, steps=steps, caption_drop=drop,
+                               initial_latents=ref["latents_0"].reshape(-1)),
+                dtype=np.uint8)
         print(f"generate {time.time() - started:.2f}s")
         image = pixels.reshape(size, size, channels)
         compare("generated image", image.astype(np.float32), ref["image"].astype(np.float32))

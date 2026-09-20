@@ -41,9 +41,19 @@ DIT_FFN = DIT_DIM * MLP_RATIO
 TIME_EMBED = 256
 CHANNELS = 16  # z_dim
 
+# Vision tower (Qwen3-VL ViT), tiny: patch 16, merge 2, one deepstack block.
+VIT_WIDTH = 16
+VIT_HEADS = 2
+VIT_FFN = 32
+VIT_BLOCKS = 2
+VIT_GRID_SIDE = 4          # num_position_embeddings = 16
+VIT_DEEPSTACK = [0]
+VIT_MERGED = VIT_WIDTH * 4
+
 # Autoencoder decoder: dim_mult [1, 2, 4, 4, 4] off base 4 gives level channels
 # [4, 8, 16, 16, 16], so the decoder walks 16 -> 16 -> 16 -> 8 -> 4.
 VAE_BASE = 4
+VAE_ENC_BASE = 2   # the encoder's narrower base_dim
 VAE_DIM_MULT = [1, 2, 4, 4, 4]
 VAE_LEVELS = [VAE_BASE * m for m in VAE_DIM_MULT]
 VAE_TEMPORAL_DOWNSAMPLE = [False, True, True, True]
@@ -73,9 +83,12 @@ def encoder_config() -> dict:
             "eos_token_id": 7,
             "bos_token_id": 5,
         },
-        "vision_config": {"depth": 2, "hidden_size": 8, "out_hidden_size": ENC_HIDDEN,
-                          "patch_size": 16, "num_heads": 1, "intermediate_size": 16,
-                          "deepstack_visual_indexes": [0]},
+        "vision_config": {"depth": VIT_BLOCKS, "hidden_size": VIT_WIDTH, "out_hidden_size": ENC_HIDDEN,
+                          "patch_size": 16, "num_heads": VIT_HEADS, "intermediate_size": VIT_FFN,
+                          "spatial_merge_size": 2, "temporal_patch_size": 2,
+                          "num_position_embeddings": VIT_GRID_SIDE * VIT_GRID_SIDE,
+                          "hidden_act": "gelu_pytorch_tanh",
+                          "deepstack_visual_indexes": VIT_DEEPSTACK},
         "tie_word_embeddings": False,
         "dtype": "bfloat16",
     }
@@ -104,7 +117,7 @@ def vae_config() -> dict:
         "_class_name": "AutoencoderKLQwenImage21",
         "_diffusers_version": "0.37.0.dev0",
         "attn_scales": [],
-        "base_dim": VAE_BASE,
+        "base_dim": VAE_ENC_BASE,
         "decoder_base_dim": VAE_BASE,
         "dim_mult": VAE_DIM_MULT,
         "dropout": 0.0,
@@ -129,10 +142,38 @@ def _encoder_tensors() -> dict[str, tuple[list[int], bytes]]:
         "model.language_model.embed_tokens.weight": t([VOCAB, ENC_HIDDEN]),
         "model.language_model.norm.weight": t([ENC_HIDDEN]),
         "lm_head.weight": t([VOCAB, ENC_HIDDEN]),
-        # The vision tower: recognised by the loader and dropped.
-        "model.visual.patch_embed.proj.weight": t([8, 3, 2, 16, 16]),
-        "model.visual.merger.linear_fc1.weight": t([ENC_HIDDEN, 32]),
+        # The vision tower, kept under the mmproj names.
+        "model.visual.patch_embed.proj.weight": t([VIT_WIDTH, 3, 2, 16, 16]),
+        "model.visual.patch_embed.proj.bias": t([VIT_WIDTH]),
+        "model.visual.pos_embed.weight": t([VIT_GRID_SIDE * VIT_GRID_SIDE, VIT_WIDTH]),
+        "model.visual.merger.norm.weight": t([VIT_WIDTH]),
+        "model.visual.merger.norm.bias": t([VIT_WIDTH]),
+        "model.visual.merger.linear_fc1.weight": t([VIT_MERGED, VIT_MERGED]),
+        "model.visual.merger.linear_fc1.bias": t([VIT_MERGED]),
+        "model.visual.merger.linear_fc2.weight": t([ENC_HIDDEN, VIT_MERGED]),
+        "model.visual.merger.linear_fc2.bias": t([ENC_HIDDEN]),
     }
+    for block in range(VIT_BLOCKS):
+        prefix = f"model.visual.blocks.{block}."
+        for name in ("norm1", "norm2"):
+            tensors[prefix + name + ".weight"] = t([VIT_WIDTH])
+            tensors[prefix + name + ".bias"] = t([VIT_WIDTH])
+        tensors[prefix + "attn.qkv.weight"] = t([3 * VIT_WIDTH, VIT_WIDTH])
+        tensors[prefix + "attn.qkv.bias"] = t([3 * VIT_WIDTH])
+        tensors[prefix + "attn.proj.weight"] = t([VIT_WIDTH, VIT_WIDTH])
+        tensors[prefix + "attn.proj.bias"] = t([VIT_WIDTH])
+        tensors[prefix + "mlp.linear_fc1.weight"] = t([VIT_FFN, VIT_WIDTH])
+        tensors[prefix + "mlp.linear_fc1.bias"] = t([VIT_FFN])
+        tensors[prefix + "mlp.linear_fc2.weight"] = t([VIT_WIDTH, VIT_FFN])
+        tensors[prefix + "mlp.linear_fc2.bias"] = t([VIT_WIDTH])
+    for index in range(len(VIT_DEEPSTACK)):
+        prefix = f"model.visual.deepstack_merger_list.{index}."
+        tensors[prefix + "norm.weight"] = t([VIT_MERGED])
+        tensors[prefix + "norm.bias"] = t([VIT_MERGED])
+        tensors[prefix + "linear_fc1.weight"] = t([VIT_MERGED, VIT_MERGED])
+        tensors[prefix + "linear_fc1.bias"] = t([VIT_MERGED])
+        tensors[prefix + "linear_fc2.weight"] = t([ENC_HIDDEN, VIT_MERGED])
+        tensors[prefix + "linear_fc2.bias"] = t([ENC_HIDDEN])
     q_width = ENC_HEADS * ENC_HEAD_DIM
     kv_width = ENC_KV_HEADS * ENC_HEAD_DIM
     for layer in range(ENC_LAYERS):
@@ -223,9 +264,32 @@ def _vae_tensors() -> dict[str, tuple[list[int], bytes]]:
     tensors["decoder.norm_out.gamma"] = t([VAE_LEVELS[0], 1, 1, 1])
     tensors["decoder.conv_out.weight"] = t([VAE_OUT_CHANNELS, VAE_LEVELS[0], 3, 3])
     tensors["decoder.conv_out.bias"] = t([VAE_OUT_CHANNELS])
-    # Encoder-side tensors the decoder never reads; the loader must drop them.
-    tensors["encoder.conv_in.weight"] = t([VAE_LEVELS[0], VAE_OUT_CHANNELS, 3, 3])
-    tensors["encoder.conv_in.bias"] = t([VAE_LEVELS[0]])
+    # The encoder half, on its own base: dims = [base * m for m in [1] + mult].
+    enc_dims = [VAE_ENC_BASE] + [VAE_ENC_BASE * m for m in VAE_DIM_MULT]
+    tensors["encoder.conv_in.weight"] = t([enc_dims[0], VAE_OUT_CHANNELS, 3, 3])
+    tensors["encoder.conv_in.bias"] = t([enc_dims[0]])
+    for level in range(levels):
+        prefix = f"encoder.down_blocks.{level}."
+        in_channels, out = enc_dims[level], enc_dims[level + 1]
+        for index in range(VAE_RES_BLOCKS):
+            _resnet(tensors, prefix + f"resnets.{index}.", t, in_channels if index == 0 else out, out)
+        if level < levels - 1:
+            tensors[prefix + "downsampler.resample.1.weight"] = t([out, out, 3, 3])
+            tensors[prefix + "downsampler.resample.1.bias"] = t([out])
+            if VAE_TEMPORAL_DOWNSAMPLE[level]:
+                tensors[prefix + "downsampler.time_conv.weight"] = t([out, out, 1, 1])
+                tensors[prefix + "downsampler.time_conv.bias"] = t([out])
+    enc_top = enc_dims[-1]
+    _resnet(tensors, "encoder.mid_block.resnets.0.", t, enc_top, enc_top)
+    _resnet(tensors, "encoder.mid_block.resnets.1.", t, enc_top, enc_top)
+    tensors["encoder.mid_block.attentions.0.norm.gamma"] = t([enc_top, 1, 1])
+    tensors["encoder.mid_block.attentions.0.to_qkv.weight"] = t([3 * enc_top, enc_top, 1, 1])
+    tensors["encoder.mid_block.attentions.0.to_qkv.bias"] = t([3 * enc_top])
+    tensors["encoder.mid_block.attentions.0.proj.weight"] = t([enc_top, enc_top, 1, 1])
+    tensors["encoder.mid_block.attentions.0.proj.bias"] = t([enc_top])
+    tensors["encoder.norm_out.gamma"] = t([enc_top, 1, 1, 1])
+    tensors["encoder.conv_out.weight"] = t([2 * CHANNELS, enc_top, 3, 3])
+    tensors["encoder.conv_out.bias"] = t([2 * CHANNELS])
     tensors["quant_conv.weight"] = t([2 * CHANNELS, 2 * CHANNELS, 1, 1])
     tensors["quant_conv.bias"] = t([2 * CHANNELS])
     return tensors

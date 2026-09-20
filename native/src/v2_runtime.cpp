@@ -8348,7 +8348,12 @@ void load_hf(const char* path, FlyweightV2Model& m) {
     const std::string directory=path;
     const auto config_text=read_text_file(directory+"/config.json");
     if(config_text.empty())throw std::runtime_error("cannot read config.json");
-    m.config=hf::config_from_json(flyweight::v2::json::parse(config_text));
+    {
+        const auto parsed_config=flyweight::v2::json::parse(config_text);
+        m.config=hf::config_from_json(parsed_config);
+        // Qwen3-VL keeps its vision tower (Qwen-Image-2.1 edits through it).
+        if(m.config.architecture=="qwen3vl")m.vision=hf::vision_config_from_qwen3_vl(parsed_config);
+    }
     m.architecture=m.config.architecture;
     // The directory name is the closest thing an HF checkpoint has to a model
     // name; config.json carries no equivalent of general.name.

@@ -2283,6 +2283,34 @@ kbd {
   background: var(--bg-elev);
   border: 1px solid var(--border);
 }
+.studio__refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 2px;
+}
+.studio__ref {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.studio__ref img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.studio__ref-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  background: var(--bg-elev);
+}
 .studio__prompt:focus-within {
   border-color: var(--accent);
 }

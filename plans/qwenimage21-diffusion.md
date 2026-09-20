@@ -1,8 +1,7 @@
 # Qwen-Image-2.1 text-to-image
 
-> **STATUS 2026-09-20**: text-to-image WORKING, parity below. Editing with
-> condition images is deliberately out of scope for this pass (see "Not in
-> this pass").
+> **STATUS 2026-09-20**: text-to-image and editing with reference images
+> both WORKING, parity below.
 
 Started 2026-09-20. The second diffusion model on the engine. Z-Image-Turbo
 (`plans/zimage-diffusion.md`) established the tower — component models opened
@@ -146,14 +145,52 @@ run a causal segment over the prefix and a full segment over the image rows.
 Existing call sites pass the same value for all of them, and
 `tools/check_zimage_parity.py` is the check that they still do.
 
-## Not in this pass
+## Editing (2026-09-20, same day)
 
-Image editing. It needs the Qwen3-VL **vision tower** (27 layers, hidden
-1152, patch 16, deepstack at 8/16/24) to put condition images into the text
-stream, the **VAE encoder** to put them into the latent stream, and
-block-causal attention over more than two blocks. The transformer and
-scheduler work here is a prerequisite for it, and the attention segment split
-already generalises to more than one image block.
+Three more pieces, each checked against its reference:
+
+- **Vision tower.** `model.visual.*` loads under the mmproj names
+  (`v.blk.N.*`, `mm.*`, `v.deepstack_list.K.*`) so `flyweight_v2_vision.hpp`'s
+  host helpers serve both; the 5-D patch conv folds to a `[1536][1152]`
+  matrix with both temporal frames fed the same patch. It runs on the
+  tower's own `DiffMatrix` GEMMs and streams like the decoder's blocks. Its
+  weights stay **f32**: at Q8_0 the merged tokens were 11% rms off the bf16
+  reference, at f32 6.5% -- and the taps show that 6.5% is bf16-class noise
+  compounding over 27 pre-LN blocks (patch 0.25%, block 0 0.56%, block 1
+  0.97%, block 8 1.55%), not a wiring error.
+- **Text encoder with images.** `qi_encode_prompt`: the projected tokens
+  overlay their `<|image_pad|>` run, positions follow `get_rope_index`
+  (frame frozen, height/width from that position, advance by the longer
+  side), the interleaved sections `[24, 20, 20]` go through
+  `qi_rope_mrope_rows`, and deepstack planes 1-3 are added to the image rows
+  after decoder layers 0-2. Fed the *reference* ViT planes
+  (`FLYWEIGHT_QI_VISION_PLANES`), the image rows land at the same error as
+  the text rows (median 5.8% vs 4.8%), which is the check that this half is
+  right.
+- **VAE encoder.** The decoder's blocks mirrored: five residual down blocks
+  (2 resnets, a stride-2 conv over a bottom/right zero pad, the `AvgDown3D`
+  shortcut -- `qi_avg_down_add`, whose padded front frame drops half the
+  slots on temporally downsampling levels), mid block, `quant_conv`, the mean
+  half of the posterior, per-channel normalization. On its own `base_dim`
+  (96), not the decoder's 144. Parity 0.61% rms.
+- **Joint sequence.** `qi_layout` walks the conditioning rows: each pad run
+  becomes its image's `h*w` latent rows (four per vision token), text stays
+  text; attention runs one segment per prefix run (text causal, image block
+  full) plus the target; every prefix row modulates from t = 0.
+
+End to end (`edit512.npz`: 512x512, 4 steps, one 512x512 reference,
+"make the bicycle blue"): VAE encode 0.61%, decode 0.72%, **final image
+1.27% pixel rms** (cos 0.99993). A 1024x1024 edit with one reference at 20
+steps takes ~75 s.
+
+Request side: `images` (data URLs / base64) on `/v1/images/generations`, or
+OpenAI's multipart `/v1/images/edits` (`image` parts); references are
+resized to the output area at their own aspect on the 32 grid, the target
+defaults to the last reference's shape; the studio has an attach button.
+
+Not done: `true_cfg_scale` with a negative prompt (a second forward per
+step), and the encoder tiling the pipeline uses above 1024x1024 references
+(ours encodes whole; a 1024x1024 reference is ~1.7 GB of workspace).
 
 ## Sizing
 

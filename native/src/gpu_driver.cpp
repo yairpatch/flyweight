@@ -1292,6 +1292,7 @@ extern "C" int flyweight_gpu_compile(
              "diff_upsample_nearest_2x_hwc_bf16", "diff_q8_bf16_gemm", "diff_pack_rows_bf16",
              // Qwen-Image-2.1 (v2_qwenimage.inc)
              "qi_channel_rms_stats", "qi_channel_rms_apply", "qi_dup_up_add",
+             "qi_rope_mrope_rows", "qi_conv2d_stride2", "qi_avg_down_add",
              "qwen_attention_query_mrope", "qwen_attention_key_mrope",
              "qwen_attention_query_mrope_rows", "qwen_attention_key_mrope_rows",
              "qwen_attention_query",

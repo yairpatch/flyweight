@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
+#include "flyweight_v2_vision.hpp"
 
 #include "flyweight_v2_config.hpp"
 #include "flyweight_v2_json.hpp"
@@ -208,6 +210,40 @@ inline ModelConfig config_from_qwen3_vl(const json::Value& config) {
     const auto& text = config.contains("text_config") ? config["text_config"] : config;
     ModelConfig out = config_from_qwen3(text);
     out.architecture = "qwen3vl";
+    // Interleaved M-RoPE sections, for the image tokens Qwen-Image-2.1's
+    // editing path puts into the prompt; a text-only prompt never reads them.
+    if (text.contains("rope_scaling") && text["rope_scaling"].contains("mrope_section")) {
+        const auto& sections = text["rope_scaling"]["mrope_section"];
+        for (std::size_t axis = 0; axis < 3 && axis < sections.size(); ++axis)
+            out.rope_sections[axis] = static_cast<std::uint32_t>(sections[axis].as_uint());
+    }
+    return out;
+}
+
+// The vision tower's geometry, in the shape the mmproj path fills from
+// `clip.*` keys so the same host helpers (smart resize, patchify, position
+// resampling) and the same tensor names serve both.
+inline VisionConfig vision_config_from_qwen3_vl(const json::Value& config) {
+    VisionConfig out;
+    if (!config.contains("vision_config")) return out;
+    const auto& vision = config["vision_config"];
+    out.present = true;
+    out.projector_type = "qwen3vl_merger";
+    out.patch_size = static_cast<std::uint32_t>(vision["patch_size"].as_uint(16));
+    out.embedding_length = static_cast<std::uint32_t>(vision["hidden_size"].as_uint());
+    out.feed_forward_length = static_cast<std::uint32_t>(vision["intermediate_size"].as_uint());
+    out.block_count = static_cast<std::uint32_t>(vision["depth"].as_uint());
+    out.head_count = static_cast<std::uint32_t>(vision["num_heads"].as_uint());
+    out.spatial_merge_size = static_cast<std::uint32_t>(vision["spatial_merge_size"].as_uint(2));
+    out.projection_dim = static_cast<std::uint32_t>(vision["out_hidden_size"].as_uint());
+    // num_position_embeddings is the learned grid's cell count, side^2.
+    const auto cells = vision["num_position_embeddings"].as_uint(0);
+    const auto side = static_cast<std::uint32_t>(std::lround(std::sqrt(static_cast<double>(cells))));
+    out.image_size = side * out.patch_size;
+    out.use_gelu = vision["hidden_act"].as_string() != "quick_gelu";
+    const auto& deepstack = vision["deepstack_visual_indexes"];
+    for (std::size_t i = 0; i < deepstack.size(); ++i)
+        out.deepstack_layers.push_back(static_cast<std::uint32_t>(deepstack[i].as_uint()));
     return out;
 }
 
@@ -380,6 +416,8 @@ inline ModelConfig config_from_qwenimage21_autoencoder(const json::Value& config
     const std::uint32_t base = static_cast<std::uint32_t>(
         config["decoder_base_dim"].as_uint(config["base_dim"].as_uint(96)));
     out.vae_decoder_base_dim = base;
+    // The encoder half is narrower: base_dim (96) against decoder_base_dim (144).
+    out.vae_encoder_base_dim = static_cast<std::uint32_t>(config["base_dim"].as_uint(base));
     const auto& multipliers = config["dim_mult"];
     out.vae_level_count = static_cast<std::uint32_t>(multipliers.size());
     if (!out.vae_level_count || out.vae_level_count > 5)
@@ -873,6 +911,65 @@ inline ParsedName translate_qwen3_5(const std::string& name,
     return parsed;
 }
 
+// Qwen3-VL spells its decoder exactly as Qwen3.5 does (no MTP block for that
+// path to look for), and its vision tower is kept rather than dropped, under
+// the names the mmproj GGUFs give the same tensors -- so the diffusion tower's
+// image path reads one vocabulary.
+inline ParsedName translate_qwen3_vl(const std::string& name, const ModelConfig& config) {
+    static const std::string kVisual = "model.visual.";
+    if (name.rfind(kVisual, 0) != 0) return translate_qwen3_5(name, config);
+    ParsedName parsed;
+    const std::string tail = name.substr(kVisual.size());
+    static const std::map<std::string, std::string> globals = {
+        {"patch_embed.proj.weight", "v.patch_embd.weight"},
+        {"patch_embed.proj.bias", "v.patch_embd.bias"},
+        {"pos_embed.weight", "v.position_embd.weight"},
+        {"merger.norm.weight", "v.post_ln.weight"},
+        {"merger.norm.bias", "v.post_ln.bias"},
+        {"merger.linear_fc1.weight", "mm.0.weight"},
+        {"merger.linear_fc1.bias", "mm.0.bias"},
+        {"merger.linear_fc2.weight", "mm.2.weight"},
+        {"merger.linear_fc2.bias", "mm.2.bias"},
+    };
+    if (const auto found = globals.find(tail); found != globals.end()) {
+        parsed.matched = true;
+        parsed.gguf = found->second;
+        return parsed;
+    }
+    static const std::map<std::string, std::string> blocks = {
+        {"norm1.weight", "ln1.weight"}, {"norm1.bias", "ln1.bias"},
+        {"norm2.weight", "ln2.weight"}, {"norm2.bias", "ln2.bias"},
+        {"attn.qkv.weight", "attn_qkv.weight"}, {"attn.qkv.bias", "attn_qkv.bias"},
+        {"attn.proj.weight", "attn_out.weight"}, {"attn.proj.bias", "attn_out.bias"},
+        {"mlp.linear_fc1.weight", "ffn_up.weight"}, {"mlp.linear_fc1.bias", "ffn_up.bias"},
+        {"mlp.linear_fc2.weight", "ffn_down.weight"}, {"mlp.linear_fc2.bias", "ffn_down.bias"},
+    };
+    static const std::map<std::string, std::string> mergers = {
+        {"norm.weight", "norm.weight"}, {"norm.bias", "norm.bias"},
+        {"linear_fc1.weight", "fc1.weight"}, {"linear_fc1.bias", "fc1.bias"},
+        {"linear_fc2.weight", "fc2.weight"}, {"linear_fc2.bias", "fc2.bias"},
+    };
+    std::uint32_t index = 0;
+    std::string rest;
+    if (split_indexed(tail, "blocks.", index, rest)) {
+        if (const auto found = blocks.find(rest); found != blocks.end()) {
+            parsed.matched = true;
+            parsed.gguf = "v.blk." + std::to_string(index) + "." + found->second;
+        }
+        return parsed;
+    }
+    if (split_indexed(tail, "deepstack_merger_list.", index, rest)) {
+        // Kept by list index; the vision config's deepstack_visual_indexes says
+        // which ViT block the k-th merger reads, and the tower resolves that.
+        if (const auto found = mergers.find(rest); found != mergers.end()) {
+            parsed.matched = true;
+            parsed.gguf = "v.deepstack_list." + std::to_string(index) + "." + found->second;
+        }
+        return parsed;
+    }
+    return parsed;
+}
+
 // Plain Qwen3: the same block tensors as a Qwen3.5 full-attention layer under
 // `model.layers.` rather than `model.language_model.layers.`, no MTP block, and
 // the embedding may double as the head (tie_word_embeddings).
@@ -944,15 +1041,15 @@ inline ParsedName translate_qwenimage21(const std::string& name) {
     return parsed;
 }
 
-// AutoencoderKLQwenImage21: the decoder half only, and within it only what a
-// single frame reaches. `time_conv` belongs to the temporal upsample, which is
-// skipped outright at T = 1 (its feature cache is empty on the first chunk), so
-// it is recognised and dropped rather than uploaded and never used.
+// AutoencoderKLQwenImage21: both halves (the encoder puts condition images
+// into the latent stream), but within them only what a single frame reaches.
+// `time_conv` belongs to the temporal resample, which is skipped outright at
+// T = 1 (its feature cache is empty on the first chunk), so it is recognised
+// and dropped rather than uploaded and never used.
 inline ParsedName translate_qwenimage21_autoencoder(const std::string& name) {
     ParsedName parsed;
     parsed.matched = true;
-    if (name.rfind("encoder.", 0) == 0 || name.rfind("quant_conv.", 0) == 0 ||
-        name.find(".time_conv.") != std::string::npos) {
+    if (name.find(".time_conv.") != std::string::npos) {
         parsed.skip = true;
         return parsed;
     }
@@ -978,9 +1075,7 @@ inline ParsedName translate_autoencoder_kl(const std::string& name) {
 inline ParsedName translate(const std::string& name,
                             const ModelConfig& config) {
     if (config.architecture == "qwen35") return translate_qwen3_5(name, config);
-    // Qwen3-VL spells its decoder exactly as Qwen3.5 does, vision tower and
-    // all; it just has no MTP block for that path to look for.
-    if (config.architecture == "qwen3vl") return translate_qwen3_5(name, config);
+    if (config.architecture == "qwen3vl") return translate_qwen3_vl(name, config);
     if (config.architecture == "qwen3") return translate_qwen3(name);
     if (config.architecture == "zimage-dit") return translate_zimage(name);
     if (config.architecture == "autoencoder-kl") return translate_autoencoder_kl(name);
@@ -1359,16 +1454,26 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
             if (parsed.skip) continue;
             if (!parsed.matched)
                 throw std::runtime_error("unmapped HF tensor: " + entry.name);
+            // The ViT patch embedding is a 5-D conv over the temporal pair,
+            // [E][3][2][p][p]; as a matrix that maps one patch's (frame,
+            // channel, y, x) inputs to E it is what the tower multiplies by,
+            // so fold the input axes (shapes are in GGUF order, E last).
+            std::vector<std::uint64_t> shape = entry.shape;
+            if (parsed.gguf == "v.patch_embd.weight" && shape.size() == 5) {
+                std::uint64_t inputs = 1;
+                for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) inputs *= shape[axis];
+                shape = {inputs, shape.back()};
+            }
             // Only now that the tensor is known to be wanted is an
             // undescribable rank an error.
-            if (entry.rank_exceeded)
+            if (shape.size() > 4)
                 throw std::runtime_error(
                     "safetensors rank exceeds the v2 ABI: " + entry.name);
 
             if (!parsed.is_expert) {
                 HfTensor tensor;
                 tensor.name = parsed.gguf;
-                tensor.shape = entry.shape;
+                tensor.shape = shape;
                 tensor.type = entry.type;
                 tensor.size = entry.size;
                 // Kept for consumers that still read `offset` directly; only

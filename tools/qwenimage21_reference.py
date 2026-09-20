@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import sys
 
 import numpy as np
@@ -65,6 +66,9 @@ def main() -> None:
                         help="the bf16 Qwen3-VL is 16 GB; a prompt of a few dozen tokens "
                              "runs in seconds on the CPU, so that is the default")
     parser.add_argument("--text-only", action="store_true", help="only dump the conditioning")
+    parser.add_argument("--image", action="append", default=[],
+                        help="a condition image (repeatable): the editing path, which also dumps "
+                             "the resized RGBA pixels, the VAE latents and the joint layout")
     args = parser.parse_args()
 
     if args.diffusers:
@@ -84,9 +88,40 @@ def main() -> None:
     tokenizer = processor.tokenizer
     system_only = [{"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
     drop_idx = len(processor.apply_chat_template(system_only, tokenize=True, return_dict=False)[0])
-    ids = tokenizer(TEMPLATE.format(args.prompt), return_tensors="pt").input_ids
-    out["input_ids"] = ids[0].numpy().astype(np.int64)
     out["drop_idx"] = np.array(drop_idx, dtype=np.int64)
+
+    # Condition images, prepared the way the pipeline does: resized to the
+    # output area at their own aspect (multiples of 32), RGBA for the VAE,
+    # alpha over white for the vision encoder.
+    from PIL import Image as PILImage
+    condition_rgba, condition_rgb = [], []
+    for index, path in enumerate(args.image):
+        picture = PILImage.open(path).convert("RGBA")
+        ratio = picture.width / picture.height
+        width = round(math.sqrt(args.size * args.size * ratio) / 32) * 32
+        height = round(math.sqrt(args.size * args.size / ratio) / 32) * 32
+        picture = picture.resize((width, height), PILImage.Resampling.LANCZOS)
+        condition_rgba.append(picture)
+        out[f"condition{index}_rgba"] = np.array(picture, dtype=np.uint8)
+        white = PILImage.new("RGB", picture.size, (255, 255, 255))
+        white.paste(picture, mask=picture.getchannel("A"))
+        condition_rgb.append(white)
+
+    if args.image:
+        slots = "<image1><|vision_start|><|image_pad|><|vision_end|>"
+        for index in range(2, len(args.image) + 1):
+            slots += f" <image{index}><|vision_start|><|image_pad|><|vision_end|>"
+        template = TEMPLATE.replace("<|im_start|>user\n{}", "<|im_start|>user\n" + slots + "{}")
+        model_inputs = processor(text=[template.format(args.prompt)], images=condition_rgb,
+                                 padding=True, return_tensors="pt")
+        out["image_grid_thw"] = model_inputs.image_grid_thw.numpy().astype(np.int64)
+        out["pixel_values_shape"] = np.array(model_inputs.pixel_values.shape, dtype=np.int64)
+    else:
+        model_inputs = tokenizer(TEMPLATE.format(args.prompt), return_tensors="pt")
+    ids = model_inputs.input_ids
+    out["input_ids"] = ids[0].numpy().astype(np.int64)
+    image_token_id = tokenizer.encode("<|image_pad|>")[0]
+    out["image_pad_mask"] = (ids[0] == image_token_id).numpy()[drop_idx:]
 
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model, subfolder="text_encoder", dtype=torch.bfloat16).to(args.encoder_device)
@@ -95,10 +130,15 @@ def main() -> None:
     # what the pipeline arranges with this same hook.
     text_model = getattr(encoder.model, "language_model", encoder.model)
     handle = text_model.norm.register_forward_hook(lambda module, inputs, output: inputs[0])
+    forward_kwargs = {"input_ids": ids.to(args.encoder_device), "output_hidden_states": True}
+    if args.image:
+        forward_kwargs["pixel_values"] = model_inputs.pixel_values.to(args.encoder_device, torch.bfloat16)
+        forward_kwargs["image_grid_thw"] = model_inputs.image_grid_thw.to(args.encoder_device)
+        if hasattr(model_inputs, "mm_token_type_ids"):
+            forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids.to(args.encoder_device)
     try:
         with torch.no_grad():
-            hidden = encoder(input_ids=ids.to(args.encoder_device),
-                             output_hidden_states=True).hidden_states
+            hidden = encoder(**forward_kwargs).hidden_states
     finally:
         handle.remove()
     embeds = hidden[-1][0][drop_idx:]
@@ -147,11 +187,28 @@ def main() -> None:
     out["latents_0"] = latents_0[0, 0].cpu().numpy()
     packed = latents_0.view(1, 64, latent_h * latent_w).transpose(1, 2).to(torch.bfloat16)
 
+    if args.image:
+        # The pipeline's own VAE encode of each condition image, normalized,
+        # is what the transformer sees in front of the target latents.
+        for index, picture in enumerate(condition_rgba):
+            tensor = pipe.image_processor.preprocess(picture, width=picture.width, height=picture.height)
+            with torch.no_grad():
+                latents = pipe._encode_vae_image(tensor.unsqueeze(2).to(device, torch.bfloat16), None)
+            out[f"condition{index}_latents"] = latents[0, :, 0].float().cpu().numpy()
+    # The pipeline re-encodes the prompt itself when condition images are
+    # passed (it needs the image_pad_mask its encoder produces), and the
+    # encoder does not fit beside the transformer; hand it ours instead.
+    conditioning = (embeds[None].to(torch.bfloat16).to(device), None,
+                    torch.from_numpy(out["image_pad_mask"])[None].to(device))
+    pipe.encode_prompt = lambda **kwargs: conditioning
     with torch.no_grad():
         result = pipe(
-            prompt=None,
-            prompt_embeds=embeds[None].to(torch.bfloat16).to(device),
+            prompt=args.prompt,
+            image=condition_rgba or None,
             height=args.size, width=args.size,
+            # Condition images are resized to this area at their own aspect;
+            # it has to match the resize the vision copy above got.
+            output_resolution=args.size,
             num_inference_steps=args.steps,
             latents=packed,
             use_kv_cache=False,

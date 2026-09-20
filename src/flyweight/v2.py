@@ -513,6 +513,15 @@ class _DiffusionInfo(ctypes.Structure):
     ]
 
 
+class _DiffusionImage(ctypes.Structure):
+    _fields_ = [
+        ("rgba", ctypes.c_void_p),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("token_offset", ctypes.c_uint64),
+    ]
+
+
 # Where the image model's weights live; see flyweight_v2.h.
 DIFFUSION_WEIGHTS = {"device": 0, "host": 1, "auto": 2}
 # OR-ed into the weights flag: exact f32 activations instead of the Q8/bf16 paths.
@@ -699,6 +708,40 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p,
                 ]
                 lib.flyweight_v2_diffusion_generate.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_edit.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(_DiffusionImage),
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    _DiffusionProgress,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_diffusion_edit.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_prompt.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+                    ctypes.POINTER(_DiffusionImage), ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_diffusion_encode_prompt.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_vision.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.flyweight_v2_diffusion_encode_vision.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_image.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_diffusion_encode_image.restype = ctypes.c_int
                 lib.flyweight_v2_hf_quant_options.argtypes = [
                     ctypes.c_char_p,
                     ctypes.POINTER(_HfQuantOption),
@@ -3679,3 +3722,111 @@ class V2Diffusion:
             )
         )
         return rgb.raw
+
+    def edit(
+        self,
+        tokens: Sequence[int],
+        images: Sequence[tuple[bytes, int, int, int]],
+        width: int,
+        height: int,
+        *,
+        steps: int | None = None,
+        shift: float | None = None,
+        seed: int = 0,
+        caption_drop: int = 0,
+        initial_latents: Any = None,
+        progress: Any = None,
+    ) -> bytes:
+        """``generate`` with condition images (Qwen-Image-2.1 only).
+
+        Each image is ``(rgba_bytes, width, height, token_offset)``: RGBA at a
+        size whose sides are multiples of 32, and where its run of
+        ``<|image_pad|>`` tokens -- ``(width // 32) * (height // 32)`` of them
+        -- starts in ``tokens``.
+        """
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        buffers, records = self._image_records(images)
+        rgb = ctypes.create_string_buffer(width * height * self.output_channels)
+        latents = None
+        if initial_latents is not None:
+            stride = self.latent_stride
+            latents = self._floats(
+                initial_latents, self.latent_channels * (height // stride) * (width // stride),
+                "initial_latents")
+
+        def on_progress(_user: Any, step: int, total: int) -> int:
+            if progress is None:
+                return 0
+            return 1 if progress(step, total) else 0
+
+        callback = _DiffusionProgress(on_progress)
+        self._check(
+            self._lib.flyweight_v2_diffusion_edit(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), ctypes.c_uint32(caption_drop),
+                records, ctypes.c_uint32(len(images)),
+                ctypes.c_uint32(width), ctypes.c_uint32(height),
+                ctypes.c_uint32(self.default_steps if steps is None else steps),
+                ctypes.c_float(self.default_shift if shift is None else shift),
+                ctypes.c_uint64(seed),
+                (ctypes.c_float * len(latents)).from_buffer(latents) if latents is not None else None,
+                callback, None, rgb,
+            )
+        )
+        del buffers
+        return rgb.raw
+
+    @staticmethod
+    def _image_records(images: Sequence[tuple[bytes, int, int, int]]) -> tuple[list, Any]:
+        buffers = [ctypes.create_string_buffer(rgba, len(rgba)) for rgba, _, _, _ in images]
+        records = (_DiffusionImage * max(1, len(images)))()
+        for index, ((rgba, image_width, image_height, offset), buffer) in enumerate(zip(images, buffers)):
+            if len(rgba) != image_width * image_height * 4:
+                raise ValueError("condition image bytes do not match width * height * 4")
+            records[index] = _DiffusionImage(
+                ctypes.cast(buffer, ctypes.c_void_p), image_width, image_height, offset)
+        return buffers, records
+
+    def encode_prompt(self, tokens: Sequence[int], images: Sequence[tuple[bytes, int, int, int]]) -> "array.array[float]":
+        """The text encoder over a prompt with images in its token runs: ``len(tokens) * caption_width`` floats."""
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        buffers, records = self._image_records(images)
+        out = array.array("f", bytes(4 * len(tokens) * self.caption_width))
+        buffer = (ctypes.c_float * len(out)).from_buffer(out)
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_prompt(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), records, ctypes.c_uint32(len(images)),
+                buffer, ctypes.c_uint64(len(out)),
+            )
+        )
+        del buffers
+        return out
+
+    def encode_vision(self, rgba: bytes, width: int, height: int) -> list["array.array[float]"]:
+        """The vision tower's planes for one RGBA image, each ``tokens * caption_width`` floats."""
+        tokens = (width // 32) * (height // 32)
+        capacity = tokens * self.caption_width * 8
+        out = array.array("f", bytes(4 * capacity))
+        planes = ctypes.c_uint32(0)
+        pixels = ctypes.create_string_buffer(rgba, len(rgba))
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_vision(
+                self._handle, pixels, ctypes.c_uint32(width), ctypes.c_uint32(height),
+                (ctypes.c_float * capacity).from_buffer(out), ctypes.c_uint64(capacity), ctypes.byref(planes),
+            )
+        )
+        size = tokens * self.caption_width
+        return [out[i * size:(i + 1) * size] for i in range(planes.value)]
+
+    def encode_image(self, rgba: bytes, width: int, height: int) -> "array.array[float]":
+        """The autoencoder's normalized latents of one RGBA image: ``latent_channels * (h/16) * (w/16)`` floats."""
+        stride = self.latent_stride
+        count = self.latent_channels * (height // stride) * (width // stride)
+        out = array.array("f", bytes(4 * count))
+        pixels = ctypes.create_string_buffer(rgba, len(rgba))
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_image(
+                self._handle, pixels, ctypes.c_uint32(width), ctypes.c_uint32(height),
+                (ctypes.c_float * count).from_buffer(out), ctypes.c_uint64(count),
+            )
+        )
+        return out
