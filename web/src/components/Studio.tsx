@@ -8,6 +8,10 @@ interface ImagesInfo {
   max_size?: string;
   weights?: string;
   precision?: string;
+  /** What a side must divide by, and the step count the model was tuned for. */
+  size_multiple?: number;
+  default_steps?: number;
+  alpha?: boolean;
 }
 
 const ASPECTS: Array<{ id: ImageSettings["aspect"]; label: string }> = [
@@ -30,6 +34,10 @@ export function Studio() {
   const health = useStore((state) => state.health);
   const info = (health?.execution?.images as ImagesInfo | null | undefined) ?? null;
   const limit = parseInt(String(info?.max_size ?? "1024x1024").split("x")[0] ?? "1024", 10) || 1024;
+  // Both follow from which image model the server loaded, so they come off the
+  // health payload rather than being pinned to one model's.
+  const multiple = Number(info?.size_multiple) || 16;
+  const defaultSteps = Number(info?.default_steps) || 8;
   const images = useStore((state) => state.images);
   const currentImageId = useStore((state) => state.currentImageId);
   const progress = useStore((state) => state.imageProgress);
@@ -54,7 +62,8 @@ export function Studio() {
     return () => window.clearInterval(timer);
   }, [progress]);
 
-  const { width, height } = imageDimensions(settings, limit);
+  const { width, height } = imageDimensions(settings, limit, multiple);
+  const steps = settings.steps || defaultSteps;
   const running = progress !== null;
   const canRender = !running && prompt.trim().length > 0 && info !== null;
 
@@ -81,7 +90,7 @@ export function Studio() {
           <div className="empty">
             <div className="empty__badge"><ImageIcon size={22} /></div>
             <h2>No image model loaded</h2>
-            <p>Start the server with <code>--image-model DIR</code> pointing at a Z-Image-Turbo snapshot to render pictures here.</p>
+            <p>Start the server with <code>--image-model DIR</code> pointing at a Z-Image-Turbo or Qwen-Image-2.1 snapshot to render pictures here.</p>
           </div>
         </div>
       </section>
@@ -180,7 +189,7 @@ export function Studio() {
           <h3>Sampling</h3>
           <label className="field field--inline">
             <span className="field__label">Steps</span>
-            <input type="number" min={1} max={50} value={settings.steps} onChange={(event) => update({ steps: Math.max(1, Math.min(50, Number(event.target.value) || 1)) })} />
+            <input type="number" min={1} max={50} value={steps} onChange={(event) => update({ steps: Math.max(1, Math.min(50, Number(event.target.value) || 1)) })} />
           </label>
           <label className="field field--inline">
             <span className="field__label">Seed</span>

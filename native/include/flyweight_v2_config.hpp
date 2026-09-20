@@ -124,6 +124,18 @@ struct ModelConfig {
     std::uint32_t vae_block_channels[4]={0,0,0,0};
     bool vae_mid_attention=false;
     float latent_scale=0.0f, latent_shift=0.0f; // scaling_factor, shift_factor
+    // Qwen-Image-2.1's autoencoder instead: five levels off one
+    // `decoder_base_dim`, per-channel latent statistics rather than a scalar
+    // scale/shift, and a temporal-upsample flag per level. The temporal path
+    // itself is inert on a single frame, but the flag still decides the
+    // duplicating shortcut's channel fan-out, so it has to survive the load.
+    std::uint32_t vae_level_count=0, vae_decoder_base_dim=0, vae_spatial_scale=0;
+    std::uint32_t vae_level_channels[5]={0,0,0,0,0};
+    std::uint8_t vae_temporal_upsample[5]={0,0,0,0,0};
+    std::vector<float> latents_mean, latents_std;
+    // Qwen-Image-2.1 DiT: text and condition-image tokens modulate from t = 0
+    // rather than the sampled timestep.
+    bool causal_condition=false;
     // GGUF tokenizer terminator ids; max means the key was absent.
     std::uint32_t eos_token_id=0xffffffffu;
     std::uint32_t eot_token_id=0xffffffffu;

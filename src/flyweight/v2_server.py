@@ -2734,9 +2734,10 @@ class NativeV2InferenceService(InferenceService):
         image_max_tokens: int = 1024,
         image_urls: str = "allow",
         image_model_path: Path | str | None = None,
-        image_max_size: int = 1024,
+        image_max_size: int = 0,
         image_weights: str = "auto",
         image_precision: str = "balanced",
+        image_reserve: bool = False,
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
@@ -2792,7 +2793,7 @@ class NativeV2InferenceService(InferenceService):
                 self.images = ImageGenerator(
                     image_model_path, device=device,
                     max_width=int(image_max_size), max_height=int(image_max_size),
-                    weights=image_weights, precision=image_precision,
+                    weights=image_weights, precision=image_precision, reserve=image_reserve,
                 )
             except BaseException:
                 self.v2_model.close()

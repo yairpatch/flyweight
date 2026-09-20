@@ -89,6 +89,12 @@ constexpr int kVaeBlendPixels = 128;
 
 }  // namespace
 
+// Qwen-Image-2.1's own weights and geometry, in v2_qwenimage.inc. The tower
+// below owns the parts both models share -- the streams, the workspace arena,
+// the staging slots, the precision flags and the text encoder -- and carries
+// one model's DiT and autoencoder inline and the other's behind this pointer.
+struct QwenImage21Tower;
+
 struct FlyweightV2Diffusion {
     FlyweightV2Model* encoder = nullptr;      // borrowed
     FlyweightV2Model* transformer = nullptr;  // borrowed
@@ -108,6 +114,10 @@ struct FlyweightV2Diffusion {
     // GEMM with bf16 activations (diffusers' numerics), bf16 attention and
     // convolutions. Between fast and exact in both cost and error.
     bool balanced = false;
+
+    // Non-null when the tower is running Qwen-Image-2.1 rather than Z-Image;
+    // the DiT and autoencoder fields below are then unused.
+    QwenImage21Tower* qwenimage = nullptr;
 
     // Text encoder.
     const Tensor* token_embedding = nullptr;
@@ -163,6 +173,28 @@ struct FlyweightV2Diffusion {
 };
 
 namespace {
+
+// Qwen-Image-2.1's half of the tower, defined in v2_qwenimage.inc, which the
+// translation unit includes after this file. Declared here because the tower's
+// create path and C API below are shared and dispatch into it.
+void qi_destroy(QwenImage21Tower* tower);
+void qi_upload_transformer(FlyweightV2Diffusion& d);   // also allocates the tower
+void qi_upload_vae(FlyweightV2Diffusion& d);
+int qi_caption_dim(const FlyweightV2Diffusion& d);
+int qi_spatial_scale(const FlyweightV2Diffusion& d);
+int qi_output_channels(const FlyweightV2Diffusion& d);
+int qi_latent_channels(const FlyweightV2Diffusion& d);
+std::uint64_t qi_workspace(const FlyweightV2Diffusion& d, std::uint32_t max_width,
+                           std::uint32_t max_height, std::uint32_t max_prompt_tokens);
+void qi_transformer_forward(FlyweightV2Diffusion& d, const float* latents, int latent_h,
+                            int latent_w, const float* caption, std::uint64_t caption_tokens,
+                            float t, float* velocity);
+void qi_decode_latents(FlyweightV2Diffusion& d, const float* latents, int latent_h, int latent_w,
+                       std::uint8_t* pixels);
+void qi_generate(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std::uint64_t count,
+                 std::uint32_t caption_drop, std::uint32_t width, std::uint32_t height,
+                 std::uint32_t steps, float shift, std::uint64_t seed, const float* initial_latents,
+                 FlyweightV2DiffusionProgress progress, void* user_data, std::uint8_t* pixels);
 
 std::uint64_t diff_alloc(FlyweightV2Diffusion& d, std::uint64_t bytes) {
     std::uint64_t pointer = 0;
@@ -384,7 +416,11 @@ std::uint64_t diff_upload_doubles(FlyweightV2Diffusion& d, const std::vector<dou
     return pointer;
 }
 
-void diff_upload_encoder(FlyweightV2Diffusion& d) {
+// `dropped_layers` is how many trailing layers the conditioning never reaches:
+// one for Z-Image, which reads hidden_states[-2], none for Qwen-Image-2.1,
+// which reads the last layer's output with the final norm hooked off.
+// `caption_width` is the DiT's expected conditioning width.
+void diff_upload_encoder(FlyweightV2Diffusion& d, int dropped_layers, int caption_width) {
     const auto& model = *d.encoder;
     const auto& config = model.config;
     d.encoder_hidden = static_cast<int>(config.hidden_size);
@@ -396,14 +432,13 @@ void diff_upload_encoder(FlyweightV2Diffusion& d) {
     d.encoder_theta = config.rope_freq_base;
     if (d.encoder_head_dim > 128)
         throw std::runtime_error("text encoder head width above 128 is not supported");
-    if (d.encoder_hidden != d.caption_dim)
+    if (d.encoder_hidden != caption_width)
         throw std::runtime_error("text encoder width " + std::to_string(d.encoder_hidden) +
-                                 " does not match the DiT's cap_feat_dim " +
-                                 std::to_string(d.caption_dim));
+                                 " does not match the DiT's conditioning width " +
+                                 std::to_string(caption_width));
     d.token_embedding = &diff_tensor(model, "token_embd.weight");
-    // hidden_states[-2] is the residual stream entering the last layer, so
-    // the last layer's weights are never read and never uploaded.
-    const int used_layers = static_cast<int>(config.layer_count) - 1;
+    // A dropped layer's weights are never read, so they are never uploaded.
+    const int used_layers = static_cast<int>(config.layer_count) - dropped_layers;
     if (used_layers < 1) throw std::runtime_error("text encoder has too few layers");
     {
         std::vector<double> frequencies(d.encoder_head_dim / 2);
@@ -533,6 +568,32 @@ void diff_upload_vae(FlyweightV2Diffusion& d) {
 }
 
 // ---- Workspace -------------------------------------------------------------
+
+// The arena a phase needs for `width` x `height` pixels and `prompt_tokens`,
+// whichever of the encoder, the transformer and the decoder wants the most.
+// The decoder is tiled, so its share stops growing at one tile.
+std::uint64_t diff_workspace_bytes(const FlyweightV2Diffusion& d, std::uint32_t width,
+                                   std::uint32_t height, std::uint32_t prompt_tokens);
+
+// Grows the workspace to `bytes` when a request needs more than the tower
+// holds. The stream is drained first so nothing still reads the old arena,
+// and the new one is taken before the old is freed so a card that cannot
+// give it fails this request and leaves the tower as it was.
+void diff_ensure_workspace(FlyweightV2Diffusion& d, std::uint64_t bytes, const char* what) {
+    if (bytes <= d.workspace_bytes) return;
+    if (d.stream && flyweight_gpu_stream_sync(d.stream) != 0)
+        throw std::runtime_error("diffusion stream sync failed before growing the workspace");
+    std::uint64_t grown = 0;
+    if (flyweight_gpu_alloc(bytes, &grown) != 0 || !grown)
+        throw std::runtime_error(std::string("not enough free device memory for this ") + what +
+                                 ": it needs a " + std::to_string(bytes / 1048576) +
+                                 " MiB workspace (the tower holds " +
+                                 std::to_string(d.workspace_bytes / 1048576) +
+                                 " MiB); render smaller, or start with --image-reserve");
+    if (d.workspace) flyweight_gpu_free(d.workspace);
+    d.workspace = grown;
+    d.workspace_bytes = bytes;
+}
 
 // A bump cursor over the arena, reset per phase.
 struct DiffArena {
@@ -710,26 +771,37 @@ struct DiffLaunch {
         run("diff_head_rms_norm", static_cast<std::uint32_t>((warps + 7) / 8), 1, 256, arguments);
     }
 
-    // q16/k16/v16 are bf16 scratch planes for the tensor-core path.
+    // q16/k16/v16 are bf16 scratch planes for the tensor-core path. `packed`
+    // says the planes already hold `rows` packed rows from an earlier call, so
+    // a second segment over the same sequence skips the packing.
     void attention(std::uint64_t q, std::uint64_t k, std::uint64_t v, std::uint64_t out, int heads,
                    int kv_heads, int head_dim, std::uint64_t rows, int q_stride, int kv_stride,
-                   bool causal, std::uint64_t q16, std::uint64_t k16, std::uint64_t v16) const {
-        int count = static_cast<int>(rows), causal_flag = causal ? 1 : 0;
+                   bool causal, std::uint64_t q16, std::uint64_t k16, std::uint64_t v16,
+                   std::uint64_t q_first = 0, std::uint64_t q_rows = 0, std::uint64_t kv_rows = 0,
+                   bool packed = false) const {
+        int plane = static_cast<int>(rows), causal_flag = causal ? 1 : 0;
+        int first = static_cast<int>(q_first);
+        int queries = static_cast<int>(q_rows ? q_rows : rows - q_first);
+        int keys = static_cast<int>(kv_rows ? kv_rows : rows);
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         if (d.flash_attention && !d.exact && head_dim == 128) {
             float q_scale = scale * 1.4426950408889634f;   // exp2 softmax
-            void* pack_arguments[] = {&q, &k, &v, &q16, &k16, &v16, &heads, &kv_heads, &count,
-                                      &q_stride, &kv_stride, &q_scale};
-            run("diff_pack_attention_bf16",
-                grid_for(rows * static_cast<std::uint64_t>(heads + 2 * kv_heads) * 128), 1, 256, pack_arguments);
-            void* arguments[] = {&q16, &k16, &v16, &out, &heads, &kv_heads, &count, &causal_flag};
-            run("diff_flash_attention_bf16", static_cast<std::uint32_t>((rows + 63) / 64),
+            if (!packed) {
+                void* pack_arguments[] = {&q, &k, &v, &q16, &k16, &v16, &heads, &kv_heads, &plane,
+                                          &q_stride, &kv_stride, &q_scale};
+                run("diff_pack_attention_bf16",
+                    grid_for(rows * static_cast<std::uint64_t>(heads + 2 * kv_heads) * 128), 1, 256,
+                    pack_arguments);
+            }
+            void* arguments[] = {&q16, &k16, &v16, &out, &heads, &kv_heads, &plane, &first,
+                                 &queries, &keys, &causal_flag};
+            run("diff_flash_attention_bf16", static_cast<std::uint32_t>((queries + 63) / 64),
                 static_cast<std::uint32_t>(heads), 128, arguments);
             return;
         }
-        void* arguments[] = {&q, &k, &v, &out, &heads, &kv_heads, &head_dim, &count,
-                             &q_stride, &kv_stride, &scale, &causal_flag};
-        run("diff_attention_rows", static_cast<std::uint32_t>((rows + 31) / 32),
+        void* arguments[] = {&q, &k, &v, &out, &heads, &kv_heads, &head_dim, &first, &queries,
+                             &keys, &q_stride, &kv_stride, &scale, &causal_flag};
+        run("diff_attention_rows", static_cast<std::uint32_t>((queries + 31) / 32),
             static_cast<std::uint32_t>(heads), 256, arguments);
     }
 
@@ -871,6 +943,7 @@ void diff_encode_text(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std:
     if (count > d.max_prompt_tokens)
         throw std::runtime_error("prompt has " + std::to_string(count) + " tokens; the tower allows " +
                                  std::to_string(d.max_prompt_tokens));
+    diff_ensure_workspace(d, diff_encoder_workspace(d, count), "prompt");
     DiffLaunch launch{d};
     DiffArena arena{d.workspace, 0, d.workspace_bytes};
     const std::uint64_t f = sizeof(float);
@@ -1089,8 +1162,7 @@ void diff_transformer_forward(FlyweightV2Diffusion& d, const float* latents, int
     const std::uint64_t f = sizeof(float);
     const int dim = d.dim;
     const int features = d.patch * d.patch * d.channels;
-    if (diff_transformer_workspace(d, rows) > d.workspace_bytes)
-        throw std::runtime_error("image or prompt is larger than the tower was created for");
+    diff_ensure_workspace(d, diff_transformer_workspace(d, rows), "image");
     DiffLaunch launch{d};
     DiffArena arena{d.workspace, 0, d.workspace_bytes};
     const DiffTransformerBuffers b = diff_transformer_buffers(d, arena, rows);
@@ -1288,8 +1360,7 @@ struct VaeState {
 // Decodes one latent tile [C][latent_h][latent_w] to f32 pixels [3][8h][8w].
 void diff_decode_tile(FlyweightV2Diffusion& d, const float* latents, int latent_h, int latent_w,
                       float* pixels) {
-    if (diff_vae_workspace(d, latent_h, latent_w) > d.workspace_bytes)
-        throw std::runtime_error("image is larger than the tower was created for");
+    diff_ensure_workspace(d, diff_vae_workspace(d, latent_h, latent_w), "image");
     const std::uint64_t f = sizeof(float);
     DiffLaunch launch{d};
     DiffArena arena{d.workspace, 0, d.workspace_bytes};
@@ -1542,6 +1613,8 @@ void diff_gaussian_noise(std::uint64_t seed, std::vector<float>& out) {
 }
 
 void diff_release(FlyweightV2Diffusion& d) {
+    qi_destroy(d.qwenimage);
+    d.qwenimage = nullptr;
     if (d.stream) flyweight_gpu_stream_sync(d.stream);
     if (d.copy_stream) flyweight_gpu_stream_sync(d.copy_stream);
     for (const auto pointer : d.allocations) flyweight_gpu_free(pointer);
@@ -1565,6 +1638,19 @@ void diff_release(FlyweightV2Diffusion& d) {
     d.stream = 0;
 }
 
+std::uint64_t diff_workspace_bytes(const FlyweightV2Diffusion& d, std::uint32_t width,
+                                   std::uint32_t height, std::uint32_t prompt_tokens) {
+    std::uint64_t bytes = diff_encoder_workspace(d, prompt_tokens);
+    if (d.qwenimage) return std::max(bytes, qi_workspace(d, width, height, prompt_tokens));
+    const int latent_h = static_cast<int>(height / 8), latent_w = static_cast<int>(width / 8);
+    const std::uint64_t image_rows = static_cast<std::uint64_t>(latent_h / d.patch) * (latent_w / d.patch);
+    const std::uint64_t rows = (image_rows + kDiffSequenceMultiple - 1) / kDiffSequenceMultiple * kDiffSequenceMultiple +
+        (static_cast<std::uint64_t>(prompt_tokens) + kDiffSequenceMultiple - 1) / kDiffSequenceMultiple * kDiffSequenceMultiple;
+    bytes = std::max(bytes, diff_transformer_workspace(d, rows));
+    return std::max(bytes, diff_vae_workspace(d, std::min(latent_h, kVaeTileLatent),
+                                              std::min(latent_w, kVaeTileLatent)));
+}
+
 // Bytes of weights the encoder and DiT would put on the device.
 std::uint64_t diff_layer_weight_bytes(const FlyweightV2Model& encoder, const FlyweightV2Model& transformer) {
     std::uint64_t total = 0;
@@ -1583,19 +1669,43 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
                                   FlyweightV2Diffusion** out) { return guarded([&]{
     const bool exact = (weights & FLYWEIGHT_V2_DIFFUSION_EXACT) != 0;
     const bool balanced = (weights & FLYWEIGHT_V2_DIFFUSION_BALANCED) != 0 && !exact;
-    weights &= ~(FLYWEIGHT_V2_DIFFUSION_EXACT | FLYWEIGHT_V2_DIFFUSION_BALANCED);
+    const bool reserve = (weights & FLYWEIGHT_V2_DIFFUSION_RESERVE) != 0;
+    weights &= ~(FLYWEIGHT_V2_DIFFUSION_EXACT | FLYWEIGHT_V2_DIFFUSION_BALANCED |
+                 FLYWEIGHT_V2_DIFFUSION_RESERVE);
     if (weights > FLYWEIGHT_V2_DIFFUSION_WEIGHTS_AUTO)
         throw std::runtime_error("invalid diffusion weights placement");
     if (!encoder || !transformer || !vae || !out) throw std::runtime_error("invalid diffusion create arguments");
-    if (encoder->config.architecture != "qwen3")
-        throw std::runtime_error("the text encoder must be a plain Qwen3 checkpoint (got " +
-                                 encoder->config.architecture + ")");
-    if (transformer->config.architecture != "zimage-dit")
-        throw std::runtime_error("the transformer must be a ZImageTransformer2DModel checkpoint");
-    if (vae->config.architecture != "autoencoder-kl")
-        throw std::runtime_error("the autoencoder must be an AutoencoderKL checkpoint");
-    if (!max_width || !max_height || max_width % 16 || max_height % 16)
-        throw std::runtime_error("max_width and max_height must be positive multiples of 16");
+    // Which model the tower runs follows from the transformer; the other two
+    // components then have to be that pipeline's.
+    const bool qwenimage = transformer->config.architecture == "qwenimage21-dit";
+    if (qwenimage) {
+        if (encoder->config.architecture != "qwen3vl")
+            throw std::runtime_error("Qwen-Image-2.1's text encoder must be a Qwen3-VL checkpoint (got " +
+                                     encoder->config.architecture + ")");
+        if (vae->config.architecture != "qwenimage21-vae")
+            throw std::runtime_error("the autoencoder must be an AutoencoderKLQwenImage21 checkpoint");
+    } else {
+        if (encoder->config.architecture != "qwen3")
+            throw std::runtime_error("the text encoder must be a plain Qwen3 checkpoint (got " +
+                                     encoder->config.architecture + ")");
+        if (transformer->config.architecture != "zimage-dit")
+            throw std::runtime_error("the transformer must be a ZImageTransformer2DModel or "
+                                     "QwenImage21Transformer2DModel checkpoint");
+        if (vae->config.architecture != "autoencoder-kl")
+            throw std::runtime_error("the autoencoder must be an AutoencoderKL checkpoint");
+    }
+    // Qwen-Image-2.1's autoencoder compresses 16x and its pipeline rounds to
+    // twice that; Z-Image's compresses 8x with a patch of 2, which is the same
+    // 16-pixel granularity.
+    const std::uint32_t multiple = qwenimage ? 32u : 16u;
+    // Zero: the model's own largest side. Z-Image was trained at 1024;
+    // Qwen-Image-2.1's card lists 2048 square (2752 on its long side at 16:9).
+    const std::uint32_t native_side = qwenimage ? 2048u : 1024u;
+    if (!max_width) max_width = native_side;
+    if (!max_height) max_height = native_side;
+    if (max_width % multiple || max_height % multiple)
+        throw std::runtime_error("max_width and max_height must be positive multiples of " +
+                                 std::to_string(multiple));
     if (!max_prompt_tokens) throw std::runtime_error("max_prompt_tokens must be positive");
     auto d = std::make_unique<FlyweightV2Diffusion>();
     d->encoder = encoder;
@@ -1652,40 +1762,49 @@ int flyweight_v2_diffusion_create(FlyweightV2Model* encoder, FlyweightV2Model* t
                     flyweight_gpu_event_create(&d->consumed_event[slot]) != 0)
                     throw std::runtime_error("failed to create diffusion staging events");
         }
-        diff_upload_transformer(*d);
-        diff_upload_encoder(*d);
-        diff_upload_vae(*d);
+        if (qwenimage) {
+            qi_upload_transformer(*d);
+            // Conditioning is the last layer's output with the encoder's final
+            // norm hooked off, so every layer runs.
+            diff_upload_encoder(*d, 0, qi_caption_dim(*d));
+            qi_upload_vae(*d);
+        } else {
+            diff_upload_transformer(*d);
+            diff_upload_encoder(*d, 1, d->caption_dim);
+            diff_upload_vae(*d);
+        }
         if (d->host_weights) {
             for (auto& slot : d->staging)
                 if (flyweight_gpu_alloc(d->staging_bytes, &slot) != 0 || !slot)
                     throw std::runtime_error("diffusion staging allocation failed (" +
                                              std::to_string(d->staging_bytes / 1048576) + " MiB)");
         }
-        // One arena for every phase, sized for the largest.
-        const int latent_h = static_cast<int>(max_height / 8), latent_w = static_cast<int>(max_width / 8);
-        const std::uint64_t image_rows = static_cast<std::uint64_t>(latent_h / d->patch) * (latent_w / d->patch);
-        const std::uint64_t rows = (image_rows + kDiffSequenceMultiple - 1) / kDiffSequenceMultiple * kDiffSequenceMultiple +
-            (static_cast<std::uint64_t>(max_prompt_tokens) + kDiffSequenceMultiple - 1) / kDiffSequenceMultiple * kDiffSequenceMultiple;
-        std::uint64_t bytes = diff_transformer_workspace(*d, rows);
-        bytes = std::max(bytes, diff_encoder_workspace(*d, max_prompt_tokens));
-        bytes = std::max(bytes, diff_vae_workspace(*d, std::min(latent_h, kVaeTileLatent),
-                                                   std::min(latent_w, kVaeTileLatent)));
+        // One arena for every phase. Reserved for the cap when asked; otherwise
+        // sized for 1024x1024 (or the cap, if smaller) and grown on demand by
+        // the first request that needs more -- see diff_ensure_workspace.
+        const std::uint32_t initial_width = reserve ? max_width : std::min(max_width, 1024u);
+        const std::uint32_t initial_height = reserve ? max_height : std::min(max_height, 1024u);
+        const std::uint64_t bytes = diff_workspace_bytes(*d, initial_width, initial_height, max_prompt_tokens);
         if (flyweight_gpu_alloc(bytes, &d->workspace) != 0 || !d->workspace)
             throw std::runtime_error("diffusion workspace allocation failed (" + std::to_string(bytes / 1048576) +
                                      " MiB); lower the maximum image size");
         d->workspace_bytes = bytes;
+        const char* growth = reserve ? "" : ", grown on demand";
         if (d->host_weights)
             std::fprintf(stderr,
                          "[flyweight] diffusion: %llu MiB of weights pinned in host memory, streamed through "
-                         "2 x %llu MiB; %llu MiB resident, %llu MiB workspace for up to %ux%u\n",
+                         "2 x %llu MiB; %llu MiB resident, %llu MiB workspace for %ux%u%s, up to %ux%u\n",
                          static_cast<unsigned long long>(d->host_bytes / 1048576),
                          static_cast<unsigned long long>(d->staging_bytes / 1048576),
                          static_cast<unsigned long long>(d->weight_bytes / 1048576),
-                         static_cast<unsigned long long>(bytes / 1048576), max_width, max_height);
+                         static_cast<unsigned long long>(bytes / 1048576), initial_width, initial_height,
+                         growth, max_width, max_height);
         else
-            std::fprintf(stderr, "[flyweight] diffusion: %llu MiB of weights, %llu MiB workspace for up to %ux%u\n",
+            std::fprintf(stderr,
+                         "[flyweight] diffusion: %llu MiB of weights, %llu MiB workspace for %ux%u%s, up to %ux%u\n",
                          static_cast<unsigned long long>(d->weight_bytes / 1048576),
-                         static_cast<unsigned long long>(bytes / 1048576), max_width, max_height);
+                         static_cast<unsigned long long>(bytes / 1048576), initial_width, initial_height,
+                         growth, max_width, max_height);
     } catch (...) {
         diff_release(*d);
         throw;
@@ -1703,6 +1822,22 @@ int flyweight_v2_diffusion_info(const FlyweightV2Diffusion* d, FlyweightV2Diffus
     out->host_bytes = d->host_bytes;
     out->max_width = d->max_width;
     out->max_height = d->max_height;
+    if (d->qwenimage) {
+        out->latent_stride = static_cast<std::uint32_t>(qi_spatial_scale(*d));
+        out->size_multiple = out->latent_stride * 2;
+        out->output_channels = static_cast<std::uint32_t>(qi_output_channels(*d));
+        out->latent_channels = static_cast<std::uint32_t>(qi_latent_channels(*d));
+        out->default_steps = 40;
+        // 0: the schedule's shift follows the image's token count.
+        out->default_shift = 0.0f;
+    } else {
+        out->latent_stride = 8;
+        out->size_multiple = 16;
+        out->output_channels = 3;
+        out->latent_channels = static_cast<std::uint32_t>(d->channels);
+        out->default_steps = 8;
+        out->default_shift = 3.0f;
+    }
     return 0;
 }); }
 
@@ -1725,29 +1860,48 @@ int flyweight_v2_diffusion_transformer_step(FlyweightV2Diffusion* d, const float
                                             uint32_t latent_w, const float* caption, uint64_t caption_tokens,
                                             float time, float* velocity) { return guarded([&]{
     if (!d || !latents || !caption || !velocity) throw std::runtime_error("invalid diffusion step arguments");
-    diff_transformer_forward(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w), caption,
-                             caption_tokens, time, velocity);
+    if (d->qwenimage)
+        qi_transformer_forward(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w),
+                               caption, caption_tokens, time, velocity);
+    else
+        diff_transformer_forward(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w),
+                                 caption, caption_tokens, time, velocity);
     return 0;
 }); }
 
 int flyweight_v2_diffusion_decode_latents(FlyweightV2Diffusion* d, const float* latents, uint32_t latent_h,
                                           uint32_t latent_w, uint8_t* rgb) { return guarded([&]{
     if (!d || !latents || !rgb) throw std::runtime_error("invalid diffusion decode arguments");
-    diff_decode_latents(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w), rgb);
+    if (d->qwenimage)
+        qi_decode_latents(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w), rgb);
+    else
+        diff_decode_latents(*d, latents, static_cast<int>(latent_h), static_cast<int>(latent_w), rgb);
     return 0;
 }); }
 
 int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* d, const uint32_t* tokens, uint64_t count,
-                                    uint32_t width, uint32_t height, uint32_t steps, float shift,
+                                    uint32_t caption_drop, uint32_t width, uint32_t height,
+                                    uint32_t steps, float shift,
                                     uint64_t seed, const float* initial_latents,
                                     FlyweightV2DiffusionProgress progress, void* user_data,
                                     uint8_t* rgb) { return guarded([&]{
     if (!d || !tokens || !rgb) throw std::runtime_error("invalid diffusion generate arguments");
-    if (!width || !height || width % 16 || height % 16)
-        throw std::runtime_error("width and height must be positive multiples of 16");
+    if (caption_drop >= count)
+        throw std::runtime_error("caption_drop covers the whole prompt");
+    const std::uint32_t multiple = d->qwenimage ? 32u : 16u;
+    if (!width || !height || width % multiple || height % multiple)
+        throw std::runtime_error("width and height must be positive multiples of " +
+                                 std::to_string(multiple));
     if (width > d->max_width || height > d->max_height)
-        throw std::runtime_error("image exceeds the size the tower was created for");
+        throw std::runtime_error("image exceeds the tower's " + std::to_string(d->max_width) + "x" +
+                                 std::to_string(d->max_height) + " limit (--image-max-size)");
     if (!steps) throw std::runtime_error("steps must be positive");
+    if (d->qwenimage) {
+        qi_generate(*d, tokens, count, caption_drop, width, height, steps, shift, seed,
+                    initial_latents, progress, user_data, rgb);
+        return 0;
+    }
+    if (caption_drop) throw std::runtime_error("this image model conditions on the whole prompt");
     const int latent_h = static_cast<int>(height / 8), latent_w = static_cast<int>(width / 8);
     const std::size_t latent_count = static_cast<std::size_t>(d->channels) * latent_h * latent_w;
     std::vector<float> caption(count * static_cast<std::uint64_t>(d->encoder_hidden));
