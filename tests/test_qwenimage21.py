@@ -43,7 +43,12 @@ class QwenImage21LoaderTests(unittest.TestCase):
             self.assertIn("blk.0.attn_q_norm.weight", names)
             self.assertIn("blk.2.post_attention_norm.weight", names)
             self.assertIn("output.weight", names)
+            # The vision tower is kept, under the mmproj names.
             self.assertFalse([name for name in names if "visual" in name])
+            self.assertIn("v.patch_embd.weight", names)
+            self.assertIn("v.blk.1.attn_qkv.weight", names)
+            self.assertIn("v.deepstack_list.0.fc2.weight", names)
+            self.assertIn("mm.2.weight", names)
             # The tokenizer came from ../processor/, and the chat template with it.
             self.assertTrue(model.tokenize("abc ab"))
             self.assertIn("<|im_start|>", model.chat_template)
@@ -73,14 +78,15 @@ class QwenImage21LoaderTests(unittest.TestCase):
         finally:
             model.close()
 
-    def test_the_autoencoder_keeps_the_single_frame_decoder(self) -> None:
+    def test_the_autoencoder_keeps_both_halves_for_a_single_frame(self) -> None:
         model = V2Model(self.snapshot / "vae")
         try:
             self.assertEqual(model.config["architecture"], "qwenimage21-vae")
             tensors = {tensor["name"]: tensor for tensor in model.tensors()}
-            self.assertNotIn("encoder.conv_in.weight", tensors)
-            self.assertNotIn("quant_conv.weight", tensors)
-            # The temporal upsample never runs on one frame.
+            self.assertIn("encoder.conv_in.weight", tensors)
+            self.assertIn("encoder.down_blocks.1.downsampler.resample.1.weight", tensors)
+            self.assertIn("quant_conv.weight", tensors)
+            # The temporal resample never runs on one frame, in either half.
             self.assertFalse([name for name in tensors if "time_conv" in name])
             self.assertIn("post_quant_conv.weight", tensors)
             self.assertIn("decoder.up_blocks.0.upsampler.resample.1.weight", tensors)
@@ -137,6 +143,23 @@ class QwenImage21LoaderTests(unittest.TestCase):
                 tower.generate(tokens, 96, 64, steps=1, caption_drop=len(tokens))
             # A constant shift is the same formula at exp(mu) = shift.
             self.assertEqual(len(tower.generate(tokens, 64, 64, steps=2, seed=3, shift=3.0)), 64 * 64 * 4)
+            # Editing: a 64x32 reference image is 2 vision tokens; its run sits
+            # at token 1 of a prompt that holds those pads.
+            pad = encoder.tokenize("<|image_pad|>")[0]
+            prompt = [tokens[0], pad, pad] + list(tokens[1:])
+            rgba = bytes(64 * 32 * 4)
+            planes = tower.encode_vision(rgba, 64, 32)
+            self.assertEqual(len(planes), 1 + len(fixture.VIT_DEEPSTACK))
+            self.assertEqual(len(planes[0]), 2 * fixture.ENC_HIDDEN)
+            latents = tower.encode_image(rgba, 64, 32)
+            self.assertEqual(len(latents), fixture.CHANNELS * 2 * 4)
+            rows = tower.encode_prompt(prompt, [(rgba, 64, 32, 1)])
+            self.assertEqual(len(rows), len(prompt) * fixture.ENC_HIDDEN)
+            edited = tower.edit(prompt, [(rgba, 64, 32, 1)], 96, 64, steps=2, seed=3, caption_drop=1)
+            self.assertEqual(len(edited), 96 * 64 * 4)
+            self.assertEqual(edited, tower.edit(prompt, [(rgba, 64, 32, 1)], 96, 64, steps=2, seed=3, caption_drop=1))
+            with self.assertRaisesRegex(V2Error, "token run"):
+                tower.edit(prompt, [(rgba, 64, 32, len(prompt) - 1)], 96, 64, steps=1)
         finally:
             tower.close()
         # Streamed from host memory, the same kernels see the same bytes.
@@ -243,3 +266,73 @@ class RequestShapingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EditsRouteTests(unittest.TestCase):
+    """`/v1/images/edits` in OpenAI's multipart shape lands on the image service as
+    a generation request carrying `images`."""
+
+    def setUp(self) -> None:
+        import threading
+        from flyweight.server import FlyweightHTTPServer, InferenceService, create_handler
+        from tests.test_server import StubGenerator
+        self.service = InferenceService("qwen-local", StubGenerator())
+        self.server = FlyweightHTTPServer(("127.0.0.1", 0), create_handler(self.service))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _post(self, path: str, body: bytes, content_type: str) -> tuple[int, dict]:
+        import http.client
+        import json
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        try:
+            connection.request("POST", path, body=body, headers={"Content-Type": content_type})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    def test_multipart_images_become_data_urls(self) -> None:
+        seen = {}
+
+        def images_generations(payload):
+            seen.update(payload)
+            return {"created": 1, "data": [{"b64_json": "AAAA", "seed": 7}]}
+
+        self.service.images_generations = images_generations
+        boundary = "b0undary"
+        parts = [
+            ("prompt", None, b"make the bicycle blue"),
+            ("size", None, b"512x512"),
+            ("n", None, b"1"),
+            ("image", "a.png", b"\x89PNG\r\nfake"),
+            ("image[]", "b.png", b"\x89PNG\r\nother"),
+        ]
+        body = b""
+        for name, filename, data in parts:
+            body += f"--{boundary}\r\n".encode()
+            disposition = f'form-data; name="{name}"' + (f'; filename="{filename}"' if filename else "")
+            body += f"Content-Disposition: {disposition}\r\n".encode()
+            if filename:
+                body += b"Content-Type: image/png\r\n"
+            body += b"\r\n" + data + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        status, payload = self._post("/v1/images/edits", body, f"multipart/form-data; boundary={boundary}")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"][0]["seed"], 7)
+        self.assertEqual(seen["prompt"], "make the bicycle blue")
+        self.assertEqual(seen["size"], "512x512")
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(len(seen["images"]), 2)
+        self.assertTrue(all(url.startswith("data:image/png;base64,") for url in seen["images"]))
+
+    def test_json_edits_without_images_are_refused(self) -> None:
+        import json
+        status, payload = self._post("/v1/images/edits", json.dumps({"prompt": "x"}).encode(), "application/json")
+        self.assertEqual(status, 400)
+        self.assertIn("image", payload["error"]["message"])

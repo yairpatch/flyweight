@@ -21,10 +21,11 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .server import APIError
 from .v2 import V2Diffusion, V2Error, V2Model
+from .vision import ImageError, expand_image_pads, fetch_image_url, image_token_offsets
 
 # The Qwen3 chat template with add_generation_prompt=True and thinking left
 # enabled, which is how Z-Image's reference pipeline conditions the DiT.
@@ -38,11 +39,22 @@ _PROMPT_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\
 _QWENIMAGE_SYSTEM = (
     "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
 )
+# One slot per condition image in the editing template, in front of the
+# prompt: "<image1>" is literal text the checkpoint expects, the pad expands
+# to the picture's vision tokens.
+_QWENIMAGE_SLOT = "<image{index}><|vision_start|><|image_pad|><|vision_end|>"
+# Condition images are resized to this many pixels at their own aspect, and a
+# request without a size renders at the last image's shape. The pipeline's
+# `output_resolution`.
+DEFAULT_EDIT_AREA_SIDE = 1024
+MAX_CONDITION_IMAGES = 10
 
-DEFAULT_STEPS = 8
-DEFAULT_SHIFT = 3.0
 MAX_STEPS = 50
 MAX_PROMPT_TOKENS = 512
+# Reference images add their vision tokens (one per 32x32 pixels: 1024 for a
+# 1024x1024 reference) on top of the text budget; four such, or sixteen at
+# 512x512. The transformer then sees four latent rows per token.
+MAX_IMAGE_TOKENS = 4096
 
 
 def _int_option(payload: Mapping[str, Any], name: str, default: int, low: int, high: int) -> int:
@@ -81,6 +93,16 @@ def parse_size(
             parameter="size",
         )
     return width, height
+
+
+def fit_to_area(width: int, height: int, side: int, multiple: int = 32) -> tuple[int, int]:
+    """The pipeline's `calculate_dimensions`: the aspect of (width, height) at
+    `side * side` pixels, both sides rounded to `multiple`."""
+    ratio = width / height
+    area = float(side * side)
+    fitted_width = round((area * ratio) ** 0.5 / multiple) * multiple
+    fitted_height = round((area / ratio) ** 0.5 / multiple) * multiple
+    return max(multiple, fitted_width), max(multiple, fitted_height)
 
 
 def snapshot_model_name(root: Path) -> str:
@@ -126,12 +148,13 @@ class ImageGenerator:
         self.encoder = V2Model(root / "text_encoder")
         self.transformer = V2Model(root / "transformer")
         self.vae = V2Model(root / "vae")
+        edits = self.transformer.config["architecture"] == "qwenimage21-dit"
         try:
             self.tower = V2Diffusion(
                 self.encoder, self.transformer, self.vae,
                 device=device, max_width=int(max_width), max_height=int(max_height),
-                max_prompt_tokens=MAX_PROMPT_TOKENS, weights=weights, precision=precision,
-                reserve=reserve,
+                max_prompt_tokens=MAX_PROMPT_TOKENS + (MAX_IMAGE_TOKENS if edits else 0),
+                weights=weights, precision=precision, reserve=reserve,
             )
         except BaseException:
             self.close()
@@ -172,6 +195,7 @@ class ImageGenerator:
             "default_steps": self.default_steps,
             "size_multiple": self.size_multiple,
             "alpha": self.pixel_mode == "RGBA",
+            "edit": self.qwenimage,
             "weights": "host" if info["host_weights"] else "device",
             "precision": "exact" if info["exact"] else "balanced" if info["balanced"] else "fast",
             "device_mib": int(info["device_bytes"]) // (1024 * 1024),
@@ -180,18 +204,76 @@ class ImageGenerator:
             "generated": self.generated,
         }
 
-    def tokenize(self, prompt: str) -> list[int]:
+    def tokenize(self, prompt: str, image_tokens: Sequence[int] = ()) -> list[int]:
+        """The prompt's tokens; with `image_tokens` (one count per condition
+        image) the editing template, each pad expanded to its picture's count."""
         template = _PROMPT_TEMPLATE
         if self.qwenimage:
-            template = _QWENIMAGE_SYSTEM + template
+            slots = " ".join(_QWENIMAGE_SLOT.format(index=i + 1) for i in range(len(image_tokens)))
+            template = _QWENIMAGE_SYSTEM + template.replace("{prompt}", slots + "{prompt}")
         tokens = list(self.encoder.tokenize(template.format(prompt=prompt)))
-        if len(tokens) > MAX_PROMPT_TOKENS:
+        if image_tokens:
+            pad = self.encoder.tokenize("<|image_pad|>")
+            if len(pad) != 1:
+                raise APIError(500, "the tokenizer has no <|image_pad|> token", "server_error")
+            try:
+                tokens = expand_image_pads(tokens, pad[0], image_tokens)
+            except ImageError as error:
+                raise APIError(400, str(error), parameter="images") from None
+        pictured = sum(image_tokens)
+        if pictured > MAX_IMAGE_TOKENS:
             raise APIError(
                 400,
-                f"prompt is {len(tokens)} tokens; the encoder reads at most {MAX_PROMPT_TOKENS}",
+                f"the reference images take {pictured} vision tokens; at most {MAX_IMAGE_TOKENS} "
+                "(smaller or fewer references)",
+                parameter="images",
+            )
+        if len(tokens) - pictured > MAX_PROMPT_TOKENS:
+            raise APIError(
+                400,
+                f"prompt is {len(tokens) - pictured} tokens; the encoder reads at most {MAX_PROMPT_TOKENS}",
                 parameter="prompt",
             )
         return tokens
+
+    def condition_images(self, payload: Mapping[str, Any], side: int) -> list[tuple[bytes, int, int]]:
+        """The request's `images` (data URLs or base64), decoded to RGBA and
+        resized to `side * side` pixels at their own aspect, on the 32 grid."""
+        values = payload.get("images")
+        if values is None:
+            return []
+        if not self.qwenimage:
+            raise APIError(400, "this image model cannot take reference images", parameter="images")
+        if not isinstance(values, list) or not values:
+            raise APIError(400, "images must be a non-empty list", parameter="images")
+        if len(values) > MAX_CONDITION_IMAGES:
+            raise APIError(400, f"at most {MAX_CONDITION_IMAGES} reference images", parameter="images")
+        try:
+            from PIL import Image
+        except ImportError as error:
+            raise APIError(500, "image input needs Pillow: pip install flyweight-llm[vision]", "server_error") from error
+        out = []
+        for value in values:
+            if isinstance(value, Mapping):
+                value = value.get("url") or value.get("b64_json") or value.get("image")
+            if not isinstance(value, str) or not value:
+                raise APIError(400, "each image must be a data URL or base64 string", parameter="images")
+            if not value.startswith(("data:", "http://", "https://")):
+                value = "data:image/*;base64," + value
+            try:
+                data = fetch_image_url(value, allow_remote=False).data
+                with Image.open(io.BytesIO(data)) as opened:
+                    picture = opened.convert("RGBA")
+            except ImageError as error:
+                raise APIError(400, str(error), parameter="images") from None
+            except Exception:  # noqa: BLE001 - reported to the client
+                raise APIError(400, "could not decode a reference image", parameter="images") from None
+            width, height = fit_to_area(picture.width, picture.height, side, self.size_multiple)
+            width = min(width, self.max_width)
+            height = min(height, self.max_height)
+            picture = picture.resize((width, height), Image.Resampling.LANCZOS)
+            out.append((picture.tobytes(), width, height))
+        return out
 
     def stream(self, payload: Mapping[str, Any]) -> Iterator[dict[str, Any]]:
         """``generate`` as server-sent events: ``progress`` per denoising step,
@@ -251,9 +333,22 @@ class ImageGenerator:
             raise APIError(
                 400, "only response_format b64_json is available", parameter="response_format"
             )
+        # With reference images and no size, the picture takes the last
+        # image's shape at the default area, as the pipeline does.
+        side = min(DEFAULT_EDIT_AREA_SIDE, self.max_width, self.max_height)
+        requested = payload.get("size")
+        if isinstance(requested, str) and "x" in requested and requested != "auto":
+            probe = parse_size(requested, (self.max_width, self.max_height),
+                               (self.max_width, self.max_height), self.size_multiple)
+            side = min(side, max(probe))
+        conditions = self.condition_images(payload, side)
+        if conditions and (requested is None or requested == "auto"):
+            _, last_width, last_height = conditions[-1]
+            default_size = (last_width, last_height)
+        else:
+            default_size = (self.max_width, self.max_height)
         width, height = parse_size(
-            payload.get("size"), (self.max_width, self.max_height),
-            (self.max_width, self.max_height), self.size_multiple,
+            requested, default_size, (self.max_width, self.max_height), self.size_multiple,
         )
         steps = _int_option(payload, "steps", self.default_steps, 1, MAX_STEPS)
         seed_value = payload.get("seed")
@@ -275,7 +370,14 @@ class ImageGenerator:
                 500, "image output needs Pillow: pip install flyweight-llm[vision]", "server_error"
             ) from error
 
-        tokens = self.tokenize(prompt)
+        token_side = self.tower.latent_stride * 2   # pixels per vision token
+        image_tokens = [(w // token_side) * (h // token_side) for _, w, h in conditions]
+        tokens = self.tokenize(prompt, image_tokens)
+        images = []
+        if conditions:
+            pad = self.encoder.tokenize("<|image_pad|>")[0]
+            offsets = image_token_offsets(tokens, pad, image_tokens)
+            images = [(rgba, w, h, offset) for (rgba, w, h), offset in zip(conditions, offsets)]
         if not self._lock.acquire(timeout=0.0):
             raise APIError(
                 429, "an image is already rendering; retry shortly", "rate_limit_error"
@@ -294,11 +396,18 @@ class ImageGenerator:
 
                 started = time.monotonic()
                 try:
-                    rgb = self.tower.generate(
-                        tokens, width, height, steps=steps, shift=float(shift),
-                        seed=seed + index, caption_drop=self.caption_drop,
-                        progress=on_progress,
-                    )
+                    if images:
+                        rgb = self.tower.edit(
+                            tokens, images, width, height, steps=steps, shift=float(shift),
+                            seed=seed + index, caption_drop=self.caption_drop,
+                            progress=on_progress,
+                        )
+                    else:
+                        rgb = self.tower.generate(
+                            tokens, width, height, steps=steps, shift=float(shift),
+                            seed=seed + index, caption_drop=self.caption_drop,
+                            progress=on_progress,
+                        )
                 except V2Error as error:
                     # The tower reports a cancel from the callback as an error.
                     if "cancelled" in str(error):

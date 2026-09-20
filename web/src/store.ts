@@ -141,6 +141,8 @@ interface StoreState {
   imageProgress: ImageProgress | null;
   imageError: string | null;
   imagePrompt: string;
+  /** Reference images for an edit, as data URLs; empty for text-to-image. */
+  imageRefs: string[];
   conversations: Conversation[];
   activeId: string | null;
   settings: GenerationSettings;
@@ -216,6 +218,7 @@ interface StoreState {
   setPanel: (panel: Panel) => void;
   setMode: (mode: Mode) => void;
   setImagePrompt: (prompt: string) => void;
+  setImageRefs: (refs: string[]) => void;
   updateImageSettings: (patch: Partial<ImageSettings>) => void;
   generateImage: (options?: { seed?: number | null }) => Promise<void>;
   cancelImage: () => void;
@@ -497,6 +500,7 @@ export const useStore = create<StoreState>()((set, get) => {
     imageProgress: null,
     imageError: null,
     imagePrompt: "",
+    imageRefs: [],
     conversations: [],
     activeId: null,
     settings: loadSettings(),
@@ -834,6 +838,7 @@ export const useStore = create<StoreState>()((set, get) => {
       set({ mode });
     },
     setImagePrompt: (imagePrompt) => set({ imagePrompt }),
+    setImageRefs: (imageRefs) => set({ imageRefs }),
     updateImageSettings: (patch) => {
       const imageSettings = { ...get().imageSettings, ...patch };
       try {
@@ -867,6 +872,7 @@ export const useStore = create<StoreState>()((set, get) => {
       const steps = state.imageSettings.steps || Number(info?.default_steps) || 8;
       const body: Record<string, unknown> = { prompt, size: `${width}x${height}`, steps, stream: true };
       if (seed !== null) body.seed = seed;
+      if (state.imageRefs.length) body.images = state.imageRefs;
       const abort = new AbortController();
       imageAbort = abort;
       set({ imageProgress: { step: 0, steps, startedAt: Date.now() }, imageError: null });

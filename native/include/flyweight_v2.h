@@ -486,6 +486,43 @@ FLYWEIGHT_V2_API int flyweight_v2_diffusion_generate(FlyweightV2Diffusion* tower
                                                      const float* initial_latents,
                                                      FlyweightV2DiffusionProgress progress, void* user_data,
                                                      uint8_t* rgb);
+/* A condition image for Qwen-Image-2.1's editing path: RGBA bytes at a size
+   the caller already resized to (both sides multiples of 32), and where in
+   `tokens` its run of <|image_pad|> tokens starts. The run must hold
+   (width / 32) * (height / 32) tokens, one per merged vision token; the
+   transformer then sees four latent rows per token. */
+typedef struct FlyweightV2DiffusionImage {
+    const uint8_t* rgba;
+    uint32_t width, height;
+    uint64_t token_offset;
+} FlyweightV2DiffusionImage;
+/* `generate` with condition images: the prompt carries the images' tokens,
+   the vision tower encodes them into the text encoder, and their VAE latents
+   are prepended to the target's in the transformer. The target size follows
+   `width`/`height` as in `generate`. Qwen-Image-2.1 only. */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_edit(FlyweightV2Diffusion* tower, const uint32_t* tokens,
+                                                 uint64_t count, uint32_t caption_drop,
+                                                 const FlyweightV2DiffusionImage* images, uint32_t image_count,
+                                                 uint32_t width, uint32_t height,
+                                                 uint32_t steps, float shift, uint64_t seed,
+                                                 const float* initial_latents,
+                                                 FlyweightV2DiffusionProgress progress, void* user_data,
+                                                 uint8_t* rgb);
+/* The pieces of `edit`, for parity checks: the text encoder over a prompt
+   whose image tokens carry the images (count * hidden f32 out), and the
+   autoencoder's encode of one image to normalized latents
+   (latent_channels * (height / 16) * (width / 16) f32 out). */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_encode_prompt(FlyweightV2Diffusion* tower, const uint32_t* tokens,
+                                                          uint64_t count, const FlyweightV2DiffusionImage* images,
+                                                          uint32_t image_count, float* output, uint64_t capacity);
+/* The vision tower over one image: `planes` blocks of tokens * hidden f32,
+   the projected tokens first, then one block per deepstack layer. */
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_encode_vision(FlyweightV2Diffusion* tower, const uint8_t* rgba,
+                                                          uint32_t width, uint32_t height,
+                                                          float* output, uint64_t capacity, uint32_t* planes);
+FLYWEIGHT_V2_API int flyweight_v2_diffusion_encode_image(FlyweightV2Diffusion* tower, const uint8_t* rgba,
+                                                         uint32_t width, uint32_t height,
+                                                         float* output, uint64_t capacity);
 FLYWEIGHT_V2_API int flyweight_v2_vision_info(const FlyweightV2Model* model, FlyweightV2VisionInfo* out);
 FLYWEIGHT_V2_API int flyweight_v2_vision_resize(const FlyweightV2Model* model, uint32_t width, uint32_t height, uint32_t min_tokens, uint32_t max_tokens, FlyweightV2VisionResize* out);
 /* Replace only the embedded Qwen MTP block with tensors from a compatible

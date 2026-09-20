@@ -990,6 +990,105 @@ void diff_upsample_nearest_2x(const float* input, float* output, const int chann
 R"FLYWEIGHT_CUDA(
 // ---- Qwen-Image-2.1 --------------------------------------------------------
 
+// Rotate-half rope with interleaved M-RoPE sections (Qwen3-VL's text stack):
+// pair j takes the temporal, height or width position by j % 3 while j lies
+// inside three times that axis's section, the temporal one otherwise -- the
+// same rule as mrope_component in flyweight_v2_vision.hpp. A text token
+// carries one position in all three slots, which makes this plain rope.
+// `positions` is [rows][3]; `x` is [rows][row_stride] with the heads at
+// `offset`; `frequencies[j]` = theta^(-2j/head_dim).
+extern "C" __global__
+void qi_rope_mrope_rows(float* x, const int* positions, const double* frequencies,
+                        const int heads, const int head_dim, const int rows,
+                        const int row_stride, const int offset,
+                        const int section_t, const int section_h, const int section_w) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int half = head_dim / 2;
+    const int total = section_t + section_h + section_w;
+    float* base = x + (long long)row * row_stride + offset;
+    for (int index = threadIdx.x; index < heads * half; index += blockDim.x) {
+        const int head = index / half, j = index % half;
+        const int sector = total > 0 ? j % total : j;
+        const int which = sector % 3;
+        int axis = 0;
+        if (which == 1 && sector < 3 * section_h) axis = 1;
+        else if (which == 2 && sector < 3 * section_w) axis = 2;
+        const double position = (double)positions[row * 3 + axis];
+        const float angle = (float)(position * frequencies[j]);
+        const float s = sinf(angle), c = cosf(angle);
+        float* vector = base + head * head_dim;
+        const float first = vector[j], second = vector[j + half];
+        vector[j] = first * c - second * s;
+        vector[j + half] = second * c + first * s;
+    }
+}
+
+// The autoencoder encoder's downsample: 3x3 convolution at stride 2 over an
+// input zero-padded by one row at the bottom and one column at the right
+// (ZeroPad2d((0, 1, 0, 1)) then Conv2d(3, stride=2)). Output is
+// [out][height/2][width/2]. Direct: one thread per output pixel and channel;
+// it runs once per condition image, so it does not need the tiled kernel.
+extern "C" __global__
+void qi_conv2d_stride2(const float* input, const float* weight, const float* bias,
+                       float* output, const int in_channels, const int out_channels,
+                       const int height, const int width) {
+    const int out_h = height / 2, out_w = width / 2;
+    const long long elements = (long long)out_channels * out_h * out_w;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int ox = (int)(index % out_w);
+        const long long rest = index / out_w;
+        const int oy = (int)(rest % out_h), co = (int)(rest / out_h);
+        float sum = bias ? bias[co] : 0.0f;
+        for (int ci = 0; ci < in_channels; ++ci) {
+            const float* plane = input + (long long)ci * height * width;
+            const float* taps = weight + ((long long)co * in_channels + ci) * 9;
+            for (int dy = 0; dy < 3; ++dy) {
+                const int sy = oy * 2 + dy;
+                if (sy >= height) continue;
+                for (int dx = 0; dx < 3; ++dx) {
+                    const int sx = ox * 2 + dx;
+                    if (sx >= width) continue;
+                    sum += plane[(long long)sy * width + sx] * taps[dy * 3 + dx];
+                }
+            }
+        }
+        output[index] = sum;
+    }
+}
+
+// The averaging shortcut of a residual down block (`AvgDown3D`), added into
+// the downsampled output. Input channels are repeated over `factor` slots
+// (frame, 2x2 pixel) and averaged in groups of `group` per output channel; a
+// temporally downsampling level pads a zero frame in front, so its slots
+// with t = 0 contribute nothing. Source of slot j of output channel oc:
+// channel (oc * group + j) / factor at pixel (2h + hs, 2w + ws) of that slot.
+extern "C" __global__
+void qi_avg_down_add(const float* input, float* output, const int out_channels,
+                     const int factor, const int group, const int factor_t, const int factor_s,
+                     const int height, const int width) {
+    const int out_h = height / factor_s, out_w = width / factor_s;
+    const long long elements = (long long)out_channels * out_h * out_w;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int ox = (int)(index % out_w);
+        const long long rest = index / out_w;
+        const int oy = (int)(rest % out_h), oc = (int)(rest / out_h);
+        float sum = 0.0f;
+        for (int j = 0; j < group; ++j) {
+            const int flat = oc * group + j;
+            const int c = flat / factor, slot = flat % factor;
+            const int t_sub = slot / (factor_s * factor_s);
+            const int spatial = slot % (factor_s * factor_s);
+            const int hs = spatial / factor_s, ws = spatial % factor_s;
+            if (factor_t == 2 && t_sub == 0) continue;
+            sum += input[((long long)c * height + oy * factor_s + hs) * width + ox * factor_s + ws];
+        }
+        output[index] += sum / (float)group;
+    }
+}
+
 // The autoencoder's normalization is per pixel over the channel axis, not per
 // group over the plane: `F.normalize(x, dim=1) * sqrt(C) * gamma`, which is an
 // RMS norm with no epsilon beyond F.normalize's clamp and no bias. Pass 1

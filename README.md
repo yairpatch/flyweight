@@ -200,7 +200,7 @@ in the browser's IndexedDB; the API key lives in session storage.
 | `POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}`, `POST /v1/responses/input_tokens` | OpenAI Responses; the 128 most recent are kept, `store: false` skips one |
 | `GET /v1/models`, `GET /v1/models/{id}`, `GET /v1/me` | OpenAI |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic |
-| `POST /v1/images/generations` | OpenAI Images, with `--image-model` |
+| `POST /v1/images/generations`, `/v1/images/edits` | OpenAI Images, with `--image-model` (edits: Qwen-Image-2.1) |
 | `POST /v1/chat/completions/{id}/stop_thinking`, `POST /v1/messages/{id}/stop_thinking` | Flyweight |
 | `GET /health`, `GET /props`, `GET /slots`, `POST /tokenize`, `POST /detokenize` | llama.cpp-style |
 
@@ -302,8 +302,11 @@ defaults to the model's own maximum: 1024 and 2048), `n` (1 to
 Qwen-Image-2.1) and `shift` (0 lets Qwen-Image-2.1's shift follow the
 image's size, as its pipeline does); the response is base64 PNG. Qwen-Image-2.1
 renders RGBA: the PNG carries an alpha channel, and a prompt starting "This is
-an RGBA image with transparency" is what makes the model use it. Text-to-image
-only for now; editing with reference images is not wired. One render at a
+an RGBA image with transparency" is what makes the model use it. It also
+edits: up to ten reference images go in as `images` (data URLs or base64) on
+the same request, or as `image` parts of an OpenAI-shaped multipart
+`POST /v1/images/edits`; the picture takes the last reference's shape unless
+`size` is set, and the studio has an attach button for them. One render at a
 time; a concurrent request gets
 429. The encoder and DiT are quantized to Q8_0 on first open and cached
 beside the checkpoint. The workspace starts sized for 1024x1024 and grows when a request needs

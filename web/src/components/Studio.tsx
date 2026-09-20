@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Dices, Download, Image as ImageIcon, Lock, RefreshCw, Square, Trash2, Wand2 } from "lucide-react";
+import { Copy, Dices, Download, Image as ImageIcon, ImagePlus, Lock, RefreshCw, Square, Trash2, Wand2, X } from "lucide-react";
 import { imageDimensions, useStore, type ImageSettings } from "../store";
 import { formatSeconds } from "../lib/format";
 
@@ -12,6 +12,8 @@ interface ImagesInfo {
   size_multiple?: number;
   default_steps?: number;
   alpha?: boolean;
+  /** Whether the model takes reference images (Qwen-Image-2.1). */
+  edit?: boolean;
 }
 
 const ASPECTS: Array<{ id: ImageSettings["aspect"]; label: string }> = [
@@ -50,6 +52,22 @@ export function Studio() {
   const cancelImage = useStore((state) => state.cancelImage);
   const deleteImage = useStore((state) => state.deleteImage);
   const toast = useStore((state) => state.toast);
+  const refs = useStore((state) => state.imageRefs);
+  const setRefs = useStore((state) => state.setImageRefs);
+  const canEdit = Boolean(info?.edit);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const attach = (files: FileList | null) => {
+    if (!files) return;
+    const readers = Array.from(files).slice(0, 10 - refs.length).map(
+      (file) => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      }),
+    );
+    void Promise.all(readers).then((urls) => setRefs([...refs, ...urls])).catch(() => toast("Could not read that image", "error"));
+  };
   const current = images.find((image) => image.id === currentImageId) ?? null;
   const url = useMemo(() => (current ? URL.createObjectURL(current.blob) : null), [current]);
   useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
@@ -130,12 +148,33 @@ export function Studio() {
           </div>
         )}
         {error && <p className="error-text studio__error">{error}</p>}
+        {refs.length > 0 && (
+          <div className="studio__refs" aria-label="Reference images">
+            {refs.map((ref, index) => (
+              <div key={index} className="studio__ref">
+                <img src={ref} alt={`Reference ${index + 1}`} />
+                <button className="icon-button icon-button--small studio__ref-remove" onClick={() => setRefs(refs.filter((_, i) => i !== index))} aria-label="Remove reference image" disabled={running}>
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+            <span className="muted">Editing: the picture takes the last reference's shape unless a size is set.</span>
+          </div>
+        )}
         <div className="studio__prompt">
+          {canEdit && (
+            <>
+              <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(event) => { attach(event.target.files); event.target.value = ""; }} />
+              <button className="icon-button" onClick={() => fileInput.current?.click()} title="Add reference images to edit" aria-label="Add reference images" disabled={running || refs.length >= 10}>
+                <ImagePlus size={16} />
+              </button>
+            </>
+          )}
           <textarea
             ref={textarea}
             rows={2}
             value={prompt}
-            placeholder="a red bicycle leaning on a brick wall, afternoon light"
+            placeholder={refs.length ? "make the bicycle blue" : "a red bicycle leaning on a brick wall, afternoon light"}
             onChange={(event) => setPrompt(event.target.value)}
             onKeyDown={(event) => {
               if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
