@@ -416,6 +416,25 @@ def _first_string(arguments: Mapping[str, Any], keys: Iterable[str]) -> str | No
     return None
 
 
+def replaced_string_key(arguments: Mapping[str, Any]) -> str | None:
+    """Which argument name this call spells a replaced string with, if any.
+
+    `classify_call` answers what a call *is* and hands back its values; a
+    caller that wants to rewrite one of those values needs the key it came
+    under, and the table of spellings should stay in one place.
+    """
+    for key in _OLD_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return key
+    return None
+
+
+def names_a_replaced_string(keys: Iterable[str]) -> bool:
+    """Whether a tool's parameter names include a search/replace edit's `old`."""
+    return any(key in _OLD_KEYS for key in keys)
+
+
 def _first_present(arguments: Mapping[str, Any], keys: Iterable[str]) -> str | None:
     """As `_first_string`, but an empty string is a value and not an absence."""
     for key in keys:
