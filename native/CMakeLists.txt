@@ -258,6 +258,19 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    flyweight_paged_kv_contract
+    tests/paged_kv_contract.cpp
+)
+target_compile_features(flyweight_paged_kv_contract PRIVATE cxx_std_20)
+target_include_directories(flyweight_paged_kv_contract PRIVATE include src)
+if(BUILD_TESTING)
+    add_test(
+        NAME flyweight_paged_kv_contract
+        COMMAND flyweight_paged_kv_contract
+    )
+endif()
+
+add_executable(
     flyweight_qwen_avx2_contract
     tests/qwen_avx2_contract.cpp
     src/qwen_cpu_avx2.cpp
