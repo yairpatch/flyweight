@@ -17678,10 +17678,27 @@ inline std::uint64_t kv_region_bytes(std::uint64_t elems,int type){return type==
 // Cache precision codes: 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4.
 // The turbo store kernels come in K and V flavours because the two rotate under
 // different sign streams, which is what lets values be accumulated rotated.
-inline const char* kv_store_kernel(int t,bool key){return t==5?(key?"kv_store_turbo4_k":"kv_store_turbo4_v"):t==4?(key?"kv_store_turbo3_k":"kv_store_turbo3_v"):t==3?"kv_store_q8":t==2?"kv_store_bf16":t==1?"kv_store_f16":"kv_store_f32";}
-inline const char* kv_scores_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4":t==4?"kv_attention_scores_turbo3":t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
+inline bool qwen_hadamard_enabled(){
+    static const bool enabled=[]{
+        const char*s=std::getenv("FLYWEIGHT_KV_HADAMARD");
+        return s&&s[0]=='1';}();
+    return enabled;
+}
+inline const char* kv_store_kernel(int t,bool key){
+    if(t==3&&key&&qwen_hadamard_enabled())return "kv_store_hadamard_q8";
+    return t==5?(key?"kv_store_turbo4_k":"kv_store_turbo4_v"):t==4?(key?"kv_store_turbo3_k":"kv_store_turbo3_v"):t==3?"kv_store_q8":t==2?"kv_store_bf16":t==1?"kv_store_f16":"kv_store_f32";
+}
+inline const char* kv_scores_kernel(const FlyweightV2QwenRuntime& r){
+    int t=r.options.cache_type_k;
+    if(t==3&&qwen_hadamard_enabled())return "kv_attention_scores_hadamard_q8";
+    return t==5?"kv_attention_scores_turbo4":t==4?"kv_attention_scores_turbo3":t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";
+}
 inline const char* kv_values_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4":t==4?"kv_attention_values_turbo3":t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
-inline const char* kv_scores_ring_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_ring":t==4?"kv_attention_scores_turbo3_ring":t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";}
+inline const char* kv_scores_ring_kernel(const FlyweightV2QwenRuntime& r){
+    int t=r.options.cache_type_k;
+    if(t==3&&qwen_hadamard_enabled())return "kv_attention_scores_hadamard_q8_ring";
+    return t==5?"kv_attention_scores_turbo4_ring":t==4?"kv_attention_scores_turbo3_ring":t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";
+}
 inline const char* kv_values_ring_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_ring":t==4?"kv_attention_values_turbo3_ring":t==3?"kv_attention_values_q8_ring":t==2?"kv_attention_values_bf16_ring":t==1?"kv_attention_values_f16_ring":"kv_attention_values_ring";}
 // The turbo tiles rank below the cuBLAS staging path (see the dispatch) and
 // above the serial per-head kernels; this switch drops them back out of the
@@ -17696,6 +17713,7 @@ inline const char* kv_fused_tiles_kernel(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
+    if(t==3&&qwen_hadamard_enabled())return "kv_attention_fused_hadamard_q8_tiles";
     return t==3?"kv_attention_fused_q8_tiles":
            t==2?"kv_attention_fused_bf16_tiles":
            t==1?"kv_attention_fused_f16_tiles":
@@ -17709,6 +17727,7 @@ inline const char* kv_fused_tiles_kernel256(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
+    if(t==3&&qwen_hadamard_enabled())return "kv_attention_fused_hadamard_q8_tiles256";
     return t==3?"kv_attention_fused_q8_tiles256":
            t==2?"kv_attention_fused_bf16_tiles256":
            t==1?"kv_attention_fused_f16_tiles256":
@@ -17720,6 +17739,7 @@ inline const char* kv_fused_tiles_kernel512(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
+    if(t==3&&qwen_hadamard_enabled())return nullptr;
     return t==3?"kv_attention_fused_q8_tiles512":
            t==2?"kv_attention_fused_bf16_tiles512":
            t==1?"kv_attention_fused_f16_tiles512":
@@ -17753,10 +17773,11 @@ inline const char* kv_gqa_tiles_kernel(
     }();
     if(!enabled||kv_heads<=0||head_dim!=256)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    const int t=r.options.cache_type_k;
+    if(t==3&&qwen_hadamard_enabled())return nullptr;
     const int share=heads/kv_heads;
     if(heads!=kv_heads*share||(share!=8&&share!=4))return nullptr;
     if(tile!=256&&tile!=512)return nullptr;
-    const int t=r.options.cache_type_k;
     const bool narrow=tile==256;
     if(share==8)
         return t==3?(narrow?"kv_attention_gqa_rows_q8_256_s8_t256"
@@ -17794,6 +17815,8 @@ inline const char* kv_gqa_mma_kernel(
     }();
     if(!enabled||kv_heads<=0)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    const int t=r.options.cache_type_k;
+    if(t==3&&qwen_hadamard_enabled())return nullptr;
     // Two instantiated shapes: 256-dim heads in groups of 8, which fill the
     // mma's 8-wide query tile exactly, and 128-dim heads in groups of 4,
     // which leave half of it idle and still come out ahead of the per-head
@@ -17803,7 +17826,6 @@ inline const char* kv_gqa_mma_kernel(
     if(!wide&&!narrow_heads)return nullptr;
     if(tile!=256&&tile!=512)return nullptr;
     const bool narrow=tile==256;
-    const int t=r.options.cache_type_k;
     const char* name=wide?(
         t==3?(narrow?"kv_attention_gqa_mma_q8_256_s8_t256"
                     :"kv_attention_gqa_mma_q8_256_s8_t512"):
@@ -17912,6 +17934,12 @@ inline int qwen_kv_prefill_stage(
         void*rotate_args[]={&queries,&vectors,&head_dim,&key_stream};
         launch("turbo_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
         return 2;
+    }
+    if(ck==3&&qwen_hadamard_enabled()){
+        int vectors=rows*heads;
+        void*rotate_args[]={&queries,&vectors,&head_dim};
+        launch("hadamard_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
+        return 1;
     }
     return 1;
 }
@@ -19251,7 +19279,7 @@ inline bool swa_snapshot_is_resident(const FlyweightV2QwenRuntime& runtime,
 // score/value kernels with a slot list (TURBO_SLOT_INDEXED): the query is
 // rotated once per block and the value fold is inverse-rotated once at the
 // end, exactly as on the dense turbo path.
-inline const char* kv_scores_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_indexed":t==4?"kv_attention_scores_turbo3_indexed":t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
+inline const char* kv_scores_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;if(t==3&&qwen_hadamard_enabled())return "kv_attention_scores_hadamard_q8_indexed";return t==5?"kv_attention_scores_turbo4_indexed":t==4?"kv_attention_scores_turbo3_indexed":t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
 inline const char* kv_values_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_indexed":t==4?"kv_attention_values_turbo3_indexed":t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
 // A layer selects when it carries indexer tensors AND a compress ratio. The
 // window exclusion is structural, not incidental: QSA selects in POSITION
@@ -19789,6 +19817,11 @@ void gemma4_prefill_rows(
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
             }
             if(layer_fused_attention){
+                if(runtime.options.cache_type_k==3&&qwen_hadamard_enabled()){
+                    int vectors=rows*heads;
+                    void*rotate_args[]={const_cast<std::uint64_t*>(&fourth_rows),&vectors,const_cast<int*>(&head_dim)};
+                    launch("hadamard_rotate_rows",static_cast<std::uint32_t>(vectors),1,256,rotate_args);
+                }
                 // Every row's KV is stored above; the kernel masks causally,
                 // so row r still attends to exactly positions 0..base+r.
                 const auto view=attention_cache_view(layer,base_position);
