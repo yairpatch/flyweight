@@ -101,6 +101,17 @@ export function Studio() {
     textarea.current?.focus();
   };
 
+  const editThis = () => {
+    if (!current || !canEdit) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setRefs([String(reader.result)]);
+      setPrompt("");
+      textarea.current?.focus();
+    };
+    reader.readAsDataURL(current.blob);
+  };
+
   if (!info) {
     return (
       <section className="studio">
@@ -259,6 +270,16 @@ export function Studio() {
         <section className="settings__section">
           <h3>This picture</h3>
           <div className="studio__actions">
+            {canEdit && (
+              <button
+                className="button button--small button--primary"
+                disabled={!current || running}
+                onClick={editThis}
+                title="Attach this picture as a reference to edit it in your next prompt"
+              >
+                <Wand2 size={13} /> Edit this
+              </button>
+            )}
             <button className="button button--small" disabled={!current || running} onClick={() => current && void generateImage({ seed: current.seed })} title="Render the same prompt and seed again">
               <RefreshCw size={13} /> Again
             </button>
