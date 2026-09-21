@@ -674,12 +674,71 @@ QiBuffers qi_transformer_buffers(FlyweightV2Diffusion& d, DiffArena& arena, std:
     return b;
 }
 
+struct QiKvCache {
+    std::uint64_t device = 0;
+    std::uint64_t layer_bytes = 0;
+    int layers = 0;
+    int kv_heads = 0;
+    std::uint64_t prefix = 0;
+
+    QiKvCache() = default;
+
+    QiKvCache(int num_layers, int num_heads, std::uint64_t prefix_rows)
+        : layers(num_layers), kv_heads(num_heads), prefix(prefix_rows) {
+        if (!layers || !kv_heads || !prefix) return;
+        layer_bytes = 2ULL * kv_heads * prefix * 128 * sizeof(std::uint16_t);
+        const std::uint64_t total_bytes = static_cast<std::uint64_t>(layers) * layer_bytes;
+        std::uint64_t ptr = 0;
+        if (flyweight_gpu_alloc(total_bytes, &ptr) == 0 && ptr) {
+            device = ptr;
+        }
+    }
+
+    ~QiKvCache() {
+        if (device) flyweight_gpu_free(device);
+    }
+
+    QiKvCache(const QiKvCache&) = delete;
+    QiKvCache& operator=(const QiKvCache&) = delete;
+
+    QiKvCache(QiKvCache&& o) noexcept
+        : device(o.device), layer_bytes(o.layer_bytes), layers(o.layers),
+          kv_heads(o.kv_heads), prefix(o.prefix) {
+        o.device = 0;
+    }
+
+    QiKvCache& operator=(QiKvCache&& o) noexcept {
+        if (this != &o) {
+            if (device) flyweight_gpu_free(device);
+            device = o.device;
+            layer_bytes = o.layer_bytes;
+            layers = o.layers;
+            kv_heads = o.kv_heads;
+            prefix = o.prefix;
+            o.device = 0;
+        }
+        return *this;
+    }
+
+    bool valid() const { return device != 0; }
+
+    std::uint64_t k(int layer) const {
+        return device + static_cast<std::uint64_t>(layer) * layer_bytes;
+    }
+
+    std::uint64_t v(int layer) const {
+        return device + static_cast<std::uint64_t>(layer) * layer_bytes +
+               static_cast<std::uint64_t>(kv_heads) * prefix * 128 * sizeof(std::uint16_t);
+    }
+};
+
 // One block over the joint sequence. Every GEMM and norm runs over all rows;
 // what splits is the modulation (text rows read the t = 0 row of `modulation`,
 // image rows the sampled one) and the attention, whose block-causal mask is
 // exactly "text rows causal over text, image rows full over everything".
 void qi_run_block(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& block,
-                  const QiBuffers& b, const QiLayout& layout) {
+                  const QiBuffers& b, const QiLayout& layout,
+                  QiKvCache* cache = nullptr, int layer = 0) {
     const QwenImage21Tower& q = *d.qwenimage;
     const std::uint64_t f = sizeof(float);
     const int dim = q.dim;
@@ -729,6 +788,15 @@ void qi_run_block(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& bl
         }
         launch.attention(b.qkv, k, v, b.attn, q.heads, q.heads, q.head_dim, rows,
                          3 * dim, 3 * dim, false, b.q16, b.k16, b.v16, text, image, rows, packed);
+        if (cache && cache->valid() && text > 0 && d.flash_attention && !d.exact && q.head_dim == 128) {
+            int kv_heads = q.heads, prefix_count = static_cast<int>(text), total_rows = static_cast<int>(rows);
+            std::uint64_t k_in = b.k16, v_in = b.v16;
+            std::uint64_t k_cache = cache->k(layer), v_cache = cache->v(layer);
+            void* arguments[] = {&k_in, &v_in, &k_cache, &v_cache, &kv_heads, &prefix_count, &total_rows};
+            launch.run("diff_kv_cache_extract",
+                       DiffLaunch::grid_for(static_cast<std::uint64_t>(kv_heads) * text * 128),
+                       1, 256, arguments);
+        }
     }
     launch.gemm(block.out, b.attn, b.normed, rows, b.q8, b.q8_scales);
     gated_add_split(b.hidden, b.normed, 1);
@@ -740,6 +808,87 @@ void qi_run_block(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& bl
     launch.silu_mul(b.gate, b.up, b.gate, rows * q.intermediate);
     launch.gemm(block.down, b.gate, b.normed, rows, b.q8, b.q8_scales);
     gated_add_split(b.hidden, b.normed, 3);
+}
+
+// Decode block specialized for steps > 0: prefix KV is restored from cache,
+// and only target image rows are computed through layer norms, QKV GEMM,
+// RoPE, Flash Attention, out GEMM, and MLP.
+void qi_run_block_decode(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& block,
+                         const QiBuffers& b, const QiLayout& layout,
+                         const QiKvCache& cache, int layer) {
+    const QwenImage21Tower& q = *d.qwenimage;
+    const std::uint64_t f = sizeof(float);
+    const int dim = q.dim;
+    const std::uint64_t rows = layout.rows, prefix = layout.prefix_rows, image = layout.image;
+    const std::uint64_t sampled = b.modulation;
+    const auto slot = [&](std::uint64_t row, int index) {
+        return row + static_cast<std::uint64_t>(index) * dim * f;
+    };
+    const std::uint64_t image_hidden = b.hidden + prefix * dim * f;
+
+    launch.layer_norm(image_hidden, b.normed, dim, image, q.epsilon);
+    launch.scale_columns(b.normed, slot(sampled, 0), dim, image);
+    launch.gemm(block.qkv, b.normed, b.qkv, image, b.q8, b.q8_scales);
+    launch.head_rms_norm(b.qkv, block.q_norm, q.heads, q.head_dim, image, 3 * dim, 0, q.epsilon);
+    launch.head_rms_norm(b.qkv, block.k_norm, q.heads, q.head_dim, image, 3 * dim, dim, q.epsilon);
+    {
+        int heads = q.heads, head_dim = q.head_dim, count = static_cast<int>(image);
+        int axis0 = q.axis_dims[0], axis1 = q.axis_dims[1];
+        std::uint64_t buffer = b.qkv;
+        std::uint64_t positions = b.positions + prefix * 3 * sizeof(std::int32_t);
+        std::uint64_t table = q.rope_frequencies;
+        void* arguments[] = {&buffer, &positions, &table, &heads, &head_dim, &count, &axis0, &axis1};
+        launch.run("diff_rope_axes_rows", count, 2, 256, arguments);
+    }
+    {
+        int kv_heads = q.heads, prefix_count = static_cast<int>(prefix), total_rows = static_cast<int>(rows);
+        std::uint64_t k_cache = cache.k(layer), v_cache = cache.v(layer);
+        std::uint64_t k_out = b.k16, v_out = b.v16;
+        void* arguments[] = {&k_cache, &v_cache, &k_out, &v_out, &kv_heads, &prefix_count, &total_rows};
+        launch.run("diff_kv_cache_restore",
+                   DiffLaunch::grid_for(static_cast<std::uint64_t>(kv_heads) * prefix * 128),
+                   1, 256, arguments);
+    }
+    {
+        int heads = q.heads, kv_heads = q.heads;
+        int total_rows = static_cast<int>(rows), prefix_count = static_cast<int>(prefix), img_count = static_cast<int>(image);
+        int q_stride = 3 * dim, kv_stride = 3 * dim;
+        float scale = 1.0f / std::sqrt(static_cast<float>(q.head_dim));
+        float q_scale = scale * 1.4426950408889634f;
+        std::uint64_t q_ptr = b.qkv;
+        std::uint64_t k_ptr = b.qkv + static_cast<std::uint64_t>(dim) * f;
+        std::uint64_t v_ptr = b.qkv + static_cast<std::uint64_t>(2 * dim) * f;
+        std::uint64_t q16 = b.q16, k16 = b.k16, v16 = b.v16;
+        void* arguments[] = {&q_ptr, &k_ptr, &v_ptr, &q16, &k16, &v16,
+                             &heads, &kv_heads, &total_rows, &prefix_count, &img_count,
+                             &q_stride, &kv_stride, &q_scale};
+        launch.run("diff_pack_target_attention_bf16",
+                   DiffLaunch::grid_for(static_cast<std::uint64_t>(image) * (heads + 2 * kv_heads) * 128),
+                   1, 256, arguments);
+    }
+    {
+        int heads = q.heads, kv_heads = q.heads;
+        int plane = static_cast<int>(rows);
+        int first = static_cast<int>(prefix);
+        int queries = static_cast<int>(image);
+        int keys = static_cast<int>(rows);
+        int causal_flag = 0;
+        std::uint64_t q16 = b.q16, k16 = b.k16, v16 = b.v16, out = b.attn;
+        void* arguments[] = {&q16, &k16, &v16, &out, &heads, &kv_heads, &plane, &first,
+                             &queries, &keys, &causal_flag};
+        launch.run("diff_flash_attention_bf16", static_cast<std::uint32_t>((queries + 63) / 64),
+                   static_cast<std::uint32_t>(heads), 128, arguments);
+    }
+    launch.gemm(block.out, b.attn + prefix * dim * f, b.normed, image, b.q8, b.q8_scales);
+    launch.gated_add(image_hidden, b.normed, slot(sampled, 1), dim, image);
+
+    launch.layer_norm(image_hidden, b.normed, dim, image, q.epsilon);
+    launch.scale_columns(b.normed, slot(sampled, 2), dim, image);
+    launch.gemm(block.gate, b.normed, b.gate, image, b.q8, b.q8_scales);
+    launch.gemm(block.up, b.normed, b.up, image, b.q8, b.q8_scales);
+    launch.silu_mul(b.gate, b.up, b.gate, image * q.intermediate);
+    launch.gemm(block.down, b.gate, b.normed, image, b.q8, b.q8_scales);
+    launch.gated_add(image_hidden, b.normed, slot(sampled, 3), dim, image);
 }
 
 // Positions over the joint sequence. Text tokens advance one shared position
@@ -829,7 +978,8 @@ QiLayout qi_layout(const float* caption, std::uint64_t caption_tokens, int capti
 void qi_transformer_forward_joint(FlyweightV2Diffusion& d, const float* latents, int latent_h, int latent_w,
                                   const float* caption, std::uint64_t caption_tokens,
                                   const std::uint8_t* pad_mask, const std::vector<QiCondition>& conditions,
-                                  float t, float* velocity) {
+                                  float t, float* velocity,
+                                  QiKvCache* cache = nullptr, bool is_decode = false) {
     QwenImage21Tower& q = *d.qwenimage;
     if (!caption_tokens) throw std::runtime_error("empty caption");
     std::vector<float> caption_rows;
@@ -881,50 +1031,62 @@ void qi_transformer_forward_joint(FlyweightV2Diffusion& d, const float* latents,
     qi_positions(layout, positions);
     launch.upload(b.positions, positions.data(), positions.size() * sizeof(std::int32_t));
 
-    // Prefix rows: zero-centred RMSNorm, linear, GELU, linear over every row
-    // (an image block's rows are zero here and are overwritten just below,
-    // which costs less than gathering the text rows apart).
-    launch.upload(b.caption, caption_rows.data(), prefix * q.caption_dim * f);
-    launch.rms_norm(b.caption, q.txt_norm, b.caption_normed, q.caption_dim, prefix, q.epsilon);
-    launch.gemm(q.txt_in, b.caption_normed, b.hidden, prefix, b.q8, b.q8_scales);
-    {
-        int elements = static_cast<int>(prefix * dim);
-        std::uint64_t hidden = b.hidden;
-        void* arguments[] = {&hidden, &elements};
-        launch.run("vision_gelu_rows", DiffLaunch::grid_for(prefix * dim), 1, 256, arguments);
-    }
-    launch.gemm(q.txt_out, b.hidden, b.normed, prefix, b.q8, b.q8_scales);
-    if (flyweight_gpu_copy_device(b.hidden, b.normed, prefix * dim * f, d.stream) != 0)
-        throw std::runtime_error("diffusion caption copy failed");
+    if (!is_decode) {
+        // Prefix rows: zero-centred RMSNorm, linear, GELU, linear over every row
+        // (an image block's rows are zero here and are overwritten just below,
+        // which costs less than gathering the text rows apart).
+        launch.upload(b.caption, caption_rows.data(), prefix * q.caption_dim * f);
+        launch.rms_norm(b.caption, q.txt_norm, b.caption_normed, q.caption_dim, prefix, q.epsilon);
+        launch.gemm(q.txt_in, b.caption_normed, b.hidden, prefix, b.q8, b.q8_scales);
+        {
+            int elements = static_cast<int>(prefix * dim);
+            std::uint64_t hidden = b.hidden;
+            void* arguments[] = {&hidden, &elements};
+            launch.run("vision_gelu_rows", DiffLaunch::grid_for(prefix * dim), 1, 256, arguments);
+        }
+        launch.gemm(q.txt_out, b.hidden, b.normed, prefix, b.q8, b.q8_scales);
+        if (flyweight_gpu_copy_device(b.hidden, b.normed, prefix * dim * f, d.stream) != 0)
+            throw std::runtime_error("diffusion caption copy failed");
 
-    // Image rows, condition blocks then the target: each latent unpatched,
-    // one row of `channels` per pixel, at its block's rows.
-    {
-        std::size_t condition = 0;
-        const auto unpatch = [&](const float* source, std::uint64_t start, std::uint64_t count) {
-            for (std::uint64_t pixel = 0; pixel < count; ++pixel)
-                for (int c = 0; c < channels; ++c)
-                    rows[(start + pixel) * channels + c] = source[static_cast<std::uint64_t>(c) * count + pixel];
-        };
-        for (const auto& segment : layout.prefix)
-            if (segment.image)
-                unpatch(conditions[condition++].latents.data(), segment.start, segment.end - segment.start);
-        unpatch(latents, prefix, layout.image);
-        launch.upload(b.latent_in, rows.data(), layout.rows * channels * f);
-        for (const auto& segment : layout.prefix)
-            if (segment.image)
-                launch.gemm(q.img_in, b.latent_in + segment.start * channels * f,
-                            b.hidden + segment.start * dim * f, segment.end - segment.start,
-                            b.q8, b.q8_scales);
-        launch.gemm(q.img_in, b.latent_in + prefix * channels * f, b.hidden + prefix * dim * f,
-                    layout.image, b.q8, b.q8_scales);
+        // Image rows, condition blocks then the target: each latent unpatched,
+        // one row of `channels` per pixel, at its block's rows.
+        {
+            std::size_t condition = 0;
+            const auto unpatch = [&](const float* source, std::uint64_t start, std::uint64_t count) {
+                for (std::uint64_t pixel = 0; pixel < count; ++pixel)
+                    for (int c = 0; c < channels; ++c)
+                        rows[(start + pixel) * channels + c] = source[static_cast<std::uint64_t>(c) * count + pixel];
+            };
+            for (const auto& segment : layout.prefix)
+                if (segment.image)
+                    unpatch(conditions[condition++].latents.data(), segment.start, segment.end - segment.start);
+            unpatch(latents, prefix, layout.image);
+            launch.upload(b.latent_in, rows.data(), layout.rows * channels * f);
+            for (const auto& segment : layout.prefix)
+                if (segment.image)
+                    launch.gemm(q.img_in, b.latent_in + segment.start * channels * f,
+                                b.hidden + segment.start * dim * f, segment.end - segment.start,
+                                b.q8, b.q8_scales);
+            launch.gemm(q.img_in, b.latent_in + prefix * channels * f, b.hidden + prefix * dim * f,
+                        layout.image, b.q8, b.q8_scales);
+        }
+    } else {
+        for (std::uint64_t pixel = 0; pixel < layout.image; ++pixel)
+            for (int c = 0; c < channels; ++c)
+                rows[pixel * channels + c] = latents[static_cast<std::uint64_t>(c) * layout.image + pixel];
+        launch.upload(b.latent_in, rows.data(), layout.image * channels * f);
+        launch.gemm(q.img_in, b.latent_in, b.hidden + prefix * dim * f, layout.image, b.q8, b.q8_scales);
     }
 
     DiffStreamer streamer{d, {}, 0};
     for (auto& block : q.blocks) streamer.refs.push_back(qi_block_matrices(block));
     for (std::size_t index = 0; index < q.blocks.size(); ++index) {
         streamer.begin(index);
-        qi_run_block(d, launch, q.blocks[index], b, layout);
+        if (!is_decode) {
+            qi_run_block(d, launch, q.blocks[index], b, layout, cache, static_cast<int>(index));
+        } else {
+            qi_run_block_decode(d, launch, q.blocks[index], b, layout, *cache, static_cast<int>(index));
+        }
         streamer.end(index);
     }
 
@@ -1853,11 +2015,28 @@ void qi_edit(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std::uint64_t
     if (initial_latents) std::memcpy(latents.data(), initial_latents, latent_count * sizeof(float));
     else diff_gaussian_noise(seed, latents);
     const auto sigmas = qi_sigmas(static_cast<int>(steps), shift, static_cast<std::uint64_t>(latent_h) * latent_w);
+    std::vector<float> dummy_caption_rows;
+    const QiLayout layout = qi_layout(conditioning, caption_tokens, q.caption_dim, mask, ordered,
+                                      latent_h, latent_w, dummy_caption_rows);
+    const std::uint64_t prefix = layout.prefix_rows;
+    bool use_kv_cache = d.flash_attention && !d.exact && q.head_dim == 128 && steps > 1 && prefix > 0;
+    if (const char* env = std::getenv("FLYWEIGHT_DIFF_KV_CACHE")) {
+        if (env[0] == '0') use_kv_cache = false;
+    }
+    std::unique_ptr<QiKvCache> cache;
+    if (use_kv_cache) {
+        cache = std::make_unique<QiKvCache>(static_cast<int>(q.blocks.size()), q.heads, prefix);
+        if (!cache->valid()) {
+            cache.reset();
+            use_kv_cache = false;
+        }
+    }
     for (std::uint32_t step = 0; step < steps; ++step) {
         const float sigma = sigmas[step], next = sigmas[step + 1];
         if (sigma == next) continue;
+        const bool is_decode = use_kv_cache && (step > 0);
         qi_transformer_forward_joint(d, latents.data(), latent_h, latent_w, conditioning, caption_tokens,
-                                     mask, ordered, sigma, velocity.data());
+                                     mask, ordered, sigma, velocity.data(), cache.get(), is_decode);
         for (std::size_t i = 0; i < latent_count; ++i) latents[i] += (next - sigma) * velocity[i];
         if (progress && progress(user_data, step + 1, steps) != 0) throw std::runtime_error("cancelled");
     }
@@ -1915,11 +2094,25 @@ void qi_generate(FlyweightV2Diffusion& d, const std::uint32_t* tokens, std::uint
     else diff_gaussian_noise(seed, latents);
     const auto sigmas = qi_sigmas(static_cast<int>(steps), shift,
                                   static_cast<std::uint64_t>(latent_h) * latent_w);
+    const std::uint64_t prefix = caption_tokens;
+    bool use_kv_cache = d.flash_attention && !d.exact && q.head_dim == 128 && steps > 1 && prefix > 0;
+    if (const char* env = std::getenv("FLYWEIGHT_DIFF_KV_CACHE")) {
+        if (env[0] == '0') use_kv_cache = false;
+    }
+    std::unique_ptr<QiKvCache> cache;
+    if (use_kv_cache) {
+        cache = std::make_unique<QiKvCache>(static_cast<int>(q.blocks.size()), q.heads, prefix);
+        if (!cache->valid()) {
+            cache.reset();
+            use_kv_cache = false;
+        }
+    }
     for (std::uint32_t step = 0; step < steps; ++step) {
         const float sigma = sigmas[step], next = sigmas[step + 1];
         if (sigma == next) continue;
-        qi_transformer_forward(d, latents.data(), latent_h, latent_w, conditioning, caption_tokens,
-                               sigma, velocity.data());
+        const bool is_decode = use_kv_cache && (step > 0);
+        qi_transformer_forward_joint(d, latents.data(), latent_h, latent_w, conditioning, caption_tokens,
+                                     nullptr, {}, sigma, velocity.data(), cache.get(), is_decode);
         // Euler on the model's own output, which is the velocity as predicted.
         for (std::size_t i = 0; i < latent_count; ++i) latents[i] += (next - sigma) * velocity[i];
         if (progress && progress(user_data, step + 1, steps) != 0) throw std::runtime_error("cancelled");

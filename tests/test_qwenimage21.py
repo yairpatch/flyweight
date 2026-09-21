@@ -226,6 +226,39 @@ class QwenImage21LoaderTests(unittest.TestCase):
             encoder.close()
 
     @unittest.skipUnless(_gpu_available(), "needs a CUDA device")
+    def test_prefix_kv_cache_matches_uncached_generation_and_editing(self) -> None:
+        import os
+        encoder = V2Model(self.snapshot / "text_encoder")
+        transformer = V2Model(self.snapshot / "transformer")
+        vae = V2Model(self.snapshot / "vae")
+        tower = V2Diffusion(encoder, transformer, vae, max_width=96, max_height=64,
+                            max_prompt_tokens=64, weights="device")
+        try:
+            tokens = encoder.tokenize("abc ab abc")
+            # 1. Multi-step text-to-image: KV cache ON vs OFF
+            os.environ["FLYWEIGHT_DIFF_KV_CACHE"] = "1"
+            cached_gen = tower.generate(tokens, 96, 64, steps=3, seed=7, caption_drop=2)
+            os.environ["FLYWEIGHT_DIFF_KV_CACHE"] = "0"
+            uncached_gen = tower.generate(tokens, 96, 64, steps=3, seed=7, caption_drop=2)
+            self.assertEqual(cached_gen, uncached_gen)
+
+            # 2. Multi-step reference editing: KV cache ON vs OFF
+            pad = encoder.tokenize("<|image_pad|>")[0]
+            prompt = [tokens[0], pad, pad] + list(tokens[1:])
+            rgba = bytes(64 * 32 * 4)
+            os.environ["FLYWEIGHT_DIFF_KV_CACHE"] = "1"
+            cached_edit = tower.edit(prompt, [(rgba, 64, 32, 1)], 96, 64, steps=3, seed=7, caption_drop=1)
+            os.environ["FLYWEIGHT_DIFF_KV_CACHE"] = "0"
+            uncached_edit = tower.edit(prompt, [(rgba, 64, 32, 1)], 96, 64, steps=3, seed=7, caption_drop=1)
+            self.assertEqual(cached_edit, uncached_edit)
+        finally:
+            os.environ.pop("FLYWEIGHT_DIFF_KV_CACHE", None)
+            tower.close()
+            vae.close()
+            transformer.close()
+            encoder.close()
+
+    @unittest.skipUnless(_gpu_available(), "needs a CUDA device")
     def test_the_generator_shapes_requests_for_the_model(self) -> None:
         generator = ImageGenerator(self.snapshot, max_width=64, max_height=64, weights="device")
         try:

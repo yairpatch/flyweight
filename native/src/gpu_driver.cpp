@@ -1290,6 +1290,7 @@ extern "C" int flyweight_gpu_compile(
              "diff_upsample_nearest_2x", "diff_pack_attention_bf16",
              "diff_flash_attention_bf16", "diff_conv2d_bf16", "diff_to_hwc_bf16",
              "diff_upsample_nearest_2x_hwc_bf16", "diff_q8_bf16_gemm", "diff_pack_rows_bf16",
+             "diff_kv_cache_extract", "diff_kv_cache_restore", "diff_pack_target_attention_bf16",
              // Qwen-Image-2.1 (v2_qwenimage.inc)
              "qi_channel_rms_stats", "qi_channel_rms_apply", "qi_dup_up_add",
              "qi_rope_mrope_rows", "qi_conv2d_stride2", "qi_avg_down_add",

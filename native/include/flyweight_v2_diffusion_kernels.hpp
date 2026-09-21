@@ -337,6 +337,78 @@ void diff_pack_attention_bf16(
     }
 }
 
+extern "C" __global__
+void diff_kv_cache_extract(
+    const unsigned short* k_in, const unsigned short* v_in,
+    unsigned short* k_cache, unsigned short* v_cache,
+    const int kv_heads, const int prefix, const int rows
+) {
+    const long long kv_elements = (long long)kv_heads * prefix * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        const int d = (int)(index & 127);
+        const long long rest = index >> 7;
+        const int r = (int)(rest % prefix);
+        const int h = (int)(rest / prefix);
+        const long long src_idx = ((long long)h * rows + r) * 128 + d;
+        k_cache[index] = k_in[src_idx];
+        v_cache[index] = v_in[src_idx];
+    }
+}
+
+extern "C" __global__
+void diff_kv_cache_restore(
+    const unsigned short* k_cache, const unsigned short* v_cache,
+    unsigned short* k_out, unsigned short* v_out,
+    const int kv_heads, const int prefix, const int rows
+) {
+    const long long kv_elements = (long long)kv_heads * prefix * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        const int d = (int)(index & 127);
+        const long long rest = index >> 7;
+        const int r = (int)(rest % prefix);
+        const int h = (int)(rest / prefix);
+        const long long dst_idx = ((long long)h * rows + r) * 128 + d;
+        k_out[dst_idx] = k_cache[index];
+        v_out[dst_idx] = v_cache[index];
+    }
+}
+
+extern "C" __global__
+void diff_pack_target_attention_bf16(
+    const float* q, const float* k, const float* v,
+    unsigned short* q_out, unsigned short* k_out, unsigned short* v_out,
+    const int heads, const int kv_heads, const int rows, const int prefix, const int image,
+    const int q_stride, const int kv_stride, const float q_scale
+) {
+    const long long q_elements = (long long)heads * image * 128;
+    const long long kv_elements = (long long)kv_heads * image * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < q_elements + 2 * kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        if (index < q_elements) {
+            const int d = (int)(index & 127);
+            const long long rest = index >> 7;
+            const int img_row = (int)(rest % image), head = (int)(rest / image);
+            const int dst_row = prefix + img_row;
+            const long long dst_idx = ((long long)head * rows + dst_row) * 128 + d;
+            q_out[dst_idx] = diff_f32_to_bf16(q[(long long)img_row * q_stride + head * 128 + d] * q_scale);
+        } else {
+            const long long local = (index - q_elements) % kv_elements;
+            const bool is_v = index - q_elements >= kv_elements;
+            const int d = (int)(local & 127);
+            const long long rest = local >> 7;
+            const int img_row = (int)(rest % image), head = (int)(rest / image);
+            const int dst_row = prefix + img_row;
+            const long long dst_idx = ((long long)head * rows + dst_row) * 128 + d;
+            const float value = (is_v ? v : k)[(long long)img_row * kv_stride + head * 128 + d];
+            (is_v ? v_out : k_out)[dst_idx] = diff_f32_to_bf16(value);
+        }
+    }
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 #define FLYWEIGHT_DIFF_FLASH_QUERIES 64
 #define FLYWEIGHT_DIFF_FLASH_KEYS 64
 extern "C" __global__ __launch_bounds__(128)
