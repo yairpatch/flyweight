@@ -190,13 +190,20 @@ def main() -> int:
     out_k8v4 = (attn_p_i8_rot @ v_4bit_rot) @ H.T
     cos_k8v4 = float(np.dot(out_ref, out_k8v4) / (np.linalg.norm(out_ref) * np.linalg.norm(out_k8v4)))
 
-    print(f"{"Configuration":<36} | {"Softmax Max Error":<18} | {"Output Cosine Sim":<18}")
+    col1, col2, col3 = "Configuration", "Softmax Max Error", "Output Cosine Sim"
+    print(f"{col1:<36} | {col2:<18} | {col3:<18}")
     print("-" * 78)
-    print(f"{"INT8 Keys (standard raw)":<36} | {p_err_i8_raw:<18.6f} | {cos_i8_raw:<18.6f}")
-    print(f"{"INT8 Keys (with Sylvester-Hadamard)":<36} | {p_err_i8_rot:<18.6f} | {cos_i8_rot:<18.6f}")
-    print(f"{"4-bit Values (standard raw)":<36} | {"(N/A - keys exact)":<18} | {cos_4bit_raw:<18.6f}")
-    print(f"{"4-bit Values (with Sylvester-Hadamard)":<36} | {"(N/A - keys exact)":<18} | {cos_4bit_rot:<18.6f}")
-    print(f"{"K8V4 Asymmetric (Hadamard K8 + V4)":<36} | {p_err_i8_rot:<18.6f} | {cos_k8v4:<18.6f}")
+    name1 = "INT8 Keys (standard raw)"
+    print(f"{name1:<36} | {p_err_i8_raw:<18.6f} | {cos_i8_raw:<18.6f}")
+    name2 = "INT8 Keys (with Sylvester-Hadamard)"
+    print(f"{name2:<36} | {p_err_i8_rot:<18.6f} | {cos_i8_rot:<18.6f}")
+    name3 = "4-bit Values (standard raw)"
+    na_str = "(N/A - keys exact)"
+    print(f"{name3:<36} | {na_str:<18} | {cos_4bit_raw:<18.6f}")
+    name4 = "4-bit Values (with Sylvester-Hadamard)"
+    print(f"{name4:<36} | {na_str:<18} | {cos_4bit_rot:<18.6f}")
+    name5 = "K8V4 Asymmetric (Hadamard K8 + V4)"
+    print(f"{name5:<36} | {p_err_i8_rot:<18.6f} | {cos_k8v4:<18.6f}")
     print("-" * 78)
     print(f"Result: Hadamard improves INT8 attention probability error by {p_err_i8_raw / p_err_i8_rot:.1f}x!")
     print(f"Result: K8V4 achieves {cos_k8v4:.6f} cosine similarity while taking only ~400 bytes/token/head.")

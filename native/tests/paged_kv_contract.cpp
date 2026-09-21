@@ -20,9 +20,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stddef.h>
+#include <stdint.h>
 #include <numeric>
 #include <random>
 #include <unordered_set>
