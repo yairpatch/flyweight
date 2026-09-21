@@ -232,10 +232,13 @@ bit-identical before and after the attention-kernel split.
 
 ## Next
 
-- The prefix KV cache (`use_kv_cache=True`): text rows are step-independent
-  under `causal_condition`, so a block could store their K/V once and later
-  steps run only the image rows. Saves 2-10% of a step at these prompt lengths;
-  the sequence layout and attention segments here already allow it.
+- Prefix KV cache (`use_kv_cache=True`, completed 2026-09-20): text and
+  condition-image rows are step-independent under `causal_condition`, so step 0
+  extracts their K/V into a layer-wise bf16 cache (`QiKvCache`) and steps
+  1..N-1 evaluate only the target image rows through layer norms, QKV GEMM,
+  RoPE, Flash Attention, and MLP. Reduces reference edit generation time from
+  9.82s to 7.57s (23% speedup) with 100% bit-exact outputs. Automatically enabled
+  when supported, with graceful fallback and environment toggle `FLYWEIGHT_DIFF_KV_CACHE=0`.
 - The DiT workspace at 2048 is ~4 GB (the 12288-wide `gate`/`up` planes are
   half of it); chunking the MLP over rows would bring it to ~2.5 GB. Since
   2026-09-20 the arena is a cap that grows on demand (`diff_ensure_workspace`,
