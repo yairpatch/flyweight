@@ -41,6 +41,21 @@ bool has_avx512_vnni() {
 #endif
 }
 
+bool has_avx_vnni() {
+#if defined(_MSC_VER)
+    int registers[4]{};
+    __cpuid(registers, 0);
+    if (registers[0] < 7) return false;
+    __cpuidex(registers, 7, 1);
+    return (registers[0] & (1 << 4)) != 0 && (_xgetbv(0) & 0x6) == 0x6;
+#else
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __cpuid_count(7, 1, eax, ebx, ecx, edx);
+    return (eax & (1u << 4)) != 0 && __builtin_cpu_supports("avx2");
+#endif
+}
+
 }  // namespace
 
 static std::uint16_t to_half(float value) {
@@ -49,8 +64,8 @@ static std::uint16_t to_half(float value) {
 }
 
 int main() {
-    if (!has_avx512_vnni()) {
-        std::printf("SKIP: no AVX512-VNNI\n");
+    if (!has_avx512_vnni() || !has_avx_vnni()) {
+        std::printf("SKIP: missing AVX512-VNNI or AVX-VNNI\n");
         return 0;
     }
     const int rows = 64, elements = 256, tokens = 7;

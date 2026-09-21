@@ -256,7 +256,9 @@ class HfLoaderTests(unittest.TestCase):
             # file copied alongside it now describes a checkpoint that no
             # longer exists.
             shard = next(moved.glob("*.safetensors"))
-            shard.touch()
+            import os
+            new_time = shard.stat().st_mtime + 10.0
+            os.utime(shard, (new_time, new_time))
             self.assertTrue((moved / cached.name).exists())
             with V2Model(moved) as model:
                 names = {str(t["name"]) for t in model.tensors()}
