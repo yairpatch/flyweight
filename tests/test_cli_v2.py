@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from flyweight.cli import (
     AUTO_PROMPT_CACHE_MIB,
@@ -17,6 +17,7 @@ from flyweight.cli import (
     _benchmark_native_prefill,
     _drop_file_cache,
     _generate,
+    _serve,
     _parser,
     _prefill_cache_seed,
     _prompt_tokens,
@@ -354,6 +355,35 @@ class BackendSelectionTests(unittest.TestCase):
         # Selected first: the service is what opens the model and allocates,
         # and an allocation belongs to the backend that was active for it.
         self.assertEqual(order, ["select:cpu", "load"])
+
+    def test_serve_selects_backend_before_loading_and_passes_k8v4(self) -> None:
+        args = _parser().parse_args([
+            "serve", "model.gguf", "--backend", "cpu", "--kv-dtype", "k8v4"
+        ])
+        service = MagicMock()
+        order: list[str] = []
+        captured_kwargs: dict[str, object] = {}
+
+        def select(backend: str) -> str:
+            order.append(f"select:{backend}")
+            return backend
+
+        def build(*args_, **kwargs):
+            order.append("load")
+            captured_kwargs.update(kwargs)
+            return service
+
+        with patch("flyweight.cli._architecture", return_value="qwen3"), \
+                patch("flyweight.cli.V2Model") as model, \
+                patch("flyweight.v2_server.NativeV2InferenceService", build), \
+                patch("flyweight.cli._serve_http", return_value=0) as mock_serve_http:
+            model.select_backend.side_effect = select
+            ret = _serve(args)
+        self.assertEqual(ret, 0)
+        self.assertEqual(order, ["select:cpu", "load"])
+        self.assertEqual(captured_kwargs.get("cache_type_k"), "q8_0")
+        self.assertEqual(captured_kwargs.get("cache_type_v"), "turbo4")
+        mock_serve_http.assert_called_once_with(args, service)
 
 
 class PromptTokenTests(unittest.TestCase):
