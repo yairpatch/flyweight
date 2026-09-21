@@ -65,6 +65,7 @@ struct CublasLtHeuristicResult {
 
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
+    CUresult (*cuDeviceGetCount)(int*) = nullptr;
     // Optional: the driver's CUDA version, to decide PTX versus cubin.
     CUresult (*cuDriverGetVersion)(int*) = nullptr;
     // Optional: names a driver result in the compile log (a PTX the driver
@@ -415,6 +416,7 @@ bool load_apis() {
     }
     bool ok = true;
     ok &= load_symbol(cuda, "cuInit", g_api.cuInit);
+    load_symbol(cuda, "cuDeviceGetCount", g_api.cuDeviceGetCount);
     load_symbol(cuda, "cuDriverGetVersion", g_api.cuDriverGetVersion);
     load_symbol(cuda, "cuGetErrorName", g_api.cuGetErrorName);
     ok &= load_symbol(
@@ -838,7 +840,13 @@ int enqueue_layer(
 
 extern "C" int flyweight_gpu_available() {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_backend_available();
-    return load_apis() ? 1 : 0;
+    if (!load_apis()) return 0;
+    if (g_api.cuInit == nullptr || g_api.cuInit(0) != 0) return 0;
+    if (g_api.cuDeviceGetCount != nullptr) {
+        int count = 0;
+        if (g_api.cuDeviceGetCount(&count) != 0 || count <= 0) return 0;
+    }
+    return 1;
 }
 
 extern "C" int flyweight_gpu_init(std::int32_t device) {
