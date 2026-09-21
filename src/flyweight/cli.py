@@ -1647,6 +1647,8 @@ def _serve(args: argparse.Namespace) -> int:
     if _architecture(args.model) == "deepseek4":
         return _serve_http(args, _deepseek4_service(args, "serve"))
     _select_backend(args)
+    from .v2_server import NativeV2InferenceService
+
     cache_type_k = args.cache_type_k
     cache_type_v = args.cache_type_v
     if getattr(args, "kv_dtype", None):
