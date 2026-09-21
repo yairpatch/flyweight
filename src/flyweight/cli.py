@@ -536,6 +536,11 @@ def _add_runtime_options(
              "/v1/images/generations beside the chat model",
     )
     add(
+        placement, "--image-transformer", type=Path, default=None, metavar="PATH",
+        help="path to a DiT transformer weights file (.gguf) or directory to use "
+             "with --image-model, overriding transformer/",
+    )
+    add(
         placement, "--image-max-size", type=int, default=0, metavar="N",
         help="largest image side a request may ask the image model for "
              "(default 0: the model's own, 1024 for Z-Image and 2048 for "
@@ -1637,6 +1642,7 @@ def _serve(args: argparse.Namespace) -> int:
         image_max_tokens=getattr(args, "image_max_tokens", 1024),
         image_urls=getattr(args, "image_urls", "allow"),
         image_model_path=getattr(args, "image_model", None),
+        image_transformer_path=getattr(args, "image_transformer", None),
         image_max_size=getattr(args, "image_max_size", 0),
         image_weights=getattr(args, "image_weights", "auto"),
         image_precision=getattr(args, "image_precision", "balanced"),

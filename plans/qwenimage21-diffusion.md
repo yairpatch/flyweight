@@ -239,6 +239,13 @@ bit-identical before and after the attention-kernel split.
   RoPE, Flash Attention, and MLP. Reduces reference edit generation time from
   9.82s to 7.57s (23% speedup) with 100% bit-exact outputs. Automatically enabled
   when supported, with graceful fallback and environment toggle `FLYWEIGHT_DIFF_KV_CACHE=0`.
+- GGUF DiT transformer support (completed 2026-09-21): support running Qwen-Image-2.1
+  when the DiT transformer is supplied as a GGUF file (e.g. from `Abiray/Qwen-Image-2.1-GGUF`),
+  with mixed checkpoint topology (HF text encoder + GGUF DiT + HF VAE).
+  Handles split Q/K/V tensors (`to_q`, `to_k`, `to_v`) via `diff_interleave_qkv` and
+  fused SwiGLU MLP (`img_mlp.gate_up.weight`) via `diff_swiglu_gate_up` without modifying
+  downstream attention or KV cache logic. `ImageGenerator` accepts explicit GGUF paths
+  via `transformer` or discovers `.gguf` in snapshot directories.
 - The DiT workspace at 2048 is ~4 GB (the 12288-wide `gate`/`up` planes are
   half of it); chunking the MLP over rows would bring it to ~2.5 GB. Since
   2026-09-20 the arena is a cap that grows on demand (`diff_ensure_workspace`,

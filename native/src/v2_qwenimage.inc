@@ -19,6 +19,10 @@ namespace {
 struct QiBlock {
     std::uint64_t q_norm = 0, k_norm = 0;
     DiffMatrix qkv, out, gate, up, down;
+    DiffMatrix q, k, v;
+    DiffMatrix gate_up;
+    bool fused_qkv = true;
+    bool fused_gate_up = false;
 };
 
 // `F.normalize(x, dim=1) * sqrt(C) * gamma`: a per-pixel RMS norm over the
@@ -265,10 +269,20 @@ QiResnet qi_upload_resnet(FlyweightV2Diffusion& d, const FlyweightV2Model& model
 
 DiffLayerRef qi_block_matrices(QiBlock& block) {
     DiffLayerRef ref;
-    ref.add(block.qkv);
+    if (block.fused_qkv) {
+        ref.add(block.qkv);
+    } else {
+        ref.add(block.q);
+        ref.add(block.k);
+        ref.add(block.v);
+    }
     ref.add(block.out);
-    ref.add(block.gate);
-    ref.add(block.up);
+    if (block.fused_gate_up) {
+        ref.add(block.gate_up);
+    } else {
+        ref.add(block.gate);
+        ref.add(block.up);
+    }
     ref.add(block.down);
     return ref;
 }
@@ -280,13 +294,28 @@ QiBlock qi_upload_block(FlyweightV2Diffusion& d, const FlyweightV2Model& model,
     QiBlock block;
     block.q_norm = diff_upload_f32(d, model, prefix + ".attn.norm_q.weight", q.head_dim);
     block.k_norm = diff_upload_f32(d, model, prefix + ".attn.norm_k.weight", q.head_dim);
-    block.qkv = diff_upload_matrix(d, model, prefix + ".attn.qkv.weight", q.dim, 3 * q.dim);
+    if (diff_has_tensor(model, prefix + ".attn.qkv.weight")) {
+        block.fused_qkv = true;
+        block.qkv = diff_upload_matrix(d, model, prefix + ".attn.qkv.weight", q.dim, 3 * q.dim);
+    } else {
+        block.fused_qkv = false;
+        block.q = diff_upload_matrix(d, model, prefix + ".attn.to_q.weight", q.dim, q.dim);
+        block.k = diff_upload_matrix(d, model, prefix + ".attn.to_k.weight", q.dim, q.dim);
+        block.v = diff_upload_matrix(d, model, prefix + ".attn.to_v.weight", q.dim, q.dim);
+    }
     block.out = diff_upload_matrix(d, model, prefix + ".attn.to_out.0.weight", q.dim, q.dim);
     // SwiGLU: gate_layer is the gated half, proj the value half, out the
     // projection back (the reference's `out(silu(gate_layer(x)) * proj(x))`).
-    block.gate = diff_upload_matrix(d, model, prefix + ".img_mlp.gate_layer.weight",
-                                    q.dim, q.intermediate);
-    block.up = diff_upload_matrix(d, model, prefix + ".img_mlp.proj.weight", q.dim, q.intermediate);
+    if (diff_has_tensor(model, prefix + ".img_mlp.gate_up.weight")) {
+        block.fused_gate_up = true;
+        block.gate_up = diff_upload_matrix(d, model, prefix + ".img_mlp.gate_up.weight",
+                                           q.dim, 2 * q.intermediate);
+    } else {
+        block.fused_gate_up = false;
+        block.gate = diff_upload_matrix(d, model, prefix + ".img_mlp.gate_layer.weight",
+                                        q.dim, q.intermediate);
+        block.up = diff_upload_matrix(d, model, prefix + ".img_mlp.proj.weight", q.dim, q.intermediate);
+    }
     block.down = diff_upload_matrix(d, model, prefix + ".img_mlp.out.weight", q.intermediate, q.dim);
     return block;
 }
@@ -762,7 +791,18 @@ void qi_run_block(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& bl
 
     launch.layer_norm(b.hidden, b.normed, dim, rows, q.epsilon);
     scale_split(b.normed, 0);
-    launch.gemm(block.qkv, b.normed, b.qkv, rows, b.q8, b.q8_scales);
+    if (block.fused_qkv) {
+        launch.gemm(block.qkv, b.normed, b.qkv, rows, b.q8, b.q8_scales);
+    } else {
+        launch.gemm(block.q, b.normed, b.gate, rows, b.q8, b.q8_scales);
+        launch.gemm(block.k, b.normed, b.gate + rows * dim * f, rows, b.q8, b.q8_scales);
+        launch.gemm(block.v, b.normed, b.gate + 2 * rows * dim * f, rows, b.q8, b.q8_scales);
+        std::uint64_t q_ptr = b.gate, k_ptr = b.gate + rows * dim * f, v_ptr = b.gate + 2 * rows * dim * f;
+        std::uint64_t qkv_ptr = b.qkv;
+        int d_dim = dim, d_rows = static_cast<int>(rows);
+        void* arguments[] = {&q_ptr, &k_ptr, &v_ptr, &qkv_ptr, &d_dim, &d_rows};
+        launch.run("diff_interleave_qkv", DiffLaunch::grid_for(rows * dim), 1, 256, arguments);
+    }
     launch.head_rms_norm(b.qkv, block.q_norm, q.heads, q.head_dim, rows, 3 * dim, 0, q.epsilon);
     launch.head_rms_norm(b.qkv, block.k_norm, q.heads, q.head_dim, rows, 3 * dim, dim, q.epsilon);
     {
@@ -803,10 +843,19 @@ void qi_run_block(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBlock& bl
 
     launch.layer_norm(b.hidden, b.normed, dim, rows, q.epsilon);
     scale_split(b.normed, 2);
-    launch.gemm(block.gate, b.normed, b.gate, rows, b.q8, b.q8_scales);
-    launch.gemm(block.up, b.normed, b.up, rows, b.q8, b.q8_scales);
-    launch.silu_mul(b.gate, b.up, b.gate, rows * q.intermediate);
-    launch.gemm(block.down, b.gate, b.normed, rows, b.q8, b.q8_scales);
+    if (block.fused_gate_up) {
+        launch.gemm(block.gate_up, b.normed, b.gate, rows, b.q8, b.q8_scales);
+        std::uint64_t in_ptr = b.gate, out_ptr = b.qkv;
+        int intermediate = q.intermediate, d_rows = static_cast<int>(rows);
+        void* arguments[] = {&in_ptr, &out_ptr, &intermediate, &d_rows};
+        launch.run("diff_swiglu_gate_up", DiffLaunch::grid_for(rows * intermediate), 1, 256, arguments);
+        launch.gemm(block.down, b.qkv, b.normed, rows, b.q8, b.q8_scales);
+    } else {
+        launch.gemm(block.gate, b.normed, b.gate, rows, b.q8, b.q8_scales);
+        launch.gemm(block.up, b.normed, b.up, rows, b.q8, b.q8_scales);
+        launch.silu_mul(b.gate, b.up, b.gate, rows * q.intermediate);
+        launch.gemm(block.down, b.gate, b.normed, rows, b.q8, b.q8_scales);
+    }
     gated_add_split(b.hidden, b.normed, 3);
 }
 
@@ -828,7 +877,18 @@ void qi_run_block_decode(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBl
 
     launch.layer_norm(image_hidden, b.normed, dim, image, q.epsilon);
     launch.scale_columns(b.normed, slot(sampled, 0), dim, image);
-    launch.gemm(block.qkv, b.normed, b.qkv, image, b.q8, b.q8_scales);
+    if (block.fused_qkv) {
+        launch.gemm(block.qkv, b.normed, b.qkv, image, b.q8, b.q8_scales);
+    } else {
+        launch.gemm(block.q, b.normed, b.gate, image, b.q8, b.q8_scales);
+        launch.gemm(block.k, b.normed, b.gate + image * dim * f, image, b.q8, b.q8_scales);
+        launch.gemm(block.v, b.normed, b.gate + 2 * image * dim * f, image, b.q8, b.q8_scales);
+        std::uint64_t q_ptr = b.gate, k_ptr = b.gate + image * dim * f, v_ptr = b.gate + 2 * image * dim * f;
+        std::uint64_t qkv_ptr = b.qkv;
+        int d_dim = dim, d_rows = static_cast<int>(image);
+        void* arguments[] = {&q_ptr, &k_ptr, &v_ptr, &qkv_ptr, &d_dim, &d_rows};
+        launch.run("diff_interleave_qkv", DiffLaunch::grid_for(image * dim), 1, 256, arguments);
+    }
     launch.head_rms_norm(b.qkv, block.q_norm, q.heads, q.head_dim, image, 3 * dim, 0, q.epsilon);
     launch.head_rms_norm(b.qkv, block.k_norm, q.heads, q.head_dim, image, 3 * dim, dim, q.epsilon);
     {
@@ -884,10 +944,19 @@ void qi_run_block_decode(FlyweightV2Diffusion& d, const DiffLaunch& launch, QiBl
 
     launch.layer_norm(image_hidden, b.normed, dim, image, q.epsilon);
     launch.scale_columns(b.normed, slot(sampled, 2), dim, image);
-    launch.gemm(block.gate, b.normed, b.gate, image, b.q8, b.q8_scales);
-    launch.gemm(block.up, b.normed, b.up, image, b.q8, b.q8_scales);
-    launch.silu_mul(b.gate, b.up, b.gate, image * q.intermediate);
-    launch.gemm(block.down, b.gate, b.normed, image, b.q8, b.q8_scales);
+    if (block.fused_gate_up) {
+        launch.gemm(block.gate_up, b.normed, b.gate, image, b.q8, b.q8_scales);
+        std::uint64_t in_ptr = b.gate, out_ptr = b.qkv;
+        int intermediate = q.intermediate, d_rows = static_cast<int>(image);
+        void* arguments[] = {&in_ptr, &out_ptr, &intermediate, &d_rows};
+        launch.run("diff_swiglu_gate_up", DiffLaunch::grid_for(image * intermediate), 1, 256, arguments);
+        launch.gemm(block.down, b.qkv, b.normed, image, b.q8, b.q8_scales);
+    } else {
+        launch.gemm(block.gate, b.normed, b.gate, image, b.q8, b.q8_scales);
+        launch.gemm(block.up, b.normed, b.up, image, b.q8, b.q8_scales);
+        launch.silu_mul(b.gate, b.up, b.gate, image * q.intermediate);
+        launch.gemm(block.down, b.gate, b.normed, image, b.q8, b.q8_scales);
+    }
     launch.gated_add(image_hidden, b.normed, slot(sampled, 3), dim, image);
 }
 

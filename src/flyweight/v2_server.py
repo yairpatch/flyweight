@@ -2734,6 +2734,7 @@ class NativeV2InferenceService(InferenceService):
         image_max_tokens: int = 1024,
         image_urls: str = "allow",
         image_model_path: Path | str | None = None,
+        image_transformer_path: Path | str | None = None,
         image_max_size: int = 0,
         image_weights: str = "auto",
         image_precision: str = "balanced",
@@ -2791,7 +2792,9 @@ class NativeV2InferenceService(InferenceService):
         if image_model_path is not None:
             try:
                 self.images = ImageGenerator(
-                    image_model_path, device=device,
+                    image_model_path,
+                    transformer=image_transformer_path,
+                    device=device,
                     max_width=int(image_max_size), max_height=int(image_max_size),
                     weights=image_weights, precision=image_precision, reserve=image_reserve,
                 )

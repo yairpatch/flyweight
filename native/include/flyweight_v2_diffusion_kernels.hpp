@@ -407,6 +407,54 @@ void diff_pack_target_attention_bf16(
     }
 }
 
+extern "C" __global__
+void diff_interleave_qkv(const float* q, const float* k, const float* v, float* qkv,
+                         const int dim, const int rows) {
+    if ((dim & 3) == 0) {
+        const int dim4 = dim / 4;
+        const long long elements4 = (long long)rows * dim4;
+        const float4* q4 = reinterpret_cast<const float4*>(q);
+        const float4* k4 = reinterpret_cast<const float4*>(k);
+        const float4* v4 = reinterpret_cast<const float4*>(v);
+        float4* qkv4 = reinterpret_cast<float4*>(qkv);
+        for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             index < elements4; index += (long long)blockDim.x * gridDim.x) {
+            const int row = (int)(index / dim4);
+            const int col = (int)(index % dim4);
+            const long long out_base = (long long)row * (3 * dim4) + col;
+            qkv4[out_base] = q4[index];
+            qkv4[out_base + dim4] = k4[index];
+            qkv4[out_base + 2 * dim4] = v4[index];
+        }
+        return;
+    }
+    const long long elements = (long long)rows * dim;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / dim);
+        const int col = (int)(index % dim);
+        const long long out_base = (long long)row * (3 * dim) + col;
+        qkv[out_base] = q[index];
+        qkv[out_base + dim] = k[index];
+        qkv[out_base + 2 * dim] = v[index];
+    }
+}
+
+extern "C" __global__
+void diff_swiglu_gate_up(const float* gate_up, float* output,
+                         const int intermediate, const int rows) {
+    const long long elements = (long long)rows * intermediate;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / intermediate);
+        const int col = (int)(index % intermediate);
+        const long long in_idx = (long long)row * (2 * intermediate) + col;
+        const float g = gate_up[in_idx];
+        const float u = gate_up[in_idx + intermediate];
+        output[index] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 #define FLYWEIGHT_DIFF_FLASH_QUERIES 64
