@@ -3119,6 +3119,71 @@ int parse(FlyweightV2Model& m) {
             throw std::runtime_error(
                 "qwen4exp compress-ratio array is shorter than the model layer count");
     }
+    if(m.architecture=="qwen_image"||m.architecture=="qwenimage21-dit"){
+        m.architecture="qwenimage21-dit";
+        m.config.architecture="qwenimage21-dit";
+        for(const auto& t : m.tensors){
+            if(t.name=="img_in.weight" && t.shape.size()>=2){
+                if(!m.config.in_channels) m.config.in_channels = static_cast<uint32_t>(t.shape[0]);
+                if(!m.config.hidden_size) m.config.hidden_size = static_cast<uint32_t>(t.shape[1]);
+            }
+            if(t.name=="txt_in.text_norm.weight" && !t.shape.empty()){
+                if(!m.config.caption_dim) m.config.caption_dim = static_cast<uint32_t>(t.shape[0]);
+            }
+            if(t.name=="transformer_blocks.0.attn.norm_q.weight" && !t.shape.empty()){
+                if(!m.config.attention_head_dim) m.config.attention_head_dim = static_cast<uint32_t>(t.shape[0]);
+            }
+            if(t.name=="transformer_blocks.0.img_mlp.gate_up.weight" && t.shape.size()>=2){
+                if(!m.config.intermediate_size) m.config.intermediate_size = static_cast<uint32_t>(t.shape[1] / 2);
+            }
+            if(t.name=="transformer_blocks.0.img_mlp.gate_layer.weight" && t.shape.size()>=2){
+                if(!m.config.intermediate_size) m.config.intermediate_size = static_cast<uint32_t>(t.shape[1]);
+            }
+        }
+        if(!m.config.layer_count){
+            std::uint32_t max_block = 0;
+            bool found_block = false;
+            for(const auto& t : m.tensors){
+                if(t.name.rfind("transformer_blocks.", 0) == 0){
+                    auto rest = t.name.substr(19);
+                    auto dot = rest.find('.');
+                    if(dot != std::string::npos){
+                        try {
+                            uint32_t b = std::stoul(rest.substr(0, dot));
+                            max_block = std::max(max_block, b + 1);
+                            found_block = true;
+                        } catch(...) {}
+                    }
+                }
+            }
+            m.config.layer_count = found_block ? max_block : 32;
+        }
+        if(!m.config.hidden_size) m.config.hidden_size = 4096;
+        if(!m.config.attention_head_dim) m.config.attention_head_dim = 128;
+        if(!m.config.attention_heads && m.config.attention_head_dim)
+            m.config.attention_heads = m.config.hidden_size / m.config.attention_head_dim;
+        if(!m.config.attention_kv_heads) m.config.attention_kv_heads = m.config.attention_heads;
+        if(!m.config.intermediate_size) m.config.intermediate_size = m.config.hidden_size * 3;
+        m.config.dense_intermediate_size = m.config.intermediate_size;
+        if(!m.config.in_channels) m.config.in_channels = 64;
+        if(!m.config.caption_dim) m.config.caption_dim = 4096;
+        m.config.causal_condition = true;
+        if(!m.config.rms_norm_epsilon) m.config.rms_norm_epsilon = 1e-6f;
+        if(!m.config.rope_freq_base) m.config.rope_freq_base = 10000.0f;
+        if(!m.config.time_scale) m.config.time_scale = 1000.0f;
+        if(m.config.rope_sections[0]==0 && m.config.rope_sections[1]==0 && m.config.rope_sections[2]==0){
+            if(m.config.attention_head_dim == 128){
+                m.config.rope_sections[0] = 16;
+                m.config.rope_sections[1] = 56;
+                m.config.rope_sections[2] = 56;
+            } else {
+                uint32_t third = m.config.attention_head_dim / 3;
+                m.config.rope_sections[0] = third;
+                m.config.rope_sections[1] = third;
+                m.config.rope_sections[2] = m.config.attention_head_dim - 2 * third;
+            }
+        }
+    }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
     if(!m.config.attention_kv_heads_by_layer.empty()&&m.config.attention_kv_heads_by_layer.size()<m.config.layer_count)

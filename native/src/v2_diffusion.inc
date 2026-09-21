@@ -317,7 +317,7 @@ struct DiffGroup {
 
 // The matrices a layer streams, in slot order.
 struct DiffLayerRef {
-    DiffMatrix* matrices[7] = {};
+    DiffMatrix* matrices[8] = {};
     int count = 0;
     void add(DiffMatrix& m) { matrices[count++] = &m; }
 };
@@ -849,7 +849,7 @@ struct DiffLaunch {
             if (m.bias) add_bias(output, m.bias, out, rows);
             return;
         }
-        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact && !d.balanced;
+        const bool mmq = format->matmul_q8_mmq && d.int8_tensor_cores && (in & 255) == 0 && q8 && !d.exact;
         if (mmq) {
             int scale_stride = (in / 32) * 2;
             {

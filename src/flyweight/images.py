@@ -129,6 +129,7 @@ class ImageGenerator:
         self,
         snapshot: Path | str,
         *,
+        transformer: Path | str | None = None,
         device: int = 0,
         max_width: int = 0,
         max_height: int = 0,
@@ -138,15 +139,44 @@ class ImageGenerator:
         model_name: str | None = None,
     ) -> None:
         root = Path(snapshot)
-        for part in ("text_encoder", "transformer", "vae"):
+        for part in ("text_encoder", "vae"):
             if not (root / part / "config.json").is_file():
                 raise FileNotFoundError(
                     f"{root} is not a diffusers image snapshot: missing {part}/config.json"
                 )
+
+        transformer_path: Path
+        if transformer is not None:
+            transformer_path = Path(transformer)
+        elif (root / "transformer").is_file() and (root / "transformer").suffix == ".gguf":
+            transformer_path = root / "transformer"
+        elif (root / "transformer").is_dir():
+            if (root / "transformer" / "config.json").is_file():
+                transformer_path = root / "transformer"
+            else:
+                ggufs = sorted((root / "transformer").glob("*.gguf"))
+                if ggufs:
+                    transformer_path = ggufs[0]
+                else:
+                    raise FileNotFoundError(
+                        f"{root} is not a diffusers image snapshot: missing transformer/config.json or transformer/*.gguf"
+                    )
+        elif (root / "transformer.gguf").is_file():
+            transformer_path = root / "transformer.gguf"
+        else:
+            raise FileNotFoundError(
+                f"{root} is not a diffusers image snapshot: missing transformer/config.json"
+            )
+
+        if transformer_path.is_dir() and not (transformer_path / "config.json").is_file():
+            ggufs = sorted(transformer_path.glob("*.gguf"))
+            if ggufs:
+                transformer_path = ggufs[0]
+
         self.path = root
         self.model_name = model_name or snapshot_model_name(root)
         self.encoder = V2Model(root / "text_encoder")
-        self.transformer = V2Model(root / "transformer")
+        self.transformer = V2Model(transformer_path)
         self.vae = V2Model(root / "vae")
         edits = self.transformer.config["architecture"] == "qwenimage21-dit"
         try:
