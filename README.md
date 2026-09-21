@@ -321,6 +321,17 @@ uses int8; `exact` keeps f32 activations at about eight times the time. A
 1024x1024 render takes about 14 s on an RTX 5070 Ti laptop. Render at 1024:
 the model is trained there.
 
+Qwen-Image-2.1 also supports GGUF DiT checkpoints (e.g. from
+[Abiray/Qwen-Image-2.1-GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF),
+such as `qwen_image_2.1_Q6_K.gguf` or `Q4_K_M.gguf`). Use `--image-transformer PATH`
+to point directly to the GGUF file alongside the snapshot:
+
+~~~bash
+flyweight serve Qwen3.8-27B-UD-IQ2_XXS.gguf \
+  --image-model /path/to/Qwen-Image-2.1 \
+  --image-transformer /path/to/qwen_image_2.1_Q6_K.gguf
+~~~
+
 ## Models and formats
 
 ### GGUF

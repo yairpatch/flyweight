@@ -140,3 +140,31 @@ class QwenImage21GGUFTests(unittest.TestCase):
         finally:
             os.environ.pop("FLYWEIGHT_DIFF_KV_CACHE", None)
             generator.close()
+
+    @unittest.skipUnless(_gpu_available(), "test requires a CUDA device")
+    def test_the_generator_edits_with_gguf_transformer(self) -> None:
+        """The generator must successfully perform image editing with GGUF DiT."""
+        import base64
+        import io
+        from PIL import Image
+
+        generator = ImageGenerator(self.snapshot, transformer=self.gguf_path, max_width=64, max_height=64, weights="device")
+        try:
+            buf = io.BytesIO()
+            Image.new("RGBA", (64, 32), (255, 0, 0, 255)).save(buf, format="PNG")
+            data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+            result = generator.generate({
+                "prompt": "make it blue",
+                "images": [data_url],
+                "size": "64x64",
+                "steps": 1,
+                "seed": 42,
+            })
+            self.assertEqual(result["size"], "64x64")
+            self.assertEqual(len(result["data"]), 1)
+            pic = Image.open(io.BytesIO(base64.b64decode(result["data"][0]["b64_json"])))
+            self.assertEqual((pic.mode, pic.size), ("RGBA", (64, 64)))
+        finally:
+            generator.close()
+
