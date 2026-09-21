@@ -488,6 +488,12 @@ def _add_runtime_options(
              + (" (default: auto)" if cache_default else " (default: off)"),
     )
     add(
+        placement, "--kv-dtype", "--kv-cache-type", dest="kv_dtype",
+        choices=KV_TYPES + ("k8v4",), default=None,
+        help="KV cache precision shorthand (e.g. k8v4, q8_0, turbo4, f16). "
+             "k8v4 selects asymmetric 8-bit Key + 4-bit Value cache.",
+    )
+    add(
         placement, "--cache-type-k", choices=KV_TYPES, default="f16",
         help="KV cache key precision; q8_0 roughly halves KV memory and auto "
              "grades it per layer. A quantized cache is never selected on your "
@@ -1278,6 +1284,13 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
         "dense_requant",
     )
     options = {name: getattr(args, name) for name in names if hasattr(args, name)}
+    if getattr(args, "kv_dtype", None):
+        if args.kv_dtype == "k8v4":
+            options["cache_type_k"] = "q8_0"
+            options["cache_type_v"] = "turbo4"
+        else:
+            options["cache_type_k"] = args.kv_dtype
+            options["cache_type_v"] = args.kv_dtype
     options["gpu_cache_bytes"] = args.gpu_cache_mib * 1024**2
     return options
 
@@ -1634,7 +1647,15 @@ def _serve(args: argparse.Namespace) -> int:
     if _architecture(args.model) == "deepseek4":
         return _serve_http(args, _deepseek4_service(args, "serve"))
     _select_backend(args)
-    from .v2_server import NativeV2InferenceService
+    cache_type_k = args.cache_type_k
+    cache_type_v = args.cache_type_v
+    if getattr(args, "kv_dtype", None):
+        if args.kv_dtype == "k8v4":
+            cache_type_k = "q8_0"
+            cache_type_v = "turbo4"
+        else:
+            cache_type_k = args.kv_dtype
+            cache_type_v = args.kv_dtype
     service = NativeV2InferenceService(
         args.model,
         mtp_model_path=args.mtp_model,
@@ -1655,8 +1676,8 @@ def _serve(args: argparse.Namespace) -> int:
         gpu_cache_mib=args.gpu_cache_mib,
         expert_mode=args.expert_mode,
         mtp_drafts=args.mtp_drafts,
-        cache_type_k=args.cache_type_k,
-        cache_type_v=args.cache_type_v,
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
         prefill_checkpoint_interval=args.prefill_checkpoint_interval,
         prefill_checkpoint_slots=args.prefill_checkpoint_slots,
         parallel_sequences=args.parallel_sequences,
