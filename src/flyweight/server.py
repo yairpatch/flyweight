@@ -22,7 +22,7 @@ import collections.abc
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overload
 from urllib.parse import unquote, urlsplit
 
-from . import transcript_audit
+from . import edit_corpus, edit_resolve, transcript_audit
 from .generation import GenerationResult, GenerationStep
 from .vision import (
     IMAGE_PLACEHOLDER, ImageError, ImageInput, image_from_anthropic_block,
@@ -353,6 +353,11 @@ class _GenerationRequest:
     # per turn. The grammar cannot stop the model writing a second one, so
     # the turn is cut after the first.
     single_tool_call: bool = False
+    # The client's own turns, normalized, for repairing an edit whose locator
+    # the model mistyped. Only filled when the request declares a tool that
+    # takes one, because normalizing a 40k-token transcript to find out that
+    # nobody is editing anything is work for nothing.
+    transcript: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1045,6 +1050,7 @@ class InferenceService:
         return self._chat_response(
             result, tools=request.tools, stop_sequences=request.stop_sequences,
             single_tool_call=request.single_tool_call,
+            transcript=request.transcript,
         )
 
     def _annotate_usage(
@@ -1638,7 +1644,8 @@ class InferenceService:
                     if tool_start is not None and end_marker in marker_window:
                         accumulated = "".join(text_parts)
                         _, tool_calls = _parse_tool_calls(
-                            accumulated, tools=request.tools
+                            accumulated, tools=request.tools,
+                            transcript=request.transcript,
                         )
                         if tool_calls:
                             break
@@ -1742,7 +1749,8 @@ class InferenceService:
         if not tool_calls:
             _, tool_calls = _parse_tool_calls(
                 accumulated, tools=request.tools,
-                keep_incomplete=final_step.stopped_on_eos)
+                keep_incomplete=final_step.stopped_on_eos,
+                transcript=request.transcript)
         if request.single_tool_call:
             tool_calls = tool_calls[:1]
         streamed_tail: list[str] = []
@@ -2409,7 +2417,11 @@ class InferenceService:
             anthropic=True,
         )
         # The client's own payload, not the translated options: the audit
-        # reads tool_use blocks in the shape the harness sent them.
+        # reads tool_use blocks in the shape the harness sent them, and so
+        # does the transcript an edit repair is resolved against.
+        request = dataclasses.replace(
+            request, transcript=self._edit_transcript("anthropic", payload, tools)
+        )
         self._record_transcript("anthropic", payload, request, tools)
         return request
 
@@ -2426,7 +2438,8 @@ class InferenceService:
             )
         content_text, reasoning, tool_calls, finish_reason, stop_sequence = (
             _finished_turn(result, request.tools, request.stop_sequences,
-                           single_tool_call=request.single_tool_call)
+                           single_tool_call=request.single_tool_call,
+                           transcript=request.transcript)
         )
         content: list[dict[str, Any]] = []
         if reasoning:
@@ -2761,6 +2774,9 @@ class InferenceService:
             tools_enabled=tools_enabled,
             tools=tools,
         )
+        request = dataclasses.replace(
+            request, transcript=self._edit_transcript("chat", payload, tools)
+        )
         self._record_transcript("chat", payload, request, tools)
         return request
 
@@ -2881,6 +2897,24 @@ class InferenceService:
                 or payload.get("disable_parallel_tool_use") is True
             ),
         )
+
+    def _edit_transcript(
+        self,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        tools: tuple[dict[str, Any], ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """The client's turns, for repairing an edit's locator -- or nothing.
+
+        Built from the payload the client sent rather than the translated
+        options a generation runs on, for the reason the audit does the same:
+        a tool call is still structured data on that side, and the Anthropic
+        translation has already flattened tool_use blocks into prompt text by
+        the time a request exists.
+        """
+        if not tools or not _edit_repair_enabled() or not _declares_edit_tool(tools):
+            return ()
+        return tuple(transcript_audit.normalize_transcript(endpoint, payload))
 
     def _record_transcript(
         self,
@@ -3045,9 +3079,11 @@ class InferenceService:
         tools: tuple[dict[str, Any], ...] = (),
         stop_sequences: tuple[str, ...] = (),
         single_tool_call: bool = False,
+        transcript: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         content, reasoning, tool_calls, finish_reason, _ = _finished_turn(
-            result, tools, stop_sequences, single_tool_call=single_tool_call
+            result, tools, stop_sequences, single_tool_call=single_tool_call,
+            transcript=transcript
         )
         message: dict[str, Any] = {
             "role": "assistant",
@@ -5249,11 +5285,98 @@ def _tool_value(value: Any) -> str:
     return str(value)
 
 
+def _edit_repair_enabled() -> bool:
+    """FLYWEIGHT_EDIT_REPAIR=0 sends the model's locator through untouched."""
+    return os.environ.get("FLYWEIGHT_EDIT_REPAIR", "1") not in ("0", "false", "no")
+
+
+def _declares_edit_tool(
+    tools: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Whether any declared tool asks for a copy of the text it replaces.
+
+    The gate on reconstructing the transcript. A client with no edit tool --
+    a chat UI, a summarizer, anything not editing files -- never pays for it.
+    """
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, Mapping) else None
+        schema = function.get("parameters") if isinstance(function, Mapping) else None
+        properties = schema.get("properties") if isinstance(schema, Mapping) else None
+        if isinstance(properties, Mapping) and transcript_audit.names_a_replaced_string(
+            properties.keys()
+        ):
+            return True
+    return False
+
+
+def _repaired_edit_arguments(
+    name: str,
+    arguments: dict[str, Any],
+    transcript: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """An edit's locator rewritten in the file's own bytes, when it has to be.
+
+    The edit contract makes the model quote the text it wants replaced, and
+    the quote has to be byte-perfect. The indentation of a line the model
+    never wrote is the easiest thing in a file to get wrong, and when it does
+    the harness rejects the whole call -- including the replacement, which was
+    the part that was reasoning about the code, and which the retry has to
+    generate again from nothing.
+
+    The file is recoverable here: the harness made the model read it before
+    editing, so it is in the transcript. When the quote misses only by
+    whitespace, and lands in exactly one place, the locator is replaced with
+    the bytes that are actually in the file and the call goes out able to
+    apply. Nothing else about it is touched.
+
+    Every condition below is a reason to leave the call alone instead. That
+    asymmetry is deliberate: the worst this can do is turn an edit that was
+    going to be refused into a different refusal, and that only stays true
+    while it refuses to guess.
+    """
+    key = transcript_audit.replaced_string_key(arguments)
+    if key is None:
+        return arguments
+    call = transcript_audit.classify_call(name, arguments)
+    if call is None or call.kind != "edit" or call.path is None or not call.old:
+        return arguments
+    for flag in ("replace_all", "replaceAll"):
+        if arguments.get(flag):
+            # Every occurrence is wanted and they need not be spelled alike,
+            # so rewriting the locator to one of them would change the set the
+            # harness matches -- a silent change of meaning, not a repair.
+            return arguments
+
+    corpus = edit_corpus.rebuild(transcript, call.path)
+    if corpus is None or not corpus.exact:
+        # Either the file was never established, or what was recovered cannot
+        # be quoted from: a truncated read, a listing with gaps, an edit that
+        # would not replay. Uniqueness cannot be proved against a fragment.
+        return arguments
+    if call.old in corpus.text:
+        return arguments  # already the file's own bytes; nothing to repair
+    outcome = edit_resolve.locate(corpus.text, find=call.old)
+    if not outcome.located or len(outcome.matches) != 1:
+        # Ambiguous, or nowhere at all. The model invented the text or meant
+        # one of several places, and neither is answerable from here.
+        return arguments
+
+    match = outcome.matches[0]
+    repaired = dict(arguments)
+    repaired[key] = corpus.text[match.start : match.end]
+    LOG.detail(
+        f"{'':<11}   edit repair: {name} on {call.path} relocated to line "
+        f"{match.line}"
+    )
+    return repaired
+
+
 def _parse_tool_calls(
     text: str,
     *,
     tools: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     keep_incomplete: bool = False,
+    transcript: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -5334,6 +5457,8 @@ def _parse_tool_calls(
             arguments = {
                 key: _infer_tool_value(item) for key, item in arguments.items()
             }
+        if transcript and isinstance(arguments, dict):
+            arguments = _repaired_edit_arguments(name, arguments, transcript)
         encoded_arguments = json.dumps(arguments, ensure_ascii=False)
         signature = (name, encoded_arguments)
         if signature in seen:
@@ -5654,6 +5779,7 @@ def _finished_turn(
     stop_sequences: Sequence[str] = (),
     *,
     single_tool_call: bool = False,
+    transcript: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str | None, str | None, list[dict[str, Any]], str, str | None]:
     """(content, reasoning, tool_calls, finish_reason, stop_sequence).
 
@@ -5669,7 +5795,8 @@ def _finished_turn(
     """
     visible, reasoning = _split_reasoning_content(result.text)
     content, tool_calls = _parse_tool_calls(
-        visible, tools=tools, keep_incomplete=result.stopped_on_eos)
+        visible, tools=tools, keep_incomplete=result.stopped_on_eos,
+        transcript=transcript)
     if single_tool_call:
         tool_calls = tool_calls[:1]
     if _turn_is_silent(visible, content, tool_calls, result.stopped_on_eos):
