@@ -37,8 +37,9 @@ export type Mode = "chat" | "images";
 
 export interface ImageSettings {
   aspect: "1:1" | "3:2" | "2:3" | "16:9" | "9:16";
-  /** The longer side in pixels; the other follows the aspect, both rounded to 16. */
+  /** The longer side in pixels; the other follows the aspect, both on the model's grid. */
   size: number;
+  /** Denoising steps, or 0 for however many the loaded model was tuned for. */
   steps: number;
   /** A fixed seed, or null for a fresh one per render. */
   seed: number | null;
@@ -70,16 +71,17 @@ const MODEL_KEY = "flyweight.model";
 const MODE_KEY = "flyweight.mode";
 const IMAGE_SETTINGS_KEY = "flyweight.images.settings.v1";
 
-const DEFAULT_IMAGE_SETTINGS: ImageSettings = { aspect: "1:1", size: 1024, steps: 8, seed: null };
+const DEFAULT_IMAGE_SETTINGS: ImageSettings = { aspect: "1:1", size: 1024, steps: 0, seed: null };
 
-/** Pixel dimensions for the studio's aspect and size, multiples of 16 within `limit`. */
-export function imageDimensions(settings: ImageSettings, limit: number): { width: number; height: number } {
+/** Pixel dimensions for the studio's aspect and size, on the model's grid within `limit`.
+ *  `multiple` is what a side must divide by: 16 for Z-Image, 32 for Qwen-Image-2.1. */
+export function imageDimensions(settings: ImageSettings, limit: number, multiple = 16): { width: number; height: number } {
   const ratios: Record<ImageSettings["aspect"], [number, number]> = { "1:1": [1, 1], "3:2": [3, 2], "2:3": [2, 3], "16:9": [16, 9], "9:16": [9, 16] };
   const [rw, rh] = ratios[settings.aspect];
   const long = Math.min(settings.size, limit);
-  const round16 = (value: number) => Math.max(256, Math.round(value / 16) * 16);
-  if (rw >= rh) return { width: round16(long), height: round16((long * rh) / rw) };
-  return { width: round16((long * rw) / rh), height: round16(long) };
+  const round = (value: number) => Math.max(multiple * 8, Math.round(value / multiple) * multiple);
+  if (rw >= rh) return { width: round(long), height: round((long * rh) / rw) };
+  return { width: round((long * rw) / rh), height: round(long) };
 }
 const HEALTH_HISTORY = 180;
 const REQUEST_HISTORY = 25;
@@ -139,6 +141,8 @@ interface StoreState {
   imageProgress: ImageProgress | null;
   imageError: string | null;
   imagePrompt: string;
+  /** Reference images for an edit, as data URLs; empty for text-to-image. */
+  imageRefs: string[];
   conversations: Conversation[];
   activeId: string | null;
   settings: GenerationSettings;
@@ -214,6 +218,7 @@ interface StoreState {
   setPanel: (panel: Panel) => void;
   setMode: (mode: Mode) => void;
   setImagePrompt: (prompt: string) => void;
+  setImageRefs: (refs: string[]) => void;
   updateImageSettings: (patch: Partial<ImageSettings>) => void;
   generateImage: (options?: { seed?: number | null }) => Promise<void>;
   cancelImage: () => void;
@@ -495,6 +500,7 @@ export const useStore = create<StoreState>()((set, get) => {
     imageProgress: null,
     imageError: null,
     imagePrompt: "",
+    imageRefs: [],
     conversations: [],
     activeId: null,
     settings: loadSettings(),
@@ -832,6 +838,7 @@ export const useStore = create<StoreState>()((set, get) => {
       set({ mode });
     },
     setImagePrompt: (imagePrompt) => set({ imagePrompt }),
+    setImageRefs: (imageRefs) => set({ imageRefs }),
     updateImageSettings: (patch) => {
       const imageSettings = { ...get().imageSettings, ...patch };
       try {
@@ -857,15 +864,18 @@ export const useStore = create<StoreState>()((set, get) => {
       const state = get();
       const prompt = state.imagePrompt.trim();
       if (!prompt || state.imageProgress) return;
-      const info = state.health?.execution?.images as { max_size?: string } | null | undefined;
+      const info = state.health?.execution?.images as
+        { max_size?: string; size_multiple?: number; default_steps?: number } | null | undefined;
       const limit = parseInt(String(info?.max_size ?? "1024x1024").split("x")[0] ?? "1024", 10) || 1024;
-      const { width, height } = imageDimensions(state.imageSettings, limit);
+      const { width, height } = imageDimensions(state.imageSettings, limit, Number(info?.size_multiple) || 16);
       const seed = options.seed === undefined ? state.imageSettings.seed : options.seed;
-      const body: Record<string, unknown> = { prompt, size: `${width}x${height}`, steps: state.imageSettings.steps, stream: true };
+      const steps = state.imageSettings.steps || Number(info?.default_steps) || 8;
+      const body: Record<string, unknown> = { prompt, size: `${width}x${height}`, steps, stream: true };
       if (seed !== null) body.seed = seed;
+      if (state.imageRefs.length) body.images = state.imageRefs;
       const abort = new AbortController();
       imageAbort = abort;
-      set({ imageProgress: { step: 0, steps: state.imageSettings.steps, startedAt: Date.now() }, imageError: null });
+      set({ imageProgress: { step: 0, steps, startedAt: Date.now() }, imageError: null });
       try {
         const response = await openStream("/v1/images/generations", body, abort.signal);
         if (!response.body) throw new Error("empty response");
@@ -891,7 +901,7 @@ export const useStore = create<StoreState>()((set, get) => {
               seed: Number(event.seed),
               width,
               height,
-              steps: state.imageSettings.steps,
+              steps,
               seconds: Number(event.seconds),
               blob: new Blob([bytes], { type: "image/png" }),
             };

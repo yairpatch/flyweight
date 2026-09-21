@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Dices, Download, Image as ImageIcon, Lock, RefreshCw, Square, Trash2, Wand2 } from "lucide-react";
+import { Copy, Dices, Download, Image as ImageIcon, ImagePlus, Lock, RefreshCw, Square, Trash2, Wand2, X } from "lucide-react";
 import { imageDimensions, useStore, type ImageSettings } from "../store";
 import { formatSeconds } from "../lib/format";
 
@@ -8,6 +8,12 @@ interface ImagesInfo {
   max_size?: string;
   weights?: string;
   precision?: string;
+  /** What a side must divide by, and the step count the model was tuned for. */
+  size_multiple?: number;
+  default_steps?: number;
+  alpha?: boolean;
+  /** Whether the model takes reference images (Qwen-Image-2.1). */
+  edit?: boolean;
 }
 
 const ASPECTS: Array<{ id: ImageSettings["aspect"]; label: string }> = [
@@ -30,6 +36,10 @@ export function Studio() {
   const health = useStore((state) => state.health);
   const info = (health?.execution?.images as ImagesInfo | null | undefined) ?? null;
   const limit = parseInt(String(info?.max_size ?? "1024x1024").split("x")[0] ?? "1024", 10) || 1024;
+  // Both follow from which image model the server loaded, so they come off the
+  // health payload rather than being pinned to one model's.
+  const multiple = Number(info?.size_multiple) || 16;
+  const defaultSteps = Number(info?.default_steps) || 8;
   const images = useStore((state) => state.images);
   const currentImageId = useStore((state) => state.currentImageId);
   const progress = useStore((state) => state.imageProgress);
@@ -42,6 +52,22 @@ export function Studio() {
   const cancelImage = useStore((state) => state.cancelImage);
   const deleteImage = useStore((state) => state.deleteImage);
   const toast = useStore((state) => state.toast);
+  const refs = useStore((state) => state.imageRefs);
+  const setRefs = useStore((state) => state.setImageRefs);
+  const canEdit = Boolean(info?.edit);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const attach = (files: FileList | null) => {
+    if (!files) return;
+    const readers = Array.from(files).slice(0, 10 - refs.length).map(
+      (file) => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      }),
+    );
+    void Promise.all(readers).then((urls) => setRefs([...refs, ...urls])).catch(() => toast("Could not read that image", "error"));
+  };
   const current = images.find((image) => image.id === currentImageId) ?? null;
   const url = useMemo(() => (current ? URL.createObjectURL(current.blob) : null), [current]);
   useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
@@ -54,7 +80,8 @@ export function Studio() {
     return () => window.clearInterval(timer);
   }, [progress]);
 
-  const { width, height } = imageDimensions(settings, limit);
+  const { width, height } = imageDimensions(settings, limit, multiple);
+  const steps = settings.steps || defaultSteps;
   const running = progress !== null;
   const canRender = !running && prompt.trim().length > 0 && info !== null;
 
@@ -74,6 +101,17 @@ export function Studio() {
     textarea.current?.focus();
   };
 
+  const editThis = () => {
+    if (!current || !canEdit) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setRefs([String(reader.result)]);
+      setPrompt("");
+      textarea.current?.focus();
+    };
+    reader.readAsDataURL(current.blob);
+  };
+
   if (!info) {
     return (
       <section className="studio">
@@ -81,7 +119,7 @@ export function Studio() {
           <div className="empty">
             <div className="empty__badge"><ImageIcon size={22} /></div>
             <h2>No image model loaded</h2>
-            <p>Start the server with <code>--image-model DIR</code> pointing at a Z-Image-Turbo snapshot to render pictures here.</p>
+            <p>Start the server with <code>--image-model DIR</code> pointing at a Z-Image-Turbo or Qwen-Image-2.1 snapshot to render pictures here.</p>
           </div>
         </div>
       </section>
@@ -121,12 +159,33 @@ export function Studio() {
           </div>
         )}
         {error && <p className="error-text studio__error">{error}</p>}
+        {refs.length > 0 && (
+          <div className="studio__refs" aria-label="Reference images">
+            {refs.map((ref, index) => (
+              <div key={index} className="studio__ref">
+                <img src={ref} alt={`Reference ${index + 1}`} />
+                <button className="icon-button icon-button--small studio__ref-remove" onClick={() => setRefs(refs.filter((_, i) => i !== index))} aria-label="Remove reference image" disabled={running}>
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+            <span className="muted">Editing: the picture takes the last reference's shape unless a size is set.</span>
+          </div>
+        )}
         <div className="studio__prompt">
+          {canEdit && (
+            <>
+              <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(event) => { attach(event.target.files); event.target.value = ""; }} />
+              <button className="icon-button" onClick={() => fileInput.current?.click()} title="Add reference images to edit" aria-label="Add reference images" disabled={running || refs.length >= 10}>
+                <ImagePlus size={16} />
+              </button>
+            </>
+          )}
           <textarea
             ref={textarea}
             rows={2}
             value={prompt}
-            placeholder="a red bicycle leaning on a brick wall, afternoon light"
+            placeholder={refs.length ? "make the bicycle blue" : "a red bicycle leaning on a brick wall, afternoon light"}
             onChange={(event) => setPrompt(event.target.value)}
             onKeyDown={(event) => {
               if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -180,7 +239,7 @@ export function Studio() {
           <h3>Sampling</h3>
           <label className="field field--inline">
             <span className="field__label">Steps</span>
-            <input type="number" min={1} max={50} value={settings.steps} onChange={(event) => update({ steps: Math.max(1, Math.min(50, Number(event.target.value) || 1)) })} />
+            <input type="number" min={1} max={50} value={steps} onChange={(event) => update({ steps: Math.max(1, Math.min(50, Number(event.target.value) || 1)) })} />
           </label>
           <label className="field field--inline">
             <span className="field__label">Seed</span>
@@ -211,6 +270,16 @@ export function Studio() {
         <section className="settings__section">
           <h3>This picture</h3>
           <div className="studio__actions">
+            {canEdit && (
+              <button
+                className="button button--small button--primary"
+                disabled={!current || running}
+                onClick={editThis}
+                title="Attach this picture as a reference to edit it in your next prompt"
+              >
+                <Wand2 size={13} /> Edit this
+              </button>
+            )}
             <button className="button button--small" disabled={!current || running} onClick={() => current && void generateImage({ seed: current.seed })} title="Render the same prompt and seed again">
               <RefreshCw size={13} /> Again
             </button>

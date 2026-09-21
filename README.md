@@ -18,6 +18,7 @@ split between the two, and the runtime measures what fits rather than asking.
 | Muse Glimmer | GGUF | Channel-tagged reasoning; no speculative decoding |
 
 Image generation with [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (RGBA out)
 runs on the same engine beside a chat model (`--image-model`).
 
 ## Install
@@ -199,7 +200,7 @@ in the browser's IndexedDB; the API key lives in session storage.
 | `POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}`, `POST /v1/responses/input_tokens` | OpenAI Responses; the 128 most recent are kept, `store: false` skips one |
 | `GET /v1/models`, `GET /v1/models/{id}`, `GET /v1/me` | OpenAI |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic |
-| `POST /v1/images/generations` | OpenAI Images, with `--image-model` |
+| `POST /v1/images/generations`, `/v1/images/edits` | OpenAI Images, with `--image-model` (edits: Qwen-Image-2.1) |
 | `POST /v1/chat/completions/{id}/stop_thinking`, `POST /v1/messages/{id}/stop_thinking` | Flyweight |
 | `GET /health`, `GET /props`, `GET /slots`, `POST /tokenize`, `POST /detokenize` | llama.cpp-style |
 
@@ -282,10 +283,11 @@ to a visible `[image omitted]` note rather than failing the request.
 
 ### Images out
 
-`--image-model DIR` loads a Z-Image-Turbo diffusers snapshot
-(`text_encoder/`, `transformer/`, `vae/`, as `huggingface-cli download
-Tongyi-MAI/Z-Image-Turbo` leaves it) and serves it at
-`/v1/images/generations` and in the UI's image studio:
+`--image-model DIR` loads a diffusers snapshot of
+[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) or
+[Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)
+(`text_encoder/`, `transformer/`, `vae/`, as `hf download` leaves it) and
+serves it at `/v1/images/generations` and in the UI's image studio:
 
 ~~~bash
 flyweight serve Qwen3.6-35B-A3B-Q6_K.gguf --image-model /path/to/Z-Image-Turbo
@@ -293,11 +295,24 @@ curl http://127.0.0.1:8000/v1/images/generations -H 'Content-Type: application/j
   -d '{"prompt": "a red bicycle leaning on a brick wall", "size": "1024x1024", "seed": 7}'
 ~~~
 
-The request takes `prompt`, `size` (multiples of 16, up to
-`--image-max-size`), `n` (1 to 4), `seed`, `steps` (default 8) and `shift`;
-the response is base64 PNG. One render at a time; a concurrent request gets
+The request takes `prompt`, `size` (on the model's grid -- multiples of 16
+for Z-Image, 32 for Qwen-Image-2.1 -- up to `--image-max-size`, which
+defaults to the model's own maximum: 1024 and 2048), `n` (1 to
+4), `seed`, `steps` (the model's own default: 8 for Z-Image, 40 for
+Qwen-Image-2.1) and `shift` (0 lets Qwen-Image-2.1's shift follow the
+image's size, as its pipeline does); the response is base64 PNG. Qwen-Image-2.1
+renders RGBA: the PNG carries an alpha channel, and a prompt starting "This is
+an RGBA image with transparency" is what makes the model use it. It also
+edits: up to ten reference images go in as `images` (data URLs or base64) on
+the same request, or as `image` parts of an OpenAI-shaped multipart
+`POST /v1/images/edits`; the picture takes the last reference's shape unless
+`size` is set, and the studio has an attach button for them. One render at a
+time; a concurrent request gets
 429. The encoder and DiT are quantized to Q8_0 on first open and cached
-beside the checkpoint. `--image-weights` keeps them on the GPU (`device`) or
+beside the checkpoint. The workspace starts sized for 1024x1024 and grows when a request needs
+more; a render the card cannot fit fails on its own rather than at startup,
+and `--image-reserve` holds the whole `--image-max-size` from the start
+instead. `--image-weights` keeps them on the GPU (`device`) or
 streams them from pinned RAM (`host`, about 1.7 GB of VRAM at 1024x1024);
 `auto` picks `host` when they would take more than half the card, which is
 what lets a 12 GB card serve a 35B chat model and Z-Image together.
@@ -305,6 +320,17 @@ what lets a 12 GB card serve a 35B chat model and Z-Image together.
 uses int8; `exact` keeps f32 activations at about eight times the time. A
 1024x1024 render takes about 14 s on an RTX 5070 Ti laptop. Render at 1024:
 the model is trained there.
+
+Qwen-Image-2.1 also supports GGUF DiT checkpoints (e.g. from
+[Abiray/Qwen-Image-2.1-GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF),
+such as `qwen_image_2.1_Q6_K.gguf` or `Q4_K_M.gguf`). Use `--image-transformer PATH`
+to point directly to the GGUF file alongside the snapshot:
+
+~~~bash
+flyweight serve Qwen3.8-27B-UD-IQ2_XXS.gguf \
+  --image-model /path/to/Qwen-Image-2.1 \
+  --image-transformer /path/to/qwen_image_2.1_Q6_K.gguf
+~~~
 
 ## Models and formats
 
@@ -457,7 +483,7 @@ Where things live:
 
 - `native/src/v2_runtime.cpp`: GGUF parsing, memory planning, scheduling,
   prefix reuse, sampling and the C ABI; `v2_mtp_verifier.inc` (prefill
-  driver and MTP), `v2_vision.inc` (the tower), `v2_diffusion.inc` (Z-Image)
+  driver and MTP), `v2_vision.inc` (the tower), `v2_diffusion.inc` (the image tower, Z-Image), `v2_qwenimage.inc` (Qwen-Image-2.1)
 - `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS, graphs, transfers
 - `native/include/flyweight_v2_qwen_kernels.hpp` and siblings: the CUDA
   kernel source, JIT-compiled by NVRTC and also compiled as host C++ for

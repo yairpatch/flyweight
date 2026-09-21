@@ -3759,7 +3759,10 @@ def create_handler(
                     self._send_json(200, service.me())
                     self.log_message("request completed: %s", path)
                     return
-                payload = self._read_json()
+                if path == "/v1/images/edits" and self.headers.get_content_type() == "multipart/form-data":
+                    payload = self._read_multipart_images()
+                else:
+                    payload = self._read_json()
                 self.log_message("request processing: %s", path)
                 # Prefill events are opt-in: they are a flyweight extension,
                 # and a client that did not ask for one should not have to
@@ -3808,9 +3811,13 @@ def create_handler(
                     self._send_json(200, service.tokenize(payload))
                     self.log_message("request completed: %s", path)
                     return
-                if path == "/v1/images/generations":
+                if path in ("/v1/images/generations", "/v1/images/edits"):
                     # Renders take seconds and hold the GPU; they count
                     # against the same admission slots as a completion.
+                    # `/v1/images/edits` is the same render with reference
+                    # images (OpenAI's shape, multipart or JSON).
+                    if path == "/v1/images/edits" and not payload.get("images"):
+                        raise APIError(400, "images/edits needs at least one image", parameter="image")
                     with service._admission():
                         if _boolean_option(payload, "stream", False):
                             self._send_sse(service.stream_images_generations(payload))
@@ -4025,6 +4032,55 @@ def create_handler(
                 )
 
             return report
+
+        def _read_multipart_images(self) -> Mapping[str, Any]:
+            """OpenAI's images/edits form: `image` parts (one or more) become the
+            `images` list as data URLs, every other field is a string the image
+            service parses, and `n`/`seed`/`steps` are read as integers."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as error:
+                raise APIError(400, "invalid Content-Length header") from error
+            if length <= 0:
+                raise APIError(400, "request body must not be empty")
+            if length > MAX_REQUEST_BYTES:
+                raise APIError(413, "request body is too large")
+            import base64
+            import email.parser
+            import email.policy
+            header = f"Content-Type: {self.headers.get('Content-Type', '')}\r\nMIME-Version: 1.0\r\n\r\n"
+            message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                header.encode("ascii") + self.rfile.read(length))
+            if not message.is_multipart():
+                raise APIError(400, "images/edits expects a multipart/form-data body")
+            payload: dict[str, Any] = {}
+            images: list[str] = []
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not isinstance(name, str):
+                    continue
+                data = part.get_payload(decode=True) or b""
+                if name in ("image", "image[]") or part.get_filename():
+                    mime = part.get_content_type() or "image/png"
+                    images.append(f"data:{mime};base64," + base64.b64encode(data).decode("ascii"))
+                    continue
+                text = data.decode("utf-8", errors="replace").strip()
+                if name in ("n", "seed", "steps"):
+                    try:
+                        payload[name] = int(text)
+                    except ValueError as error:
+                        raise APIError(400, f"{name} must be an integer", parameter=name) from error
+                elif name == "shift":
+                    try:
+                        payload[name] = float(text)
+                    except ValueError as error:
+                        raise APIError(400, "shift must be a number", parameter="shift") from error
+                else:
+                    payload[name] = text
+            if not images:
+                raise APIError(400, "images/edits needs at least one image part", parameter="image")
+            payload["images"] = images
+            return payload
 
         def _read_json(self) -> Mapping[str, Any]:
             content_type = self.headers.get_content_type()

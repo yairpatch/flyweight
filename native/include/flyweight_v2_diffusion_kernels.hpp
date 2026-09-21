@@ -189,29 +189,35 @@ void diff_rope_half_rows(float* x, const int* positions, const double* frequenci
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
-// Attention over `rows` queries against the same rows of keys/values, with
-// separate strided q/k/v pointers (a fused qkv row is q at stride 3*H*D, k
-// and v at offsets inside it), grouped query heads (kv_head = head / (heads /
-// kv_heads)), and an optional causal mask. Same shape as
-// vision_attention_rows: one block per (head, 32 queries), keys streamed
-// through shared memory 24 at a time, 8 threads per query with an online
-// softmax merged by shuffles. head_dim <= 128; blockDim 256. Output is
-// [rows][heads*head_dim].
+// Attention over the queries in rows [q_first, q_first + q_rows) against the
+// keys/values in rows [0, kv_rows), with separate strided q/k/v pointers (a
+// fused qkv row is q at stride 3*H*D, k and v at offsets inside it), grouped
+// query heads (kv_head = head / (heads / kv_heads)), and an optional causal
+// mask. Same shape as vision_attention_rows: one block per (head, 32
+// queries), keys streamed through shared memory 24 at a time, 8 threads per
+// query with an online softmax merged by shuffles. head_dim <= 128; blockDim
+// 256. Output is written at the query's own row of [rows][heads*head_dim].
+//
+// The query range is separate from the key range so that one block-causal
+// sequence takes two calls: the text prefix against itself with the causal
+// mask, then the image rows against everything. Whole-sequence callers pass
+// q_first 0 and q_rows == kv_rows, which is the original behaviour.
 #define FLYWEIGHT_DIFF_KEY_CHUNK 24
 extern "C" __global__
 void diff_attention_rows(
     const float* q, const float* k, const float* v, float* output,
-    const int heads, const int kv_heads, const int head_dim, const int rows,
+    const int heads, const int kv_heads, const int head_dim,
+    const int q_first, const int q_rows, const int kv_rows,
     const int q_stride, const int kv_stride, const float scale, const int causal
 ) {
     const int head = blockIdx.y;
     const int tile = blockIdx.x * 32;
-    if (head >= heads || tile >= rows) return;
+    if (head >= heads || tile >= q_rows) return;
     const int kv_head = head / (heads / kv_heads);
     const int query_index = threadIdx.x >> 3;
     const int lane_in_query = threadIdx.x & 7;
-    const int row = tile + query_index;
-    const bool live = row < rows;
+    const int row = q_first + tile + query_index;
+    const bool live = tile + query_index < q_rows;
     __shared__ float k_tile[FLYWEIGHT_DIFF_KEY_CHUNK][129];
     __shared__ float v_tile[FLYWEIGHT_DIFF_KEY_CHUNK][129];
     __shared__ float q_tile[32][129];
@@ -223,7 +229,7 @@ void diff_attention_rows(
     float acc[128];
     for (int d = 0; d < 128; ++d) acc[d] = 0.0f;
     // With a causal mask no query in this tile sees past the tile's last row.
-    const int key_limit = causal ? min(rows, tile + 32) : rows;
+    const int key_limit = causal ? min(kv_rows, q_first + tile + 32) : kv_rows;
     for (int chunk = 0; chunk < key_limit; chunk += FLYWEIGHT_DIFF_KEY_CHUNK) {
         const int count = min(FLYWEIGHT_DIFF_KEY_CHUNK, key_limit - chunk);
         for (int load = threadIdx.x; load < FLYWEIGHT_DIFF_KEY_CHUNK * head_dim; load += blockDim.x) {
@@ -331,13 +337,139 @@ void diff_pack_attention_bf16(
     }
 }
 
+extern "C" __global__
+void diff_kv_cache_extract(
+    const unsigned short* k_in, const unsigned short* v_in,
+    unsigned short* k_cache, unsigned short* v_cache,
+    const int kv_heads, const int prefix, const int rows
+) {
+    const long long kv_elements = (long long)kv_heads * prefix * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        const int d = (int)(index & 127);
+        const long long rest = index >> 7;
+        const int r = (int)(rest % prefix);
+        const int h = (int)(rest / prefix);
+        const long long src_idx = ((long long)h * rows + r) * 128 + d;
+        k_cache[index] = k_in[src_idx];
+        v_cache[index] = v_in[src_idx];
+    }
+}
+
+extern "C" __global__
+void diff_kv_cache_restore(
+    const unsigned short* k_cache, const unsigned short* v_cache,
+    unsigned short* k_out, unsigned short* v_out,
+    const int kv_heads, const int prefix, const int rows
+) {
+    const long long kv_elements = (long long)kv_heads * prefix * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        const int d = (int)(index & 127);
+        const long long rest = index >> 7;
+        const int r = (int)(rest % prefix);
+        const int h = (int)(rest / prefix);
+        const long long dst_idx = ((long long)h * rows + r) * 128 + d;
+        k_out[dst_idx] = k_cache[index];
+        v_out[dst_idx] = v_cache[index];
+    }
+}
+
+extern "C" __global__
+void diff_pack_target_attention_bf16(
+    const float* q, const float* k, const float* v,
+    unsigned short* q_out, unsigned short* k_out, unsigned short* v_out,
+    const int heads, const int kv_heads, const int rows, const int prefix, const int image,
+    const int q_stride, const int kv_stride, const float q_scale
+) {
+    const long long q_elements = (long long)heads * image * 128;
+    const long long kv_elements = (long long)kv_heads * image * 128;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < q_elements + 2 * kv_elements; index += (long long)blockDim.x * gridDim.x) {
+        if (index < q_elements) {
+            const int d = (int)(index & 127);
+            const long long rest = index >> 7;
+            const int img_row = (int)(rest % image), head = (int)(rest / image);
+            const int dst_row = prefix + img_row;
+            const long long dst_idx = ((long long)head * rows + dst_row) * 128 + d;
+            q_out[dst_idx] = diff_f32_to_bf16(q[(long long)img_row * q_stride + head * 128 + d] * q_scale);
+        } else {
+            const long long local = (index - q_elements) % kv_elements;
+            const bool is_v = index - q_elements >= kv_elements;
+            const int d = (int)(local & 127);
+            const long long rest = local >> 7;
+            const int img_row = (int)(rest % image), head = (int)(rest / image);
+            const int dst_row = prefix + img_row;
+            const long long dst_idx = ((long long)head * rows + dst_row) * 128 + d;
+            const float value = (is_v ? v : k)[(long long)img_row * kv_stride + head * 128 + d];
+            (is_v ? v_out : k_out)[dst_idx] = diff_f32_to_bf16(value);
+        }
+    }
+}
+
+extern "C" __global__
+void diff_interleave_qkv(const float* q, const float* k, const float* v, float* qkv,
+                         const int dim, const int rows) {
+    if ((dim & 3) == 0) {
+        const int dim4 = dim / 4;
+        const long long elements4 = (long long)rows * dim4;
+        const float4* q4 = reinterpret_cast<const float4*>(q);
+        const float4* k4 = reinterpret_cast<const float4*>(k);
+        const float4* v4 = reinterpret_cast<const float4*>(v);
+        float4* qkv4 = reinterpret_cast<float4*>(qkv);
+        for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             index < elements4; index += (long long)blockDim.x * gridDim.x) {
+            const int row = (int)(index / dim4);
+            const int col = (int)(index % dim4);
+            const long long out_base = (long long)row * (3 * dim4) + col;
+            qkv4[out_base] = q4[index];
+            qkv4[out_base + dim4] = k4[index];
+            qkv4[out_base + 2 * dim4] = v4[index];
+        }
+        return;
+    }
+    const long long elements = (long long)rows * dim;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / dim);
+        const int col = (int)(index % dim);
+        const long long out_base = (long long)row * (3 * dim) + col;
+        qkv[out_base] = q[index];
+        qkv[out_base + dim] = k[index];
+        qkv[out_base + 2 * dim] = v[index];
+    }
+}
+
+extern "C" __global__
+void diff_swiglu_gate_up(const float* gate_up, float* output,
+                         const int intermediate, const int rows) {
+    const long long elements = (long long)rows * intermediate;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / intermediate);
+        const int col = (int)(index % intermediate);
+        const long long in_idx = (long long)row * (2 * intermediate) + col;
+        const float g = gate_up[in_idx];
+        const float u = gate_up[in_idx + intermediate];
+        output[index] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 #define FLYWEIGHT_DIFF_FLASH_QUERIES 64
 #define FLYWEIGHT_DIFF_FLASH_KEYS 64
 extern "C" __global__ __launch_bounds__(128)
 void diff_flash_attention_bf16(
     const unsigned short* q, const unsigned short* k, const unsigned short* v,
-    float* output, const int heads, const int kv_heads, const int rows, const int causal
+    float* output, const int heads, const int kv_heads, const int plane_rows,
+    const int q_first, const int q_rows, const int kv_rows, const int causal
 ) {
+    // Queries [q_first, q_first + q_rows) against keys [0, kv_rows), both
+    // indexing planes of `plane_rows` rows; see diff_attention_rows on why the
+    // two ranges are separate. Whole-sequence callers pass q_first 0 and
+    // q_rows == kv_rows == plane_rows.
+    const int q_limit = q_first + q_rows;
     // Declared as uint4 rows for 16-byte alignment (the host build of the
     // corpus has no __align__); read through the half-width views below.
     __shared__ uint4 k_tile4[FLYWEIGHT_DIFF_FLASH_KEYS][17];
@@ -346,36 +478,36 @@ void diff_flash_attention_bf16(
     unsigned short (*vt_tile)[72] = (unsigned short (*)[72])vt_tile4;
     const int head = blockIdx.y;
     const int kv_head = head / (heads / kv_heads);
-    const int query_base = blockIdx.x * FLYWEIGHT_DIFF_FLASH_QUERIES;
-    if (query_base >= rows) return;
+    const int query_base = q_first + blockIdx.x * FLYWEIGHT_DIFF_FLASH_QUERIES;
+    if (query_base >= q_limit) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int quad = lane >> 2, pair = lane & 3;   // fragment row and column pair
     const int row0 = query_base + warp * 16 + quad, row1 = row0 + 8;
-    const unsigned short* q_head = q + (long long)head * rows * 128;
-    const unsigned short* k_head = k + (long long)kv_head * rows * 128;
-    const unsigned short* v_head = v + (long long)kv_head * rows * 128;
+    const unsigned short* q_head = q + (long long)head * plane_rows * 128;
+    const unsigned short* k_head = k + (long long)kv_head * plane_rows * 128;
+    const unsigned short* v_head = v + (long long)kv_head * plane_rows * 128;
 
     // Q fragments: A operand of m16n8k16 for eight k-steps of 16.
     unsigned int q_frag[8][4];
     for (int step = 0; step < 8; ++step) {
         const int column = step * 16 + pair * 2;
-        q_frag[step][0] = row0 < rows ? *(const unsigned int*)(q_head + (long long)row0 * 128 + column) : 0u;
-        q_frag[step][1] = row1 < rows ? *(const unsigned int*)(q_head + (long long)row1 * 128 + column) : 0u;
-        q_frag[step][2] = row0 < rows ? *(const unsigned int*)(q_head + (long long)row0 * 128 + column + 8) : 0u;
-        q_frag[step][3] = row1 < rows ? *(const unsigned int*)(q_head + (long long)row1 * 128 + column + 8) : 0u;
+        q_frag[step][0] = row0 < q_limit ? *(const unsigned int*)(q_head + (long long)row0 * 128 + column) : 0u;
+        q_frag[step][1] = row1 < q_limit ? *(const unsigned int*)(q_head + (long long)row1 * 128 + column) : 0u;
+        q_frag[step][2] = row0 < q_limit ? *(const unsigned int*)(q_head + (long long)row0 * 128 + column + 8) : 0u;
+        q_frag[step][3] = row1 < q_limit ? *(const unsigned int*)(q_head + (long long)row1 * 128 + column + 8) : 0u;
     }
     float o[16][4];
     for (int d = 0; d < 16; ++d) for (int i = 0; i < 4; ++i) o[d][i] = 0.0f;
     float m0 = -1.0e30f, m1 = -1.0e30f, l0 = 0.0f, l1 = 0.0f;
 
-    const int key_limit = causal ? min(rows, query_base + FLYWEIGHT_DIFF_FLASH_QUERIES) : rows;
+    const int key_limit = causal ? min(kv_rows, query_base + FLYWEIGHT_DIFF_FLASH_QUERIES) : kv_rows;
     for (int key_base = 0; key_base < key_limit; key_base += FLYWEIGHT_DIFF_FLASH_KEYS) {
         // Stage K [64][128] and V^T [128][64]; keys past the end read as zero.
         for (int load = threadIdx.x; load < FLYWEIGHT_DIFF_FLASH_KEYS * 16; load += 128) {
             const int key = load >> 4, chunk = (load & 15) * 8;
             const int key_index = key_base + key;
             uint4 k_bits = make_uint4(0u, 0u, 0u, 0u), v_bits = make_uint4(0u, 0u, 0u, 0u);
-            if (key_index < rows) {
+            if (key_index < kv_rows) {
                 k_bits = *(const uint4*)(k_head + (long long)key_index * 128 + chunk);
                 v_bits = *(const uint4*)(v_head + (long long)key_index * 128 + chunk);
             }
@@ -403,8 +535,8 @@ void diff_flash_attention_bf16(
             const int key = key_base + j * 8 + pair * 2;
             for (int i = 0; i < 2; ++i) {
                 const int key_index = key + i;
-                if (key_index >= rows || (causal && key_index > row0)) s[j][i] = -1.0e30f;
-                if (key_index >= rows || (causal && key_index > row1)) s[j][2 + i] = -1.0e30f;
+                if (key_index >= kv_rows || (causal && key_index > row0)) s[j][i] = -1.0e30f;
+                if (key_index >= kv_rows || (causal && key_index > row1)) s[j][2 + i] = -1.0e30f;
             }
             block_max0 = fmaxf(block_max0, fmaxf(s[j][0], s[j][1]));
             block_max1 = fmaxf(block_max1, fmaxf(s[j][2], s[j][3]));
@@ -460,11 +592,11 @@ void diff_flash_attention_bf16(
     const long long out_stride = (long long)heads * 128;
     for (int d = 0; d < 16; ++d) {
         const int column = head * 128 + d * 8 + pair * 2;
-        if (row0 < rows) {
+        if (row0 < q_limit) {
             float2 value = make_float2(o[d][0] * inverse0, o[d][1] * inverse0);
             *(float2*)(output + row0 * out_stride + column) = value;
         }
-        if (row1 < rows) {
+        if (row1 < q_limit) {
             float2 value = make_float2(o[d][2] * inverse1, o[d][3] * inverse1);
             *(float2*)(output + row1 * out_stride + column) = value;
         }
@@ -971,6 +1103,179 @@ void diff_upsample_nearest_2x(const float* input, float* output, const int chann
         const int y = (int)(rest % (height * 2));
         const int c = (int)(rest / (height * 2));
         output[index] = input[((long long)c * height + y / 2) * width + x / 2];
+    }
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// ---- Qwen-Image-2.1 --------------------------------------------------------
+
+// Rotate-half rope with interleaved M-RoPE sections (Qwen3-VL's text stack):
+// pair j takes the temporal, height or width position by j % 3 while j lies
+// inside three times that axis's section, the temporal one otherwise -- the
+// same rule as mrope_component in flyweight_v2_vision.hpp. A text token
+// carries one position in all three slots, which makes this plain rope.
+// `positions` is [rows][3]; `x` is [rows][row_stride] with the heads at
+// `offset`; `frequencies[j]` = theta^(-2j/head_dim).
+extern "C" __global__
+void qi_rope_mrope_rows(float* x, const int* positions, const double* frequencies,
+                        const int heads, const int head_dim, const int rows,
+                        const int row_stride, const int offset,
+                        const int section_t, const int section_h, const int section_w) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int half = head_dim / 2;
+    const int total = section_t + section_h + section_w;
+    float* base = x + (long long)row * row_stride + offset;
+    for (int index = threadIdx.x; index < heads * half; index += blockDim.x) {
+        const int head = index / half, j = index % half;
+        const int sector = total > 0 ? j % total : j;
+        const int which = sector % 3;
+        int axis = 0;
+        if (which == 1 && sector < 3 * section_h) axis = 1;
+        else if (which == 2 && sector < 3 * section_w) axis = 2;
+        const double position = (double)positions[row * 3 + axis];
+        const float angle = (float)(position * frequencies[j]);
+        const float s = sinf(angle), c = cosf(angle);
+        float* vector = base + head * head_dim;
+        const float first = vector[j], second = vector[j + half];
+        vector[j] = first * c - second * s;
+        vector[j + half] = second * c + first * s;
+    }
+}
+
+// The autoencoder encoder's downsample: 3x3 convolution at stride 2 over an
+// input zero-padded by one row at the bottom and one column at the right
+// (ZeroPad2d((0, 1, 0, 1)) then Conv2d(3, stride=2)). Output is
+// [out][height/2][width/2]. Direct: one thread per output pixel and channel;
+// it runs once per condition image, so it does not need the tiled kernel.
+extern "C" __global__
+void qi_conv2d_stride2(const float* input, const float* weight, const float* bias,
+                       float* output, const int in_channels, const int out_channels,
+                       const int height, const int width) {
+    const int out_h = height / 2, out_w = width / 2;
+    const long long elements = (long long)out_channels * out_h * out_w;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int ox = (int)(index % out_w);
+        const long long rest = index / out_w;
+        const int oy = (int)(rest % out_h), co = (int)(rest / out_h);
+        float sum = bias ? bias[co] : 0.0f;
+        for (int ci = 0; ci < in_channels; ++ci) {
+            const float* plane = input + (long long)ci * height * width;
+            const float* taps = weight + ((long long)co * in_channels + ci) * 9;
+            for (int dy = 0; dy < 3; ++dy) {
+                const int sy = oy * 2 + dy;
+                if (sy >= height) continue;
+                for (int dx = 0; dx < 3; ++dx) {
+                    const int sx = ox * 2 + dx;
+                    if (sx >= width) continue;
+                    sum += plane[(long long)sy * width + sx] * taps[dy * 3 + dx];
+                }
+            }
+        }
+        output[index] = sum;
+    }
+}
+
+// The averaging shortcut of a residual down block (`AvgDown3D`), added into
+// the downsampled output. Input channels are repeated over `factor` slots
+// (frame, 2x2 pixel) and averaged in groups of `group` per output channel; a
+// temporally downsampling level pads a zero frame in front, so its slots
+// with t = 0 contribute nothing. Source of slot j of output channel oc:
+// channel (oc * group + j) / factor at pixel (2h + hs, 2w + ws) of that slot.
+extern "C" __global__
+void qi_avg_down_add(const float* input, float* output, const int out_channels,
+                     const int factor, const int group, const int factor_t, const int factor_s,
+                     const int height, const int width) {
+    const int out_h = height / factor_s, out_w = width / factor_s;
+    const long long elements = (long long)out_channels * out_h * out_w;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int ox = (int)(index % out_w);
+        const long long rest = index / out_w;
+        const int oy = (int)(rest % out_h), oc = (int)(rest / out_h);
+        float sum = 0.0f;
+        for (int j = 0; j < group; ++j) {
+            const int flat = oc * group + j;
+            const int c = flat / factor, slot = flat % factor;
+            const int t_sub = slot / (factor_s * factor_s);
+            const int spatial = slot % (factor_s * factor_s);
+            const int hs = spatial / factor_s, ws = spatial % factor_s;
+            if (factor_t == 2 && t_sub == 0) continue;
+            sum += input[((long long)c * height + oy * factor_s + hs) * width + ox * factor_s + ws];
+        }
+        output[index] += sum / (float)group;
+    }
+}
+
+// The autoencoder's normalization is per pixel over the channel axis, not per
+// group over the plane: `F.normalize(x, dim=1) * sqrt(C) * gamma`, which is an
+// RMS norm with no epsilon beyond F.normalize's clamp and no bias. Pass 1
+// writes one reciprocal per pixel. Reading down a channel for a fixed pixel
+// would be a strided load, so threads walk pixels and the loop walks channels.
+extern "C" __global__
+void qi_channel_rms_stats(const float* input, float* scales, const int channels,
+                          const int plane) {
+    const long long pixel = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= plane) return;
+    float sum = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        const float value = input[(long long)c * plane + pixel];
+        sum += value * value;
+    }
+    scales[pixel] = rsqrtf(sum / (float)channels + 1.0e-12f);
+}
+
+// Pass 2, through the same 32-channel x 32-pixel tile diff_group_norm_apply
+// uses so both output layouts write coalesced.
+extern "C" __global__
+void qi_channel_rms_apply(const float* input, const float* scales, const float* gamma,
+                          float* output, unsigned short* output_hwc,
+                          const int channels, const int plane, const int silu) {
+    __shared__ float tile[32][33];
+    const int p0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;   // 32 x 8
+    for (int i = ty; i < 32; i += 8) {
+        const int c = c0 + i, p = p0 + tx;
+        if (c < channels && p < plane) {
+            float value = input[(long long)c * plane + p] * scales[p] * gamma[c];
+            if (silu) value = value / (1.0f + expf(-value));
+            tile[i][tx] = value;
+            if (!output_hwc) output[(long long)c * plane + p] = value;
+        }
+    }
+    if (!output_hwc) return;
+    __syncthreads();
+    for (int i = ty; i < 32; i += 8) {
+        const int p = p0 + i, c = c0 + tx;
+        if (c < channels && p < plane)
+            output_hwc[(long long)p * channels + (c & ~15) + diff_channel_slot(c & 15)] =
+                diff_f32_to_bf16(tile[tx][i]);
+    }
+}
+
+// The duplicating shortcut of a residual up block (`DupUp3D`), added into an
+// already-upsampled output. The reference repeats each input channel
+// `repeats` times, reads the result as [out_channels][factor] and scatters
+// `factor` = factor_t * 4 of them over the frame and the 2x2 pixel block; at
+// one frame only slot `t_keep` survives. So the source channel of output
+// (oc, 2h + hs, 2w + ws) is (oc * factor + t_keep * 4 + hs * 2 + ws) / repeats.
+extern "C" __global__
+void qi_dup_up_add(const float* input, float* output, const int out_channels,
+                   const int factor, const int repeats, const int t_keep,
+                   const int height, const int width) {
+    const int out_width = width * 2;
+    const long long elements = (long long)out_channels * height * 2 * out_width;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const int x = (int)(index % out_width);
+        const long long rest = index / out_width;
+        const int y = (int)(rest % (height * 2));
+        const int oc = (int)(rest / (height * 2));
+        const int slot = t_keep * 4 + (y & 1) * 2 + (x & 1);
+        const int c = (oc * factor + slot) / repeats;
+        output[index] += input[((long long)c * height + (y >> 1)) * width + (x >> 1)];
     }
 }
 

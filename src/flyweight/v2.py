@@ -504,6 +504,21 @@ class _DiffusionInfo(ctypes.Structure):
         ("max_height", ctypes.c_uint32),
         ("device_bytes", ctypes.c_uint64),
         ("host_bytes", ctypes.c_uint64),
+        ("latent_stride", ctypes.c_uint32),
+        ("size_multiple", ctypes.c_uint32),
+        ("output_channels", ctypes.c_uint32),
+        ("default_steps", ctypes.c_uint32),
+        ("latent_channels", ctypes.c_uint32),
+        ("default_shift", ctypes.c_float),
+    ]
+
+
+class _DiffusionImage(ctypes.Structure):
+    _fields_ = [
+        ("rgba", ctypes.c_void_p),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("token_offset", ctypes.c_uint64),
     ]
 
 
@@ -512,6 +527,9 @@ DIFFUSION_WEIGHTS = {"device": 0, "host": 1, "auto": 2}
 # OR-ed into the weights flag: exact f32 activations instead of the Q8/bf16 paths.
 DIFFUSION_EXACT = 8
 DIFFUSION_BALANCED = 16
+# OR-ed into the weights flag: reserve the workspace for the maximum size at
+# create instead of growing it on demand.
+DIFFUSION_RESERVE = 32
 DIFFUSION_PRECISION = {"fast": 0, "balanced": DIFFUSION_BALANCED, "exact": DIFFUSION_EXACT}
 
 
@@ -681,6 +699,7 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_uint32,
                     ctypes.c_uint32,
                     ctypes.c_uint32,
+                    ctypes.c_uint32,
                     ctypes.c_float,
                     ctypes.c_uint64,
                     ctypes.c_void_p,
@@ -689,6 +708,40 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p,
                 ]
                 lib.flyweight_v2_diffusion_generate.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_edit.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(_DiffusionImage),
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    _DiffusionProgress,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_diffusion_edit.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_prompt.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+                    ctypes.POINTER(_DiffusionImage), ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_diffusion_encode_prompt.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_vision.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.flyweight_v2_diffusion_encode_vision.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_image.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_diffusion_encode_image.restype = ctypes.c_int
                 lib.flyweight_v2_hf_quant_options.argtypes = [
                     ctypes.c_char_p,
                     ctypes.POINTER(_HfQuantOption),
@@ -3461,6 +3514,12 @@ class V2Diffusion:
     outlive the tower. Latents are ``[16][height/8][width/8]`` float32 arrays,
     images come back as ``height*width*3`` interleaved RGB bytes.
 
+    ``max_width`` / ``max_height`` cap what a request may ask for; zero means
+    the model's own largest side. The workspace behind them starts at 1024x1024
+    (or the cap, if smaller) and grows on demand unless ``reserve`` asks for
+    the whole cap at create -- the guarantee, at the cost of holding the
+    memory from the start.
+
     ``weights`` places the encoder's and DiT's weights: ``"device"``,
     ``"host"`` (pinned host memory, streamed a layer at a time through a few
     hundred MiB of device memory, so a chat model can share the card), or
@@ -3479,11 +3538,12 @@ class V2Diffusion:
         vae: V2Model,
         *,
         device: int = 0,
-        max_width: int = 1024,
-        max_height: int = 1024,
+        max_width: int = 0,
+        max_height: int = 0,
         max_prompt_tokens: int = 512,
         weights: str = "auto",
         precision: str = "fast",
+        reserve: bool = False,
     ) -> None:
         if weights not in DIFFUSION_WEIGHTS:
             raise ValueError(f"weights must be one of {sorted(DIFFUSION_WEIGHTS)}")
@@ -3501,13 +3561,26 @@ class V2Diffusion:
                 encoder._handle, transformer._handle, vae._handle,
                 ctypes.c_int32(device), ctypes.c_uint32(max_width),
                 ctypes.c_uint32(max_height), ctypes.c_uint32(max_prompt_tokens),
-                ctypes.c_uint32(DIFFUSION_WEIGHTS[weights] | DIFFUSION_PRECISION[precision]),
+                ctypes.c_uint32(DIFFUSION_WEIGHTS[weights] | DIFFUSION_PRECISION[precision]
+                                | (DIFFUSION_RESERVE if reserve else 0)),
                 ctypes.byref(self._handle),
             )
         )
+        # Geometry follows from which image model the snapshot held, so read it
+        # back rather than assuming one model's.
+        geometry = self.info
+        # A zero cap meant the model's own maximum; read back what that was.
+        self.max_width = int(geometry["max_width"])
+        self.max_height = int(geometry["max_height"])
+        self.latent_stride = int(geometry["latent_stride"])
+        self.latent_channels = int(geometry["latent_channels"])
+        self.output_channels = int(geometry["output_channels"])
+        self.size_multiple = int(geometry["size_multiple"])
+        self.default_steps = int(geometry["default_steps"])
+        self.default_shift = float(geometry["default_shift"])
 
     @property
-    def info(self) -> dict[str, int | bool]:
+    def info(self) -> dict[str, int | bool | float]:
         """Where the weights ended up and what the tower holds on the device."""
         value = _DiffusionInfo()
         self._check(self._lib.flyweight_v2_diffusion_info(self._handle, ctypes.byref(value)))
@@ -3519,6 +3592,12 @@ class V2Diffusion:
             "max_height": int(value.max_height),
             "device_bytes": int(value.device_bytes),
             "host_bytes": int(value.host_bytes),
+            "latent_stride": int(value.latent_stride),
+            "size_multiple": int(value.size_multiple),
+            "output_channels": int(value.output_channels),
+            "latent_channels": int(value.latent_channels),
+            "default_steps": int(value.default_steps),
+            "default_shift": float(value.default_shift),
         }
 
     def close(self) -> None:
@@ -3559,8 +3638,8 @@ class V2Diffusion:
     def transformer_step(
         self, latents: Any, latent_h: int, latent_w: int, caption: Any, caption_tokens: int, time: float
     ) -> "array.array[float]":
-        """One DiT forward: the raw model output (before negation) for the latents."""
-        count = 16 * latent_h * latent_w
+        """One DiT forward: the raw model output for the latents."""
+        count = self.latent_channels * latent_h * latent_w
         x = self._floats(latents, count, "latents")
         c = self._floats(caption, caption_tokens * self.caption_width, "caption")
         out = array.array("f", bytes(4 * count))
@@ -3575,10 +3654,11 @@ class V2Diffusion:
         return out
 
     def decode_latents(self, latents: Any, latent_h: int, latent_w: int) -> bytes:
-        """VAE decode: ``(latent_h*8) * (latent_w*8) * 3`` RGB bytes."""
-        count = 16 * latent_h * latent_w
+        """VAE decode, interleaved 8-bit pixels: RGB, or RGBA where the model has alpha."""
+        count = self.latent_channels * latent_h * latent_w
         x = self._floats(latents, count, "latents")
-        rgb = ctypes.create_string_buffer(latent_h * 8 * latent_w * 8 * 3)
+        stride, channels = self.latent_stride, self.output_channels
+        rgb = ctypes.create_string_buffer(latent_h * stride * latent_w * stride * channels)
         self._check(
             self._lib.flyweight_v2_diffusion_decode_latents(
                 self._handle, (ctypes.c_float * count).from_buffer(x),
@@ -3593,22 +3673,36 @@ class V2Diffusion:
         width: int,
         height: int,
         *,
-        steps: int = 8,
-        shift: float = 3.0,
+        steps: int | None = None,
+        shift: float | None = None,
         seed: int = 0,
+        caption_drop: int = 0,
         initial_latents: Any = None,
         progress: Any = None,
     ) -> bytes:
-        """The whole pipeline: ``width*height*3`` RGB bytes.
+        """The whole pipeline: ``width*height*output_channels`` interleaved bytes.
+
+        ``caption_drop`` leading tokens are encoded but kept out of the
+        conditioning, which is how a prompt with a system-role prefix reaches
+        Qwen-Image-2.1's transformer.
+
+        ``steps`` and ``shift`` default to the model's own; a ``shift`` of zero
+        means the sampler's shift follows the image's token count, which is how
+        Qwen-Image-2.1 is sampled.
 
         ``progress(step, steps)`` is called after the encoder and after each
         denoising step; returning a true value cancels the run.
         """
         ids = (ctypes.c_uint32 * len(tokens))(*tokens)
-        rgb = ctypes.create_string_buffer(width * height * 3)
+        stride = self.latent_stride
+        rgb = ctypes.create_string_buffer(width * height * self.output_channels)
         latents = None
         if initial_latents is not None:
-            latents = self._floats(initial_latents, 16 * (height // 8) * (width // 8), "initial_latents")
+            latents = self._floats(
+                initial_latents,
+                self.latent_channels * (height // stride) * (width // stride),
+                "initial_latents",
+            )
 
         def on_progress(_user: Any, step: int, total: int) -> int:
             if progress is None:
@@ -3618,10 +3712,121 @@ class V2Diffusion:
         callback = _DiffusionProgress(on_progress)
         self._check(
             self._lib.flyweight_v2_diffusion_generate(
-                self._handle, ids, ctypes.c_uint64(len(tokens)), ctypes.c_uint32(width), ctypes.c_uint32(height),
-                ctypes.c_uint32(steps), ctypes.c_float(shift), ctypes.c_uint64(seed),
+                self._handle, ids, ctypes.c_uint64(len(tokens)), ctypes.c_uint32(caption_drop),
+                ctypes.c_uint32(width), ctypes.c_uint32(height),
+                ctypes.c_uint32(self.default_steps if steps is None else steps),
+                ctypes.c_float(self.default_shift if shift is None else shift),
+                ctypes.c_uint64(seed),
                 (ctypes.c_float * len(latents)).from_buffer(latents) if latents is not None else None,
                 callback, None, rgb,
             )
         )
         return rgb.raw
+
+    def edit(
+        self,
+        tokens: Sequence[int],
+        images: Sequence[tuple[bytes, int, int, int]],
+        width: int,
+        height: int,
+        *,
+        steps: int | None = None,
+        shift: float | None = None,
+        seed: int = 0,
+        caption_drop: int = 0,
+        initial_latents: Any = None,
+        progress: Any = None,
+    ) -> bytes:
+        """``generate`` with condition images (Qwen-Image-2.1 only).
+
+        Each image is ``(rgba_bytes, width, height, token_offset)``: RGBA at a
+        size whose sides are multiples of 32, and where its run of
+        ``<|image_pad|>`` tokens -- ``(width // 32) * (height // 32)`` of them
+        -- starts in ``tokens``.
+        """
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        buffers, records = self._image_records(images)
+        rgb = ctypes.create_string_buffer(width * height * self.output_channels)
+        latents = None
+        if initial_latents is not None:
+            stride = self.latent_stride
+            latents = self._floats(
+                initial_latents, self.latent_channels * (height // stride) * (width // stride),
+                "initial_latents")
+
+        def on_progress(_user: Any, step: int, total: int) -> int:
+            if progress is None:
+                return 0
+            return 1 if progress(step, total) else 0
+
+        callback = _DiffusionProgress(on_progress)
+        self._check(
+            self._lib.flyweight_v2_diffusion_edit(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), ctypes.c_uint32(caption_drop),
+                records, ctypes.c_uint32(len(images)),
+                ctypes.c_uint32(width), ctypes.c_uint32(height),
+                ctypes.c_uint32(self.default_steps if steps is None else steps),
+                ctypes.c_float(self.default_shift if shift is None else shift),
+                ctypes.c_uint64(seed),
+                (ctypes.c_float * len(latents)).from_buffer(latents) if latents is not None else None,
+                callback, None, rgb,
+            )
+        )
+        del buffers
+        return rgb.raw
+
+    @staticmethod
+    def _image_records(images: Sequence[tuple[bytes, int, int, int]]) -> tuple[list, Any]:
+        buffers = [ctypes.create_string_buffer(rgba, len(rgba)) for rgba, _, _, _ in images]
+        records = (_DiffusionImage * max(1, len(images)))()
+        for index, ((rgba, image_width, image_height, offset), buffer) in enumerate(zip(images, buffers)):
+            if len(rgba) != image_width * image_height * 4:
+                raise ValueError("condition image bytes do not match width * height * 4")
+            records[index] = _DiffusionImage(
+                ctypes.cast(buffer, ctypes.c_void_p), image_width, image_height, offset)
+        return buffers, records
+
+    def encode_prompt(self, tokens: Sequence[int], images: Sequence[tuple[bytes, int, int, int]]) -> "array.array[float]":
+        """The text encoder over a prompt with images in its token runs: ``len(tokens) * caption_width`` floats."""
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        buffers, records = self._image_records(images)
+        out = array.array("f", bytes(4 * len(tokens) * self.caption_width))
+        buffer = (ctypes.c_float * len(out)).from_buffer(out)
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_prompt(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), records, ctypes.c_uint32(len(images)),
+                buffer, ctypes.c_uint64(len(out)),
+            )
+        )
+        del buffers
+        return out
+
+    def encode_vision(self, rgba: bytes, width: int, height: int) -> list["array.array[float]"]:
+        """The vision tower's planes for one RGBA image, each ``tokens * caption_width`` floats."""
+        tokens = (width // 32) * (height // 32)
+        capacity = tokens * self.caption_width * 8
+        out = array.array("f", bytes(4 * capacity))
+        planes = ctypes.c_uint32(0)
+        pixels = ctypes.create_string_buffer(rgba, len(rgba))
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_vision(
+                self._handle, pixels, ctypes.c_uint32(width), ctypes.c_uint32(height),
+                (ctypes.c_float * capacity).from_buffer(out), ctypes.c_uint64(capacity), ctypes.byref(planes),
+            )
+        )
+        size = tokens * self.caption_width
+        return [out[i * size:(i + 1) * size] for i in range(planes.value)]
+
+    def encode_image(self, rgba: bytes, width: int, height: int) -> "array.array[float]":
+        """The autoencoder's normalized latents of one RGBA image: ``latent_channels * (h/16) * (w/16)`` floats."""
+        stride = self.latent_stride
+        count = self.latent_channels * (height // stride) * (width // stride)
+        out = array.array("f", bytes(4 * count))
+        pixels = ctypes.create_string_buffer(rgba, len(rgba))
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_image(
+                self._handle, pixels, ctypes.c_uint32(width), ctypes.c_uint32(height),
+                (ctypes.c_float * count).from_buffer(out), ctypes.c_uint64(count),
+            )
+        )
+        return out
