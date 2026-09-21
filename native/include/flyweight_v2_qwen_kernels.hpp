@@ -10203,6 +10203,117 @@ KV_SCORES_TURBO_RING(kv_attention_scores_turbo3_ring, 3)
 KV_SCORES_TURBO_RING(kv_attention_scores_turbo4_ring, 4)
 #undef KV_SCORES_TURBO_RING
 
+// ---- Sylvester-Hadamard outlier-suppressed Q8 KV kernels ----
+// Rotates keys and queries by the canonical Sylvester-Hadamard transform (H)
+// before quantizing keys to Q8 or computing attention scores.
+// Orthogonality (H^T H = I) guarantees dot-product invariance: <H q, H k> == <q, k>.
+// Squashes activation outliers by distributing channel energy evenly across heads,
+// dramatically reducing INT8 quantization noise without learned codebooks or sign flips.
+
+__device__ __forceinline__ void kv_store_hadamard_q8_impl(
+    const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) {
+    const int head = blockIdx.x;
+    if (head >= kv_heads) return;
+    __shared__ float rotated[TURBO_MAX_DIM];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rotated[d] = current[head * head_dim + d];
+    __syncthreads();
+    turbo_fwht_shared(rotated, head_dim);
+    const int blocks = head_dim / 32;
+    unsigned char* row = cache + ((long long)head * capacity + position) * blocks * 34;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const float* blk = rotated + b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(blk[i]));
+        const float scale = amax / 127.0f;
+        const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        unsigned char* dst = row + b * 34;
+        *((__half*)dst) = __float2half(scale);
+        signed char* q = (signed char*)(dst + 2);
+        for (int i = 0; i < 32; ++i) {
+            int v = __float2int_rn(blk[i] * inv);
+            q[i] = (signed char)max(-127, min(127, v));
+        }
+    }
+}
+
+extern "C" __global__ void kv_store_hadamard_q8(
+    const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) { kv_store_hadamard_q8_impl(current, cache, kv_heads, head_dim, position, capacity); }
+
+extern "C" __global__ void kv_store_hadamard_q8_rows(
+    const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity,
+    const int row_stride
+) {
+    const int row = blockIdx.y;
+    kv_store_hadamard_q8_impl(current + (long long)row * row_stride, cache, kv_heads, head_dim,
+                              (position + row) % capacity, capacity);
+}
+
+#define HADAMARD_SLOT_LINEAR 0
+#define HADAMARD_SLOT_RING 1
+#define HADAMARD_SLOT_INDEXED 2
+
+template<int MODE>
+__device__ void kv_scores_hadamard_q8_impl(
+    const float* query, const unsigned char* keys, const int* slots, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first, const float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    __shared__ float rq[TURBO_MAX_DIM];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rq[d] = query[head * head_dim + d];
+    __syncthreads();
+    turbo_fwht_shared(rq, head_dim);
+    const int token = blockIdx.y * blockDim.x + threadIdx.x;
+    if (token >= tokens) return;
+    const int group = heads / kv_heads;
+    const int kv_head = head / group;
+    const int blocks = head_dim / 32;
+    const int slot = MODE == HADAMARD_SLOT_RING ? (first + token) % capacity
+        : MODE == HADAMARD_SLOT_INDEXED ? slots[token] : token;
+    const unsigned char* k = keys + ((long long)kv_head * capacity + slot) * blocks * 34;
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; ++d) sum += rq[d] * kv_ld_q8(k, d);
+    scores[head * tokens + token] = sum * scale;
+}
+
+extern "C" __global__ void kv_attention_scores_hadamard_q8(
+    const float* query, const unsigned char* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) {
+    kv_scores_hadamard_q8_impl<HADAMARD_SLOT_LINEAR>(
+        query, keys, (const int*)0, scores,
+        heads, kv_heads, head_dim, tokens, capacity, 0, scale);
+}
+
+extern "C" __global__ void kv_attention_scores_hadamard_q8_ring(
+    const float* query, const unsigned char* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first, const float scale
+) {
+    kv_scores_hadamard_q8_impl<HADAMARD_SLOT_RING>(
+        query, keys, (const int*)0, scores,
+        heads, kv_heads, head_dim, tokens, capacity, first, scale);
+}
+
+extern "C" __global__ void kv_attention_scores_hadamard_q8_indexed(
+    const float* query, const unsigned char* keys, const int* slots,
+    float* scores, const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) {
+    kv_scores_hadamard_q8_impl<HADAMARD_SLOT_INDEXED>(
+        query, keys, slots, scores,
+        heads, kv_heads, head_dim, tokens, capacity, 0, scale);
+}
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(// One block per head, so the weighted sum is accumulated in the rotated domain
 // in shared memory and inverse-rotated once at the end: R^-1 = R^T = S*H, i.e.
@@ -10419,6 +10530,19 @@ extern "C" __global__ void turbo_unrotate_rows(
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
         base[i] = scratch[i] * turbo_sign_d(i, (unsigned)stream_id);
 }
+extern "C" __global__ void hadamard_rotate_rows(
+    float* data, const int rows, const int dim
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float scratch[TURBO_MAX_DIM];
+    float* base = data + (long long)row * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) scratch[i] = base[i];
+    __syncthreads();
+    turbo_fwht_shared(scratch, dim);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) base[i] = scratch[i];
+}
+
 
 #define KV_VALUES_TURBO_RING(name, BITS) \
 extern "C" __global__ void name(float* scores, const unsigned char* values, float* output, \
@@ -11469,6 +11593,156 @@ KV_ATTENTION_FUSED_TILES(
 )
 #undef KV_ATTENTION_FUSED_TILES
 #undef KV_ATTENTION_FUSED_TILES_W
+
+template<int maximum_head_dim>
+__device__ void kv_attention_fused_hadamard_q8_tiles_impl(
+    const float* query,
+    const unsigned char* keys,
+    const unsigned char* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+    constexpr int warp_count = 8;
+    constexpr int parts = maximum_head_dim / 32;
+    constexpr int tokens_per_tile = 1024;
+    const int head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (head >= heads || head_dim > maximum_head_dim || (head_dim & 31) != 0)
+        return;
+    __shared__ float rotated_query[maximum_head_dim];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rotated_query[d] = query[head * head_dim + d];
+    __syncthreads();
+    turbo_fwht_shared(rotated_query, head_dim);
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int kv_head = head / (heads / kv_heads);
+    const int blocks = head_dim / 32;
+    const unsigned char* key_base = keys + ((long long)kv_head * capacity) * blocks * 34;
+    const unsigned char* value_base = values + ((long long)kv_head * capacity) * blocks * 34;
+    float accumulator[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) accumulator[part] = 0.0f;
+    float maximum = -3.402823466e+38F;
+    float denominator = 0.0f;
+
+    for (int token = tile_begin + warp;
+         token < tile_end;
+         token += warp_count) {
+        int slot = first + token;
+        if (slot >= capacity) slot -= capacity;
+        const unsigned char* key_row = key_base + (long long)slot * blocks * 34;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim)
+                dot += rotated_query[dimension] * kv_ld_q8(key_row, dimension);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        const float score = __shfl_sync(0xffffffff, dot, 0) * scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float old_scale = maximum == -3.402823466e+38F
+            ? 0.0f : __expf(maximum - next_maximum);
+        const float token_scale = __expf(score - next_maximum);
+        denominator = denominator * old_scale + token_scale;
+
+        const unsigned char* value_row = value_base + (long long)slot * blocks * 34;
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim) {
+                accumulator[part] = accumulator[part] * old_scale
+                    + token_scale * kv_ld_q8(value_row, dimension);
+            }
+        }
+        maximum = next_maximum;
+    }
+
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float merged_maximum;
+    __shared__ float merged_denominator;
+    __shared__ float partial_output[warp_count][maximum_head_dim];
+    if (lane == 0) {
+        warp_maximum[warp] = maximum;
+        warp_denominator[warp] = denominator;
+    }
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int dimension = lane + part * 32;
+        if (dimension < head_dim)
+            partial_output[warp][dimension] = accumulator[part];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float tile_maximum = warp_maximum[0];
+        #pragma unroll
+        for (int index = 1; index < warp_count; ++index)
+            tile_maximum = fmaxf(tile_maximum, warp_maximum[index]);
+        float tile_denominator = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index) {
+            const float factor = warp_denominator[index] == 0.0f
+                ? 0.0f : __expf(warp_maximum[index] - tile_maximum);
+            warp_scale[index] = factor;
+            tile_denominator += warp_denominator[index] * factor;
+        }
+        merged_maximum = tile_maximum;
+        merged_denominator = tile_denominator;
+    }
+    __syncthreads();
+
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    float* record = partial
+        + ((long long)head * tile_count + tile) * (maximum_head_dim + 2);
+    if (threadIdx.x == 0) {
+        record[0] = merged_maximum;
+        record[1] = merged_denominator;
+    }
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index)
+            result += partial_output[index][dimension] * warp_scale[index];
+        record[dimension + 2] = result;
+    }
+}
+
+extern "C" __global__ void kv_attention_fused_hadamard_q8_tiles(
+    const float* query, const unsigned char* keys, const unsigned char* values, float* partial,
+    const int heads, const int kv_heads, const int head_dim, const int tokens,
+    const int capacity, const int first, const float scale
+) {
+    kv_attention_fused_hadamard_q8_tiles_impl<128>(
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens,
+        capacity, first, scale);
+}
+
+extern "C" __global__ void kv_attention_fused_hadamard_q8_tiles256(
+    const float* query, const unsigned char* keys, const unsigned char* values, float* partial,
+    const int heads, const int kv_heads, const int head_dim, const int tokens,
+    const int capacity, const int first, const float scale
+) {
+    kv_attention_fused_hadamard_q8_tiles_impl<256>(
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens,
+        capacity, first, scale);
+}
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 // Turbo twin of the fused tiles kernel above. The cache rows live in the
