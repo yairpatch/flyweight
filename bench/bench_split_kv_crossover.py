@@ -214,12 +214,14 @@ __global__ void attention_split_kv_merge(
 """
 
 def bench(f, iters=50):
-    for _ in range(5): f()
+    for _ in range(5):
+        f()
     cp.cuda.Stream.null.synchronize()
     start = cp.cuda.Event()
     end = cp.cuda.Event()
     start.record()
-    for _ in range(iters): f()
+    for _ in range(iters):
+        f()
     end.record()
     end.synchronize()
     return cp.cuda.get_elapsed_time(start, end) / iters * 1000.0 # us

@@ -33,13 +33,18 @@ namespace {
 
 bool has_avx512_vnni() {
 #if defined(_MSC_VER)
-    int regs[4] = {0, 0, 0, 0};
-    __cpuidex(regs, 7, 0);
-    return (regs[2] & (1 << 11)) != 0 && (regs[1] & (1 << 16)) != 0;
+    int registers[4]{};
+    __cpuid(registers, 0);
+    if (registers[0] < 7) return false;
+    __cpuidex(registers, 7, 0);
+    const bool f = (registers[1] & (1 << 16)) != 0;
+    const bool bw = (registers[1] & (1 << 30)) != 0;
+    const bool vl = (registers[1] & (1 << 31)) != 0;
+    const bool vnni = (registers[2] & (1 << 11)) != 0;
+    return f && bw && vl && vnni && (_xgetbv(0) & 0xE6) == 0xE6;
 #else
-    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
-    return (ecx & (1u << 11)) != 0 && (ebx & (1u << 16)) != 0;
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")
+        && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
 #endif
 }
 

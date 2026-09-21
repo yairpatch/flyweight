@@ -20,15 +20,30 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 #include <vector>
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 #define FLYWEIGHT_SPLIT_HD __host__ __device__ __forceinline__
+#define FLYWEIGHT_RESTRICT __restrict__
+#elif defined(_MSC_VER)
+#define FLYWEIGHT_SPLIT_HD inline
+#define FLYWEIGHT_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define FLYWEIGHT_SPLIT_HD inline
+#define FLYWEIGHT_RESTRICT __restrict__
 #else
 #define FLYWEIGHT_SPLIT_HD inline
+#define FLYWEIGHT_RESTRICT
 #endif
 
 namespace flyweight::split_kv {
+
+using std::int32_t;
+using std::int64_t;
+using std::uint32_t;
+using std::size_t;
 
 inline constexpr int kMaxSplits = 64;
 
@@ -60,9 +75,9 @@ struct SplitPartialStat {
 // Merge partial split statistics into global maximum and denominator
 // Returns global denominator L
 FLYWEIGHT_SPLIT_HD float merge_split_stats(
-    const SplitPartialStat* __restrict__ partials,
+    const SplitPartialStat* FLYWEIGHT_RESTRICT partials,
     int num_splits,
-    float* __restrict__ split_weights,
+    float* FLYWEIGHT_RESTRICT split_weights,
     float& out_global_max
 ) {
     float global_max = -1.0e30f;
@@ -89,12 +104,12 @@ FLYWEIGHT_SPLIT_HD float merge_split_stats(
 // Merge partial value accumulators across splits
 // out_output = (sum_s partial_acc[s, d] * split_weights[s]) / global_denom
 FLYWEIGHT_SPLIT_HD void merge_split_values(
-    const float* __restrict__ partial_acc, // [num_splits, head_dim]
-    const float* __restrict__ split_weights, // [num_splits]
+    const float* FLYWEIGHT_RESTRICT partial_acc, // [num_splits, head_dim]
+    const float* FLYWEIGHT_RESTRICT split_weights, // [num_splits]
     float global_denom,
     int num_splits,
     int head_dim,
-    float* __restrict__ out_output // [head_dim]
+    float* FLYWEIGHT_RESTRICT out_output // [head_dim]
 ) {
     const float inv_denom = global_denom > 0.0f ? (1.0f / global_denom) : 0.0f;
     for (int d = 0; d < head_dim; ++d) {

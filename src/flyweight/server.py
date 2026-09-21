@@ -4059,7 +4059,8 @@ def create_handler(
                 name = part.get_param("name", header="content-disposition")
                 if not isinstance(name, str):
                     continue
-                data = part.get_payload(decode=True) or b""
+                raw_data = part.get_payload(decode=True)
+                data = raw_data if isinstance(raw_data, bytes) else b""
                 if name in ("image", "image[]") or part.get_filename():
                     mime = part.get_content_type() or "image/png"
                     images.append(f"data:{mime};base64," + base64.b64encode(data).decode("ascii"))
