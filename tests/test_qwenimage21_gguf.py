@@ -61,6 +61,7 @@ class QwenImage21GGUFTests(unittest.TestCase):
         finally:
             model.close()
 
+    @unittest.skipUnless(_gpu_available(), "test requires a CUDA device")
     def test_generator_with_explicit_transformer_path(self) -> None:
         generator = ImageGenerator(self.snapshot, transformer=self.gguf_path)
         try:
@@ -70,6 +71,7 @@ class QwenImage21GGUFTests(unittest.TestCase):
         finally:
             generator.close()
 
+    @unittest.skipUnless(_gpu_available(), "test requires a CUDA device")
     def test_generator_with_gguf_in_transformer_directory(self) -> None:
         gguf_snapshot = self.root / "gguf_snapshot"
         shutil.copytree(self.snapshot / "text_encoder", gguf_snapshot / "text_encoder")
