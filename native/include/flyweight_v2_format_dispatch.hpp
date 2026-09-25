@@ -20,8 +20,8 @@
 //     16 attn_v projections (and the whole MTP draft layer) carry this type.
 //   - IQ1_M (29) was absent from the CPU expert set even though
 //     `qwen_iq1m_dot_row` already decoded it. `unsupported_quant_types()`
-//     therefore listed every IQ1_M tensor as unusable. Admitted 2026-09-25:
-//     the scalar dot is the CPU path (no AVX2/AVX-512 twin yet).
+//     therefore listed every IQ1_M tensor as unusable. Admitted 2026-09-25.
+//     AVX2 covers the row dot and the row dequant; there is no AVX-512 twin.
 //
 // Names must match the kernels registered with flyweight_gpu_launch_named; a
 // Python source-scan test cross-checks every literal below against the kernel
@@ -285,9 +285,9 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1m_q8_matmul_tiled", .matmul_q8_mmq = "iq1m_q8_mmq",
      .matmul_rows = "iq1m_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     // Scalar `qwen_iq1m_dot_row` only -- no AVX twin, and no grouped
-     // octet decoder, so decode-shaped GPU experts stay on the CPU. The
-     // routed block-table MMQ (`iq1m_q8_mmq_routed`) covers prefill.
+     // AVX2 row dot and dequant; no grouped octet decoder, so
+     // decode-shaped GPU experts stay on the CPU. Prefill can take
+     // `iq1m_q8_mmq_routed`.
      .cpu_expert = true},
     {.type = 30, .family = "bf16",
      .matmul_rows = "bf16_matmul_rows",

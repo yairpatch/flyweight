@@ -4262,7 +4262,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
     // takes its own admission: qwen4exp's 640-wide expert down rows fail the
@@ -5897,7 +5897,7 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
         qwen_iq3s_dequant_row_vnni512(packed,elements,row,output);return;}
     // 22 (IQ2_S) joined 2026-09-16 for the GSQ-RCO mix, where the tripwire
     // named it on 20 gate/up stacks.
-    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
