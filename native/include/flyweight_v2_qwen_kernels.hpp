@@ -5997,6 +5997,32 @@ __device__ __forceinline__ void iq4nl_q8_decode(
 
 FLYWEIGHT_Q8_MMQ_ROUTED(iq4nl_q8_mmq_routed, iq4nl_q8_decode, 18, 5, 0)
 
+// Q2_0 for the routed MMQ: the same 18-byte flat block as IQ4_NL, but 64
+// two-bit codes instead of 32 nibbles, so one block is two Q8 groups and the
+// (6, 1) shifts apply. Group g reads bytes 2+(g&1)*8 of block g>>1 -- four
+// consecutive elements per byte, code q stored as the int8 (q-1). Both k16
+// halves share the block scale. 640-wide down rows are exactly ten blocks.
+__device__ __forceinline__ void q20_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const unsigned char* base = row_data + (linear_group >> 1) * 18;
+    const unsigned char* codes = base + 2 + (linear_group & 1) * 8;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        const unsigned char byte = codes[step];
+        words[step] =
+            ((int)(unsigned char)(((byte >> 0) & 3) - 1))
+            | ((int)(unsigned char)(((byte >> 2) & 3) - 1) << 8)
+            | ((int)(unsigned char)(((byte >> 4) & 3) - 1) << 16)
+            | ((int)(unsigned char)(((byte >> 6) & 3) - 1) << 24);
+    }
+    const float d = __half2float(*((const __half*)base));
+    *scale_low = d;
+    *scale_high = d;
+}
+
+FLYWEIGHT_Q8_MMQ_ROUTED(q20_q8_mmq_routed, q20_q8_decode, 18, 6, 1)
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 

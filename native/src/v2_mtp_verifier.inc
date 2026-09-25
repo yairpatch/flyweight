@@ -2649,8 +2649,8 @@ void qwen_forward_rows(
                 : runtime.options.routed_moe!=0;
             // A format reaches the routed kernel when it has one and the width
             // divides its blocking: 256 for the super-block formats, 32 for
-            // IQ4_NL's flat blocks, which is what lets the 640-wide down
-            // projection in at all.
+            // IQ4_NL's flat blocks, 64 for Q2_0 -- both of those let the
+            // 640-wide down projection in at all.
             auto routed_kernel=[&](std::uint32_t type,int in_size){
                 return qwen_routed_mmq_kernel(type,in_size);
             };

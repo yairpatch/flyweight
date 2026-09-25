@@ -297,9 +297,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 39, .family = "mxfp4", .cpu_expert = true},
     // Q2_0 (ggml type 42, 2026-09): f16 scale + 64 two-bit codes per 18-byte
     // block. ISTA DASLab's GSQ-RCO qwen4exp builds put ffn_down_exps in it on
-    // 30 layers and ffn_down_shexp on 8. Routed experts: the grouped family
-    // and the rows matmul (prefill streaming). Dense: no decode matvec, so
-    // prepare requantizes a static Q2_0 tensor to Q8_0.
+    // 30 layers and ffn_down_shexp on 8. Routed experts: the grouped family,
+    // the rows matmul, and q20_q8_mmq_routed (64-wide unit, so 640-wide downs
+    // divide). Dense: no decode matvec, so prepare requantizes a static Q2_0
+    // tensor to Q8_0.
     {.type = 42, .family = "q20",
      .matmul_rows = "q20_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,

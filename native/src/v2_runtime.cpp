@@ -1589,12 +1589,7 @@ constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 byt
 constexpr std::uint32_t kIq1sBlockSize = kIq1sBlockBytes;
 constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
 constexpr std::uint32_t kMxfp4BlockElements = 32;
-// Q2_0 (ggml type 42): d[f16] then qs[16], 64 two-bit codes with element j at
-// bits 2*(j%4) of byte j/4. Code q decodes to (q-1)*d, so the levels are
-// {-d, 0, d, 2d}. ISTA DASLab's GSQ-RCO qwen4exp builds ship ffn_down_exps in
-// it on most layers.
-constexpr int kQ20BlockBytes = 18;
-constexpr int kQ20BlockElements = 64;
+// Q2_0 block layout lives in qwen_kquant.h beside qwen_q2_0_value.
 // The FP4 codebook, doubled -- which is why the scale is halved to match.
 constexpr float kMxfp4Lut[16] = {
     0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
@@ -4211,14 +4206,6 @@ float ue4m3_to_float(std::uint8_t bits){
 // weight_scale_2 runs ~3e-5, far below E4M3's smallest subnormal (2^-9), so
 // folding it back into the block scales flushes ~56% of them to zero. The scale
 // is carried in f32 to the kernels instead.
-float qwen_q2_0_value(const std::uint8_t*packed,std::uint64_t absolute){
-    const auto*base=packed+absolute/kQ20BlockElements*kQ20BlockBytes;
-    const int within=static_cast<int>(absolute%kQ20BlockElements);
-    std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
-    const int code=(base[2+within/4]>>((within&3)*2))&3;
-    return qwen_half_value(scale_bits)*static_cast<float>(code-1);
-}
-
 float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
     const std::uint64_t block=absolute/kNvfp4BlockElements;
     const int offset=static_cast<int>(absolute%kNvfp4BlockElements);
@@ -4502,8 +4489,8 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 
 // The routed block-table MMQ kernel for an expert role, or empty where the
 // format has none or the width does not divide its blocking: 256 for the
-// super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
-// 640-wide down projection in).
+// super-block formats, 32 for IQ4_NL's flat blocks, 64 for Q2_0 (both of
+// those let qwen4exp's 640-wide down projection in).
 //
 // Its own list rather than grouped_expert_prefix + suffix, because the two sets
 // are not the same one: Q4_0 has a grouped kernel and no MMQ kernel, so reading
@@ -4533,10 +4520,11 @@ std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
         case 22: family = "iq2s"; break;
         case 23: family = "iq4xs"; break;
         case 29: family = "iq1m"; break;
+        case 42: family = "q20"; break;
         default: break;
     }
     if (!family) return {};
-    const int unit = type == 20 ? 32 : 256;
+    const int unit = type == 20 ? 32 : type == 42 ? 64 : 256;
     return in_size % unit == 0 ? std::string(family) + "_q8_mmq_routed"
                                : std::string();
 }
