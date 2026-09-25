@@ -951,6 +951,176 @@ void add_cases() {
         },
         1e-5f,
     });
+
+    cases().push_back(Case{
+        "qwen_attention_gate",
+        [](std::vector<std::vector<float>>& outputs) {
+            // Widths on and off the 256-thread block boundary, with gates
+            // past the +-80 clamp the corpus applies.
+            for (int elements : {256, 1024, 1537, 4096, 1}) {
+                auto attended = random_vector(elements, -4.0f, 4.0f);
+                auto gates = random_vector(elements, -100.0f, 100.0f);
+                std::vector<float> output(elements, 0.0f);
+                const float* attended_p = attended.data();
+                const float* gates_p = gates.data();
+                float* output_p = output.data();
+                void* arguments[] = {&attended_p, &gates_p, &output_p,
+                                     &elements};
+                flyweight_cpu_launch_named(
+                    "qwen_attention_gate",
+                    static_cast<std::uint32_t>((elements + 255) / 256), 1,
+                    256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        1e-5f,
+    });
+
+    cases().push_back(Case{
+        "route_topk_sigmoid_bias",
+        [](std::vector<std::vector<float>>& outputs) {
+            // qwen4exp's 512x10 shape first, then small and edge shapes;
+            // with and without bias, normalized and raw, scaled and not.
+            // Selection is discrete and compared exactly like route_topk.
+            const int shapes[][2] = {{512, 10}, {256, 8}, {64, 1}, {32, 32}};
+            for (const auto& shape : shapes) {
+                for (int with_bias = 0; with_bias < 2; ++with_bias) {
+                    for (int normalize = 0; normalize < 2; ++normalize) {
+                        int experts = shape[0];
+                        int top_k = shape[1];
+                        auto logits = random_vector(experts, -6.0f, 6.0f);
+                        auto bias = random_vector(experts, -1.0f, 1.0f);
+                        std::vector<int> selected(top_k, -1);
+                        std::vector<float> weights(top_k, 0.0f);
+                        const float* logits_p = logits.data();
+                        const float* bias_p =
+                            with_bias ? bias.data() : nullptr;
+                        int* selected_p = selected.data();
+                        float* weights_p = weights.data();
+                        float weight_scale = 2.5f;
+                        void* arguments[] = {
+                            &logits_p, &bias_p, &selected_p, &weights_p,
+                            &experts, &top_k, &normalize, &weight_scale};
+                        flyweight_cpu_launch_named(
+                            "route_topk_sigmoid_bias", 1, 1, 256,
+                            static_cast<std::uint32_t>(2 * experts *
+                                                       sizeof(float)),
+                            0, arguments);
+                        std::vector<float> combined;
+                        for (int value : selected)
+                            combined.push_back(static_cast<float>(value));
+                        for (float value : weights) combined.push_back(value);
+                        outputs.push_back(std::move(combined));
+                    }
+                }
+            }
+        },
+        1e-5f,
+    });
+
+    cases().push_back(Case{
+        "route_topk_sigmoid_bias_rows",
+        [](std::vector<std::vector<float>>& outputs) {
+            const int shapes[][3] = {{512, 10, 5}, {64, 4, 1}, {32, 32, 3}};
+            for (const auto& shape : shapes) {
+                int experts = shape[0];
+                int top_k = shape[1];
+                int rows = shape[2];
+                auto logits = random_vector(
+                    static_cast<std::size_t>(rows) * experts, -6.0f, 6.0f);
+                auto bias = random_vector(experts, -1.0f, 1.0f);
+                std::vector<int> selected(
+                    static_cast<std::size_t>(rows) * top_k, -1);
+                std::vector<float> weights(
+                    static_cast<std::size_t>(rows) * top_k, 0.0f);
+                const float* logits_p = logits.data();
+                const float* bias_p = bias.data();
+                int* selected_p = selected.data();
+                float* weights_p = weights.data();
+                int normalize = 1;
+                float weight_scale = 1.0f;
+                void* arguments[] = {
+                    &logits_p, &bias_p, &selected_p, &weights_p, &rows,
+                    &experts, &top_k, &normalize, &weight_scale};
+                flyweight_cpu_launch_named(
+                    "route_topk_sigmoid_bias_rows", rows, 1, 256,
+                    static_cast<std::uint32_t>(2 * experts * sizeof(float)),
+                    0, arguments);
+                std::vector<float> combined;
+                for (int value : selected)
+                    combined.push_back(static_cast<float>(value));
+                for (float value : weights) combined.push_back(value);
+                outputs.push_back(std::move(combined));
+            }
+        },
+        1e-5f,
+    });
+
+    cases().push_back(Case{
+        "qwen_delta_recurrent_rows",
+        [](std::vector<std::vector<float>>& outputs) {
+            // Non-128 head dims: this kernel is the rows path the head_dim
+            // guard selects instead of the chunk twin. Both gate modes.
+            for (int head_dim : {32, 64}) {
+                for (int rows : {1, 9}) {
+                    for (int gate_sigmoid : {0, 1}) {
+                        int key_heads = 2, value_heads = 4;
+                        const int total_key = key_heads * head_dim;
+                        const std::size_t width =
+                            static_cast<std::size_t>(2 * total_key +
+                                                     value_heads * head_dim);
+                        auto convolved = random_vector(
+                            static_cast<std::size_t>(rows) * width, -1.0f,
+                            1.0f);
+                        auto gates = random_vector(
+                            static_cast<std::size_t>(rows) * value_heads *
+                                head_dim,
+                            -4.0f, 4.0f);
+                        auto beta_logits = random_vector(
+                            static_cast<std::size_t>(rows) * value_heads,
+                            -2.0f, 2.0f);
+                        auto decay_logits = random_vector(
+                            static_cast<std::size_t>(rows) * value_heads,
+                            -2.0f, 2.0f);
+                        auto decay_coefficients = random_vector(value_heads,
+                                                                -3.0f, -0.1f);
+                        auto dt_bias =
+                            random_vector(value_heads, -1.0f, 1.0f);
+                        auto norm_weights =
+                            random_vector(head_dim, 0.5f, 1.5f);
+                        std::vector<float> state(
+                            static_cast<std::size_t>(value_heads) * head_dim *
+                                head_dim,
+                            0.01f);
+                        std::vector<float> out(
+                            static_cast<std::size_t>(rows) * value_heads *
+                            head_dim, 0.0f);
+                        const float* convolved_p = convolved.data();
+                        const float* gates_p = gates.data();
+                        const float* beta_p = beta_logits.data();
+                        const float* decay_p = decay_logits.data();
+                        const float* coeff_p = decay_coefficients.data();
+                        const float* dt_p = dt_bias.data();
+                        const float* norm_p = norm_weights.data();
+                        float* state_p = state.data();
+                        float* out_p = out.data();
+                        float epsilon = 1e-6f;
+                        void* arguments[] = {
+                            &convolved_p, &gates_p, &beta_p, &decay_p,
+                            &coeff_p, &dt_p, &norm_p, &state_p, &out_p,
+                            &rows, &key_heads, &value_heads, &head_dim,
+                            &epsilon, &gate_sigmoid};
+                        flyweight_cpu_launch_named(
+                            "qwen_delta_recurrent_rows", value_heads, 1, 256,
+                            0, 0, arguments);
+                        outputs.push_back(std::move(out));
+                        outputs.push_back(std::move(state));
+                    }
+                }
+            }
+        },
+        1e-4f,
+    });
 }
 
 }  // namespace
