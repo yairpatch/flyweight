@@ -1281,7 +1281,7 @@ extern "C" int flyweight_gpu_compile(
              "iq4xs_q8_mmq_routed", "iq4nl_q8_mmq_routed",
              "iq2s_q8_mmq_routed", "iq1m_q8_mmq_routed",
              "q20_q8_mmq_routed",
-             "q3k_q8_mmq_routed", "q6k_q8_mmq_routed",
+             "q3k_q8_mmq_routed", "q6k_q8_mmq_routed", "q80_q8_mmq_routed",
              // The asymmetric K-quants, through the _MIN routed macro
              "q4k_q8_mmq_routed", "q5k_q8_mmq_routed",
              "q2k_q8_mmq_routed",

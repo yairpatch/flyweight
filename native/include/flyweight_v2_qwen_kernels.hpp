@@ -313,7 +313,12 @@ void quantize_q8_blocks_rows(
     }
     maximum = __shfl_sync(0xffffffff, maximum, 0);
     const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
-    if (lane == 0) scales[row * scale_stride + block32] = __float2half(scale);
+    // A 256-thread launch is eight warps, so a row narrower than 256 still
+    // has warps whose block32 is past the row. scale_stride is only two
+    // halves of padding; those stores land on the next row's scales and race
+    // with that row's own write.
+    if (lane == 0 && index < elements)
+        scales[row * scale_stride + block32] = __float2half(scale);
     if (index < elements) {
         const int quantized = max(-127, min(127, __float2int_rn(value / scale)));
         output[row * elements + index] = (signed char)quantized;
@@ -8261,19 +8266,24 @@ FLYWEIGHT_Q8_MMQ_ROUTED(q6k_q8_mmq_routed, q6k_q8_decode, 210, 8, 3)
 
 // Q8_0 against a Q8-blocked activation. A 34-byte block (fp16 d, 32 int8) is
 // only 2-byte aligned, so the weights are read from the 4-byte grid and
-// realigned with byte_perm: an even group starts two bytes into a word, an odd
-// group starts on one. Nine or eight 32-bit loads per 32 weights, against the
-// 34 byte loads plus 32 half loads of the per-element kernel that served
-// every Q8_0 dense tensor before -- the LM head an NVFP4 build requantizes to
-// Q8_0 among them. The 272-byte stride is eight blocks: the macros address
-// rows in 256-value super-blocks, and a row of 256k values starts 16-byte
-// aligned, which is what makes the word grid legal.
+// realigned with byte_perm: a 4-byte-aligned block starts two bytes into a
+// word, a 2-mod-4 block starts on one. Nine or eight 32-bit loads per 32
+// weights, against the 34 byte loads plus 32 half loads of the per-element
+// kernel that served every Q8_0 dense tensor before -- the LM head an NVFP4
+// build requantizes to Q8_0 among them.
+//
+// The dense stride is 272 (eight blocks), so a row of 256k values starts
+// 16-byte aligned and group parity matches the address. The routed kernel's
+// stride is one block, 34, so row r starts 2-mod-4 whenever r and the block
+// count are both odd (and whenever the expert pointer itself is 2-mod-4).
+// Keying the load off group parity then reads the neighboring word. The
+// address bit is the same test on an aligned row and the right one otherwise.
 __device__ __forceinline__ void q80_q8_decode(
     const unsigned char* row_data, const int linear_group,
     int* words, float* scale_low, float* scale_high) {
-    const unsigned char* base = row_data + linear_group * 34;
+    const unsigned char* base = row_data + (long long)linear_group * 34;
     unsigned int scale_bits;
-    if ((linear_group & 1) == 0) {
+    if (((uintptr_t)base & 2) == 0) {
         const unsigned int* stream = (const unsigned int*)base;
         unsigned int prev = stream[0];
         scale_bits = prev & 0xffffu;
@@ -8284,8 +8294,14 @@ __device__ __forceinline__ void q80_q8_decode(
             prev = next;
         }
     } else {
+        // The scale is the two bytes at base; the 32 weights at base+2 are
+        // 4-byte aligned. Reading them as stream[-1] would pull two bytes
+        // from before this block, which is outside the expert when the
+        // pointer itself is only 2-mod-4.
+        unsigned short scale_half = 0;
+        memcpy(&scale_half, base, sizeof(scale_half));
+        scale_bits = scale_half;
         const unsigned int* stream = (const unsigned int*)(base + 2);
-        scale_bits = stream[-1] >> 16;
         #pragma unroll
         for (int quad = 0; quad < 8; ++quad) words[quad] = (int)stream[quad];
     }
@@ -8326,6 +8342,10 @@ FLYWEIGHT_Q8_LM_HEAD(q80_q8_lm_head_argmax_warp, q80_q8_group, 272)
 FLYWEIGHT_Q8_MATVEC_ROWS(q80_q8_matvec_transposed_rows, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MATMUL_TILED(q80_q8_matmul_tiled, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MMQ_ONE(q80_q8_mmq, q80_q8_decode, 272)
+// Flat 32-element blocks, same (5, 0) shape as IQ4_NL. Stride 34 is not a
+// multiple of 4; q80_q8_decode keys its word loads off the address so a row
+// that starts 2-mod-4 still decodes the block it was handed.
+FLYWEIGHT_Q8_MMQ_ROUTED(q80_q8_mmq_routed, q80_q8_decode, 34, 5, 0)
 
 
 // Decode one complete 256-value Q6_K super-block per warp.  The scalar helper

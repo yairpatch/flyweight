@@ -144,6 +144,10 @@ const Format kQ3k{110, fill_scales_at<110, 108, 108>, qwen_q3k_value};
 const Format kQ20{
     kQ20BlockBytes, fill_leading_scale<kQ20BlockBytes>, qwen_q2_0_value,
     kQ20BlockElements};
+// Q8_0 is a flat 32-element block (f16 scale, then 32 int8s), same shape the
+// routed kernel addresses with (block_shift, group_shift) = (5, 0).
+const Format kQ80{
+    kQ8BlockSize, fill_leading_scale<kQ8BlockSize>, qwen_q8_value, 32};
 
 // The kernel accumulates a row in f32 in a tree; the reference here does it in
 // double, elementwise, through the other decoder. The error that separates them
@@ -534,9 +538,10 @@ int check_tiled(const char* kernel, const Format& format,
 // over the padded buffer unconditionally, so a stale value there is a wrong
 // answer for some real token, not merely wasted work.
 int check_routed_mmq(const char* kernel, const Format& format,
-                     std::uint32_t threads) {
+                     std::uint32_t threads, int input_size = 512,
+                     std::size_t align_pad = 0) {
     std::mt19937 rng(20260828);
-    const int input_size = 512, output_size = 9;
+    const int output_size = 9;
     const int rows = 7, top_k = 3, experts = 4;
     const int routes = rows * top_k;
     const int scale_stride = input_size / 32;
@@ -544,8 +549,14 @@ int check_routed_mmq(const char* kernel, const Format& format,
         static_cast<std::size_t>(input_size) / format.block_elements *
         output_size * format.block_bytes;
 
-    std::vector<std::uint8_t> weights(matrix_bytes * experts);
-    format.fill(rng, weights);
+    // align_pad shifts the expert base off a 4-byte boundary. Q8_0's 34-byte
+    // block is only 2-aligned, and a routed row can start 2-mod-4; the decode
+    // has to follow the address, not group parity.
+    std::vector<std::uint8_t> stored(matrix_bytes * experts);
+    format.fill(rng, stored);
+    std::vector<std::uint8_t> weights(align_pad + stored.size());
+    std::memcpy(weights.data() + align_pad, stored.data(), stored.size());
+    const std::uint8_t* weight_base = weights.data() + align_pad;
     const auto activations = quantize_rows(rng, input_size, rows);
     std::vector<std::int32_t> selected(static_cast<std::size_t>(routes));
     std::uniform_int_distribution<int> pick(0, experts - 1);
@@ -559,7 +570,7 @@ int check_routed_mmq(const char* kernel, const Format& format,
         static_cast<std::size_t>(experts));
     for (int expert = 0; expert < experts; ++expert)
         expert_ptrs[expert] = reinterpret_cast<unsigned long long>(
-            weights.data() + static_cast<std::size_t>(expert) * matrix_bytes);
+            weight_base + static_cast<std::size_t>(expert) * matrix_bytes);
 
     std::vector<float> output(
         static_cast<std::size_t>(aligned.padded_total) * output_size, -1.0f);
@@ -598,7 +609,7 @@ int check_routed_mmq(const char* kernel, const Format& format,
                     continue;
                 }
                 const std::uint8_t* base =
-                    weights.data() + static_cast<std::size_t>(expert) * matrix_bytes +
+                    weight_base + static_cast<std::size_t>(expert) * matrix_bytes +
                     static_cast<std::size_t>(out) *
                         (input_size / format.block_elements) * format.block_bytes;
                 // Not reference_row: that one indexes rows from the start of
@@ -1110,6 +1121,10 @@ int main() {
     // super-block (8, 3) every other format above takes, which is the whole
     // reason the expert down projection can reach this kernel at all.
     failures += check_routed_mmq("iq4nl_q8_mmq_routed", kIq4nl, kMmqThreads);
+    // Q8_0 is the other flat 32-wide block. 544 values is 17 blocks, so odd
+    // rows start 2-mod-4, and the 2-byte pad makes the expert base itself
+    // 2-mod-4: both are the alignments group parity gets wrong.
+    failures += check_routed_mmq("q80_q8_mmq_routed", kQ80, kMmqThreads, 544, 2);
     // Q2_0 is the other flat-block down type on GSQ-RCO: 64-wide blocks,
     // (6, 1) shifts, same 18-byte stride as IQ4_NL. 512 in this fixture is
     // eight blocks; qwen4exp's 640-wide downs are ten.
