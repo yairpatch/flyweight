@@ -356,9 +356,9 @@ class BackendSelectionTests(unittest.TestCase):
         # and an allocation belongs to the backend that was active for it.
         self.assertEqual(order, ["select:cpu", "load"])
 
-    def test_serve_selects_backend_before_loading_and_passes_k8v4(self) -> None:
+    def test_serve_selects_backend_before_loading_and_passes_kv_dtype(self) -> None:
         args = _parser().parse_args([
-            "serve", "model.gguf", "--backend", "cpu", "--kv-dtype", "k8v4"
+            "serve", "model.gguf", "--backend", "cpu", "--kv-dtype", "q8_0"
         ])
         service = MagicMock()
         order: list[str] = []
@@ -382,7 +382,7 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(order, ["select:cpu", "load"])
         self.assertEqual(captured_kwargs.get("cache_type_k"), "q8_0")
-        self.assertEqual(captured_kwargs.get("cache_type_v"), "turbo4")
+        self.assertEqual(captured_kwargs.get("cache_type_v"), "q8_0")
         mock_serve_http.assert_called_once_with(args, service)
 
 
