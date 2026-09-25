@@ -668,6 +668,79 @@ void qwen_u8_gemm_k32_vnni512(
 }
 
 // ---------------------------------------------------------------------------
+// IQ3_S direct-from-packed fold for the shared int16 rows path.
+//
+// The float weight is d * (1 + 2s) * grid * sign with a 4-bit group scale s
+// and odd grid magnitudes to 15: the (1+2s) * magnitude product reaches
+// 15 * 15 = 225, past int8, so the int8 fold cannot take it -- but int16
+// holds it exactly, and the product feeds qwen_i16_gemm_k256_vnni512
+// against the same 14-bit activations the via-float fold uses. Everything
+// below is exact integer arithmetic over the packed codes; it skips the
+// float dequant the i16 path folds from, which was the largest single cost
+// of a chunk on IQ3_S gate/up stacks.
+// ---------------------------------------------------------------------------
+
+void qwen_iq3s_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m512i high_bit = _mm512_set1_epi32(256);
+    const __m512i zero = _mm512_setzero_si512();
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq3sBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq3sBlockBytes;
+            const auto* quants = base + 2;
+            const auto* high = base + 66;
+            const auto* signs = base + 74;
+            scales[static_cast<std::size_t>(r) * blocks + block] = half_value(base);
+            for (int gather = 0; gather < 4; ++gather) {
+                // Sixteen grid indices: the qs byte plus bit 8 from the
+                // matching qh bit, in the same order the scalar dot reads.
+                std::uint16_t high_mask = 0;
+                std::memcpy(&high_mask, high + gather * 2, sizeof(high_mask));
+                const __m512i index = _mm512_or_si512(
+                    _mm512_cvtepu8_epi32(_mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(quants + gather * 16))),
+                    _mm512_maskz_mov_epi32(static_cast<__mmask16>(high_mask), high_bit));
+                const __m512i gathered = _mm512_i32gather_epi32(
+                    index, static_cast<const void*>(kIq3sGrid), 4);
+                // 64 magnitudes as two vectors of 32 words; the two 32-value
+                // groups of this gather take the low and high nibble of the
+                // gather's scale byte as (1 + 2 * nibble).
+                const __m512i mag_lo = _mm512_cvtepu8_epi16(
+                    _mm512_castsi512_si256(gathered));
+                const __m512i mag_hi = _mm512_cvtepu8_epi16(
+                    _mm512_extracti64x4_epi64(gathered, 1));
+                std::uint8_t packed_scales = 0;
+                std::memcpy(&packed_scales, base + 106 + gather, sizeof(packed_scales));
+                const __m512i folded_lo = _mm512_mullo_epi16(
+                    mag_lo, _mm512_set1_epi16(static_cast<short>(
+                        1 + 2 * (packed_scales & 15))));
+                const __m512i folded_hi = _mm512_mullo_epi16(
+                    mag_hi, _mm512_set1_epi16(static_cast<short>(
+                        1 + 2 * ((packed_scales >> 4) & 15))));
+                // One sign bit per value: negate the folded weight where set.
+                std::uint64_t sign_mask = 0;
+                std::memcpy(&sign_mask, signs + gather * 8, sizeof(sign_mask));
+                const __m512i signed_lo = _mm512_mask_sub_epi16(
+                    folded_lo, static_cast<__mmask32>(sign_mask), zero, folded_lo);
+                const __m512i signed_hi = _mm512_mask_sub_epi16(
+                    folded_hi, static_cast<__mmask32>(sign_mask >> 32), zero, folded_hi);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64), signed_lo);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64 + 32), signed_hi);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // int16 rows path for the prefill expert sweep: exact weights, 14-bit
 // activations, dpwssd.
 //

@@ -228,6 +228,11 @@ void qwen_iq1s_dequant_row_vnni512(
 // correction as a 16-lane accumulator seed per 64 values), activations are
 // unsigned-8 (q+128) with per-256 or per-32 scales, and each (row, token)
 // dot is dpbusd over the folded bytes. out is rows x count, row-major.
+//
+// IQ3_S takes the same shape with 16-bit folded weights: the group scale
+// times the grid magnitude reaches (1+2*7)*15 = 225, past int8, but the
+// folded product is still exact in int16 and feeds the shared int16 GEMM
+// against the same 14-bit activations the via-float fold uses.
 void qwen_iq1s_fold_rows_vnni512(
     const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
     std::int8_t* weights, float* scales, std::int32_t* corrections, float* deltas);
@@ -247,6 +252,14 @@ void qwen_u8_gemm_k32_vnni512(
     const std::int8_t* weights, const float* pair_scales, const std::int32_t* pair_init, int rows,
     const std::uint8_t* const* activations, const float* const* activation_pair_scales, int count,
     int elements, float* out);
+// IQ3_S direct-from-packed fold for the shared int16 rows path: recovers the
+// exact (1+2s) * grid * sign integer (at most 225) per value with the block's
+// float d as its scale, feeding qwen_i16_gemm_k256_vnni512 against the same
+// 14-bit activations the via-float fold uses. Skips the float dequant the
+// i16 path folds from.
+void qwen_iq3s_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
 
 // int16 rows path (AVX512-VNNI, dpwssd): weights are the codebook's integer
 // codes recovered exactly from the float decode (one float scale per 256),
