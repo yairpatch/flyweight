@@ -100,6 +100,10 @@ int main() {
            "IQ4_XS rows gate changed; update the admission note");
     expect(v2::qwen_format(29)->cpu_expert == true, 29,
            "IQ1_M CPU expert support changed; update the admission note");
+    expect(v2::qwen_format(19)->lm_head_argmax != nullptr, 19,
+           "IQ1_S LM-head kernel dropped");
+    expect(v2::qwen_format(19)->embedding != nullptr, 19,
+           "IQ1_S embedding kernel dropped");
 
     if (failures) {
         std::fprintf(stderr, "format dispatch contract: %d failure(s)\n",

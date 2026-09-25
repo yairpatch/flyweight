@@ -221,6 +221,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
+     .lm_head_argmax = "iq1s_lm_head_argmax_warp",
+     .lm_head_argmax_q8 = "iq1s_q8_lm_head_argmax_warp",
+     .embedding = "qwen_iq1s_embedding",
+     .embedding_rows = "qwen_iq1s_embedding_rows",
      .grouped_expert_prefix = "iq1s", .cpu_expert = true},
     // IQ3_S carried a routed-expert decode but no dense Q8 group kernels, so
     // every IQ3_S dense projection ran the per-element float matvec: 93 GB/s

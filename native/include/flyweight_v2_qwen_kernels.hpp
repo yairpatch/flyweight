@@ -6738,6 +6738,7 @@ __device__ __forceinline__ float iq1s_q8_group(
 }
 
 FLYWEIGHT_Q8_MATVEC(iq1s_q8_matvec_transposed_warp, iq1s_q8_group, 50)
+FLYWEIGHT_Q8_LM_HEAD(iq1s_q8_lm_head_argmax_warp, iq1s_q8_group, 50)
 
 // Batched twin of iq1s_q8_group. A group of 32 is one scale, so both halves of
 // the Q8 block get it.
@@ -8418,6 +8419,7 @@ FLYWEIGHT_LM_HEAD_ARGMAX(iq2s_lm_head_argmax_warp, iq2s_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq3s_lm_head_argmax_warp, iq3s_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq2xs_lm_head_argmax_warp, iq2xs_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq4xs_lm_head_argmax_warp, iq4xs_value)
+FLYWEIGHT_LM_HEAD_ARGMAX(iq1s_lm_head_argmax_warp, iq1s_value)
 
 #undef FLYWEIGHT_LM_HEAD_ARGMAX
 
