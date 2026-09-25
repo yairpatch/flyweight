@@ -1073,7 +1073,10 @@ float iq4nl_dot(const std::uint8_t* row_data, const float* input, int elements) 
 // high bits from the group's qh halfword. The delta rides the accumulator as
 // `delta * sum(values)`, so the octet path stays a plain int8 expand + FMA.
 float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
-    float result = 0.0f;
+    // One accumulator for the whole row. Reducing every group of 32 paid two
+    // horizontal sums for a scale and a delta that are constant across those
+    // 32 weights; folding both into the FMA leaves a single reduction.
+    __m256 accumulator = _mm256_setzero_ps();
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
         const float d = half_value(base);
@@ -1084,9 +1087,9 @@ float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
             const float scale =
                 d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
             const float delta = (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+            const __m256 scale_v = _mm256_set1_ps(scale);
+            const __m256 delta_v = _mm256_set1_ps(scale * delta);
             const float* values = vector + group * 32;
-            __m256 weighted = _mm256_setzero_ps();
-            __m256 plain = _mm256_setzero_ps();
             for (int part = 0; part < 4; ++part) {
                 const std::uint32_t index =
                     static_cast<std::uint32_t>(base[2 + group * 4 + part]) |
@@ -1097,14 +1100,13 @@ float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
                     _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
                         static_cast<long long>(grid))));
                 const __m256 loaded = _mm256_loadu_ps(values + part * 8);
-                weighted = _mm256_fmadd_ps(magnitudes, loaded, weighted);
-                plain = _mm256_add_ps(plain, loaded);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, scale_v), loaded, accumulator);
+                accumulator = _mm256_fmadd_ps(delta_v, loaded, accumulator);
             }
-            result += scale *
-                (horizontal_sum(weighted) + delta * horizontal_sum(plain));
         }
     }
-    return result;
+    return horizontal_sum(accumulator);
 }
 
 // IQ1_M: the same 2048-entry grid and +-0.125 delta as IQ1_S, one octet per

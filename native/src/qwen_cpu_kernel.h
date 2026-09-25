@@ -187,6 +187,19 @@ float qwen_iq1s_dot_q8_k_vnni512(
     std::uint64_t row
 );
 
+// Up to four consecutive IQ1_S rows against one Q8_K activation. The
+// activation is loaded once per super-block and applied to every row, so a
+// decode that walks an expert's rows does not reload it. `row_count` is 1..4.
+// Each row matches `qwen_iq1s_dot_q8_k_vnni512`.
+void qwen_iq1s_dot_q8_k_vnni512_rows(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t first_row,
+    int row_count,
+    float* outputs
+);
+
 // The same IQ1_S x Q8_K dot on AVX-VNNI (VEX, 256-bit), for parts without
 // AVX-512: one dpbusd per 32-value group. Requires AVX-VNNI (feature bit 2).
 float qwen_iq1s_dot_q8_k_avx_vnni(

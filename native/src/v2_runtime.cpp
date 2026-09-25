@@ -4437,9 +4437,15 @@ void qwen_quant_dot_rows(
     const std::uint8_t* packed, std::uint32_t type, const float* input,
     int elements, std::uint64_t first_row, int row_count, float* outputs
 ) {
+    const auto features = flyweight_cpu_features();
+    if (type == 20 && (features & 2u) != 0 && elements % 32 == 0
+        && row_count >= 1 && row_count <= 4 && qwen_iq_avx512_enabled()) {
+        qwen_quant_dot_rows_avx512(
+            packed, type, input, elements, first_row, row_count, outputs);
+        return;
+    }
     if (type == 12 && elements % kBlockElements == 0
         && row_count >= 1 && row_count <= 4) {
-        const auto features = flyweight_cpu_features();
         if ((features & 2u) != 0) {
             qwen_quant_dot_rows_avx512(
                 packed, type, input, elements, first_row, row_count, outputs);
@@ -6956,6 +6962,36 @@ void qwen_cpu_moe(
 #pragma omp for schedule(static)
 #endif
                 for (int row = 0; row < hidden; row += 4) down_tile(row);
+            } else if (iq1s_q8 && gate_type == 19 && (cpu_features & 8u) != 0) {
+                // Four gate/up rows share one load of the Q8 activation, and
+                // four down rows share one load of the activated vector.
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+                for (int task = 0;
+                     task < routed_count * ((intermediate + 3) / 4); ++task) {
+                    constexpr int tile_rows = 4;
+                    const int tiles_per_expert = (intermediate + tile_rows - 1) / tile_rows;
+                    const int rank = task / tiles_per_expert;
+                    const int first_row = (task % tiles_per_expert) * tile_rows;
+                    const int count = std::min(tile_rows, intermediate - first_row);
+                    float gate_values[tile_rows]{}, up_values[tile_rows]{};
+                    qwen_iq1s_dot_q8_k_vnni512_rows(
+                        gate[rank], input_q8_data, hidden, first_row, count, gate_values);
+                    qwen_iq1s_dot_q8_k_vnni512_rows(
+                        up[rank], input_q8_data, hidden, first_row, count, up_values);
+                    for (int lane = 0; lane < count; ++lane) {
+                        const float gate_value = gate_values[lane] * gate_scale[rank];
+                        const float up_value = up_values[lane] * up_scale[rank];
+                        const float clipped = std::max(-80.0f, std::min(80.0f, gate_value));
+                        activated[rank * intermediate + first_row + lane] =
+                            gate_value / (1.0f + std::exp(-clipped)) * up_value;
+                    }
+                }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+                for (int row = 0; row < hidden; row += 4) down_tile(row);
             } else {
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
@@ -6965,7 +7001,7 @@ void qwen_cpu_moe(
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-                for (int row = 0; row < hidden; ++row) down_row(row);
+                for (int row = 0; row < hidden; row += 4) down_tile(row);
             }
         }
     }

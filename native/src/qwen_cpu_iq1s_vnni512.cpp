@@ -164,56 +164,80 @@ float qwen_iq1s_dot_q8_k_vnni512(
     int elements,
     std::uint64_t row
 ) {
+    float output = 0.0f;
+    qwen_iq1s_dot_q8_k_vnni512_rows(packed, input, elements, row, 1, &output);
+    return output;
+}
+
+void qwen_iq1s_dot_q8_k_vnni512_rows(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t first_row,
+    int row_count,
+    float* outputs
+) {
     const int blocks = elements / 256;
-    const auto* row_data =
-        packed + row * static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
+    const auto row_bytes =
+        static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
+    const auto* first =
+        packed + first_row * row_bytes;
     const __m512i one = _mm512_set1_epi8(1);
     const __m256i plus_delta = _mm256_castps_si256(_mm256_set1_ps(kIq1sDelta - 1.0f));
     const __m256i minus_delta = _mm256_castps_si256(_mm256_set1_ps(-kIq1sDelta - 1.0f));
-    float result = 0.0f;
+    const __m256i sum_ones = _mm256_set1_epi16(1);
+    float result[4] = {};
     for (int block = 0; block < blocks; ++block) {
-        const auto* base = row_data + block * kIq1sBlockBytes;
         const auto& q8 = input[block];
-        __m256i index_octets[4];
-        __m128i qh;
-        iq1s_block_indices(base, index_octets, qh);
-        // Per-group scale 2*s+1 from qh bits 12-14, as eight dwords.
-        const __m256i qh32 = _mm256_cvtepu16_epi32(qh);
-        const __m256i scales = _mm256_add_epi32(
-            _mm256_slli_epi32(
-                _mm256_and_si256(_mm256_srli_epi32(qh32, 12), _mm256_set1_epi32(7)), 1),
-            _mm256_set1_epi32(1));
-        const __m512i scales512 = _mm512_castsi256_si512(scales);
-        __m512i accumulator = _mm512_setzero_si512();
-        for (int pair = 0; pair < 4; ++pair) {
-            const __m512i octets = _mm512_i32gather_epi64(
-                index_octets[pair], static_cast<const void*>(kIq1sGrid), 8);
-            const __m512i lifted = _mm512_add_epi8(octets, one);
-            const __m512i activation = _mm512_loadu_si512(
+        __m512i activation[4];
+        for (int pair = 0; pair < 4; ++pair)
+            activation[pair] = _mm512_loadu_si512(
                 static_cast<const void*>(q8.values + pair * 64));
-            const __m512i dots = _mm512_dpbusd_epi32(_mm512_setzero_si512(), lifted, activation);
-            accumulator = _mm512_add_epi32(
-                accumulator,
-                _mm512_mullo_epi32(dots, _mm512_permutexvar_epi32(scale_lane_select(pair), scales512)));
-        }
-        // The lift and the delta both ride the group's activation sum:
-        // sum((w + 1) x) - sum(x) + delta * sum(x) = sum(w x) + delta * sum(x).
         const __m256i sums16 =
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8.sums));
-        const __m256i group_sums = _mm256_madd_epi16(sums16, _mm256_set1_epi16(1));
-        const __m256 scaled_sums =
-            _mm256_cvtepi32_ps(_mm256_mullo_epi32(scales, group_sums));
-        const __m256i negative = _mm256_srai_epi32(_mm256_slli_epi32(qh32, 16), 31);
-        const __m256 delta_less_one = _mm256_castsi256_ps(
-            _mm256_blendv_epi8(plus_delta, minus_delta, negative));
-        const __m256 side = _mm256_mul_ps(scaled_sums, delta_less_one);
-        __m128 side4 = _mm_add_ps(_mm256_castps256_ps128(side), _mm256_extractf128_ps(side, 1));
-        side4 = _mm_hadd_ps(side4, side4);
-        side4 = _mm_hadd_ps(side4, side4);
-        result += half_value(base) * q8.scale *
-            (static_cast<float>(_mm512_reduce_add_epi32(accumulator)) + _mm_cvtss_f32(side4));
+        const __m256i group_sums = _mm256_madd_epi16(sums16, sum_ones);
+        for (int row = 0; row < row_count; ++row) {
+            const auto* base = first + row * row_bytes + block * kIq1sBlockBytes;
+            __m256i index_octets[4];
+            __m128i qh;
+            iq1s_block_indices(base, index_octets, qh);
+            // Per-group scale 2*s+1 from qh bits 12-14, as eight dwords.
+            const __m256i qh32 = _mm256_cvtepu16_epi32(qh);
+            const __m256i scales = _mm256_add_epi32(
+                _mm256_slli_epi32(
+                    _mm256_and_si256(_mm256_srli_epi32(qh32, 12), _mm256_set1_epi32(7)), 1),
+                _mm256_set1_epi32(1));
+            const __m512i scales512 = _mm512_castsi256_si512(scales);
+            __m512i accumulator = _mm512_setzero_si512();
+            for (int pair = 0; pair < 4; ++pair) {
+                const __m512i octets = _mm512_i32gather_epi64(
+                    index_octets[pair], static_cast<const void*>(kIq1sGrid), 8);
+                const __m512i lifted = _mm512_add_epi8(octets, one);
+                const __m512i dots = _mm512_dpbusd_epi32(
+                    _mm512_setzero_si512(), lifted, activation[pair]);
+                accumulator = _mm512_add_epi32(
+                    accumulator,
+                    _mm512_mullo_epi32(
+                        dots, _mm512_permutexvar_epi32(scale_lane_select(pair), scales512)));
+            }
+            // The lift and the delta both ride the group's activation sum:
+            // sum((w + 1) x) - sum(x) + delta * sum(x) = sum(w x) + delta * sum(x).
+            const __m256 scaled_sums =
+                _mm256_cvtepi32_ps(_mm256_mullo_epi32(scales, group_sums));
+            const __m256i negative = _mm256_srai_epi32(_mm256_slli_epi32(qh32, 16), 31);
+            const __m256 delta_less_one = _mm256_castsi256_ps(
+                _mm256_blendv_epi8(plus_delta, minus_delta, negative));
+            const __m256 side = _mm256_mul_ps(scaled_sums, delta_less_one);
+            __m128 side4 = _mm_add_ps(
+                _mm256_castps256_ps128(side), _mm256_extractf128_ps(side, 1));
+            side4 = _mm_hadd_ps(side4, side4);
+            side4 = _mm_hadd_ps(side4, side4);
+            result[row] += half_value(base) * q8.scale *
+                (static_cast<float>(_mm512_reduce_add_epi32(accumulator)) +
+                 _mm_cvtss_f32(side4));
+        }
     }
-    return result;
+    for (int row = 0; row < row_count; ++row) outputs[row] = result[row];
 }
 
 // dpbusd over 64 values yields 16 dwords, one per grid entry: lanes 0-7 are
