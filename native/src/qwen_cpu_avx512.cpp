@@ -724,6 +724,43 @@ float iq4nl_dot(const std::uint8_t* row_data, const float* input, int elements) 
     return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
 }
 
+// Four consecutive IQ4_NL rows share one pass over the activation. Each row
+// keeps the same two accumulators as iq4nl_dot, so a row matches that kernel.
+template <int kRows>
+void iq4nl_dot_rows(const std::uint8_t* first, std::uint64_t row_bytes,
+                    const float* input, int elements, float* outputs) {
+    __m512 sum0[kRows], sum1[kRows];
+    for (int row = 0; row < kRows; ++row) {
+        sum0[row] = _mm512_setzero_ps();
+        sum1[row] = _mm512_setzero_ps();
+    }
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    for (int block = 0; block < elements / 32; ++block) {
+        const __m512 in0 = _mm512_loadu_ps(input + block * 32);
+        const __m512 in1 = _mm512_loadu_ps(input + block * 32 + 16);
+        for (int row = 0; row < kRows; ++row) {
+            const auto* base = first + row * row_bytes + block * kIq4nlBlockBytes;
+            const __m512 scale = _mm512_set1_ps(half_value(base));
+            const __m128i bytes = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(base + 2));
+            const __m128i low =
+                _mm_shuffle_epi8(levels, _mm_and_si128(bytes, nibble_mask));
+            const __m128i high = _mm_shuffle_epi8(
+                levels, _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask));
+            sum0[row] = _mm512_fmadd_ps(
+                _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low)), scale),
+                in0, sum0[row]);
+            sum1[row] = _mm512_fmadd_ps(
+                _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high)), scale),
+                in1, sum1[row]);
+        }
+    }
+    for (int row = 0; row < kRows; ++row)
+        outputs[row] = _mm512_reduce_add_ps(_mm512_add_ps(sum0[row], sum1[row]));
+}
+
 void q5_dot_pair(const std::uint8_t* row_data,const float*first,const float*second,int elements,float&out_first,float&out_second){
     __m512 a0=_mm512_setzero_ps(),a1=_mm512_setzero_ps(),b0=_mm512_setzero_ps(),b1=_mm512_setzero_ps();
     const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
@@ -1343,7 +1380,24 @@ void qwen_quant_dot_rows_avx512(
     const std::uint8_t* packed, std::uint32_t type, const float* input,
     int elements, std::uint64_t first_row, int row_count, float* outputs
 ) {
-    if (type != 12 || row_count < 1 || row_count > 4) {
+    if (row_count < 1 || row_count > 4) {
+        for (int row = 0; row < row_count; ++row)
+            outputs[row] = qwen_quant_dot_avx512(
+                packed, type, input, elements, first_row + row);
+        return;
+    }
+    if (type == 20 && elements % 32 == 0) {
+        const auto row_bytes = static_cast<std::uint64_t>(elements / 32) * kIq4nlBlockBytes;
+        const auto* first = packed + first_row * row_bytes;
+        switch (row_count) {
+            case 1: iq4nl_dot_rows<1>(first, row_bytes, input, elements, outputs); break;
+            case 2: iq4nl_dot_rows<2>(first, row_bytes, input, elements, outputs); break;
+            case 3: iq4nl_dot_rows<3>(first, row_bytes, input, elements, outputs); break;
+            case 4: iq4nl_dot_rows<4>(first, row_bytes, input, elements, outputs); break;
+        }
+        return;
+    }
+    if (type != 12) {
         for (int row = 0; row < row_count; ++row)
             outputs[row] = qwen_quant_dot_avx512(
                 packed, type, input, elements, first_row + row);

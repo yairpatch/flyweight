@@ -141,6 +141,9 @@ const Format kQ5k{176, fill_scales_at<176, 0, 2>, qwen_q5_value};
 const Format kQ6k{210, fill_scales_at<210, 208, 208>, qwen_q6_value};
 const Format kQ2k{84, fill_scales_at<84, 80, 82>, qwen_q2k_value};
 const Format kQ3k{110, fill_scales_at<110, 108, 108>, qwen_q3k_value};
+const Format kQ20{
+    kQ20BlockBytes, fill_leading_scale<kQ20BlockBytes>, qwen_q2_0_value,
+    kQ20BlockElements};
 
 // The kernel accumulates a row in f32 in a tree; the reference here does it in
 // double, elementwise, through the other decoder. The error that separates them
@@ -1107,6 +1110,10 @@ int main() {
     // super-block (8, 3) every other format above takes, which is the whole
     // reason the expert down projection can reach this kernel at all.
     failures += check_routed_mmq("iq4nl_q8_mmq_routed", kIq4nl, kMmqThreads);
+    // Q2_0 is the other flat-block down type on GSQ-RCO: 64-wide blocks,
+    // (6, 1) shifts, same 18-byte stride as IQ4_NL. 512 in this fixture is
+    // eight blocks; qwen4exp's 640-wide downs are ten.
+    failures += check_routed_mmq("q20_q8_mmq_routed", kQ20, kMmqThreads);
     failures += check_routed_mmq("iq2s_q8_mmq_routed", kIq2s, kMmqThreads);
     failures += check_routed_mmq("iq1m_q8_mmq_routed", kIq1m, kMmqThreads);
     failures += check_routed_mmq("q3k_q8_mmq_routed", kQ3k, kMmqThreads);

@@ -10,8 +10,7 @@
 // The point is not the lookup -- it is that a new format becomes one row here
 // plus its kernels, and that a *missing* kernel is a visible null instead of a
 // silent fall-through to a slower or wrong path. Two such drifts were found
-// while building this table and are preserved as-is (they are behavior, and
-// changing behavior is a separate, measured commit):
+// while building this table; both are now admitted:
 //
 //   - IQ4_XS (23) has a Q8-activation warp matvec, a tiled kernel and an MMQ
 //     kernel, but the rows forward's admission gate never listed it, so its
@@ -19,8 +18,10 @@
 //     block -- a full weight read per 4-row group where MMQ covers 128 tokens.
 //     Admitted 2026-08-26 after measuring on the 27B dense checkpoint, whose
 //     16 attn_v projections (and the whole MTP draft layer) carry this type.
-//   - IQ1_M (29) is absent from the CPU expert set even though the CPU dot
-//     decodes IQ1_S; `cpu_expert` records it.
+//   - IQ1_M (29) was absent from the CPU expert set even though
+//     `qwen_iq1m_dot_row` already decoded it. `unsupported_quant_types()`
+//     therefore listed every IQ1_M tensor as unusable. Admitted 2026-09-25.
+//     AVX2 covers the row dot and the row dequant; there is no AVX-512 twin.
 //
 // Names must match the kernels registered with flyweight_gpu_launch_named; a
 // Python source-scan test cross-checks every literal below against the kernel
@@ -220,6 +221,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
+     .lm_head_argmax = "iq1s_lm_head_argmax_warp",
+     .lm_head_argmax_q8 = "iq1s_q8_lm_head_argmax_warp",
+     .embedding = "qwen_iq1s_embedding",
+     .embedding_rows = "qwen_iq1s_embedding_rows",
      .grouped_expert_prefix = "iq1s", .cpu_expert = true},
     // IQ3_S carried a routed-expert decode but no dense Q8 group kernels, so
     // every IQ3_S dense projection ran the per-element float matvec: 93 GB/s
@@ -280,8 +285,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1m_q8_matmul_tiled", .matmul_q8_mmq = "iq1m_q8_mmq",
      .matmul_rows = "iq1m_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     // No CPU expert dot today; see the file comment.
-     .cpu_expert = false},
+     // AVX2 row dot and dequant; no grouped octet decoder, so
+     // decode-shaped GPU experts stay on the CPU. Prefill can take
+     // `iq1m_q8_mmq_routed`.
+     .cpu_expert = true},
     {.type = 30, .family = "bf16",
      .matmul_rows = "bf16_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::per_token,
@@ -294,9 +301,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     {.type = 39, .family = "mxfp4", .cpu_expert = true},
     // Q2_0 (ggml type 42, 2026-09): f16 scale + 64 two-bit codes per 18-byte
     // block. ISTA DASLab's GSQ-RCO qwen4exp builds put ffn_down_exps in it on
-    // 30 layers and ffn_down_shexp on 8. Routed experts: the grouped family
-    // and the rows matmul (prefill streaming). Dense: no decode matvec, so
-    // prepare requantizes a static Q2_0 tensor to Q8_0.
+    // 30 layers and ffn_down_shexp on 8. Routed experts: the grouped family,
+    // the rows matmul, and q20_q8_mmq_routed (64-wide unit, so 640-wide downs
+    // divide). Dense: no decode matvec, so prepare requantizes a static Q2_0
+    // tensor to Q8_0.
     {.type = 42, .family = "q20",
      .matmul_rows = "q20_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,

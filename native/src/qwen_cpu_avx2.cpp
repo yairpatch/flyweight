@@ -1073,7 +1073,10 @@ float iq4nl_dot(const std::uint8_t* row_data, const float* input, int elements) 
 // high bits from the group's qh halfword. The delta rides the accumulator as
 // `delta * sum(values)`, so the octet path stays a plain int8 expand + FMA.
 float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
-    float result = 0.0f;
+    // One accumulator for the whole row. Reducing every group of 32 paid two
+    // horizontal sums for a scale and a delta that are constant across those
+    // 32 weights; folding both into the FMA leaves a single reduction.
+    __m256 accumulator = _mm256_setzero_ps();
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
         const float d = half_value(base);
@@ -1084,9 +1087,9 @@ float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
             const float scale =
                 d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
             const float delta = (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+            const __m256 scale_v = _mm256_set1_ps(scale);
+            const __m256 delta_v = _mm256_set1_ps(scale * delta);
             const float* values = vector + group * 32;
-            __m256 weighted = _mm256_setzero_ps();
-            __m256 plain = _mm256_setzero_ps();
             for (int part = 0; part < 4; ++part) {
                 const std::uint32_t index =
                     static_cast<std::uint32_t>(base[2 + group * 4 + part]) |
@@ -1097,11 +1100,48 @@ float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
                     _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
                         static_cast<long long>(grid))));
                 const __m256 loaded = _mm256_loadu_ps(values + part * 8);
-                weighted = _mm256_fmadd_ps(magnitudes, loaded, weighted);
-                plain = _mm256_add_ps(plain, loaded);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, scale_v), loaded, accumulator);
+                accumulator = _mm256_fmadd_ps(delta_v, loaded, accumulator);
             }
-            result += scale *
-                (horizontal_sum(weighted) + delta * horizontal_sum(plain));
+        }
+    }
+    return horizontal_sum(accumulator);
+}
+
+// IQ1_M: the same 2048-entry grid and +-0.125 delta as IQ1_S, one octet per
+// group of eight. The super-block scale is four nibbles scattered across the
+// scale halfwords (qwen_iq1m_scale); each group of eight carries its own
+// 3-bit sub-scale and sign.
+float iq1m_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq1mBlockBytes;
+        std::uint16_t sc[4];
+        std::memcpy(sc, base + 48, 8);
+        const float d = qwen_iq1m_scale(base);
+        const float* vector = input + block * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int group = 0; group < 4; ++group) {
+                const auto qh = base[32 + ib * 2 + group / 2];
+                const std::uint32_t index =
+                    static_cast<std::uint32_t>(base[ib * 4 + group]) |
+                    ((static_cast<std::uint32_t>(qh) << ((group & 1) ? 4 : 8)) & 0x700u);
+                const float delta =
+                    (qh & ((group & 1) ? 0x80 : 0x08)) ? -kIq1mDelta : kIq1mDelta;
+                const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+                const float scale =
+                    d * static_cast<float>(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+                std::uint64_t grid = 0;
+                std::memcpy(&grid, &kIq1sGrid[index], 8);
+                const __m256 magnitudes = _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
+                        static_cast<long long>(grid))));
+                const __m256 loaded =
+                    _mm256_loadu_ps(vector + ib * 32 + group * 8);
+                result += scale * (horizontal_sum(_mm256_mul_ps(magnitudes, loaded)) +
+                                   delta * horizontal_sum(loaded));
+            }
         }
     }
     return result;
@@ -1382,6 +1422,7 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);
     if(type==20)return iq4nl_dot(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,input,elements);
     if(type==19)return iq1s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,input,elements);
+    if(type==29)return iq1m_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1mBlockBytes,input,elements);
     if(type==10)return q2_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,input,elements);
     if(type==11)return q3_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,input,elements);
     if(type==12)return q4_dot(packed+row*static_cast<std::uint64_t>(elements/256)*144,input,elements);
@@ -1792,6 +1833,37 @@ void iq4xs_dequant(const std::uint8_t* row_data, float* output, int elements) {
     }
 }
 
+void iq1m_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq1mBlockBytes;
+        std::uint16_t sc[4];
+        std::memcpy(sc, base + 48, 8);
+        const float d = qwen_iq1m_scale(base);
+        float* out = output + block * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int group = 0; group < 4; ++group) {
+                const auto qh = base[32 + ib * 2 + group / 2];
+                const std::uint32_t index =
+                    static_cast<std::uint32_t>(base[ib * 4 + group]) |
+                    ((static_cast<std::uint32_t>(qh) << ((group & 1) ? 4 : 8)) & 0x700u);
+                const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+                const __m256 scale = _mm256_set1_ps(
+                    d * static_cast<float>(2 * ((sc[ib / 2] >> shift) & 7) + 1));
+                const __m256 delta = _mm256_set1_ps(
+                    (qh & ((group & 1) ? 0x80 : 0x08)) ? -kIq1mDelta : kIq1mDelta);
+                std::uint64_t grid = 0;
+                std::memcpy(&grid, &kIq1sGrid[index], 8);
+                const __m256 magnitudes = _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
+                        static_cast<long long>(grid))));
+                _mm256_storeu_ps(
+                    out + ib * 32 + group * 8,
+                    _mm256_mul_ps(scale, _mm256_add_ps(magnitudes, delta)));
+            }
+        }
+    }
+}
+
 void iq1s_dequant(const std::uint8_t* row_data, float* output, int elements) {
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
@@ -1834,6 +1906,7 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==22)iq2s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2sBlockBytes,output,elements);
     else if(type==23)iq4xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,output,elements);
     else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
+    else if(type==29)iq1m_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1mBlockBytes,output,elements);
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==42)q20_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*18,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);

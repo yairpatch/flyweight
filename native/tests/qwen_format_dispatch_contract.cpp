@@ -94,14 +94,16 @@ int main() {
                f.type, "IQ expert prefix disagrees with the family");
     }
 
-    // Recorded drifts stay recorded until a measured commit changes them; if
-    // one flips, this contract must flip with it deliberately. IQ4_XS was
-    // admitted to the rows-forward Q8 block 2026-08-26 (measured on the 27B
-    // dense checkpoint, prefill parity green).
+    // Admission locks: these used to be recorded drifts. If one flips,
+    // the format-table comment has to flip with it.
     expect(v2::qwen_format(23)->rows_q8_gate == true, 23,
            "IQ4_XS rows gate changed; update the admission note");
-    expect(v2::qwen_format(29)->cpu_expert == false, 29,
-           "IQ1_M CPU expert support changed; retire the drift note");
+    expect(v2::qwen_format(29)->cpu_expert == true, 29,
+           "IQ1_M CPU expert support changed; update the admission note");
+    expect(v2::qwen_format(19)->lm_head_argmax != nullptr, 19,
+           "IQ1_S LM-head kernel dropped");
+    expect(v2::qwen_format(19)->embedding != nullptr, 19,
+           "IQ1_S embedding kernel dropped");
 
     if (failures) {
         std::fprintf(stderr, "format dispatch contract: %d failure(s)\n",

@@ -902,3 +902,19 @@ inline float qwen_iq4nl_dot_row(
     }
     return result;
 }
+
+// Q2_0 (ggml type 42): 18-byte flat blocks of 64 -- an f16 scale then 16
+// bytes of two-bit codes, element j at bits 2*(j%4) of byte j/4. Code q
+// decodes to (q-1)*d, so the levels are {-d, 0, d, 2d}. GSQ-RCO qwen4exp
+// puts ffn_down_exps in it on 30 layers; those 640-wide rows are 10 blocks.
+constexpr std::uint32_t kQ20BlockBytes = 18;
+constexpr std::uint32_t kQ20BlockElements = 64;
+
+inline float qwen_q2_0_value(const std::uint8_t* packed, std::uint64_t absolute) {
+    const auto* base = packed + absolute / kQ20BlockElements * kQ20BlockBytes;
+    const int within = static_cast<int>(absolute % kQ20BlockElements);
+    std::uint16_t scale_bits = 0;
+    std::memcpy(&scale_bits, base, 2);
+    const int code = (base[2 + within / 4] >> ((within & 3) * 2)) & 3;
+    return qwen_half_value(scale_bits) * static_cast<float>(code - 1);
+}

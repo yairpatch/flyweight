@@ -1589,12 +1589,7 @@ constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 byt
 constexpr std::uint32_t kIq1sBlockSize = kIq1sBlockBytes;
 constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
 constexpr std::uint32_t kMxfp4BlockElements = 32;
-// Q2_0 (ggml type 42): d[f16] then qs[16], 64 two-bit codes with element j at
-// bits 2*(j%4) of byte j/4. Code q decodes to (q-1)*d, so the levels are
-// {-d, 0, d, 2d}. ISTA DASLab's GSQ-RCO qwen4exp builds ship ffn_down_exps in
-// it on most layers.
-constexpr int kQ20BlockBytes = 18;
-constexpr int kQ20BlockElements = 64;
+// Q2_0 block layout lives in qwen_kquant.h beside qwen_q2_0_value.
 // The FP4 codebook, doubled -- which is why the scale is halved to match.
 constexpr float kMxfp4Lut[16] = {
     0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
@@ -4211,14 +4206,6 @@ float ue4m3_to_float(std::uint8_t bits){
 // weight_scale_2 runs ~3e-5, far below E4M3's smallest subnormal (2^-9), so
 // folding it back into the block scales flushes ~56% of them to zero. The scale
 // is carried in f32 to the kernels instead.
-float qwen_q2_0_value(const std::uint8_t*packed,std::uint64_t absolute){
-    const auto*base=packed+absolute/kQ20BlockElements*kQ20BlockBytes;
-    const int within=static_cast<int>(absolute%kQ20BlockElements);
-    std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
-    const int code=(base[2+within/4]>>((within&3)*2))&3;
-    return qwen_half_value(scale_bits)*static_cast<float>(code-1);
-}
-
 float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
     const std::uint64_t block=absolute/kNvfp4BlockElements;
     const int offset=static_cast<int>(absolute%kNvfp4BlockElements);
@@ -4275,7 +4262,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
     // takes its own admission: qwen4exp's 640-wide expert down rows fail the
@@ -4450,9 +4437,15 @@ void qwen_quant_dot_rows(
     const std::uint8_t* packed, std::uint32_t type, const float* input,
     int elements, std::uint64_t first_row, int row_count, float* outputs
 ) {
+    const auto features = flyweight_cpu_features();
+    if (type == 20 && (features & 2u) != 0 && elements % 32 == 0
+        && row_count >= 1 && row_count <= 4 && qwen_iq_avx512_enabled()) {
+        qwen_quant_dot_rows_avx512(
+            packed, type, input, elements, first_row, row_count, outputs);
+        return;
+    }
     if (type == 12 && elements % kBlockElements == 0
         && row_count >= 1 && row_count <= 4) {
-        const auto features = flyweight_cpu_features();
         if ((features & 2u) != 0) {
             qwen_quant_dot_rows_avx512(
                 packed, type, input, elements, first_row, row_count, outputs);
@@ -4485,9 +4478,11 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 // which is what keeps such a model's routed experts on the CPU expert path --
 // that path decodes every type qwen_quant_dot supports.
 const char* qwen_grouped_expert_prefix(std::uint32_t type) {
-    // Only the formats with a device octet decoder. IQ2_S and IQ1_M pack their
-    // signs and grid indices differently and have none, so models using them
-    // still route experts to the CPU.
+    // Only the formats with a device octet decoder. IQ2_S has one
+    // (`iq2s_octet` / FLYWEIGHT_GROUPED_EXPERTS) since 2026-09-16. IQ1_M
+    // still packs signs and grid indices differently and has none, so its
+    // decode-shaped experts stay on the CPU; prefill can take the routed
+    // MMQ kernel when the width divides.
     const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->grouped_expert_prefix : nullptr;
 }
@@ -4500,8 +4495,8 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 
 // The routed block-table MMQ kernel for an expert role, or empty where the
 // format has none or the width does not divide its blocking: 256 for the
-// super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
-// 640-wide down projection in).
+// super-block formats, 32 for IQ4_NL's flat blocks, 64 for Q2_0 (both of
+// those let qwen4exp's 640-wide down projection in).
 //
 // Its own list rather than grouped_expert_prefix + suffix, because the two sets
 // are not the same one: Q4_0 has a grouped kernel and no MMQ kernel, so reading
@@ -4509,11 +4504,11 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 // caught only by the width check below, one Q4_0 expert stack at a 256-multiple
 // width away from launching a name that does not exist.
 //
-// IQ2_S (22) and IQ1_M (29) are omitted deliberately: the corpus defines
-// iq2s_q8_mmq_routed and iq1m_q8_mmq_routed and the driver registers both, but
-// this function has never named them, so admitting them here would enable an
-// unmeasured path rather than fix one. Same shape as the IQ4_XS rows-gate drift
-// recorded in the format table.
+// IQ2_S (22) and IQ1_M (29) were omitted even though the corpus defines
+// iq2s_q8_mmq_routed and iq1m_q8_mmq_routed and the driver registers both.
+// The GSQ-RCO mix puts IQ2_S on gate/up stacks; without this case those
+// layers never reach the block-table MMQ. Admitted 2026-09-25; the IQ
+// kernel contract already pins both kernels.
 std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
     const char* family = nullptr;
     switch (type) {
@@ -4528,11 +4523,14 @@ std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
         case 19: family = "iq1s"; break;
         case 20: family = "iq4nl"; break;
         case 21: family = "iq3s"; break;
+        case 22: family = "iq2s"; break;
         case 23: family = "iq4xs"; break;
+        case 29: family = "iq1m"; break;
+        case 42: family = "q20"; break;
         default: break;
     }
     if (!family) return {};
-    const int unit = type == 20 ? 32 : 256;
+    const int unit = type == 20 ? 32 : type == 42 ? 64 : 256;
     return in_size % unit == 0 ? std::string(family) + "_q8_mmq_routed"
                                : std::string();
 }
@@ -5905,7 +5903,7 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
         qwen_iq3s_dequant_row_vnni512(packed,elements,row,output);return;}
     // 22 (IQ2_S) joined 2026-09-16 for the GSQ-RCO mix, where the tripwire
     // named it on 20 gate/up stacks.
-    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
@@ -6964,6 +6962,36 @@ void qwen_cpu_moe(
 #pragma omp for schedule(static)
 #endif
                 for (int row = 0; row < hidden; row += 4) down_tile(row);
+            } else if (iq1s_q8 && gate_type == 19 && (cpu_features & 8u) != 0) {
+                // Four gate/up rows share one load of the Q8 activation, and
+                // four down rows share one load of the activated vector.
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+                for (int task = 0;
+                     task < routed_count * ((intermediate + 3) / 4); ++task) {
+                    constexpr int tile_rows = 4;
+                    const int tiles_per_expert = (intermediate + tile_rows - 1) / tile_rows;
+                    const int rank = task / tiles_per_expert;
+                    const int first_row = (task % tiles_per_expert) * tile_rows;
+                    const int count = std::min(tile_rows, intermediate - first_row);
+                    float gate_values[tile_rows]{}, up_values[tile_rows]{};
+                    qwen_iq1s_dot_q8_k_vnni512_rows(
+                        gate[rank], input_q8_data, hidden, first_row, count, gate_values);
+                    qwen_iq1s_dot_q8_k_vnni512_rows(
+                        up[rank], input_q8_data, hidden, first_row, count, up_values);
+                    for (int lane = 0; lane < count; ++lane) {
+                        const float gate_value = gate_values[lane] * gate_scale[rank];
+                        const float up_value = up_values[lane] * up_scale[rank];
+                        const float clipped = std::max(-80.0f, std::min(80.0f, gate_value));
+                        activated[rank * intermediate + first_row + lane] =
+                            gate_value / (1.0f + std::exp(-clipped)) * up_value;
+                    }
+                }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+                for (int row = 0; row < hidden; row += 4) down_tile(row);
             } else {
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
@@ -6973,7 +7001,7 @@ void qwen_cpu_moe(
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-                for (int row = 0; row < hidden; ++row) down_row(row);
+                for (int row = 0; row < hidden; row += 4) down_tile(row);
             }
         }
     }

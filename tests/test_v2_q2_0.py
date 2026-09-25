@@ -4,8 +4,9 @@ ISTA DASLab's GSQ-RCO builds of Qwen3.8-Flash-Next store the routed expert
 down projection in Q2_0 on most layers and the shared-expert down projection
 in it on a few. The type is 18 bytes per 64 values: an f16 scale then sixteen
 bytes of two-bit codes, element j at bits 2*(j%4) of byte j/4, code q meaning
-(q-1)*d. It has CPU decoders only: routed experts run on the CPU expert path
-and a Q2_0 static tensor is requantized to Q8_0 at prepare.
+(q-1)*d. Prefill can take q20_q8_mmq_routed (64-wide unit, so 640-wide downs
+divide). Decode still uses the CPU expert path / grouped octet kernels, and a
+Q2_0 static tensor is requantized to Q8_0 at prepare.
 
 The fixture packs the same random weights two ways -- Q2_0 bytes, and the
 decoded values as f32 -- so the runtime's Q2_0 path is checked against its own

@@ -169,6 +169,56 @@ int main() {
     check("iq3s", 21, kIq3sBlockBytes, qwen_iq3s_dot_row);
     check("iq4xs", 23, kIq4xsBlockBytes, qwen_iq4xs_dot_row);
     check("iq1s", 19, kIq1sBlockBytes, qwen_iq1s_dot_row);
+    // IQ1_M's f16 scale is four nibbles in the scale halfwords, not the
+    // leading two bytes check() pins, so a random block is an arbitrary
+    // exponent. Pin those nibbles to 1.0 and leave the grid random.
+    {
+        constexpr int kElements = 3072;
+        constexpr int kRows = 6;
+        std::mt19937 generator(1234u + 29);
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::normal_distribution<float> activation(0.0f, 1.0f);
+        const std::size_t blocks = kElements / 256;
+        std::vector<std::uint8_t> packed(blocks * kIq1mBlockBytes * kRows);
+        for (auto& value : packed) value = static_cast<std::uint8_t>(byte(generator));
+        constexpr std::uint16_t kOne = 0x3c00;
+        for (std::size_t base = 0; base + kIq1mBlockBytes <= packed.size();
+             base += kIq1mBlockBytes) {
+            for (int half = 0; half < 4; ++half) {
+                std::uint16_t word;
+                std::memcpy(&word, packed.data() + base + 48 + half * 2, 2);
+                const std::uint16_t nibble =
+                    static_cast<std::uint16_t>((kOne >> (4 * half)) & 0xf);
+                word = static_cast<std::uint16_t>((word & 0x0fff) | (nibble << 12));
+                std::memcpy(packed.data() + base + 48 + half * 2, &word, 2);
+            }
+        }
+        std::vector<float> input(kElements);
+        for (auto& value : input) value = activation(generator);
+        float scale = 0.0f;
+        for (const float value : input) scale += std::fabs(value);
+        scale *= 256.0f * 8.0f;
+        for (int row = 0; row < kRows; ++row) {
+            const float expected =
+                qwen_iq1m_dot_row(packed.data(), input.data(), kElements, row);
+            const float actual = qwen_quant_dot_avx2(
+                packed.data(), 29, input.data(), kElements, row);
+            char name[64];
+            std::snprintf(name, sizeof(name), "iq1m row %d", row);
+            expect_close(name, actual, expected, scale);
+        }
+        std::vector<float> decoded(kElements, 0.0f);
+        qwen_dequant_row_avx2(packed.data(), 29, kElements, 0, decoded.data());
+        for (int i = 0; i < kElements; ++i) {
+            const float got = decoded[static_cast<std::size_t>(i)];
+            const float want = qwen_iq1m_value(packed.data(), static_cast<std::uint64_t>(i));
+            if (std::fabs(got - want) > 1e-5f * std::max(1.0f, std::fabs(want))) {
+                std::fprintf(stderr, "iq1m dequant[%d]: %.9g vs %.9g\n", i, got, want);
+                ++failures;
+                break;
+            }
+        }
+    }
     // The vectorized row decoders feed the chunked-prefill GEMM; pin them
     // element-for-element against the scalar value decoders.
     {
