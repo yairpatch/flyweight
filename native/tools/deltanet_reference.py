@@ -32,7 +32,8 @@ def silu(x: np.ndarray) -> np.ndarray:
 
 
 def reference(convolved, gates, beta_logits, decay_logits, a_log, dt_bias,
-              norm, state, key_heads, value_heads, head_dim, epsilon):
+              norm, state, key_heads, value_heads, head_dim, epsilon,
+              gate_sigmoid=False):
     """Run the recurrence over every row; returns (output, final_state).
 
     `state` is not modified; the returned state is a fresh array.
@@ -67,8 +68,10 @@ def reference(convolved, gates, beta_logits, decay_logits, a_log, dt_bias,
 
             inverse_rms = 1.0 / np.sqrt(np.dot(core, core) / head_dim + epsilon)
             gate = gates[t, h * head_dim:(h + 1) * head_dim].astype(np.float64)
+            scale = silu(gate) if not gate_sigmoid else 1.0 / (
+                1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
             output[t, h * head_dim:(h + 1) * head_dim] = (
-                core * inverse_rms * norm.astype(np.float64) * silu(gate))
+                core * inverse_rms * norm.astype(np.float64) * scale)
     return output, state.astype(np.float32)
 
 

@@ -32,8 +32,11 @@ CHUNK, DIM, TILE = 64, 128, 32
 #   Qwen3.6-27B      (dense): 48 value / 16 key / 128
 #   Qwen3.6-35B-A3B  (MoE):   32 value / 16 key / 128
 # head_dim is 128 in both, which is what these kernels require.
-GEOMETRY = {"dense-27b": (16, 48), "moe-35b-a3b": (16, 32)}
+GEOMETRY = {"dense-27b": (16, 48), "moe-35b-a3b": (16, 32),
+            "qwen4exp": (16, 48)}
 KEY_HEADS, VALUE_HEADS = GEOMETRY[os.environ.get("FLYWEIGHT_GEOMETRY", "dense-27b")]
+# qwen4exp uses sigmoid output gate; all other geometries use silu.
+GATE_SIGMOID = np.int32(1 if os.environ.get("FLYWEIGHT_GEOMETRY") == "qwen4exp" else 0)
 EPSILON = 1e-6
 # Once the kernels are embedded in flyweight_v2_native_kernels.hpp the corpus
 # already defines them; appending the prototype again would be a redefinition.
@@ -58,7 +61,7 @@ def chunked(g, rows, key_heads, value_heads, state, buffers):
     launch("qwen_delta_state_pass", (value_heads, DIM // TILE, 1), (256, 1, 1),
            (g["convolved"], pmat, gcum, qinv, kinv, w_rows, u_rows, state, core, r, k, v))
     launch("qwen_delta_norm_gate", (rows, value_heads, 1), (DIM, 1, 1),
-           (core, g["gates"], g["norm"], out, v, np.float32(EPSILON)))
+           (core, g["gates"], g["norm"], out, v, np.float32(EPSILON), GATE_SIGMOID))
     return out, state
 
 
@@ -68,7 +71,7 @@ def sequential(g, rows, key_heads, value_heads, state, out):
         (g["convolved"], g["gates"], g["beta_logits"], g["decay_logits"],
          g["a_log"], g["dt_bias"], g["norm"], state, out,
          np.int32(rows), np.int32(key_heads), np.int32(value_heads),
-         np.int32(DIM), np.float32(EPSILON)))
+         np.int32(DIM), np.float32(EPSILON), GATE_SIGMOID))
     return out, state
 
 
@@ -97,10 +100,11 @@ def report(rows, seed=7):
         print(f"decay weights from {CHECKPOINT.split('/')[-1]} blk.{layer}: "
               f"a_log [{a_log.min():+.2f}, {a_log.max():+.2f}]")
     data = ref.random_inputs(rows, KEY_HEADS, VALUE_HEADS, DIM, seed=seed, decay=decay)
+    gate = bool(int(GATE_SIGMOID))
     want_out, want_state = ref.reference(
         data["convolved"], data["gates"], data["beta_logits"], data["decay_logits"],
         data["a_log"], data["dt_bias"], data["norm"], data["state"],
-        KEY_HEADS, VALUE_HEADS, DIM, EPSILON)
+        KEY_HEADS, VALUE_HEADS, DIM, EPSILON, gate_sigmoid=gate)
     scale_out = np.abs(want_out).max()
     scale_state = np.abs(want_state).max()
 
@@ -129,7 +133,7 @@ def report(rows, seed=7):
         kh.kernel("qwen_delta_recurrent_chunk"),
         g["convolved"], g["gates"], g["beta_logits"], g["decay_logits"], g["a_log"],
         g["dt_bias"], g["norm"], state, out, np.int32(rows), np.int32(KEY_HEADS),
-        np.int32(VALUE_HEADS), np.int32(DIM), np.float32(EPSILON),
+        np.int32(VALUE_HEADS), np.int32(DIM), np.float32(EPSILON), GATE_SIGMOID,
         grid=(VALUE_HEADS, 1, 1), block=(128, 1, 1))
 
     # The four-kernel sequence is timed as a whole, under the same settling rule
@@ -201,7 +205,8 @@ def replay(directory):
     want_out, want_state = ref.reference(
         data["convolved"], data["gates"], data["beta_logits"], data["decay_logits"],
         data["a_log"], data["dt_bias"], data["norm"], data["state"],
-        key_heads, value_heads, head_dim, epsilon)
+        key_heads, value_heads, head_dim, epsilon,
+        gate_sigmoid=bool(int(os.environ.get("FLYWEIGHT_GATE_SIGMOID", "0"))))
     scale_out, scale_state = np.abs(want_out).max(), np.abs(want_state).max()
 
     g = {k: cp.asarray(v) for k, v in data.items()}

@@ -463,7 +463,8 @@ void qwen_delta_state_pass(
 extern "C" __global__
 void qwen_delta_norm_gate(
     const float* core, const float* gates, const float* norm_weights,
-    float* output, const int value_heads, const float epsilon
+    float* output, const int value_heads, const float epsilon,
+    const int gate_sigmoid
 ) {
     const int token = blockIdx.x;
     const int head = blockIdx.y;
@@ -482,6 +483,8 @@ void qwen_delta_norm_gate(
     const float inverse_rms = rsqrtf(total / (float)DELTA_DIM + epsilon);
 
     const float gate = gates[offset];
+    const float logistic =
+        1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
     output[offset] = value * inverse_rms * norm_weights[lane]
-        * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+        * (gate_sigmoid ? logistic : gate * logistic);
 }
