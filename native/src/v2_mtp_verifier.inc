@@ -1690,11 +1690,6 @@ void qwen_forward_rows(
                        runtime.options.cache_type_v==3&&
                        cublas_prefill_requested&&cublas_tile_rows>0&&
                        cublas_workspace_ok)){
-                if(runtime.options.cache_type_k==3&&qwen_hadamard_enabled()){
-                    int vectors=rows*heads;
-                    void*rotate_args[]={const_cast<std::uint64_t*>(&queries),&vectors,const_cast<int*>(&head_dim)};
-                    launch("hadamard_rotate_rows",static_cast<std::uint32_t>(vectors),1,256,rotate_args);
-                }
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.

@@ -489,9 +489,9 @@ def _add_runtime_options(
     )
     add(
         placement, "--kv-dtype", "--kv-cache-type", dest="kv_dtype",
-        choices=KV_TYPES + ("k8v4",), default=None,
-        help="KV cache precision shorthand (e.g. k8v4, q8_0, turbo4, f16). "
-             "k8v4 selects asymmetric 8-bit Key + 4-bit Value cache.",
+        choices=KV_TYPES, default=None,
+        help="KV cache precision shorthand (e.g. q8_0, turbo4, f16). "
+             "Sets both the key and value cache.",
     )
     add(
         placement, "--cache-type-k", choices=KV_TYPES, default="f16",
@@ -1285,12 +1285,8 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
     )
     options = {name: getattr(args, name) for name in names if hasattr(args, name)}
     if getattr(args, "kv_dtype", None):
-        if args.kv_dtype == "k8v4":
-            options["cache_type_k"] = "q8_0"
-            options["cache_type_v"] = "turbo4"
-        else:
-            options["cache_type_k"] = args.kv_dtype
-            options["cache_type_v"] = args.kv_dtype
+        options["cache_type_k"] = args.kv_dtype
+        options["cache_type_v"] = args.kv_dtype
     options["gpu_cache_bytes"] = args.gpu_cache_mib * 1024**2
     return options
 
@@ -1652,12 +1648,8 @@ def _serve(args: argparse.Namespace) -> int:
     cache_type_k = args.cache_type_k
     cache_type_v = args.cache_type_v
     if getattr(args, "kv_dtype", None):
-        if args.kv_dtype == "k8v4":
-            cache_type_k = "q8_0"
-            cache_type_v = "turbo4"
-        else:
-            cache_type_k = args.kv_dtype
-            cache_type_v = args.kv_dtype
+        cache_type_k = args.kv_dtype
+        cache_type_v = args.kv_dtype
     service = NativeV2InferenceService(
         args.model,
         mtp_model_path=args.mtp_model,

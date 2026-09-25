@@ -232,32 +232,6 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
-    flyweight_hadamard_contract
-    tests/hadamard_contract.cpp
-)
-target_compile_features(flyweight_hadamard_contract PRIVATE cxx_std_20)
-target_include_directories(flyweight_hadamard_contract PRIVATE src)
-if(BUILD_TESTING)
-    add_test(
-        NAME flyweight_hadamard_contract
-        COMMAND flyweight_hadamard_contract
-    )
-endif()
-
-add_executable(
-    flyweight_k8v4_contract
-    tests/k8v4_contract.cpp
-)
-target_compile_features(flyweight_k8v4_contract PRIVATE cxx_std_20)
-target_include_directories(flyweight_k8v4_contract PRIVATE include src)
-if(BUILD_TESTING)
-    add_test(
-        NAME flyweight_k8v4_contract
-        COMMAND flyweight_k8v4_contract
-    )
-endif()
-
-add_executable(
     flyweight_paged_kv_contract
     tests/paged_kv_contract.cpp
 )
