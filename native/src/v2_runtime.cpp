@@ -7231,9 +7231,10 @@ void qwen_cpu_moe_rows(
     const QwenQ8KBlock* input_q8_data=input_q8.data();
     // Whole-batch int8 rows path (qwen_cpu_iq1s_vnni512.cpp): rows folded
     // once to int8, dpbusd against unsigned-8 activations. Covers the
-    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down); the other
-    // formats keep the dequant-and-f32-GEMM path below. FLYWEIGHT_ROWS_Q8=0
-    // disables it for A/B.
+    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down); IQ3_S gate/up
+    // take the 16-bit twin below under FLYWEIGHT_ROWS_Q8_IQ3S=1; the other
+    // formats keep the int16 or dequant-and-f32-GEMM paths below.
+    // FLYWEIGHT_ROWS_Q8=0 disables it for A/B.
     static const char* rows_q8_setting=std::getenv("FLYWEIGHT_ROWS_Q8");
     const bool rows_q8=(flyweight_cpu_features()&8u)!=0&&!direct_quant
         &&gate_type==19&&up_type==19&&hidden%256==0
@@ -7247,6 +7248,18 @@ void qwen_cpu_moe_rows(
     static const char* rows_q8_down_setting=std::getenv("FLYWEIGHT_ROWS_Q8_DOWN");
     const bool rows_q8_down=rows_q8&&
         rows_q8_down_setting&&rows_q8_down_setting[0]=='1';
+    // IQ3_S twin of rows_q8 with 16-bit folded weights (dpwssd;
+    // qwen_cpu_iq1s_vnni512.cpp): the group scale times the grid magnitude
+    // reaches 225, past int8. Opt-in behind FLYWEIGHT_ROWS_Q8_IQ3S=1 -- a
+    // wrong fold corrupts every routed token silently, so this stays off
+    // until the contract and the parity runs below say otherwise. No down
+    // constraint: the down projection dispatches on its own type further
+    // down, and tying gate/up to it would halve the layers covered.
+    static const char* rows_q8_iq3s_setting=std::getenv("FLYWEIGHT_ROWS_Q8_IQ3S");
+    const bool rows_q8_iq3s=(flyweight_cpu_features()&8u)!=0&&!direct_quant
+        &&gate_type==21&&up_type==21&&hidden%256==0
+        &&rows_q8_iq3s_setting&&rows_q8_iq3s_setting[0]=='1'
+        &&!(q8_setting&&q8_setting[0]=='0');
     thread_local std::vector<std::uint8_t> tl_input_u8;
     thread_local std::vector<float> tl_input_u8_scales;
     thread_local std::vector<float> tl_input_u8_sums;
@@ -7268,14 +7281,14 @@ void qwen_cpu_moe_rows(
     const float* input_u8_scale_data=input_u8_scales.data();
     const float* input_u8_sum_data=input_u8_sums.data();
     // Exact int16 rows path for the IQ codebook gate/up stacks that have no
-    // int8 fold (the GSQ-RCO mix: IQ2_XXS/XS/S, IQ3_XXS, IQ3_S; also IQ4_XS
-    // and IQ1_S where rows_q8 does not apply). Weights fold to their integer
+    // int8 fold (the GSQ-RCO mix: IQ2_XXS/XS/S, IQ3_XXS; also IQ4_XS, IQ3_S
+    // where rows_q8_iq3s is off, and IQ1_S where rows_q8 does not apply). Weights fold to their integer
     // codes exactly; activations are 14-bit per 256 -- finer than the f32
     // GEMM's inputs are worth, and 128x finer than the Q8 paths. Measured
     // 2026-09-16 on the 2048-token GSQ-RCO prefill: see the memory note.
     // FLYWEIGHT_ROWS_I16=0 restores dequant-and-f32-GEMM for A/B.
     static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
-    const bool rows_i16=(flyweight_cpu_features()&8u)!=0&&!direct_quant&&!rows_q8
+    const bool rows_i16=(flyweight_cpu_features()&8u)!=0&&!direct_quant&&!rows_q8&&!rows_q8_iq3s
         &&qwen_i16_fold_multiplier(gate_type)!=0&&qwen_i16_fold_multiplier(up_type)!=0
         &&hidden%256==0
         &&!(rows_i16_setting&&rows_i16_setting[0]=='0');
@@ -7283,7 +7296,7 @@ void qwen_cpu_moe_rows(
     thread_local std::vector<float> tl_input_i16_scales;
     auto& input_i16=tl_input_i16;
     auto& input_i16_scales=tl_input_i16_scales;
-    if(rows_i16){
+    if(rows_i16||rows_q8_iq3s){
         input_i16.resize(static_cast<std::size_t>(rows)*hidden);
         input_i16_scales.resize(static_cast<std::size_t>(rows)*q8_blocks);
 #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
@@ -7498,6 +7511,35 @@ void qwen_cpu_moe_rows(
             qwen_u8_gemm_k256_vnni512(fold_up.data(),fold_up_scales.data(),
                 fold_up_corr.data(),fold_up_deltas.data(),mr,act_ptrs.data(),
                 act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,up_values.data());
+        }else if(rows_q8_iq3s){
+            // Direct-from-packed twin of the int16 branch: same 14-bit
+            // activations and the same int16 GEMM, but the weights skip the
+            // float dequant the i16 fold starts from.
+            thread_local std::vector<std::int16_t> fold_gate_w16,fold_up_w16;
+            thread_local std::vector<float> fold_gate_scales_w16,fold_up_scales_w16;
+            thread_local std::vector<const std::int16_t*> act_ptrs_w16;
+            thread_local std::vector<const float*> act_scale_ptrs_w16;
+            fold_gate_w16.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_up_w16.resize(static_cast<std::size_t>(kTaskRows)*hidden);
+            fold_gate_scales_w16.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            fold_up_scales_w16.resize(static_cast<std::size_t>(kTaskRows)*q8_blocks);
+            act_ptrs_w16.resize(count);act_scale_ptrs_w16.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence){
+                const std::size_t token=static_cast<std::size_t>(
+                    occurrences[begin+occurrence]/routed_count);
+                act_ptrs_w16[occurrence]=input_i16_data+token*hidden;
+                act_scale_ptrs_w16[occurrence]=input_i16_scale_data+token*q8_blocks;
+            }
+            t_dq0=moe_profile?qwen_moe_now():0;
+            qwen_iq3s_fold_rows_vnni512(gate_data,hidden,row0,mr,fold_gate_w16.data(),
+                fold_gate_scales_w16.data());
+            qwen_iq3s_fold_rows_vnni512(up_data,hidden,row0,mr,fold_up_w16.data(),
+                fold_up_scales_w16.data());
+            t_gemm0=moe_profile?qwen_moe_now():0;
+            qwen_i16_gemm_k256_vnni512(fold_gate_w16.data(),fold_gate_scales_w16.data(),
+                mr,act_ptrs_w16.data(),act_scale_ptrs_w16.data(),count,hidden,gate_values.data());
+            qwen_i16_gemm_k256_vnni512(fold_up_w16.data(),fold_up_scales_w16.data(),
+                mr,act_ptrs_w16.data(),act_scale_ptrs_w16.data(),count,hidden,up_values.data());
         }else{
         gate_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);up_block.resize(static_cast<std::size_t>(kTaskRows)*hidden);
         t_dq0=moe_profile?qwen_moe_now():0;
