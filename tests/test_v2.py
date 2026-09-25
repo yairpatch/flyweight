@@ -228,6 +228,23 @@ class V2RuntimeTests(unittest.TestCase):
         missing = sorted(name for name in names if f'"{name}"' not in driver)
         self.assertEqual(missing, [], "unregistered kernel names in the table")
 
+    def test_routed_mmq_switch_names_iq2s_and_iq1m(self):
+        """The routed MMQ switch used to omit types whose kernels exist.
+
+        iq2s_q8_mmq_routed and iq1m_q8_mmq_routed are in the corpus and the
+        driver; without the case labels, GSQ-RCO IQ2_S gate/up stacks and
+        any IQ1_M expert role never reach them.
+        """
+        root = Path(__file__).resolve().parents[1]
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+        start = runtime.find("std::string qwen_routed_mmq_kernel")
+        self.assertNotEqual(start, -1, "qwen_routed_mmq_kernel not found")
+        body = runtime[start : runtime.find("bool qwen_routed_mmq_available", start)]
+        self.assertIn("case 22:", body)
+        self.assertIn("case 29:", body)
+        self.assertIn('"iq2s"', body)
+        self.assertIn('"iq1m"', body)
+
     def test_rows_forward_only_honors_hybrid_prefill_cpu_in_hybrid_mode(self):
         # The policy derives routed_gpu_execution_allowed()==false from
         # hybrid_prefill_cpu only in hybrid mode. If the rows forward sets the

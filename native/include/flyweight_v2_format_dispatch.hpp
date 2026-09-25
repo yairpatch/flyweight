@@ -10,8 +10,7 @@
 // The point is not the lookup -- it is that a new format becomes one row here
 // plus its kernels, and that a *missing* kernel is a visible null instead of a
 // silent fall-through to a slower or wrong path. Two such drifts were found
-// while building this table and are preserved as-is (they are behavior, and
-// changing behavior is a separate, measured commit):
+// while building this table; both are now admitted:
 //
 //   - IQ4_XS (23) has a Q8-activation warp matvec, a tiled kernel and an MMQ
 //     kernel, but the rows forward's admission gate never listed it, so its
@@ -19,8 +18,10 @@
 //     block -- a full weight read per 4-row group where MMQ covers 128 tokens.
 //     Admitted 2026-08-26 after measuring on the 27B dense checkpoint, whose
 //     16 attn_v projections (and the whole MTP draft layer) carry this type.
-//   - IQ1_M (29) is absent from the CPU expert set even though the CPU dot
-//     decodes IQ1_S; `cpu_expert` records it.
+//   - IQ1_M (29) was absent from the CPU expert set even though
+//     `qwen_iq1m_dot_row` already decoded it. `unsupported_quant_types()`
+//     therefore listed every IQ1_M tensor as unusable. Admitted 2026-09-25:
+//     the scalar dot is the CPU path (no AVX2/AVX-512 twin yet).
 //
 // Names must match the kernels registered with flyweight_gpu_launch_named; a
 // Python source-scan test cross-checks every literal below against the kernel
@@ -280,8 +281,10 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1m_q8_matmul_tiled", .matmul_q8_mmq = "iq1m_q8_mmq",
      .matmul_rows = "iq1m_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     // No CPU expert dot today; see the file comment.
-     .cpu_expert = false},
+     // Scalar `qwen_iq1m_dot_row` only -- no AVX twin, and no grouped
+     // octet decoder, so decode-shaped GPU experts stay on the CPU. The
+     // routed block-table MMQ (`iq1m_q8_mmq_routed`) covers prefill.
+     .cpu_expert = true},
     {.type = 30, .family = "bf16",
      .matmul_rows = "bf16_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::per_token,

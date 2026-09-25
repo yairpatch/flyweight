@@ -4485,9 +4485,11 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 // which is what keeps such a model's routed experts on the CPU expert path --
 // that path decodes every type qwen_quant_dot supports.
 const char* qwen_grouped_expert_prefix(std::uint32_t type) {
-    // Only the formats with a device octet decoder. IQ2_S and IQ1_M pack their
-    // signs and grid indices differently and have none, so models using them
-    // still route experts to the CPU.
+    // Only the formats with a device octet decoder. IQ2_S has one
+    // (`iq2s_octet` / FLYWEIGHT_GROUPED_EXPERTS) since 2026-09-16. IQ1_M
+    // still packs signs and grid indices differently and has none, so its
+    // decode-shaped experts stay on the CPU; prefill can take the routed
+    // MMQ kernel when the width divides.
     const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->grouped_expert_prefix : nullptr;
 }
@@ -4509,11 +4511,11 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 // caught only by the width check below, one Q4_0 expert stack at a 256-multiple
 // width away from launching a name that does not exist.
 //
-// IQ2_S (22) and IQ1_M (29) are omitted deliberately: the corpus defines
-// iq2s_q8_mmq_routed and iq1m_q8_mmq_routed and the driver registers both, but
-// this function has never named them, so admitting them here would enable an
-// unmeasured path rather than fix one. Same shape as the IQ4_XS rows-gate drift
-// recorded in the format table.
+// IQ2_S (22) and IQ1_M (29) were omitted even though the corpus defines
+// iq2s_q8_mmq_routed and iq1m_q8_mmq_routed and the driver registers both.
+// The GSQ-RCO mix puts IQ2_S on gate/up stacks; without this case those
+// layers never reach the block-table MMQ. Admitted 2026-09-25; the IQ
+// kernel contract already pins both kernels.
 std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
     const char* family = nullptr;
     switch (type) {
@@ -4528,7 +4530,9 @@ std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
         case 19: family = "iq1s"; break;
         case 20: family = "iq4nl"; break;
         case 21: family = "iq3s"; break;
+        case 22: family = "iq2s"; break;
         case 23: family = "iq4xs"; break;
+        case 29: family = "iq1m"; break;
         default: break;
     }
     if (!family) return {};
