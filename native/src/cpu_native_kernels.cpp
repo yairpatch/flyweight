@@ -1282,4 +1282,284 @@ FLYWEIGHT_CPU_NATIVE_KERNEL("k2_half_split_rope", k2_half_split_rope);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
 
+// --- qwen_attention_gate --------------------------------------------------
+//
+// Corpus signature:
+//   void qwen_attention_gate(const float* attended, const float* gates,
+//                            float* output, const int elements)
+//
+// Per-channel sigmoid output gate over the attention result; fires on every
+// attention layer of every decode token and prefill row. Pure elementwise,
+// so the twin is a flat parallel loop with the same clamp the corpus uses.
+void qwen_attention_gate(const Launch&, void** arguments) {
+    const float* attended = *reinterpret_cast<const float**>(arguments[0]);
+    const float* gates = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int elements = *reinterpret_cast<const int*>(arguments[3]);
+
+    parallel_chunks(static_cast<std::uint64_t>(elements), [&](std::uint64_t index) {
+        const float gate = gates[index];
+        const float clamped = std::fmin(80.0f, std::fmax(-80.0f, gate));
+        output[index] = attended[index] / (1.0f + std::exp(-clamped));
+    });
+}
+
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_gate", qwen_attention_gate);
+
+// --- route_topk_sigmoid_bias ----------------------------------------------
+//
+// Corpus signature:
+//   void route_topk_sigmoid_bias(const float* logits, const float* bias,
+//                                int* selected, float* routing_weights,
+//                                const int experts, const int top_k,
+//                                const int normalize, const float weight_scale)
+//
+// Sigmoid-gated top-k with a score-correction bias (DeepSeek-V3 style):
+// selection ranks on score + bias, weights are the unbiased sigmoids,
+// renormalized over the selection. The serial argmax with strict `>` is
+// reproduced exactly -- ties resolve to the lowest expert index, and routing
+// is discrete, so "close enough" is not a defensible standard here either.
+// Bias may be null (unbiased checkpoints); the corpus guards it, so does this.
+void route_topk_sigmoid_bias(const Launch&, void** arguments) {
+    const float* logits = *reinterpret_cast<const float**>(arguments[0]);
+    const float* bias = *reinterpret_cast<const float**>(arguments[1]);
+    int* selected = *reinterpret_cast<int**>(arguments[2]);
+    float* routing_weights = *reinterpret_cast<float**>(arguments[3]);
+    const int experts = *reinterpret_cast<const int*>(arguments[4]);
+    const int top_k = *reinterpret_cast<const int*>(arguments[5]);
+    const int normalize = *reinterpret_cast<const int*>(arguments[6]);
+    const float weight_scale = *reinterpret_cast<const float*>(arguments[7]);
+
+    static thread_local std::vector<float> scores, ranking;
+    if (static_cast<int>(scores.size()) < experts) {
+        scores.resize(experts);
+        ranking.resize(experts);
+    }
+    for (int index = 0; index < experts; ++index) {
+        const float probability = 1.0f / (1.0f + std::exp(-logits[index]));
+        scores[index] = probability;
+        ranking[index] = probability + (bias != nullptr ? bias[index] : 0.0f);
+    }
+    float total = 0.0f;
+    for (int rank = 0; rank < top_k; ++rank) {
+        int best_index = 0;
+        float best_value = -3.402823466e+38F;
+        for (int expert = 0; expert < experts; ++expert) {
+            if (ranking[expert] > best_value) {
+                best_value = ranking[expert];
+                best_index = expert;
+            }
+        }
+        selected[rank] = best_index;
+        routing_weights[rank] = scores[best_index];
+        total += scores[best_index];
+        ranking[best_index] = -3.402823466e+38F;
+    }
+    const float inverse =
+        normalize != 0 && total > 0.0f ? weight_scale / total : weight_scale;
+    for (int rank = 0; rank < top_k; ++rank) routing_weights[rank] *= inverse;
+}
+
+FLYWEIGHT_CPU_NATIVE_KERNEL("route_topk_sigmoid_bias", route_topk_sigmoid_bias);
+
+// --- route_topk_sigmoid_bias_rows -----------------------------------------
+//
+// Corpus signature:
+//   void route_topk_sigmoid_bias_rows(const float* logits, const float* bias,
+//                                     int* selected, float* routing_weights,
+//                                     const int rows, const int experts,
+//                                     const int top_k, const int normalize,
+//                                     const float weight_scale)
+//
+// Row-batched twin: one token per parallel chunk, same serial selection.
+void route_topk_sigmoid_bias_rows(const Launch&, void** arguments) {
+    const float* logits = *reinterpret_cast<const float**>(arguments[0]);
+    const float* bias = *reinterpret_cast<const float**>(arguments[1]);
+    int* selected = *reinterpret_cast<int**>(arguments[2]);
+    float* routing_weights = *reinterpret_cast<float**>(arguments[3]);
+    const int rows = *reinterpret_cast<const int*>(arguments[4]);
+    const int experts = *reinterpret_cast<const int*>(arguments[5]);
+    const int top_k = *reinterpret_cast<const int*>(arguments[6]);
+    const int normalize = *reinterpret_cast<const int*>(arguments[7]);
+    const float weight_scale = *reinterpret_cast<const float*>(arguments[8]);
+
+    parallel_chunks(static_cast<std::uint64_t>(rows), [&](std::uint64_t row) {
+        static thread_local std::vector<float> scores, ranking;
+        if (static_cast<int>(scores.size()) < experts) {
+            scores.resize(experts);
+            ranking.resize(experts);
+        }
+        const std::int64_t logits_offset =
+            static_cast<std::int64_t>(row) * experts;
+        const std::int64_t output_offset =
+            static_cast<std::int64_t>(row) * top_k;
+        for (int index = 0; index < experts; ++index) {
+            const float probability =
+                1.0f / (1.0f + std::exp(-logits[logits_offset + index]));
+            scores[index] = probability;
+            ranking[index] = probability + (bias != nullptr ? bias[index] : 0.0f);
+        }
+        float total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank) {
+            int best_index = 0;
+            float best_value = -3.402823466e+38F;
+            for (int expert = 0; expert < experts; ++expert) {
+                if (ranking[expert] > best_value) {
+                    best_value = ranking[expert];
+                    best_index = expert;
+                }
+            }
+            selected[output_offset + rank] = best_index;
+            routing_weights[output_offset + rank] = scores[best_index];
+            total += scores[best_index];
+            ranking[best_index] = -3.402823466e+38F;
+        }
+        const float inverse =
+            normalize != 0 && total > 0.0f ? weight_scale / total : weight_scale;
+        for (int rank = 0; rank < top_k; ++rank)
+            routing_weights[output_offset + rank] *= inverse;
+    });
+}
+
+FLYWEIGHT_CPU_NATIVE_KERNEL("route_topk_sigmoid_bias_rows",
+                            route_topk_sigmoid_bias_rows);
+
+// --- qwen_delta_recurrent_rows --------------------------------------------
+//
+// Corpus signature:
+//   void qwen_delta_recurrent_rows(
+//       const float* convolved, const float* gates,
+//       const float* beta_logits, const float* decay_logits,
+//       const float* decay_coefficients, const float* dt_bias,
+//       const float* norm_weights, float* state, float* output,
+//       const int rows, const int key_heads, const int value_heads,
+//       const int head_dim, const float epsilon, const int gate_sigmoid)
+//
+// The general-geometry DeltaNet recurrence (any head_dim): one token at a
+// time with the state in global memory, parallel over value heads. Same
+// structure as the _chunk twin above, minus the 128-wide specialization:
+// per-token scalars, rank-one state update, RMSNormGated epilogue with the
+// qwen4exp sigmoid/silu switch.
+void qwen_delta_recurrent_rows(const Launch&, void** arguments) {
+    const float* convolved = *reinterpret_cast<const float**>(arguments[0]);
+    const float* gates = *reinterpret_cast<const float**>(arguments[1]);
+    const float* beta_logits = *reinterpret_cast<const float**>(arguments[2]);
+    const float* decay_logits = *reinterpret_cast<const float**>(arguments[3]);
+    const float* decay_coefficients =
+        *reinterpret_cast<const float**>(arguments[4]);
+    const float* dt_bias = *reinterpret_cast<const float**>(arguments[5]);
+    const float* norm_weights = *reinterpret_cast<const float**>(arguments[6]);
+    float* state = *reinterpret_cast<float**>(arguments[7]);
+    float* output = *reinterpret_cast<float**>(arguments[8]);
+    const int rows = *reinterpret_cast<const int*>(arguments[9]);
+    const int key_heads = *reinterpret_cast<const int*>(arguments[10]);
+    const int value_heads = *reinterpret_cast<const int*>(arguments[11]);
+    const int head_dim = *reinterpret_cast<const int*>(arguments[12]);
+    const float epsilon = *reinterpret_cast<const float*>(arguments[13]);
+    const int gate_sigmoid = *reinterpret_cast<const int*>(arguments[14]);
+
+    const int total_key_dim = key_heads * head_dim;
+
+    parallel_chunks(static_cast<std::uint64_t>(value_heads),
+                    [&](std::uint64_t head_index) {
+        const int head = static_cast<int>(head_index);
+        const int key_head = head % key_heads;
+        const int key_offset = key_head * head_dim;
+
+        // Per-worker scratch, reused across heads and launches. Sized on
+        // first use; head_dim is fixed for a given model.
+        static thread_local std::vector<float> query, key, memory, delta,
+            core;
+        if (static_cast<int>(query.size()) < head_dim) {
+            query.resize(head_dim); key.resize(head_dim);
+            memory.resize(head_dim); delta.resize(head_dim);
+            core.resize(head_dim);
+        }
+
+        for (int token = 0; token < rows; ++token) {
+            const float* row = convolved +
+                static_cast<std::int64_t>(token) *
+                    (total_key_dim * 2 + value_heads * head_dim);
+            float query_square = 0.0f, key_square = 0.0f;
+            for (int dim = 0; dim < head_dim; ++dim) {
+                query[dim] = row[key_offset + dim];
+                key[dim] = row[total_key_dim + key_offset + dim];
+                query_square += query[dim] * query[dim];
+                key_square += key[dim] * key[dim];
+            }
+            const float query_inverse_norm =
+                (1.0f / std::sqrt(query_square + 1.0e-6f)) *
+                (1.0f / std::sqrt(static_cast<float>(head_dim)));
+            const float key_inverse_norm =
+                1.0f / std::sqrt(key_square + 1.0e-6f);
+            const float beta = 1.0f / (1.0f + std::exp(
+                -beta_logits[static_cast<std::int64_t>(token) * value_heads + head]));
+            const float softplus_input =
+                decay_logits[static_cast<std::int64_t>(token) * value_heads + head] +
+                dt_bias[head];
+            const float softplus = softplus_input > 20.0f
+                ? softplus_input
+                : std::log1p(std::exp(softplus_input));
+            const float decay_scale =
+                std::exp(decay_coefficients[head] * softplus);
+
+            for (int dim = 0; dim < head_dim; ++dim)
+                key[dim] *= key_inverse_norm;
+
+            // Sweep one: decay the state and read the memory out of it.
+            for (int dim = 0; dim < head_dim; ++dim) memory[dim] = 0.0f;
+            for (int k = 0; k < head_dim; ++k) {
+                float* state_row = state +
+                    (static_cast<std::int64_t>(head) * head_dim + k) * head_dim;
+                const float key_value = key[k];
+                for (int dim = 0; dim < head_dim; ++dim) {
+                    const float decayed = state_row[dim] * decay_scale;
+                    state_row[dim] = decayed;
+                    memory[dim] += decayed * key_value;
+                }
+            }
+
+            for (int dim = 0; dim < head_dim; ++dim) {
+                const float value =
+                    row[total_key_dim * 2 + head * head_dim + dim];
+                delta[dim] = (value - memory[dim]) * beta;
+            }
+
+            // Sweep two: rank-one update, and read the core out of the new
+            // state. Same order as the corpus: update first, then
+            // accumulate, per key lane.
+            for (int dim = 0; dim < head_dim; ++dim) core[dim] = 0.0f;
+            for (int k = 0; k < head_dim; ++k) {
+                float* state_row = state +
+                    (static_cast<std::int64_t>(head) * head_dim + k) * head_dim;
+                const float key_value = key[k];
+                const float query_value = query[k] * query_inverse_norm;
+                for (int dim = 0; dim < head_dim; ++dim) {
+                    const float updated = state_row[dim] + key_value * delta[dim];
+                    state_row[dim] = updated;
+                    core[dim] += updated * query_value;
+                }
+            }
+
+            float square = 0.0f;
+            for (int dim = 0; dim < head_dim; ++dim)
+                square += core[dim] * core[dim];
+            const float inverse_rms = 1.0f / std::sqrt(
+                square / static_cast<float>(head_dim) + epsilon);
+            for (int dim = 0; dim < head_dim; ++dim) {
+                const int output_index =
+                    (token * value_heads + head) * head_dim + dim;
+                const float gate = gates[output_index];
+                const float clamped = std::fmin(80.0f, std::fmax(-80.0f, gate));
+                const float logistic = 1.0f / (1.0f + std::exp(-clamped));
+                output[output_index] = core[dim] * inverse_rms * norm_weights[dim] *
+                                       (gate_sigmoid ? logistic : gate * logistic);
+            }
+        }
+    });
+}
+
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_delta_recurrent_rows",
+                            qwen_delta_recurrent_rows);
+
 }  // namespace flyweight::cpu
