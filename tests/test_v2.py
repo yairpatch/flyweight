@@ -228,21 +228,24 @@ class V2RuntimeTests(unittest.TestCase):
         missing = sorted(name for name in names if f'"{name}"' not in driver)
         self.assertEqual(missing, [], "unregistered kernel names in the table")
 
-    def test_routed_mmq_switch_names_iq2s_iq1m_and_q20(self):
+    def test_routed_mmq_switch_names_q80_iq2s_iq1m_and_q20(self):
         """The routed MMQ switch used to omit types whose kernels exist.
 
-        iq2s_q8_mmq_routed, iq1m_q8_mmq_routed and q20_q8_mmq_routed are in
-        the corpus and the driver; without the case labels, GSQ-RCO IQ2_S
-        gate/up stacks, Q2_0 downs and any IQ1_M expert role never reach them.
+        q80_q8_mmq_routed, iq2s_q8_mmq_routed, iq1m_q8_mmq_routed and
+        q20_q8_mmq_routed are in the corpus and the driver; without the case
+        labels, UD Q8_0 down stacks, GSQ-RCO IQ2_S gate/up stacks, Q2_0 downs
+        and any IQ1_M expert role never reach them.
         """
         root = Path(__file__).resolve().parents[1]
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         start = runtime.find("std::string qwen_routed_mmq_kernel")
         self.assertNotEqual(start, -1, "qwen_routed_mmq_kernel not found")
         body = runtime[start : runtime.find("bool qwen_routed_mmq_available", start)]
+        self.assertIn("case 8:", body)
         self.assertIn("case 22:", body)
         self.assertIn("case 29:", body)
         self.assertIn("case 42:", body)
+        self.assertIn('"q80"', body)
         self.assertIn('"iq2s"', body)
         self.assertIn('"iq1m"', body)
         self.assertIn('"q20"', body)

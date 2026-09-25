@@ -4495,8 +4495,8 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 
 // The routed block-table MMQ kernel for an expert role, or empty where the
 // format has none or the width does not divide its blocking: 256 for the
-// super-block formats, 32 for IQ4_NL's flat blocks, 64 for Q2_0 (both of
-// those let qwen4exp's 640-wide down projection in).
+// super-block formats, 32 for IQ4_NL and Q8_0's flat blocks, 64 for Q2_0
+// (those let a 640-wide down projection in).
 //
 // Its own list rather than grouped_expert_prefix + suffix, because the two sets
 // are not the same one: Q4_0 has a grouped kernel and no MMQ kernel, so reading
@@ -4512,6 +4512,7 @@ std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
 std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
     const char* family = nullptr;
     switch (type) {
+        case 8: family = "q80"; break;
         case 10: family = "q2k"; break;
         case 11: family = "q3k"; break;
         case 12: family = "q4k"; break;
@@ -4530,15 +4531,15 @@ std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
         default: break;
     }
     if (!family) return {};
-    const int unit = type == 20 ? 32 : type == 42 ? 64 : 256;
+    const int unit = (type == 8 || type == 20) ? 32 : type == 42 ? 64 : 256;
     return in_size % unit == 0 ? std::string(family) + "_q8_mmq_routed"
                                : std::string();
 }
 
-// Whether the routed MMQ carries most MoE layers: the UD checkpoints keep a
-// few layers' down experts in Q8_0, which has no routed kernel and falls
-// back to the per-expert GEMM for that layer alone; those few do not decide
-// the budget for the rest.
+// Whether the routed MMQ carries most MoE layers. A layer counts only when
+// gate, up, and down all have a kernel for their width; a format still missing
+// one (or a width that does not divide) falls that layer back to the
+// per-expert GEMM, and those few do not decide the budget for the rest.
 bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
     if (!runtime.int8_tensor_cores) return false;
     const int hidden = static_cast<int>(runtime.model->config.hidden_size);
