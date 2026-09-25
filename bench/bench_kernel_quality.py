@@ -82,6 +82,7 @@ ARMS: dict[str, dict[str, str]] = {
     "tile32": {"FLYWEIGHT_CUBLAS_TILE_ROWS": "32"},
     "tile64": {"FLYWEIGHT_CUBLAS_TILE_ROWS": "64"},
     "qsa": {"FLYWEIGHT_QSA": "1"},
+    "rows-q8-iq3s": {"FLYWEIGHT_ROWS_Q8_IQ3S": "1"},
 }
 
 
@@ -293,6 +294,11 @@ def cmd_model(args) -> int:
         env = dict(os.environ)
         env.update(ARMS.get(base, {}))
         env["FLYWEIGHT_EXPERT_HISTORY"] = "0"
+        # Workers must import the checkout under test, never the installed
+        # copy: an env flag the installed library does not know would be
+        # silently ignored and the comparison vacuous.
+        env["PYTHONPATH"] = str(BENCH.parent / "src") + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         cmd = [sys.executable, str(BENCH / "bench_kernel_quality.py"),
                "worker", args.model, "--context", str(args.context),
                "--gpu-cache-mib", str(args.gpu_cache_mib),
@@ -383,6 +389,8 @@ def _agree_all(args, label, ref_prompts) -> dict[str, float]:
     env = dict(os.environ)
     env.update(ARMS.get(base, {}))
     env["FLYWEIGHT_EXPERT_HISTORY"] = "0"
+    env["PYTHONPATH"] = str(BENCH.parent / "src") + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     refs_blob = json.dumps({n: ref_prompts[n]["tokens"] for n in ref_prompts})
     cmd = [sys.executable, str(BENCH / "bench_kernel_quality.py"),
            "agreebatch", args.model, "--context", str(args.context),
