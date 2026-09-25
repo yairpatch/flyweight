@@ -260,6 +260,21 @@ void qwen_u8_gemm_k32_vnni512(
 void qwen_iq3s_fold_rows_vnni512(
     const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
     std::int16_t* weights, float* scales);
+// IQ2_XS/IQ2_S/IQ2_XXS/IQ3_XXS twins: same contract, per-format code
+// extraction, block scale d over the format's power-of-two multiplier
+// (8, 8, 8, 4). See the section comment in the .cpp.
+void qwen_iq2xs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
+void qwen_iq2s_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
+void qwen_iq2xxs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
+void qwen_iq3xxs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
 
 // int16 rows path (AVX512-VNNI, dpwssd): weights are the codebook's integer
 // codes recovered exactly from the float decode (one float scale per 256),

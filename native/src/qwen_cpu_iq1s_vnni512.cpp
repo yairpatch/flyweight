@@ -740,6 +740,304 @@ void qwen_iq3s_fold_rows_vnni512(
     }
 }
 
+// --- IQ2_XS/IQ2_S/IQ2_XXS/IQ3_XXS direct folds -------------------------------
+//
+// Same contract as the IQ3_S fold above: exact integers in int16 with the
+// block's float d over the format's power-of-two multiplier, feeding the
+// shared int16 GEMM. Only the code extraction differs per format; the
+// multipliers live in qwen_i16_fold_multiplier (8, 8, 8, 4).
+//
+// IQ2_XS (GGML type 17): 74 bytes per 256 values -> d(2), 16xuint16 grid
+// index (9 bits) + sign selector (7 bits), 16 nibble scales (one per 16
+// values). Grid magnitudes to 43: (2s+1) * grid <= 645.
+void qwen_iq2xs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m512i zero = _mm512_setzero_si512();
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq2xsBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq2xsBlockBytes;
+            scales[static_cast<std::size_t>(r) * blocks + block] =
+                half_value(base) * 0.125f;
+            // 64 values per gather: 8 entries covering 16-value groups
+            // 4g..4g+3, each entry 8 magnitudes from one grid pattern.
+            for (int gather = 0; gather < 4; ++gather) {
+                __m128i entries = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(base + 2 + gather * 16));
+                const __m512i indices = _mm512_cvtepu16_epi64(_mm_and_si128(
+                    entries, _mm_set1_epi16(511)));
+                const __m512i patterns = _mm512_i64gather_epi64(
+                    indices, static_cast<const void*>(kIq2xsGrid), 8);
+                const __m512i mag_lo = _mm512_cvtepu8_epi16(
+                    _mm512_castsi512_si256(patterns));
+                const __m512i mag_hi = _mm512_cvtepu8_epi16(
+                    _mm512_extracti64x4_epi64(patterns, 1));
+                // Sign selectors and scales stay scalar: 8 table lookups and
+                // 4 nibbles per gather, against 64 vectorized magnitudes.
+                alignas(16) std::uint16_t raw[8];
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(raw), entries);
+                std::uint64_t sign_mask = 0;
+                int group_scale[4];
+                for (int k = 0; k < 8; ++k) {
+                    const std::uint8_t signs =
+                        kIq2xxsSigns[(raw[k] >> 9) & 127];
+                    sign_mask |= static_cast<std::uint64_t>(signs) << (8 * k);
+                    if ((k & 1) == 0) {
+                        const int group = gather * 4 + k / 2;
+                        const std::uint8_t byte = base[66 + (group >> 1)];
+                        group_scale[k / 2] =
+                            1 + 2 * ((byte >> (4 * (group & 1))) & 15);
+                    }
+                }
+                // Halves take two 16-value groups each; blend the second
+                // group's scale over the top 16 lanes of each half.
+                __m512i folded_lo = _mm512_mullo_epi16(
+                    mag_lo, _mm512_set1_epi16(
+                                static_cast<short>(group_scale[0])));
+                folded_lo = _mm512_mask_mullo_epi16(
+                    folded_lo, 0xFFFF0000u, mag_lo, _mm512_set1_epi16(
+                                                   static_cast<short>(
+                                                       group_scale[1])));
+                __m512i folded_hi = _mm512_mullo_epi16(
+                    mag_hi, _mm512_set1_epi16(
+                                static_cast<short>(group_scale[2])));
+                folded_hi = _mm512_mask_mullo_epi16(
+                    folded_hi, 0xFFFF0000u, mag_hi, _mm512_set1_epi16(
+                                                   static_cast<short>(
+                                                       group_scale[3])));
+                folded_lo = _mm512_mask_sub_epi16(
+                    folded_lo, static_cast<__mmask32>(sign_mask), zero,
+                    folded_lo);
+                folded_hi = _mm512_mask_sub_epi16(
+                    folded_hi, static_cast<__mmask32>(sign_mask >> 32), zero,
+                    folded_hi);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64),
+                    folded_lo);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64 + 32),
+                    folded_hi);
+            }
+        }
+    }
+}
+
+// IQ2_S (GGML type 22): 82 bytes per 256 values -> d(2), 32 grid indices
+// (one byte each, two high bits from qh), 32 literal sign bytes, 16 nibble
+// scales (one per 16 values). Grid magnitudes to 43: (2s+1) * grid <= 645.
+void qwen_iq2s_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m512i zero = _mm512_setzero_si512();
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq2sBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq2sBlockBytes;
+            const auto* quants = base + 2;
+            const auto* signs = base + 34;
+            const auto* high = base + 66;
+            const auto* scales_b = base + 74;
+            scales[static_cast<std::size_t>(r) * blocks + block] =
+                half_value(base) * 0.125f;
+            // 64 values per gather: 8 indices covering 16-value groups
+            // 4g..4g+3, each index 8 magnitudes from one grid pattern.
+            for (int gather = 0; gather < 4; ++gather) {
+                // Two high bits per index from the matching qh bits. Byte
+                // 2g covers indices 0-3, byte 2g+1 covers 4-7, so one u16
+                // broadcast with lane counts 0,2,..,14 selects both. Only
+                // the low 8 lanes carry indices; the gather takes 256 bits.
+                const __m128i qs8 = _mm_loadu_si64(quants + gather * 8);
+                std::uint16_t qh_pair = 0;
+                std::memcpy(&qh_pair, high + gather * 2, sizeof(qh_pair));
+                const __m256i index = _mm256_or_si256(
+                    _mm256_cvtepu8_epi32(qs8),
+                    _mm256_slli_epi32(
+                        _mm256_and_si256(
+                            _mm256_srlv_epi32(
+                                _mm256_set1_epi32(
+                                    static_cast<int>(qh_pair)),
+                                _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12,
+                                                  14)),
+                            _mm256_set1_epi32(3)),
+                        8));
+                const __m512i patterns = _mm512_i32gather_epi64(
+                    index,
+                    static_cast<const void*>(kIq2sGrid), 8);
+                const __m512i mag_lo = _mm512_cvtepu8_epi16(
+                    _mm512_castsi512_si256(patterns));
+                const __m512i mag_hi = _mm512_cvtepu8_epi16(
+                    _mm512_extracti64x4_epi64(patterns, 1));
+                std::uint64_t sign_mask = 0;
+                std::memcpy(&sign_mask, signs + gather * 8, sizeof(sign_mask));
+                int group_scale[4];
+                for (int k = 0; k < 4; ++k) {
+                    const int group = gather * 4 + k;
+                    group_scale[k] =
+                        1 + 2 * ((scales_b[group >> 1] >> (4 * (group & 1))) & 15);
+                }
+                __m512i folded_lo = _mm512_mullo_epi16(
+                    mag_lo, _mm512_set1_epi16(
+                                static_cast<short>(group_scale[0])));
+                folded_lo = _mm512_mask_mullo_epi16(
+                    folded_lo, 0xFFFF0000u, mag_lo, _mm512_set1_epi16(
+                                                   static_cast<short>(
+                                                       group_scale[1])));
+                __m512i folded_hi = _mm512_mullo_epi16(
+                    mag_hi, _mm512_set1_epi16(
+                                static_cast<short>(group_scale[2])));
+                folded_hi = _mm512_mask_mullo_epi16(
+                    folded_hi, 0xFFFF0000u, mag_hi, _mm512_set1_epi16(
+                                                   static_cast<short>(
+                                                       group_scale[3])));
+                folded_lo = _mm512_mask_sub_epi16(
+                    folded_lo, static_cast<__mmask32>(sign_mask), zero,
+                    folded_lo);
+                folded_hi = _mm512_mask_sub_epi16(
+                    folded_hi, static_cast<__mmask32>(sign_mask >> 32), zero,
+                    folded_hi);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64),
+                    folded_lo);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + gather * 64 + 32),
+                    folded_hi);
+            }
+        }
+    }
+}
+
+// IQ2_XXS (GGML type 16): 66 bytes per 256 values -> d(2), 8x(uint32 grid
+// indices + uint32 signs-and-scale). Each 32-value group holds four 8-bit
+// indices into the 256-entry grid of 8-value patterns, four 7-bit sign
+// selectors and one 4-bit scale. Grid magnitudes to 43.
+void qwen_iq2xxs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m512i zero = _mm512_setzero_si512();
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq2xxsBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq2xxsBlockBytes;
+            scales[static_cast<std::size_t>(r) * blocks + block] =
+                half_value(base) * 0.125f;
+            // One 32-value group at a time: 4 scalar pattern lookups (the
+            // entries are 8 bytes apart, past what one gather covers
+            // cheaply), then a full-width scale and negate over the 32.
+            for (int group = 0; group < 8; ++group) {
+                std::uint32_t low = 0, high = 0;
+                std::memcpy(&low, base + 2 + group * 8, sizeof(low));
+                std::memcpy(&high, base + 2 + group * 8 + 4, sizeof(high));
+                alignas(32) std::uint8_t mags[32];
+                std::uint32_t sign_bits = 0;
+                for (int quad = 0; quad < 4; ++quad) {
+                    std::memcpy(mags + quad * 8,
+                                kIq2xxsGrid[(low >> (8 * quad)) & 255],
+                                sizeof(std::uint64_t));
+                    sign_bits |= static_cast<std::uint32_t>(
+                                     kIq2xxsSigns[(high >> (7 * quad)) & 127])
+                                 << (8 * quad);
+                }
+                __m512i folded = _mm512_cvtepu8_epi16(_mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(mags)));
+                folded = _mm512_mullo_epi16(
+                    folded, _mm512_set1_epi16(static_cast<short>(
+                                1 + 2 * ((high >> 28) & 15))));
+                folded = _mm512_mask_sub_epi16(
+                    folded, static_cast<__mmask32>(sign_bits), zero, folded);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + group * 32),
+                    folded);
+            }
+        }
+    }
+}
+
+// IQ3_XXS (GGML type 18): 98 bytes per 256 values -> d(2), 64 index bytes
+// (two per 8-output quad), 8xuint32 scale-and-signs. Grid entries are four
+// values wide (magnitudes to 62): (2s+1) * grid <= 930.
+void qwen_iq3xxs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m512i zero = _mm512_setzero_si512();
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq3xxsBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq3xxsBlockBytes;
+            const auto* quants = base + 2;
+            scales[static_cast<std::size_t>(r) * blocks + block] =
+                half_value(base) * 0.25f;
+            // 64 values per pair: 16 indices covering two 32-value groups.
+            // The low 32 magnitudes are group 2p (scale aux0), the high 32
+            // group 2p+1 (scale aux1): one scale per half, no blending.
+            for (int pair = 0; pair < 4; ++pair) {
+                const __m128i index_bytes = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(quants + pair * 16));
+                const __m512i patterns = _mm512_i32gather_epi32(
+                    _mm512_cvtepu8_epi32(index_bytes),
+                    static_cast<const void*>(kIq3xxsGrid), 4);
+                const __m512i mag_lo = _mm512_cvtepu8_epi16(
+                    _mm512_castsi512_si256(patterns));
+                const __m512i mag_hi = _mm512_cvtepu8_epi16(
+                    _mm512_extracti64x4_epi64(patterns, 1));
+                const int group0 = pair * 2;
+                std::uint32_t aux0 = 0, aux1 = 0;
+                std::memcpy(&aux0, base + 2 + 64 + group0 * 4, sizeof(aux0));
+                std::memcpy(&aux1, base + 2 + 64 + (group0 + 1) * 4,
+                            sizeof(aux1));
+                __m512i folded_lo = _mm512_mullo_epi16(
+                    mag_lo, _mm512_set1_epi16(static_cast<short>(
+                                1 + 2 * ((aux0 >> 28) & 15))));
+                __m512i folded_hi = _mm512_mullo_epi16(
+                    mag_hi, _mm512_set1_epi16(static_cast<short>(
+                                1 + 2 * ((aux1 >> 28) & 15))));
+                // Signs stay scalar: 8 selectors per pair against 64
+                // vectorized magnitudes; quads 0-3 address group 2p,
+                // quads 4-7 group 2p+1.
+                std::uint64_t sign_mask = 0;
+                for (int q = 0; q < 8; ++q) {
+                    const std::uint32_t aux = (q < 4) ? aux0 : aux1;
+                    const std::uint8_t signs = kIq2xxsSigns[
+                        (aux >> (7 * (q & 3))) & 127];
+                    sign_mask |= static_cast<std::uint64_t>(signs) << (8 * q);
+                }
+                folded_lo = _mm512_mask_sub_epi16(
+                    folded_lo, static_cast<__mmask32>(sign_mask), zero,
+                    folded_lo);
+                folded_hi = _mm512_mask_sub_epi16(
+                    folded_hi, static_cast<__mmask32>(sign_mask >> 32), zero,
+                    folded_hi);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + pair * 64),
+                    folded_lo);
+                _mm512_storeu_si512(
+                    static_cast<void*>(row_out + block * 256 + pair * 64 + 32),
+                    folded_hi);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // int16 rows path for the prefill expert sweep: exact weights, 14-bit
 // activations, dpwssd.
