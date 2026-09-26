@@ -20651,6 +20651,329 @@ static int gemma4_decode(FlyweightV2QwenRuntime& runtime, std::uint32_t input_to
 }
 
 int flyweight_v2_qwen_runtime_synchronize(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime||!runtime->stream)throw std::runtime_error("native Qwen runtime is not prepared");if(flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA synchronization failed");return 0;});}
+}
+
+// One hybrid routed-expert step, shared by single-token decode and
+// multi-decode. Resident experts run on the GPU; misses run on the CPU and
+// are admitted into the cache. `fence_staging` is the multi-decode case,
+// where the next sequence will reuse this staging buffer and must wait until
+// the uploads queued here have been consumed.
+template <class Launch>
+static void qwen_run_hybrid_experts(
+    FlyweightV2QwenRuntime& runtime, QwenLayerPlan& layer,
+    std::uint32_t layer_number,
+    const flyweight::v2::ExpertExecutionPolicy& expert_policy,
+    int route_count, int hidden_size, int intermediate, int experts,
+    std::uint8_t* staging, std::uint64_t staging_cursor,
+    const std::int32_t* selected, const float* route_weights,
+    float* cpu_input, float* cpu_activated, float* cpu_output,
+    std::uint64_t normalized, std::uint64_t activated,
+    std::uint64_t third, std::uint64_t fourth,
+    bool fence_staging, Launch& launch
+) {
+    static const bool persistent = [] {
+        const char* setting = std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");
+        return setting && setting[0] == '1';
+    }();
+    static const bool tensor_cores = [] {
+        const char* setting = std::getenv("FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES");
+        return setting && setting[0] == '1';
+    }();
+    static const bool tensor_core_trace =
+        std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE") != nullptr;
+    static const bool nvfp4_tiled = [] {
+        const char* setting = std::getenv("FLYWEIGHT_NVFP4_TILED");
+        return setting && setting[0] == '1';
+    }();
+    if (runtime.expert_slots.empty())
+        throw std::runtime_error("native hybrid MoE requires an expert cache budget");
+    if (fence_staging &&
+        flyweight_gpu_event_sync(runtime.staging_event) != 0)
+        throw std::runtime_error("native Qwen staging event failed");
+    std::array<std::int32_t, 256> cpu_selected{};
+    std::array<float, 256> cpu_compact_weights{}, gpu_compact_weights{};
+    std::array<float, 256> gpu_gate_scales{}, gpu_up_scales{}, gpu_down_scales{};
+    std::array<std::uint64_t, 256> gate_pointers{}, up_pointers{},
+        down_pointers{}, native_pointers{};
+    int cpu_count = 0, gpu_count = 0;
+    struct PendingUpload {
+        std::uint64_t device, host_offset, bytes;
+        std::size_t slot_index;
+    };
+    std::array<PendingUpload, 256> pending{};
+    int pending_count = 0;
+    auto& moe_prof = qwen_moe_profile();
+    for (int rank = 0; rank < route_count; ++rank) {
+        const int expert = selected[rank];
+        if (expert < 0 || expert >= experts)
+            throw std::runtime_error("native hybrid MoE selected an invalid expert");
+        const auto cache_key = (static_cast<std::uint64_t>(layer_number) << 32) |
+            static_cast<std::uint32_t>(expert);
+        const double t_lookup = moe_now();
+        auto resident = runtime.expert_residency.find(cache_key);
+        if (moe_profile_enabled()) {
+            moe_prof.lookup += moe_now() - t_lookup;
+            ++moe_prof.lookups;
+        }
+        if (resident != runtime.expert_residency.end()) {
+            const auto slot_index = resident->second;
+            auto& slot = runtime.expert_slots[slot_index];
+            const double t_access = moe_now();
+            const auto& history = record_expert_access(runtime, layer_number, expert);
+            if (expert_policy.residency_may_change())
+                slot.last_used = history.last_used;
+            record_expert_cache_hit(runtime, slot);
+            if (moe_profile_enabled()) moe_prof.access += moe_now() - t_access;
+            const auto device_base =
+                runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
+            std::uint64_t role_offset = 0;
+            for (int role = 0; role < 3; ++role) {
+                const auto bytes =
+                    runtime.model->tensors[layer.expert_tensors[role]].size / experts;
+                const auto pointer = device_base + role_offset;
+                if (role == 0) gate_pointers[gpu_count] = pointer;
+                else if (role == 1) up_pointers[gpu_count] = pointer;
+                else down_pointers[gpu_count] = pointer;
+                role_offset += bytes;
+            }
+            if (slot.native_valid && runtime.expert_native_cache)
+                native_pointers[gpu_count] = runtime.expert_native_cache +
+                    slot_index * runtime.expert_slot_bytes;
+            gpu_compact_weights[gpu_count] = route_weights[rank];
+            const double t_scales = moe_now();
+            gpu_gate_scales[gpu_count] =
+                qwen_expert_role_scale(runtime, layer.expert_gate_scale, expert);
+            gpu_down_scales[gpu_count] =
+                qwen_expert_role_scale(runtime, layer.expert_down_scale, expert);
+            gpu_up_scales[gpu_count] =
+                qwen_expert_role_scale(runtime, layer.expert_up_scale, expert) *
+                gpu_down_scales[gpu_count];
+            if (moe_profile_enabled()) moe_prof.scales += moe_now() - t_scales;
+            ++gpu_count;
+            continue;
+        }
+        ++runtime.expert_cache_misses;
+        cpu_selected[cpu_count] = expert;
+        cpu_compact_weights[cpu_count] = route_weights[rank];
+        if (layer.expert_down_scale != std::numeric_limits<std::uint64_t>::max()) {
+            const auto& scale_tensor = runtime.model->tensors[layer.expert_down_scale];
+            const auto scale_bytes =
+                scale_tensor.size / runtime.model->config.expert_count;
+            float down_scale = 1.0f;
+            std::memcpy(
+                &down_scale,
+                tensor_data(*runtime.model, scale_tensor) +
+                    static_cast<std::uint64_t>(expert) * scale_bytes,
+                sizeof(float));
+            cpu_compact_weights[cpu_count] *= down_scale;
+        }
+        ++cpu_count;
+        const double t_admit = moe_now();
+        const auto slot_index =
+            select_expert_cache_slot(runtime, layer_number, expert, true);
+        if (moe_profile_enabled()) {
+            moe_prof.admission += moe_now() - t_admit;
+            ++moe_prof.admissions;
+        }
+        if (slot_index == kNoExpertSlot) continue;
+        auto& slot = runtime.expert_slots[slot_index];
+        slot.key = cache_key;
+        slot.valid = true;
+        slot.native_valid = false;
+        slot.last_used = ++runtime.expert_clock;
+        runtime.expert_residency[cache_key] = slot_index;
+        const auto slot_base =
+            runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
+        if (layer.expert_dma) {
+            std::uint64_t role_offset = 0;
+            for (int role = 0; role < 3; ++role) {
+                const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
+                const auto bytes = tensor.size / experts;
+                const auto offset = static_cast<std::uint64_t>(expert) * bytes;
+                if (flyweight_gpu_upload(
+                        slot_base + role_offset,
+                        tensor_data(*runtime.model, tensor) + offset, bytes,
+                        runtime.stream) != 0)
+                    throw std::runtime_error("native hybrid MoE DMA cache upload failed");
+                role_offset += bytes;
+            }
+            if (runtime.expert_native_cache) {
+                const auto gate_bytes =
+                    runtime.model->tensors[layer.expert_tensors[0]].size / experts;
+                const auto up_bytes =
+                    runtime.model->tensors[layer.expert_tensors[1]].size / experts;
+                const int status = flyweight_gpu_nvfp4_prepare_expert(
+                    slot_base, slot_base + gate_bytes,
+                    slot_base + gate_bytes + up_bytes,
+                    runtime.expert_native_cache + slot_index * runtime.expert_slot_bytes,
+                    runtime.stream, hidden_size, intermediate);
+                if (status != 0)
+                    throw std::runtime_error("persistent NVFP4 expert preparation failed");
+                slot.native_valid = true;
+            }
+        } else {
+            const auto bundle_start = staging_cursor;
+            const double t_stage = moe_now();
+            for (int role = 0; role < 3; ++role) {
+                const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
+                const auto bytes = tensor.size / experts;
+                const auto offset = static_cast<std::uint64_t>(expert) * bytes;
+                if (staging_cursor + bytes > runtime.expert_staging_bytes)
+                    throw std::runtime_error("native hybrid MoE staging overflow");
+                std::memcpy(
+                    staging + staging_cursor,
+                    tensor_data(*runtime.model, tensor) + offset, bytes);
+                staging_cursor += bytes;
+            }
+            if (moe_profile_enabled()) {
+                moe_prof.staging += moe_now() - t_stage;
+                moe_prof.staged_bytes += staging_cursor - bundle_start;
+            }
+            pending[pending_count++] = {
+                slot_base, bundle_start, staging_cursor - bundle_start, slot_index};
+        }
+    }
+    const double t_table = moe_now();
+    if (gpu_count) {
+        const auto table_bytes = static_cast<std::uint64_t>(gpu_count) *
+            (3 * sizeof(std::uint64_t) + 4 * sizeof(float));
+        const auto table_host = device_align(staging_cursor);
+        const auto table_device = runtime.expert_staging +
+            runtime.expert_staging_bytes - device_align(table_bytes);
+        if (table_host + table_bytes > runtime.expert_staging_bytes)
+            throw std::runtime_error("native hybrid MoE pointer staging overflow");
+        std::memcpy(staging + table_host, gate_pointers.data(), gpu_count * sizeof(std::uint64_t));
+        std::memcpy(staging + table_host + gpu_count * sizeof(std::uint64_t), up_pointers.data(), gpu_count * sizeof(std::uint64_t));
+        std::memcpy(staging + table_host + 2 * gpu_count * sizeof(std::uint64_t), down_pointers.data(), gpu_count * sizeof(std::uint64_t));
+        std::memcpy(staging + table_host + 3 * gpu_count * sizeof(std::uint64_t), gpu_compact_weights.data(), gpu_count * sizeof(float));
+        std::memcpy(staging + table_host + 3 * gpu_count * sizeof(std::uint64_t) + gpu_count * sizeof(float), gpu_gate_scales.data(), gpu_count * sizeof(float));
+        std::memcpy(staging + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 2 * gpu_count * sizeof(float), gpu_up_scales.data(), gpu_count * sizeof(float));
+        std::memcpy(staging + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 3 * gpu_count * sizeof(float), gpu_down_scales.data(), gpu_count * sizeof(float));
+        if (flyweight_gpu_upload(table_device, staging + table_host, table_bytes, runtime.stream) != 0)
+            throw std::runtime_error("native hybrid MoE table upload failed");
+        const auto gate_table = table_device;
+        const auto up_table = gate_table + gpu_count * sizeof(std::uint64_t);
+        const auto down_table = up_table + gpu_count * sizeof(std::uint64_t);
+        const auto weight_table = down_table + gpu_count * sizeof(std::uint64_t);
+        const auto gate_scale_table = weight_table + gpu_count * sizeof(float);
+        const auto up_scale_table = gate_scale_table + gpu_count * sizeof(float);
+        const auto down_scale_table = up_scale_table + gpu_count * sizeof(float);
+        if (moe_profile_enabled()) moe_prof.table += moe_now() - t_table;
+        const auto gate_type = runtime.model->tensors[layer.expert_tensors[0]].type;
+        const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
+        if (!qwen_gpu_expert_type_supported(gate_type) ||
+            !qwen_gpu_expert_type_supported(down_type))
+            throw std::runtime_error(
+                "native GPU expert quantization is unsupported: " +
+                std::to_string(gate_type) + "/" + std::to_string(down_type));
+        const bool persistent_enabled = persistent && runtime.expert_native_cache &&
+            std::all_of(
+                native_pointers.begin(), native_pointers.begin() + gpu_count,
+                [](std::uint64_t pointer) { return pointer != 0; });
+        bool tensor_cores_done = false;
+        if (persistent_enabled && gate_type == 40 && down_type == 40) {
+            const int status = flyweight_gpu_nvfp4_moe_persistent(
+                native_pointers.data(), weight_table, gate_scale_table,
+                up_scale_table, down_scale_table, normalized, activated, third,
+                runtime.stream, hidden_size, intermediate, gpu_count);
+            if (status == 0) {
+                ++runtime.nvfp4_tensor_core_moe_calls;
+                runtime.nvfp4_tensor_core_moe_last_status = 0;
+                tensor_cores_done = true;
+            } else {
+                ++runtime.nvfp4_tensor_core_moe_fallbacks;
+                runtime.nvfp4_tensor_core_moe_last_status = status;
+                if (tensor_core_trace)
+                    std::fprintf(stderr, "[nvfp4-persistent] hybrid fallback status=%d experts=%d\n", status, gpu_count);
+            }
+        }
+        if (!tensor_cores_done && tensor_cores && gate_type == 40 && down_type == 40) {
+            const int status = flyweight_gpu_nvfp4_moe_cublas(
+                gate_table, up_table, down_table, normalized, activated, third,
+                weight_table, gate_scale_table, up_scale_table, down_scale_table,
+                runtime.stream, hidden_size, intermediate, gpu_count);
+            if (status == 0) {
+                ++runtime.nvfp4_tensor_core_moe_calls;
+                runtime.nvfp4_tensor_core_moe_last_status = 0;
+                tensor_cores_done = true;
+            } else {
+                ++runtime.nvfp4_tensor_core_moe_fallbacks;
+                runtime.nvfp4_tensor_core_moe_last_status = status;
+                if (tensor_core_trace)
+                    std::fprintf(stderr, "[nvfp4-tc] hybrid fallback status=%d experts=%d\n", status, gpu_count);
+            }
+        }
+        if (!tensor_cores_done) {
+            const double t_launch = moe_now();
+            void* gate_up_args[] = {
+                const_cast<std::uint64_t*>(&gate_table),
+                const_cast<std::uint64_t*>(&up_table),
+                const_cast<std::uint64_t*>(&normalized),
+                const_cast<std::uint64_t*>(&activated),
+                const_cast<int*>(&hidden_size),
+                const_cast<int*>(&intermediate),
+                &gpu_count,
+                const_cast<std::uint64_t*>(&gate_scale_table),
+                const_cast<std::uint64_t*>(&up_scale_table)};
+            launch(
+                qwen_grouped_swiglu_name(gate_type, nvfp4_tiled, false).c_str(),
+                gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate,
+                gpu_count, 256, gate_up_args);
+            const int status = qwen_launch_grouped_accumulate(
+                runtime.stream, down_type, down_table, activated, third,
+                weight_table, intermediate, hidden_size, gpu_count);
+            if (status != 0)
+                throw std::runtime_error("native hybrid MoE down projection failed");
+            if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_launch;
+        }
+    }
+    const double t_queue = moe_now();
+    for (int index = 0; index < pending_count; ++index) {
+        const auto& upload = pending[index];
+        if (flyweight_gpu_upload(
+                upload.device, staging + upload.host_offset, upload.bytes,
+                runtime.stream) != 0)
+            throw std::runtime_error("native hybrid MoE cache upload failed");
+        if (runtime.expert_native_cache) {
+            const auto gate_bytes =
+                runtime.model->tensors[layer.expert_tensors[0]].size / experts;
+            const auto up_bytes =
+                runtime.model->tensors[layer.expert_tensors[1]].size / experts;
+            const int status = flyweight_gpu_nvfp4_prepare_expert(
+                upload.device, upload.device + gate_bytes,
+                upload.device + gate_bytes + up_bytes,
+                runtime.expert_native_cache + upload.slot_index * runtime.expert_slot_bytes,
+                runtime.stream, hidden_size, intermediate);
+            if (status != 0)
+                throw std::runtime_error("persistent NVFP4 expert preparation failed");
+            runtime.expert_slots[upload.slot_index].native_valid = true;
+        }
+    }
+    if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_queue;
+    if (fence_staging &&
+        flyweight_gpu_event_record(runtime.staging_event, runtime.stream) != 0)
+        throw std::runtime_error("native Qwen staging event failed");
+    if (cpu_count) {
+        const auto compute_started = timing_enabled()
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        qwen_cpu_moe(
+            runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
+            cpu_count, cpu_input, cpu_activated, cpu_output);
+        if (timing_enabled())
+            runtime.expert_compute_nanoseconds +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - compute_started).count();
+        if (flyweight_gpu_upload(fourth, cpu_output, hidden_size * sizeof(float), runtime.stream) != 0)
+            throw std::runtime_error("native hybrid MoE output upload failed");
+        float scale = 1.0f;
+        int count = hidden_size;
+        void* add_args[] = {&third, &fourth, &scale, &count};
+        launch("scaled_add", (hidden_size + 255) / 256, 1, 256, add_args);
+    }
+}
+
+extern "C" {
 int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t input_token,uint32_t*output_token){return guarded([&]{
     if(!runtime||!output_token)throw std::runtime_error("invalid native Qwen decode arguments");
     if(!runtime->decode_ready)throw std::runtime_error("native Qwen runtime is not prepared for decode");
@@ -21003,7 +21326,6 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     // boundary (~1-3 us) vs Linux vDSO (~20 ns).  With ~40 calls across 30
     // layers this was ~120 us/token of pure overhead.
     static const bool env_delta_serial=[]{const char*s=std::getenv("FLYWEIGHT_DELTA_SERIAL");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_persistent=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
     static const bool env_nvfp4_tc=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
     static const bool env_nvfp4_tc_trace=std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
     static const bool env_nvfp4_tiled=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_TILED");return s&&s[0]=='1';}();
@@ -21833,201 +22155,12 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");
             add(third,fourth);
         }else if(expert_policy.is_hybrid()){
-            if(runtime->expert_slots.empty())throw std::runtime_error("native hybrid MoE requires an expert cache budget");
-            std::array<std::int32_t,256>cpu_selected{};
-            std::array<float,256>cpu_compact_weights{},gpu_compact_weights{};
-            std::array<float,256>gpu_gate_scales{},gpu_up_scales{},gpu_down_scales{};
-            std::array<std::uint64_t,256>gate_pointers{},up_pointers{},
-                down_pointers{},native_pointers{};
-            int cpu_count=0,gpu_count=0;
-            std::uint64_t staging_cursor=device_align(cpu_output_offset+hidden_size*sizeof(float));
-            struct PendingUpload{
-                std::uint64_t device,host_offset,bytes;
-                std::size_t slot_index;
-            };
-            std::array<PendingUpload,256>pending{};int pending_count=0;
-            auto&moe_prof=qwen_moe_profile();
-            for(int rank=0;rank<route_count;++rank){
-                const int expert=selected_host[rank];if(expert<0||expert>=experts)throw std::runtime_error("native hybrid MoE selected an invalid expert");
-                const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
-                const double t_lookup=moe_now();
-                auto resident=runtime->expert_residency.find(cache_key);
-                if(moe_profile_enabled()){moe_prof.lookup+=moe_now()-t_lookup;++moe_prof.lookups;}
-                if(resident!=runtime->expert_residency.end()){
-                    const auto slot_index=resident->second;auto&slot=runtime->expert_slots[slot_index];
-                    const double t_access=moe_now();
-                    const auto&history=record_expert_access(
-                        *runtime,layer_number,expert);
-                    if(expert_policy.residency_may_change())
-                        slot.last_used=history.last_used;
-                    record_expert_cache_hit(*runtime,slot);
-                    if(moe_profile_enabled())moe_prof.access+=moe_now()-t_access;
-                    const auto device_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){const auto bytes=runtime->model->tensors[layer.expert_tensors[role]].size/experts;const auto pointer=device_base+role_offset;if(role==0)gate_pointers[gpu_count]=pointer;else if(role==1)up_pointers[gpu_count]=pointer;else down_pointers[gpu_count]=pointer;role_offset+=bytes;}
-                    if(slot.native_valid&&runtime->expert_native_cache)
-                        native_pointers[gpu_count]=
-                            runtime->expert_native_cache+
-                            slot_index*runtime->expert_slot_bytes;
-                    gpu_compact_weights[gpu_count]=cpu_weights[rank];
-                    // Scales ride alongside the pointer table. SiLU makes the gate path
-                    // non-linear, so gate/up must be applied before the activation; the
-                    // down projection is linear, so its scale rides on `up` and comes
-                    // out of the accumulate unchanged.
-                    const double t_scales=moe_now();
-                    gpu_gate_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_gate_scale,expert);
-                    gpu_down_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_down_scale,expert);
-                    gpu_up_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_up_scale,expert)
-                        *gpu_down_scales[gpu_count];
-                    if(moe_profile_enabled())moe_prof.scales+=moe_now()-t_scales;
-                    ++gpu_count;continue;
-                }
-                ++runtime->expert_cache_misses;cpu_selected[cpu_count]=expert;cpu_compact_weights[cpu_count]=cpu_weights[rank];
-                if(layer.expert_down_scale!=std::numeric_limits<std::uint64_t>::max()){
-                    const auto&st=runtime->model->tensors[layer.expert_down_scale];
-                    const auto experts_count=runtime->model->config.expert_count;
-                    const auto scale_bytes=st.size/experts_count;
-                    float ds=1.0f;std::memcpy(&ds,tensor_data(*runtime->model,st)+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
-                    cpu_compact_weights[cpu_count]*=ds;
-                }
-                ++cpu_count;
-                const double t_admit=moe_now();
-                const auto slot_index=select_expert_cache_slot(*runtime,layer_number,expert,true);
-                if(moe_profile_enabled()){moe_prof.admission+=moe_now()-t_admit;++moe_prof.admissions;}
-                if(slot_index==kNoExpertSlot)continue;
-                auto&slot=runtime->expert_slots[slot_index];slot.key=cache_key;slot.valid=true;slot.native_valid=false;slot.last_used=++runtime->expert_clock;runtime->expert_residency[cache_key]=slot_index;
-                const auto slot_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;
-                if(layer.expert_dma){
-                    // DMA each role straight from the registered mmap into the cache slot;
-                    // no CPU staging memcpy (the 4.4 ms/token page-in cost we are attacking).
-                    std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(flyweight_gpu_upload(slot_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE DMA cache upload failed");role_offset+=bytes;}
-                    if(runtime->expert_native_cache){
-                        const auto gate_bytes=runtime->model->tensors[
-                            layer.expert_tensors[0]].size/experts;
-                        const auto up_bytes=runtime->model->tensors[
-                            layer.expert_tensors[1]].size/experts;
-                        const int status=flyweight_gpu_nvfp4_prepare_expert(
-                            slot_base,slot_base+gate_bytes,
-                            slot_base+gate_bytes+up_bytes,
-                            runtime->expert_native_cache+
-                                slot_index*runtime->expert_slot_bytes,
-                            runtime->stream,hidden_size,intermediate);
-                        if(status!=0)throw std::runtime_error(
-                            "persistent NVFP4 expert preparation failed");
-                        slot.native_valid=true;
-                    }
-                }else{
-                    const auto bundle_start=staging_cursor;
-                    const double t_stage=moe_now();
-                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native hybrid MoE staging overflow");std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);staging_cursor+=bytes;}
-                    if(moe_profile_enabled()){moe_prof.staging+=moe_now()-t_stage;moe_prof.staged_bytes+=staging_cursor-bundle_start;}
-                    pending[pending_count++]={slot_base,bundle_start,
-                        staging_cursor-bundle_start,slot_index};
-                }
-            }
-            const double t_table=moe_now();
-            if(gpu_count){
-                const auto table_bytes=static_cast<std::uint64_t>(gpu_count)*(3*sizeof(std::uint64_t)+4*sizeof(float));
-                const auto table_host=device_align(staging_cursor);const auto table_device=runtime->expert_staging+runtime->expert_staging_bytes-device_align(table_bytes);
-                if(table_host+table_bytes>runtime->expert_staging_bytes)throw std::runtime_error("native hybrid MoE pointer staging overflow");
-                std::memcpy(staging+table_host,gate_pointers.data(),gpu_count*sizeof(std::uint64_t));
-                std::memcpy(staging+table_host+gpu_count*sizeof(std::uint64_t),up_pointers.data(),gpu_count*sizeof(std::uint64_t));
-                std::memcpy(staging+table_host+2*gpu_count*sizeof(std::uint64_t),down_pointers.data(),gpu_count*sizeof(std::uint64_t));
-                std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t),gpu_compact_weights.data(),gpu_count*sizeof(float));
-                std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+gpu_count*sizeof(float),gpu_gate_scales.data(),gpu_count*sizeof(float));
-                std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+2*gpu_count*sizeof(float),gpu_up_scales.data(),gpu_count*sizeof(float));
-                std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+3*gpu_count*sizeof(float),gpu_down_scales.data(),gpu_count*sizeof(float));
-                if(flyweight_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE table upload failed");
-                const auto gate_table=table_device,up_table=gate_table+gpu_count*sizeof(std::uint64_t),down_table=up_table+gpu_count*sizeof(std::uint64_t),weight_table=down_table+gpu_count*sizeof(std::uint64_t);
-                const auto gate_scale_table=weight_table+gpu_count*sizeof(float),up_scale_table=gate_scale_table+gpu_count*sizeof(float),down_scale_table=up_scale_table+gpu_count*sizeof(float);
-                if(moe_profile_enabled())moe_prof.table+=moe_now()-t_table;
-                const auto gate_type=runtime->model->tensors[layer.expert_tensors[0]].type;
-                const auto down_type=runtime->model->tensors[layer.expert_tensors[2]].type;
-        // The grouped dispatch below ends in a k-quant fallback, so an
-        // unhandled type would be decoded as Q5_K rather than rejected. Prepare
-        // already routes such models to the CPU; this makes the silent path
-        // unreachable if that ever stops holding.
-        if(!qwen_gpu_expert_type_supported(gate_type)||
-           !qwen_gpu_expert_type_supported(down_type))
-            throw std::runtime_error(
-                "native GPU expert quantization is unsupported: "+
-                std::to_string(gate_type)+"/"+std::to_string(down_type));
-                const bool persistent_enabled=env_nvfp4_persistent&&runtime->expert_native_cache&&
-                    std::all_of(native_pointers.begin(),
-                        native_pointers.begin()+gpu_count,
-                        [](std::uint64_t pointer){return pointer!=0;});
-                const bool tc_enabled=env_nvfp4_tc;
-                bool tc_done=false;
-                if(persistent_enabled&&gate_type==40&&down_type==40){
-                    const int tc_status=flyweight_gpu_nvfp4_moe_persistent(
-                        native_pointers.data(),weight_table,
-                        gate_scale_table,up_scale_table,down_scale_table,
-                        normalized,activated,third,runtime->stream,
-                        hidden_size,intermediate,gpu_count);
-                    if(tc_status==0){++runtime->nvfp4_tensor_core_moe_calls;runtime->nvfp4_tensor_core_moe_last_status=0;tc_done=true;}
-                    else{
-                        ++runtime->nvfp4_tensor_core_moe_fallbacks;
-                        runtime->nvfp4_tensor_core_moe_last_status=tc_status;
-                        if(env_nvfp4_tc_trace)
-                            std::fprintf(stderr,"[nvfp4-persistent] hybrid fallback status=%d experts=%d\n",tc_status,gpu_count);
-                    }
-                }
-                if(!tc_done&&tc_enabled&&gate_type==40&&down_type==40){
-                    const int tc_status=flyweight_gpu_nvfp4_moe_cublas(
-                        gate_table,up_table,down_table,normalized,activated,third,
-                        weight_table,gate_scale_table,up_scale_table,down_scale_table,runtime->stream,
-                        hidden_size,intermediate,gpu_count);
-                    if(tc_status==0){++runtime->nvfp4_tensor_core_moe_calls;runtime->nvfp4_tensor_core_moe_last_status=0;tc_done=true;}
-                    else{
-                        ++runtime->nvfp4_tensor_core_moe_fallbacks;
-                        runtime->nvfp4_tensor_core_moe_last_status=tc_status;
-                        if(env_nvfp4_tc_trace)
-                            std::fprintf(stderr,"[nvfp4-tc] hybrid fallback status=%d experts=%d\n",tc_status,gpu_count);
-                    }
-                }
-                if(!tc_done){
-                    const double t_launch=moe_now();
-                    const bool nvfp4_tiled=env_nvfp4_tiled;
-                    void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),&gpu_count,const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
-                    launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,gpu_count,256,gate_up_args);
-                    const int status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count);
-                    if(status!=0)throw std::runtime_error("native hybrid MoE down projection failed");
-                    if(moe_profile_enabled())moe_prof.queue+=moe_now()-t_launch;
-                }
-            }
-            const double t_queue=moe_now();
-            for(int index=0;index<pending_count;++index){
-                const auto&upload=pending[index];
-                if(flyweight_gpu_upload(upload.device,
-                        staging+upload.host_offset,upload.bytes,
-                        runtime->stream)!=0)
-                    throw std::runtime_error(
-                        "native hybrid MoE cache upload failed");
-                if(runtime->expert_native_cache){
-                    const auto gate_bytes=runtime->model->tensors[
-                        layer.expert_tensors[0]].size/experts;
-                    const auto up_bytes=runtime->model->tensors[
-                        layer.expert_tensors[1]].size/experts;
-                    const int status=flyweight_gpu_nvfp4_prepare_expert(
-                        upload.device,upload.device+gate_bytes,
-                        upload.device+gate_bytes+up_bytes,
-                        runtime->expert_native_cache+
-                            upload.slot_index*runtime->expert_slot_bytes,
-                        runtime->stream,hidden_size,intermediate);
-                    if(status!=0)throw std::runtime_error(
-                        "persistent NVFP4 expert preparation failed");
-                    runtime->expert_slots[
-                        upload.slot_index].native_valid=true;
-                }
-            }
-            if(moe_profile_enabled())moe_prof.queue+=moe_now()-t_queue;
-            if(cpu_count){
-                const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                qwen_cpu_moe(*runtime,layer,cpu_selected.data(),cpu_compact_weights.data(),cpu_count,cpu_input,cpu_activated,cpu_output);
-                if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-                if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native hybrid MoE output upload failed");
-                add(third,fourth);
-            }
+            qwen_run_hybrid_experts(
+                *runtime,layer,layer_number,expert_policy,route_count,
+                hidden_size,intermediate,experts,staging,
+                device_align(cpu_output_offset+hidden_size*sizeof(float)),
+                selected_host,cpu_weights,cpu_input,cpu_activated,cpu_output,
+                normalized,activated,third,fourth,false,launch_named);
         }else{
         std::uint64_t staging_cursor=device_align(top_k*sizeof(std::int32_t));
         bool has_uncached_expert=false;
@@ -25506,10 +25639,6 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                     runtime->sequences[s.slot].processed_tokens, s.ple_embed);
         }
     }
-    static const bool env_nvfp4_persistent_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc_trace_b=std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
-    static const bool env_nvfp4_tiled_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_TILED");return s&&s[0]=='1';}();
     for (std::uint32_t layer_number = 0; layer_number < runtime->layers.size(); ++layer_number) {
         auto& layer = runtime->layers[layer_number];
         auto tensor = [&](std::size_t role) { return runtime->device_tensors[layer.static_tensors.at(role)]; };
@@ -25942,202 +26071,13 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                 if (flyweight_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native CPU MoE output upload failed");
                 add(s.third, s.fourth);
             } else {
-                if (runtime->expert_slots.empty()) throw std::runtime_error("native hybrid MoE requires an expert cache budget");
-                // The shared paging area's previous contents may still be
-                // consumed by stream-queued uploads; fence before rewriting.
-                if (flyweight_gpu_event_sync(runtime->staging_event) != 0) throw std::runtime_error("native Qwen staging event failed");
                 auto* pag = staging + shared_base;
-                std::array<std::int32_t, 256> cpu_selected{};
-                std::array<float, 256> cpu_compact_weights{}, gpu_compact_weights{};
-                std::array<float, 256> gpu_gate_scales{}, gpu_up_scales{}, gpu_down_scales{};
-                std::array<std::uint64_t, 256> gate_pointers{}, up_pointers{},
-                    down_pointers{}, native_pointers{};
-                int cpu_count = 0, gpu_count = 0;
-                std::uint64_t staging_cursor = 0;
-                struct PendingUpload {
-                    std::uint64_t device, host_offset, bytes;
-                    std::size_t slot_index;
-                };
-                std::array<PendingUpload, 256> pending{}; int pending_count = 0;
-                for (int rank = 0; rank < route_count; ++rank) {
-                    const int expert = s.selected_host[rank];
-                    if (expert < 0 || expert >= experts) throw std::runtime_error("native hybrid MoE selected an invalid expert");
-                    const auto cache_key = (static_cast<std::uint64_t>(layer_number) << 32) | static_cast<std::uint32_t>(expert);
-                    auto resident = runtime->expert_residency.find(cache_key);
-                    if (resident != runtime->expert_residency.end()) {
-                        const auto slot_index = resident->second; auto& slot = runtime->expert_slots[slot_index];
-                        const auto& history = record_expert_access(
-                            *runtime, layer_number, expert);
-                        if (expert_policy.residency_may_change())
-                            slot.last_used = history.last_used;
-                        record_expert_cache_hit(*runtime,slot);
-                        const auto device_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes; std::uint64_t role_offset = 0;
-                        for (int role = 0; role < 3; ++role) { const auto bytes = runtime->model->tensors[layer.expert_tensors[role]].size / experts; const auto pointer = device_base + role_offset; if (role == 0) gate_pointers[gpu_count] = pointer; else if (role == 1) up_pointers[gpu_count] = pointer; else down_pointers[gpu_count] = pointer; role_offset += bytes; }
-                        if (slot.native_valid && runtime->expert_native_cache)
-                            native_pointers[gpu_count] =
-                                runtime->expert_native_cache +
-                                slot_index * runtime->expert_slot_bytes;
-                        gpu_compact_weights[gpu_count] = s.cpu_weights[rank];
-                        // See the decode path: gate/up before SiLU, down folded into `up`.
-                        gpu_gate_scales[gpu_count] = qwen_expert_role_scale(*runtime, layer.expert_gate_scale, expert);
-                        gpu_down_scales[gpu_count] = qwen_expert_role_scale(*runtime, layer.expert_down_scale, expert);
-                        gpu_up_scales[gpu_count] = qwen_expert_role_scale(*runtime, layer.expert_up_scale, expert)
-                            * gpu_down_scales[gpu_count];
-                        ++gpu_count; continue;
-                    }
-                    ++runtime->expert_cache_misses; cpu_selected[cpu_count] = expert; cpu_compact_weights[cpu_count]=s.cpu_weights[rank];
-                    if(layer.expert_down_scale!=std::numeric_limits<std::uint64_t>::max()){
-                        const auto&st=runtime->model->tensors[layer.expert_down_scale];
-                        const auto experts_count=runtime->model->config.expert_count;
-                        const auto scale_bytes=st.size/experts_count;
-                        float ds=1.0f;std::memcpy(&ds,tensor_data(*runtime->model,st)+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
-                        cpu_compact_weights[cpu_count]*=ds;
-                    }
-                    ++cpu_count;
-                    const auto slot_index = select_expert_cache_slot(*runtime, layer_number, expert, true);
-                    if (slot_index == kNoExpertSlot) continue;
-                    auto& slot = runtime->expert_slots[slot_index]; slot.key = cache_key; slot.valid = true; slot.native_valid = false; slot.last_used = ++runtime->expert_clock; runtime->expert_residency[cache_key] = slot_index;
-                    const auto slot_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes;
-                    if (layer.expert_dma) {
-                        std::uint64_t role_offset = 0;
-                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (flyweight_gpu_upload(slot_base + role_offset, tensor_data(*runtime->model,t) + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
-                        if(runtime->expert_native_cache){
-                            const auto gate_bytes=runtime->model->tensors[
-                                layer.expert_tensors[0]].size/experts;
-                            const auto up_bytes=runtime->model->tensors[
-                                layer.expert_tensors[1]].size/experts;
-                            const int status=flyweight_gpu_nvfp4_prepare_expert(
-                                slot_base,slot_base+gate_bytes,
-                                slot_base+gate_bytes+up_bytes,
-                                runtime->expert_native_cache+
-                                    slot_index*runtime->expert_slot_bytes,
-                                runtime->stream,hidden_size,intermediate);
-                            if(status!=0)throw std::runtime_error(
-                                "persistent NVFP4 expert preparation failed");
-                            slot.native_valid=true;
-                        }
-                    } else {
-                        const auto bundle_start = staging_cursor;
-                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (staging_cursor + bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE staging overflow"); std::memcpy(pag + staging_cursor, tensor_data(*runtime->model,t) + offset, bytes); staging_cursor += bytes; }
-                        pending[pending_count++] = {
-                            slot_base, bundle_start,
-                            staging_cursor - bundle_start, slot_index};
-                    }
-                }
-                if (gpu_count) {
-                    const auto table_bytes = static_cast<std::uint64_t>(gpu_count) * (3 * sizeof(std::uint64_t) + 4 * sizeof(float));
-                    const auto table_host = device_align(staging_cursor); const auto table_device = runtime->expert_staging + runtime->expert_staging_bytes - device_align(table_bytes);
-                    if (table_host + table_bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE pointer staging overflow");
-                    std::memcpy(pag + table_host, gate_pointers.data(), gpu_count * sizeof(std::uint64_t));
-                    std::memcpy(pag + table_host + gpu_count * sizeof(std::uint64_t), up_pointers.data(), gpu_count * sizeof(std::uint64_t));
-                    std::memcpy(pag + table_host + 2 * gpu_count * sizeof(std::uint64_t), down_pointers.data(), gpu_count * sizeof(std::uint64_t));
-                    std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t), gpu_compact_weights.data(), gpu_count * sizeof(float));
-                    std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + gpu_count * sizeof(float), gpu_gate_scales.data(), gpu_count * sizeof(float));
-                    std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 2 * gpu_count * sizeof(float), gpu_up_scales.data(), gpu_count * sizeof(float));
-                    std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 3 * gpu_count * sizeof(float), gpu_down_scales.data(), gpu_count * sizeof(float));
-                    if (flyweight_gpu_upload(table_device, pag + table_host, table_bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE table upload failed");
-                    const auto gate_table = table_device, up_table = gate_table + gpu_count * sizeof(std::uint64_t), down_table = up_table + gpu_count * sizeof(std::uint64_t), weight_table = down_table + gpu_count * sizeof(std::uint64_t);
-                    const auto gate_scale_table = weight_table + gpu_count * sizeof(float), up_scale_table = gate_scale_table + gpu_count * sizeof(float), down_scale_table = up_scale_table + gpu_count * sizeof(float);
-                    const auto gate_type = runtime->model->tensors[layer.expert_tensors[0]].type;
-                    const auto down_type = runtime->model->tensors[layer.expert_tensors[2]].type;
-        // The grouped dispatch below ends in a k-quant fallback, so an
-        // unhandled type would be decoded as Q5_K rather than rejected. Prepare
-        // already routes such models to the CPU; this makes the silent path
-        // unreachable if that ever stops holding.
-        if(!qwen_gpu_expert_type_supported(gate_type)||
-           !qwen_gpu_expert_type_supported(down_type))
-            throw std::runtime_error(
-                "native GPU expert quantization is unsupported: "+
-                std::to_string(gate_type)+"/"+std::to_string(down_type));
-                    const bool persistent_enabled =
-                        env_nvfp4_persistent_b &&
-                        runtime->expert_native_cache &&
-                        std::all_of(
-                            native_pointers.begin(),
-                            native_pointers.begin()+gpu_count,
-                            [](std::uint64_t pointer){return pointer!=0;});
-                    const bool tc_enabled = env_nvfp4_tc_b;
-                    bool tc_done = false;
-                    if (persistent_enabled && gate_type == 40 &&
-                        down_type == 40) {
-                        const int tc_status =
-                            flyweight_gpu_nvfp4_moe_persistent(
-                                native_pointers.data(),weight_table,gate_scale_table,
-                                up_scale_table,down_scale_table,s.normalized,
-                                s.activated,s.third,runtime->stream,
-                                hidden_size,intermediate,gpu_count);
-                        if(tc_status==0){
-                            ++runtime->nvfp4_tensor_core_moe_calls;
-                            runtime->nvfp4_tensor_core_moe_last_status=0;
-                            tc_done=true;
-                        }else{
-                            ++runtime->nvfp4_tensor_core_moe_fallbacks;
-                            runtime->nvfp4_tensor_core_moe_last_status=
-                                tc_status;
-                            if(env_nvfp4_tc_trace_b)
-                                std::fprintf(
-                                    stderr,
-                                    "[nvfp4-persistent] fallback status=%d "
-                                    "experts=%d\n",tc_status,gpu_count);
-                        }
-                    }
-                    if (!tc_done && tc_enabled && gate_type == 40 && down_type == 40) {
-                        const int tc_status = flyweight_gpu_nvfp4_moe_cublas(
-                            gate_table, up_table, down_table, s.normalized,
-                            s.activated, s.third, weight_table, gate_scale_table,
-                            up_scale_table, down_scale_table, runtime->stream, hidden_size,
-                            intermediate, gpu_count);
-                        if (tc_status == 0) {
-                            ++runtime->nvfp4_tensor_core_moe_calls;
-                            runtime->nvfp4_tensor_core_moe_last_status = 0;
-                            tc_done = true;
-                        } else {
-                            ++runtime->nvfp4_tensor_core_moe_fallbacks;
-                            runtime->nvfp4_tensor_core_moe_last_status = tc_status;
-                            if (env_nvfp4_tc_trace_b)
-                                std::fprintf(stderr, "[nvfp4-tc] multi-decode fallback status=%d experts=%d\n", tc_status, gpu_count);
-                        }
-                    }
-                    if (!tc_done) {
-                        const bool nvfp4_tiled = env_nvfp4_tiled_b;
-                        void* gate_up_args[] = {const_cast<std::uint64_t*>(&gate_table), const_cast<std::uint64_t*>(&up_table), &s.normalized, &s.activated, const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate), &gpu_count, const_cast<std::uint64_t*>(&gate_scale_table), const_cast<std::uint64_t*>(&up_scale_table)};
-                        launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(), gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate, gpu_count, 256, gate_up_args);
-                        const int status = qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,s.activated,s.third,weight_table,intermediate,hidden_size,gpu_count);
-                        if (status != 0) throw std::runtime_error("native hybrid MoE down projection failed");
-                    }
-                }
-                for (int index = 0; index < pending_count; ++index) {
-                    const auto& upload=pending[index];
-                    if (flyweight_gpu_upload(
-                            upload.device,pag+upload.host_offset,upload.bytes,
-                            runtime->stream)!=0)
-                        throw std::runtime_error(
-                            "native hybrid MoE cache upload failed");
-                    if(runtime->expert_native_cache){
-                        const auto gate_bytes=runtime->model->tensors[
-                            layer.expert_tensors[0]].size/experts;
-                        const auto up_bytes=runtime->model->tensors[
-                            layer.expert_tensors[1]].size/experts;
-                        const int status=flyweight_gpu_nvfp4_prepare_expert(
-                            upload.device,upload.device+gate_bytes,
-                            upload.device+gate_bytes+up_bytes,
-                            runtime->expert_native_cache+
-                                upload.slot_index*runtime->expert_slot_bytes,
-                            runtime->stream,hidden_size,intermediate);
-                        if(status!=0)throw std::runtime_error(
-                            "persistent NVFP4 expert preparation failed");
-                        runtime->expert_slots[
-                            upload.slot_index].native_valid=true;
-                    }
-                }
-                if (flyweight_gpu_event_record(runtime->staging_event, runtime->stream) != 0) throw std::runtime_error("native Qwen staging event failed");
-                if (cpu_count) {
-                    const auto compute_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                    qwen_cpu_moe(*runtime, layer, cpu_selected.data(), cpu_compact_weights.data(), cpu_count, s.cpu_input, s.cpu_activated, s.cpu_output);
-                    if(timing_enabled())runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
-                    if (flyweight_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native hybrid MoE output upload failed");
-                    add(s.third, s.fourth);
-                }
+                qwen_run_hybrid_experts(
+                    *runtime, layer, layer_number, expert_policy, route_count,
+                    hidden_size, intermediate, experts, pag, 0,
+                    s.selected_host, s.cpu_weights, s.cpu_input, s.cpu_activated,
+                    s.cpu_output, s.normalized, s.activated, s.third, s.fourth,
+                    true, launch_named);
             }
             if(timing_enabled())runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
             if (runtime->qwen4exp) hc_post_multi(s, s.third);
