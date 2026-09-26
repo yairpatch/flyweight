@@ -288,6 +288,11 @@ void qwen_iq2xxs_fold_rows_vnni512(
 void qwen_iq3xxs_fold_rows_vnni512(
     const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
     std::int16_t* weights, float* scales);
+// IQ4_XS twin: d * (s-32) * grid, multiplier 1. Covers the one promoted
+// gate/up stack in the UD-IQ4_XS mix.
+void qwen_iq4xs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales);
 
 // int16 rows path (AVX512-VNNI, dpwssd): weights are the codebook's integer
 // codes recovered exactly from the float decode (one float scale per 256),

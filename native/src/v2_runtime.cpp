@@ -5907,6 +5907,14 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    // IQ4_NL's native block is 32 (no 256 super-block), so like the dot it
+    // takes its own admission ahead of the K-quant %256 gate. AVX-512 first:
+    // UD-IQ4_XS's down projection is this type on 43/48 layers, and the AVX2
+    // decoder was the only path even on boxes that already ran the AVX-512
+    // IQ4_NL expert dots.
+    if(type==20&&(flyweight_cpu_features()&2u)!=0&&elements%32==0&&
+       qwen_iq_avx512_enabled()){
+        qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
     if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==42&&(flyweight_cpu_features()&1u)!=0&&elements%kQ20BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // Q8_0's native block is 32, so a 640-wide expert down row fails the
@@ -7260,9 +7268,10 @@ void qwen_cpu_moe_rows(
     const QwenQ8KBlock* input_q8_data=input_q8.data();
     // Whole-batch int8 rows path (qwen_cpu_iq1s_vnni512.cpp): rows folded
     // once to int8, dpbusd against unsigned-8 activations. Covers the
-    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down); IQ3_S gate/up
-    // take the 16-bit twin below under FLYWEIGHT_ROWS_Q8_IQ3S=1; the other
-    // formats keep the int16 or dequant-and-f32-GEMM paths below.
+    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down). The GSQ-RCO
+    // gate/up types take the direct int16 fold below; FLYWEIGHT_ROWS_Q8_IQ3S=0
+    // puts those back on dequant-then-fold. Everything else keeps the int16
+    // or dequant-and-f32-GEMM paths below.
     // FLYWEIGHT_ROWS_Q8=0 disables it for A/B.
     static const char* rows_q8_setting=std::getenv("FLYWEIGHT_ROWS_Q8");
     const bool rows_q8=(flyweight_cpu_features()&8u)!=0&&!direct_quant
@@ -7277,21 +7286,27 @@ void qwen_cpu_moe_rows(
     static const char* rows_q8_down_setting=std::getenv("FLYWEIGHT_ROWS_Q8_DOWN");
     const bool rows_q8_down=rows_q8&&
         rows_q8_down_setting&&rows_q8_down_setting[0]=='1';
-    // IQ3_S/IQ2 direct-fold twin of rows_q8 (qwen_cpu_iq1s_vnni512.cpp):
+    // IQ3_S/IQ2/IQ4_XS direct-fold twin of rows_i16 (qwen_cpu_iq1s_vnni512.cpp):
     // gate/up stacks whose codebooks are exact integers in int16 skip the
     // float dequant and fold straight from packed codes, feeding the shared
     // int16 GEMM against the same 14-bit activations. Covers IQ3_S (21),
-    // IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18) and IQ2_S (22) gate/up pairs.
-    // Opt-in behind FLYWEIGHT_ROWS_Q8_IQ3S=1 -- a wrong fold corrupts every
-    // routed token silently, so this stays off until the contract and the
-    // parity runs below say otherwise. No down constraint: the down
-    // projection dispatches on its own type further down, and tying gate/up
-    // to it would halve the layers covered.
+    // IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ2_S (22) and IQ4_XS (23) --
+    // every routed gate/up stack in the UD-IQ4_XS and GSQ-RCO qwen4exp mixes.
+    // On by default: the rows contract pins each fold against the scalar
+    // value function.
+    // FLYWEIGHT_ROWS_Q8_IQ3S=0 restores dequant-then-fold. FLYWEIGHT_ROWS_I16=0
+    // still means the f32 GEMM, and =2 still runs the verify against it, so
+    // both hold the direct fold off. No down constraint: the down projection
+    // dispatches on its own type further down.
     static const char* rows_q8_iq3s_setting=std::getenv("FLYWEIGHT_ROWS_Q8_IQ3S");
+    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
+    const bool rows_i16_holds=rows_i16_setting&&
+        (rows_i16_setting[0]=='0'||rows_i16_setting[0]=='2');
     const bool rows_q8_iq3s=(flyweight_cpu_features()&8u)!=0&&!direct_quant
         &&gate_type==up_type&&(gate_type==21||gate_type==16||gate_type==17||
-                              gate_type==18||gate_type==22)&&hidden%256==0
-        &&rows_q8_iq3s_setting&&rows_q8_iq3s_setting[0]=='1'
+                              gate_type==18||gate_type==22||gate_type==23)&&hidden%256==0
+        &&!(rows_q8_iq3s_setting&&rows_q8_iq3s_setting[0]=='0')
+        &&!rows_i16_holds
         &&!(q8_setting&&q8_setting[0]=='0');
     thread_local std::vector<std::uint8_t> tl_input_u8;
     thread_local std::vector<float> tl_input_u8_scales;
@@ -7314,13 +7329,14 @@ void qwen_cpu_moe_rows(
     const float* input_u8_scale_data=input_u8_scales.data();
     const float* input_u8_sum_data=input_u8_sums.data();
     // Exact int16 rows path for the IQ codebook gate/up stacks without a
-    // direct fold (IQ4_XS, IQ1_S where rows_q8 does not apply, and the five
-    // direct-fold types where rows_q8_iq3s is off). Weights fold to their integer
-    // codes exactly; activations are 14-bit per 256 -- finer than the f32
-    // GEMM's inputs are worth, and 128x finer than the Q8 paths. Measured
+    // direct fold (IQ1_S where rows_q8 does not apply). The six direct-fold
+    // types take this path only when FLYWEIGHT_ROWS_Q8_IQ3S=0.
+    // Weights fold to their integer codes exactly; activations are 14-bit per
+    // 256 -- finer than the f32 GEMM's inputs are worth, and 128x finer than
+    // the Q8 paths. Measured
     // 2026-09-16 on the 2048-token GSQ-RCO prefill: see the memory note.
-    // FLYWEIGHT_ROWS_I16=0 restores dequant-and-f32-GEMM for A/B.
-    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
+    // FLYWEIGHT_ROWS_I16=0 restores dequant-and-f32-GEMM for A/B. The getenv
+    // is above: =0 and =2 also hold the direct fold off.
     const bool rows_i16=(flyweight_cpu_features()&8u)!=0&&!direct_quant&&!rows_q8&&!rows_q8_iq3s
         &&qwen_i16_fold_multiplier(gate_type)!=0&&qwen_i16_fold_multiplier(up_type)!=0
         &&hidden%256==0
@@ -7564,13 +7580,14 @@ void qwen_cpu_moe_rows(
                 act_scale_ptrs_w16[occurrence]=input_i16_scale_data+token*q8_blocks;
             }
             t_dq0=moe_profile?qwen_moe_now():0;
-            // The gate admits exactly the five direct-fold types above.
+            // The gate admits exactly the six direct-fold types above.
             void (*fold_direct)(const std::uint8_t*,int,std::uint64_t,int,
                                 std::int16_t*,float*) =
                 gate_type==21 ? qwen_iq3s_fold_rows_vnni512 :
                 gate_type==17 ? qwen_iq2xs_fold_rows_vnni512 :
                 gate_type==22 ? qwen_iq2s_fold_rows_vnni512 :
                 gate_type==16 ? qwen_iq2xxs_fold_rows_vnni512 :
+                gate_type==23 ? qwen_iq4xs_fold_rows_vnni512 :
                                 qwen_iq3xxs_fold_rows_vnni512;
             fold_direct(gate_data,hidden,row0,mr,fold_gate_w16.data(),
                         fold_gate_scales_w16.data());

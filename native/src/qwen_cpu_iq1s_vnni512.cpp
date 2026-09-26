@@ -1062,6 +1062,52 @@ void qwen_iq3xxs_fold_rows_vnni512(
     }
 }
 
+// IQ4_XS (GGML type 23): d * (s-32) * kIq4nlValues[code]. The integer
+// (s-32)*grid fits int16 (|s|<=32, |grid|<=113); block scale is d
+// (multiplier 1). The UD-IQ4_XS mix promotes one gate/up stack to it -- without
+// this fold that layer stayed on dequant-then-i16 while its IQ3_S siblings
+// took the direct path.
+void qwen_iq4xs_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int16_t* weights, float* scales
+) {
+    const int blocks = elements / 256;
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    for (int r = 0; r < rows; ++r) {
+        const auto* row_data =
+            packed + (row0 + static_cast<std::uint64_t>(r)) *
+                         static_cast<std::uint64_t>(blocks) * kIq4xsBlockBytes;
+        std::int16_t* row_out = weights + static_cast<std::size_t>(r) * elements;
+        for (int block = 0; block < blocks; ++block) {
+            const auto* base = row_data + block * kIq4xsBlockBytes;
+            std::uint16_t scales_high = 0;
+            std::memcpy(&scales_high, base + 2, 2);
+            scales[static_cast<std::size_t>(r) * blocks + block] = half_value(base);
+            for (int sub = 0; sub < 8; ++sub) {
+                const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+                const int scale =
+                    (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+                const __m128i quants = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(base + 8 + sub * 16));
+                const __m128i first =
+                    _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+                const __m128i second = _mm_shuffle_epi8(
+                    levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+                const __m256i scale_v = _mm256_set1_epi16(static_cast<short>(scale));
+                const __m256i codes_lo = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(first), scale_v);
+                const __m256i codes_hi = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(second), scale_v);
+                std::int16_t* out = row_out + block * 256 + sub * 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(out), codes_lo);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 16), codes_hi);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // int16 rows path for the prefill expert sweep: exact weights, 14-bit
 // activations, dpwssd.

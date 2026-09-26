@@ -247,6 +247,23 @@ int main() {
                     break;
                 }
             }
+            // IQ4_NL and Q8_0 are the flat-block types the AVX-512 dequant
+            // table admits (super-block IQ formats stay on AVX2 / VNNI).
+            if (avx512_available() && (type == 20 || type == 8)) {
+                std::vector<float> decoded512(elements, 0.0f);
+                qwen_dequant_row_avx512(
+                    packed.data(), type, elements, 0, decoded512.data());
+                for (int i = 0; i < elements; ++i) {
+                    if (std::fabs(decoded512[i] - decoded[i]) >
+                        1e-5f * std::max(1.0f, std::fabs(decoded[i]))) {
+                        std::fprintf(stderr,
+                                     "%s avx512 dequant[%d]: %.9g vs avx2 %.9g\n",
+                                     label, i, decoded512[i], decoded[i]);
+                        ++failures;
+                        break;
+                    }
+                }
+            }
         };
         dequant_check("iq1s", 19, kIq1sBlockBytes, 256, qwen_iq1s_value);
         dequant_check("iq4nl", 20, kIq4nlBlockBytes, 32, qwen_iq4nl_value);
