@@ -24,7 +24,7 @@ FIELDS = (
     "expert_cache_slots", "expert_cache_bytes", "expert_tensor_bytes",
     "expert_cache_hits", "expert_cache_misses", "expert_cache_admissions",
     "expert_cache_deferred_admissions", "expert_cache_rejections",
-    "prefill_cache_seeded_experts", "expert_history_loaded_entries",
+    "prefill_cache_seeded_experts",
     "expert_residency_frozen", "route_expert_sum", "gpu_allocated_bytes",
     "mtp_tensor_bytes", "direct_paging", "expert_cache_prompt_bypasses",
 )
@@ -61,8 +61,7 @@ def probe(model: V2Model, prompt: list[int], drafts: int) -> None:
               f"deferred={info['expert_cache_deferred_admissions']} "
               f"rejections={info['expert_cache_rejections']} "
               f"seeded={info['prefill_cache_seeded_experts']} "
-              f"frozen={info['expert_residency_frozen']} "
-              f"history={info['expert_history_loaded_entries']}")
+              f"frozen={info['expert_residency_frozen']}")
         print(f"    direct_paging={info['direct_paging']} "
               f"prompt_bypasses={info['expert_cache_prompt_bypasses']}")
         print()

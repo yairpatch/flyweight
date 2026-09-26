@@ -251,8 +251,6 @@ typedef struct FlyweightV2QwenRuntimeInfo {
     uint64_t prefill_ple_nanoseconds; /* per-layer-token-embedding (n-gram engram) staging:
                                          host-side hash, row decode from the mmap, and upload.
                                          Measured in both drivers, unlike the gpu_* split. */
-    uint64_t expert_history_loaded_entries; /* nonzero persisted expert counters restored */
-    uint64_t expert_history_saves; /* successful atomic sidecar replacements */
     uint64_t next_layer_prefetch_predictions; /* predicted expert IDs issued */
     uint64_t next_layer_prefetch_hits; /* predictions present in the next real route */
     uint64_t next_layer_prefetch_bytes; /* expert tensor bytes covered by page hints */

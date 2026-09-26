@@ -238,7 +238,6 @@ def cmd_kernel(args) -> int:
 
 def run_worker(args) -> int:
     """One arm: greedy continuations + teacher-forced agreement as JSON."""
-    os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     from flyweight.v2 import V2Model
 
     model = V2Model(args.model)
@@ -295,7 +294,6 @@ def cmd_model(args) -> int:
         base = "default" if label == "default'" else label
         env = dict(os.environ)
         env.update(ARMS.get(base, {}))
-        env["FLYWEIGHT_EXPERT_HISTORY"] = "0"
         # Workers must import the checkout under test, never the installed
         # copy: an env flag the installed library does not know would be
         # silently ignored and the comparison vacuous.
@@ -390,7 +388,6 @@ def _agree_all(args, label, ref_prompts) -> dict[str, float]:
         return _agree_cache[key]
     env = dict(os.environ)
     env.update(ARMS.get(base, {}))
-    env["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     env["PYTHONPATH"] = str(BENCH.parent / "src") + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     refs_blob = json.dumps({n: ref_prompts[n]["tokens"] for n in ref_prompts})
@@ -416,7 +413,6 @@ def run_agreebatch(args) -> int:
     """Worker: teacher-forced agreement for all refs with a single prepare."""
     from flyweight.v2 import V2Model
 
-    os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     model = V2Model(args.model)
     try:
         refs = json.loads(args.agree_refs or "{}")

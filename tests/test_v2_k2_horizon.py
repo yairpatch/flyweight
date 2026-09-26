@@ -268,22 +268,6 @@ class K2HorizonValueCacheTests(unittest.TestCase):
         self.assertEqual(produced[0][1]["mova_prefetch_predictions"], 0)
         self.assertGreater(produced[2][1]["mova_prefetch_predictions"], 0)
 
-    def test_value_expert_history_is_persisted_beside_the_expert_history(self):
-        model, spec = _model(spec=_mova_spec())
-        directory = Path(_WORKSPACES[-1].name)
-        runtime = _native(model)
-        try:
-            runtime.generate([7, 11, 3], 4, lambda _t: None)
-        finally:
-            runtime.close()
-            model.close()
-        histories = sorted(directory.glob("*.expert-history.mova"))
-        self.assertEqual(len(histories), 1, "one value-expert history per checkpoint")
-        # Fixed 44-byte header, then (frequency u32, last_used u64) per
-        # (layer, value expert): the same record the feed-forward table uses.
-        entries = spec.layers * spec.value_experts
-        self.assertEqual(histories[0].stat().st_size, 44 + 12 * entries)
-
 
 class K2HorizonDecodeAttentionTests(unittest.TestCase):
     """K2 decodes through the 128-dim attention dispatch (tensor-core MMA,

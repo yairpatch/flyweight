@@ -9,11 +9,9 @@ than in a kernel swap. At temperature 0 the only way two runs diverge is that
 the logits differed, so a mismatch localises to arithmetic rather than sampling.
 
 Each sample is a fresh subprocess, but a fresh process does NOT mean isolated:
-placement reads state that survives the process. Two such inputs are known --
-`<model>.expert-history` next to the checkpoint (disable with
-FLYWEIGHT_EXPERT_HISTORY=off) and free VRAM sampled by the gpu_cache_bytes=0
-auto-fit (pin with --option gpu_cache_bytes=...). Runs that leave either
-uncontrolled measure the drift of that state, not the runtime.
+placement reads free VRAM sampled by the gpu_cache_bytes=0 auto-fit (pin with
+--option gpu_cache_bytes=...). A run that leaves that uncontrolled measures
+the drift of that state, not the runtime.
 
     ./tools/check_greedy_determinism.py MODEL.gguf --runs 3
     ./tools/check_greedy_determinism.py MODEL.gguf --env FLYWEIGHT_IQ2_Q8_DECODE=0

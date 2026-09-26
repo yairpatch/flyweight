@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import statistics
@@ -485,7 +484,6 @@ def main() -> None:
     depths = [float(d) for d in args.depths.split(",") if d.strip()]
     candidates = [t.strip() for t in args.types.split(",") if t.strip()]
 
-    os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     model = V2Model(args.model)
     try:
         from flyweight.v2_server import NativeV2Tokenizer

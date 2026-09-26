@@ -13,14 +13,11 @@ of them is speed:
 
 Arms are interleaved within each round because this box's clocks drift ~27%
 across a long run, and one runtime exists at a time because two do not fit.
-The expert history is off: it is an ambient input to expert placement, and
-placement decides both speed and output.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import statistics
 import time
 
@@ -52,7 +49,6 @@ def main() -> None:
     args = parser.parse_args()
 
     arms = [t.strip() for t in args.types.split(",") if t.strip()]
-    os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     model = V2Model(args.model)
     base = list(model.tokenize(PROMPT, capacity=args.context))
     repeats = (args.prompt_tokens + len(base) - 1) // len(base)
