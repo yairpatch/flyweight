@@ -995,7 +995,7 @@ struct FlyweightV2QwenRuntime {
     // K2-Horizon MoVA: the value projection is a routed 64-expert mixture, and
     // the expert stack is served exactly like the feed-forward experts -- a
     // device cache of whole experts with its own slots, residency map and
-    // persisted frequency history, misses computed on the host from the
+    // frequency history, misses computed on the host from the
     // mapping and admitted into the cache. It is a second cache rather than a
     // second tenant of the feed-forward one because a value expert is one
     // matrix, ~40% of a SwiGLU triple; packing it into those slots would
@@ -1006,7 +1006,6 @@ struct FlyweightV2QwenRuntime {
     std::vector<QwenExpertSlot> mova_slots;
     std::unordered_map<std::uint64_t, std::size_t> mova_residency;
     std::vector<QwenExpertHistory> mova_history;
-    std::string mova_history_path;
     std::uint64_t mova_cache_hits = 0, mova_cache_misses = 0;
     std::uint64_t mova_cache_admissions = 0, mova_cache_evictions = 0;
     std::uint64_t mova_cache_rejections = 0;
@@ -1122,10 +1121,6 @@ struct FlyweightV2QwenRuntime {
     // for that layer, or -1 for layers whose routed experts remain on the CPU.
     std::vector<std::int32_t> whole_expert_layer_slots;
     std::vector<QwenExpertHistory> expert_history;
-    std::string expert_history_path;
-    std::uint64_t expert_history_fingerprint = 0;
-    std::uint64_t expert_history_loaded_entries = 0;
-    std::uint64_t expert_history_saves = 0;
     std::vector<std::uint16_t> expert_transitions;
     std::uint64_t next_layer_prefetch_predictions = 0;
     std::uint64_t next_layer_prefetch_hits = 0;
@@ -1517,7 +1512,7 @@ struct QwenResidencyEpochGuard {
 std::size_t qwen_cache_layer_count(const FlyweightV2QwenRuntime& runtime) {
     // The MTP block's routed experts execute directly on the CPU and do
     // not consult expert_residency. Only target layers consume GPU cache slots
-    // or persistent routing history.
+    // or the routing-frequency table.
     return runtime.layers.size();
 }
 
@@ -1637,218 +1632,6 @@ constexpr bool qwen_simd_quant_type(std::uint32_t type) {
 constexpr bool qwen_simd_multi_type(std::uint32_t type) {
     return type == 8 || type == 12 || type == 13 || type == 14;
 }
-
-constexpr char kExpertHistoryMagic[8] = {'C','O','L','H','I','S','T','1'};
-constexpr std::uint32_t kExpertHistoryVersion = 1;
-
-static std::uint64_t expert_history_hash_bytes(
-    std::uint64_t hash, const void* data, std::size_t size
-) {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    for (std::size_t index = 0; index < size; ++index) {
-        hash ^= bytes[index];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-static std::uint64_t qwen_model_fingerprint(const FlyweightV2Model& model) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    // Total mapped bytes, not the opened file's: a split checkpoint's first
-    // shard is a few megabytes of metadata and would not distinguish models.
-    // This equals `size` for a single file, so existing fingerprints hold.
-    const std::uint64_t bytes = model.mapped_bytes();
-    hash = expert_history_hash_bytes(hash, &bytes, sizeof(bytes));
-    hash = expert_history_hash_bytes(
-        hash, model.architecture.data(), model.architecture.size()
-    );
-    hash = expert_history_hash_bytes(hash, model.name.data(), model.name.size());
-    for (const auto& tensor : model.tensors) {
-        hash = expert_history_hash_bytes(hash, tensor.name.data(), tensor.name.size());
-        hash = expert_history_hash_bytes(hash, &tensor.offset, sizeof(tensor.offset));
-        hash = expert_history_hash_bytes(hash, &tensor.size, sizeof(tensor.size));
-    }
-    return hash;
-}
-
-static std::string qwen_expert_history_path(const FlyweightV2Model& model) {
-    const char* setting = std::getenv("FLYWEIGHT_EXPERT_HISTORY");
-    if (setting && (!std::strcmp(setting, "0") || !std::strcmp(setting, "off"))) {
-        return {};
-    }
-    if (setting && *setting && std::strcmp(setting, "1") &&
-        std::strcmp(setting, "auto")) {
-        return setting;
-    }
-    return model.path.empty() ? std::string{} : model.path + ".expert-history";
-}
-
-template <typename T>
-static bool expert_history_read(std::ifstream& input, T& value) {
-    return static_cast<bool>(
-        input.read(reinterpret_cast<char*>(&value), sizeof(value))
-    );
-}
-
-template <typename T>
-static bool expert_history_write(std::ofstream& output, const T& value) {
-    return static_cast<bool>(
-        output.write(reinterpret_cast<const char*>(&value), sizeof(value))
-    );
-}
-
-// One routing-history table on disk: a fixed header, then (frequency,
-// last_used) per (layer, expert). The feed-forward experts and the MoVA value
-// experts each keep one, at different paths and with different expert counts;
-// the format and the ageing on load are the same.
-struct QwenExpertHistoryTable {
-    std::vector<QwenExpertHistory>& entries;
-    std::uint32_t layers;
-    std::uint32_t experts;
-    const char* label;
-};
-
-static std::uint64_t qwen_load_expert_history_table(
-    const std::string& path, std::uint64_t fingerprint, std::uint64_t& clock,
-    QwenExpertHistoryTable table
-) {
-    if (path.empty()) return 0;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return 0;
-    char magic[sizeof(kExpertHistoryMagic)]{};
-    std::uint32_t version = 0, layers = 0, experts = 0;
-    std::uint64_t file_fingerprint = 0, file_clock = 0, entries = 0;
-    if (!input.read(magic, sizeof(magic)) ||
-        std::memcmp(magic, kExpertHistoryMagic, sizeof(magic)) ||
-        !expert_history_read(input, version) ||
-        !expert_history_read(input, file_fingerprint) ||
-        !expert_history_read(input, layers) ||
-        !expert_history_read(input, experts) ||
-        !expert_history_read(input, file_clock) ||
-        !expert_history_read(input, entries) ||
-        version != kExpertHistoryVersion ||
-        file_fingerprint != fingerprint ||
-        layers != table.layers ||
-        experts != table.experts ||
-        entries != table.entries.size()) {
-        std::fprintf(
-            stderr,
-            "[flyweight] ignoring incompatible %s history: %s\n",
-            table.label, path.c_str()
-        );
-        return 0;
-    }
-    std::vector<QwenExpertHistory> loaded(table.entries.size());
-    std::uint64_t loaded_entries = 0, maximum_last_used = 0;
-    for (auto& item : loaded) {
-        if (!expert_history_read(input, item.frequency) ||
-            !expert_history_read(input, item.last_used)) {
-            std::fprintf(
-                stderr,
-                "[flyweight] ignoring truncated %s history: %s\n",
-                table.label, path.c_str()
-            );
-            return 0;
-        }
-        // Age the prior process's workload once at startup while retaining at
-        // least one observation for experts that were ever useful.
-        if (item.frequency) item.frequency = std::max(1U, item.frequency / 2U);
-        if (item.frequency) ++loaded_entries;
-        maximum_last_used = std::max(maximum_last_used, item.last_used);
-    }
-    if (input.peek() != std::ifstream::traits_type::eof()) {
-        std::fprintf(
-            stderr,
-            "[flyweight] ignoring oversized %s history: %s\n",
-            table.label, path.c_str()
-        );
-        return 0;
-    }
-    table.entries = std::move(loaded);
-    clock = std::max({clock, file_clock, maximum_last_used});
-    std::fprintf(
-        stderr,
-        "[flyweight] restored %llu learned %s entries from %s\n",
-        static_cast<unsigned long long>(loaded_entries),
-        table.label, path.c_str()
-    );
-    return loaded_entries;
-}
-
-static bool qwen_save_expert_history_table(
-    const std::string& path, std::uint64_t fingerprint, std::uint64_t clock,
-    const QwenExpertHistoryTable& table
-) {
-    if (path.empty() || table.entries.empty()) return false;
-    const std::string temporary = path + ".tmp";
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output) return false;
-    const std::uint64_t entries = table.entries.size();
-    output.write(kExpertHistoryMagic, sizeof(kExpertHistoryMagic));
-    bool valid =
-        expert_history_write(output, kExpertHistoryVersion) &&
-        expert_history_write(output, fingerprint) &&
-        expert_history_write(output, table.layers) &&
-        expert_history_write(output, table.experts) &&
-        expert_history_write(output, clock) &&
-        expert_history_write(output, entries);
-    for (const auto& item : table.entries) {
-        valid = valid && expert_history_write(output, item.frequency);
-        valid = valid && expert_history_write(output, item.last_used);
-    }
-    output.flush();
-    valid = valid && static_cast<bool>(output);
-    output.close();
-    if (!valid || std::rename(temporary.c_str(), path.c_str())) {
-        std::remove(temporary.c_str());
-        return false;
-    }
-    return true;
-}
-
-static void qwen_load_expert_history(FlyweightV2QwenRuntime& runtime) {
-    runtime.expert_history_path = qwen_expert_history_path(*runtime.model);
-    runtime.expert_history_fingerprint = qwen_model_fingerprint(*runtime.model);
-    runtime.expert_history_loaded_entries = qwen_load_expert_history_table(
-        runtime.expert_history_path, runtime.expert_history_fingerprint,
-        runtime.expert_clock,
-        {runtime.expert_history,
-         static_cast<std::uint32_t>(runtime.layers.size()),
-         runtime.model->config.expert_count, "expert"});
-    // The value-expert table lives beside the feed-forward one and shares
-    // its enable switch: FLYWEIGHT_EXPERT_HISTORY=off silences both.
-    runtime.mova_history_path = runtime.expert_history_path.empty() ||
-            runtime.mova_history.empty()
-        ? std::string{}
-        : runtime.expert_history_path + ".mova";
-    qwen_load_expert_history_table(
-        runtime.mova_history_path, runtime.expert_history_fingerprint,
-        runtime.expert_clock,
-        {runtime.mova_history,
-         static_cast<std::uint32_t>(runtime.layers.size()),
-         runtime.model->config.value_expert_count, "value-expert"});
-}
-
-static void qwen_save_expert_history(FlyweightV2QwenRuntime& runtime) {
-    if (qwen_save_expert_history_table(
-            runtime.expert_history_path, runtime.expert_history_fingerprint,
-            runtime.expert_clock,
-            {runtime.expert_history,
-             static_cast<std::uint32_t>(runtime.layers.size()),
-             runtime.model->config.expert_count, "expert"}))
-        ++runtime.expert_history_saves;
-    qwen_save_expert_history_table(
-        runtime.mova_history_path, runtime.expert_history_fingerprint,
-        runtime.expert_clock,
-        {runtime.mova_history,
-         static_cast<std::uint32_t>(runtime.layers.size()),
-         runtime.model->config.value_expert_count, "value-expert"});
-}
-
-struct QwenExpertHistorySaveGuard {
-    FlyweightV2QwenRuntime& runtime;
-    ~QwenExpertHistorySaveGuard() { qwen_save_expert_history(runtime); }
-};
 
 static std::size_t select_expert_cache_slot(
     FlyweightV2QwenRuntime& runtime, std::uint32_t layer,
@@ -2493,7 +2276,6 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
         runtime.registration_cancel.store(true, std::memory_order_release);
         runtime.registration_thread.join();
     }
-    qwen_save_expert_history(runtime);
     if (runtime.stream) flyweight_gpu_stream_sync(runtime.stream);
     // An enqueued expert prefetch DMAs from the model mmap on its own stream,
     // and the main stream only waits for it at the consumption point -- which
@@ -2689,7 +2471,6 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.expert_history.clear();
     runtime.expert_residency.clear();
     runtime.mova_history.clear();
-    runtime.mova_history_path.clear();
     runtime.mova_workspace_bytes = runtime.mova_host_bytes = 0;
     runtime.mova_stage_bytes = 0;
     runtime.decode_ready = false;
@@ -15417,8 +15198,6 @@ int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->prefill_gpu_transfer_nanoseconds=runtime->prefill_gpu_transfer_nanoseconds;
     out->prefill_gpu_split_layers=runtime->prefill_gpu_split_layers;
     out->prefill_ple_nanoseconds=runtime->prefill_ple_nanoseconds;
-    out->expert_history_loaded_entries=runtime->expert_history_loaded_entries;
-    out->expert_history_saves=runtime->expert_history_saves;
     out->next_layer_prefetch_predictions=runtime->next_layer_prefetch_predictions;
     out->next_layer_prefetch_hits=runtime->next_layer_prefetch_hits;
     out->next_layer_prefetch_bytes=runtime->next_layer_prefetch_bytes;
@@ -17551,7 +17330,6 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 ? runtime->layers.size() * runtime->model->config.value_expert_count
                 : 0,
             QwenExpertHistory{});
-        qwen_load_expert_history(*runtime);
         runtime->device_tensors.assign(runtime->model->tensors.size(),0);
         std::uint64_t cursor=0;
         std::vector<float> widened;
@@ -25276,7 +25054,6 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
         throw std::runtime_error("native Qwen generation exceeds the context limit");
     if(!runtime->engine_tasks.empty()||!runtime->engine_pending.empty())throw std::runtime_error("the cooperative engine is active; blocking generate is unavailable");
     qwen_unfreeze_expert_residency(*runtime);
-    QwenExpertHistorySaveGuard history_save{*runtime};
     QwenKvOccupancyGuard kv_occupancy{*runtime};
     // Pick the decode slot for this prompt before any reuse/diagnostics run.
     // Slots may differ in size, so the router is told what the whole request
@@ -26749,7 +26526,6 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
         }
     }
     if(!finished.empty()){
-        qwen_save_expert_history(*runtime);
         // The engine's request boundary, matching the blocking path's guard.
         qwen_note_kv_occupancy(*runtime);
     }

@@ -6,7 +6,7 @@ bitwise-identical by construction, so every run's token stream must match --
 a stream mismatch fails the diagnostic, not just the timing.
 
 Determinism guards per the Ornith findings: explicit gpu_cache_bytes,
-FLYWEIGHT_EXPERT_HISTORY=0, no prefill cache seed, single runtime for all arms.
+no prefill cache seed, single runtime for all arms.
 """
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import time
 
 from flyweight.v2 import V2Model
 
-os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
 os.environ["FLYWEIGHT_MTP_ADAPTIVE"] = "0"
 
 MODEL = "/home/yair/Downloads/Ornith-1.5-35B-Q4_K_M.gguf"

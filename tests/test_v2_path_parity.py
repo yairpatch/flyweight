@@ -276,14 +276,10 @@ class MoeBatchedDecodeParityTests(_ParityCase):
             "context_limit": 256,
             "expert_mode": "cpu",
         }
-        # The expert-history sidecar feeds earlier runs' routing back into
-        # later placement -- an ambient input this parity class must not have.
-        os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "off"
 
     @classmethod
     def tearDownClass(cls):
         cls._model.close()
-        del os.environ["FLYWEIGHT_EXPERT_HISTORY"]
 
     def _prompt_pair(self) -> tuple[list[int], list[int]]:
         return tuple(_prompts(self._spec.vocabulary, (40, 33)))
@@ -409,12 +405,10 @@ class PrefillExpertStreamParityTests(_ParityCase):
             "prefill_cache_seed": 8,
             "expert_residency": "immutable",
         }
-        os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "off"
 
     @classmethod
     def tearDownClass(cls):
         cls._model.close()
-        del os.environ["FLYWEIGHT_EXPERT_HISTORY"]
 
     def _generate(self, **options):
         prompt = _prompts(self._spec.vocabulary, (40,))[0]

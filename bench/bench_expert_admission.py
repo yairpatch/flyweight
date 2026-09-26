@@ -66,10 +66,6 @@ def main() -> None:
     args = parser.parse_args()
 
     arms = list(ARMS)
-    # The .expert-history sidecar is an ambient input to placement -- restored
-    # at prepare, rewritten at teardown -- so arm N+1 would start from what arm
-    # N learned. Off for the whole comparison.
-    os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
     model = V2Model(args.model)
     base = list(model.tokenize(PROMPT, capacity=args.context))
     repeats = (args.prompt_tokens + len(base) - 1) // len(base)

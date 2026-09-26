@@ -397,8 +397,6 @@ class _QwenRuntimeInfo(ctypes.Structure):
         # FLYWEIGHT_PREFILL_PIPELINE=0 brings the split back.
         ("prefill_gpu_split_layers", ctypes.c_uint64),
         ("prefill_ple_nanoseconds", ctypes.c_uint64),
-        ("expert_history_loaded_entries", ctypes.c_uint64),
-        ("expert_history_saves", ctypes.c_uint64),
         ("next_layer_prefetch_predictions", ctypes.c_uint64),
         ("next_layer_prefetch_hits", ctypes.c_uint64),
         ("next_layer_prefetch_bytes", ctypes.c_uint64),
