@@ -2279,8 +2279,12 @@ void qwen_forward_rows(
                 runtime.model->tensors[layer.expert_tensors[0]].type==40&&
                 runtime.model->tensors[layer.expert_tensors[1]].type==40&&
                 runtime.model->tensors[layer.expert_tensors[2]].type==40;
+            const int token_floor=static_cast<int>(runtime.prefill_stream_token_floor);
             std::vector<int> staged;staged.reserve(order.size());
             for(const int expert:order){
+                // Densest-first: once token counts fall below the PCIe break-even
+                // floor, remaining experts cost more to stage than they save.
+                if(expert_tokens[expert]<token_floor)break;
                 if(cursor+stride>stream_slice_bytes)break;
                 // Other formats' GEMM kernels have no seam for a per-expert
                 // scale, so their scaled experts stay on the CPU.

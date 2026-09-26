@@ -2969,11 +2969,9 @@ class V2QwenRuntime:
                 )
             if hybrid_prefill is None:
                 effective_hybrid_prefill = "cpu"
-            # -1 is "auto", which the native side resolves to 256 MiB for the
-            # routed kernels (measured optimum on qwen4exp UD-IQ1_S and the
-            # 35B Q6_K; 512 and above lose to uploads) and 48 MiB otherwise.
-            if prefill_expert_stream_mib < 0:
-                prefill_expert_stream_mib = 256
+            # -1 is "auto": the native side resolves 256 MiB for routed MMQ
+            # (measured optimum) or 48 MiB otherwise, then scales with a
+            # pinned→device bandwidth probe. Leave -1 alone so that probe runs.
         effective_expert_residency = expert_residency
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
