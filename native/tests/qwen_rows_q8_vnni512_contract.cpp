@@ -385,6 +385,8 @@ int main() {
              qwen_iq2xxs_fold_rows_vnni512},
             {"iq3xxs", 18, kIq3xxsBlockBytes, 4.0f, qwen_iq3xxs_value,
              qwen_iq3xxs_fold_rows_vnni512},
+            {"iq4xs", 23, kIq4xsBlockBytes, 1.0f, qwen_iq4xs_value,
+             qwen_iq4xs_fold_rows_vnni512},
         };
         for (const auto& format : formats) {
             constexpr int kElements = 2560, kRows = 4, kTokens = 16;

@@ -82,7 +82,9 @@ ARMS: dict[str, dict[str, str]] = {
     "tile32": {"FLYWEIGHT_CUBLAS_TILE_ROWS": "32"},
     "tile64": {"FLYWEIGHT_CUBLAS_TILE_ROWS": "64"},
     "qsa": {"FLYWEIGHT_QSA": "1"},
-    "rows-q8-iq3s": {"FLYWEIGHT_ROWS_Q8_IQ3S": "1"},
+    # Direct-from-packed int16 fold is the default for IQ2/IQ3 gate/up.
+    # This arm is the dequant-then-fold path it replaced.
+    "rows-i16": {"FLYWEIGHT_ROWS_Q8_IQ3S": "0"},
 }
 
 

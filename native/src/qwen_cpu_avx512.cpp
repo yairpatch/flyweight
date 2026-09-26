@@ -692,6 +692,34 @@ float q20_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
 }
 
+// IQ4_NL store form of the dot below. Prefill's batched MoE dequantizes every
+// routed expert's down rows through here once per chunk; the AVX2 twin was the
+// only admission, so an AVX-512 box still wrote four 8-wide stores per 32-block
+// even though the dot already used 16-wide converts. Two `_mm512_storeu_ps`
+// cover a block; arithmetic matches `qwen_iq4nl_value` / the AVX2 dequant.
+void iq4nl_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * kIq4nlBlockBytes;
+        const __m512 scale = _mm512_set1_ps(half_value(base));
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low =
+            _mm_shuffle_epi8(levels, _mm_and_si128(bytes, nibble_mask));
+        const __m128i high = _mm_shuffle_epi8(
+            levels, _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask));
+        float* out = output + block * 32;
+        _mm512_storeu_ps(
+            out, _mm512_mul_ps(
+                     scale, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low))));
+        _mm512_storeu_ps(
+            out + 16, _mm512_mul_ps(
+                          scale, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high))));
+    }
+}
+
 // IQ4_NL: the same 18-byte/32-element shape as Q4_0, differing only in how a
 // nibble becomes a weight -- Q4_0 subtracts 8, IQ4_NL indexes a 16-entry
 // non-uniform codebook. `_mm_shuffle_epi8` does that lookup for 16 nibbles in
@@ -1485,6 +1513,11 @@ void qwen_dequant_row_avx512(
     } else if (type == 8) {
         q8_dequant(packed + row * static_cast<std::uint64_t>(elements / 32) * 34,
                    output, elements);
+    } else if (type == 20) {
+        iq4nl_dequant(
+            packed + row * static_cast<std::uint64_t>(elements / 32)
+                * kIq4nlBlockBytes,
+            output, elements);
     } else {
         // Unknown type: never walk it as Q8_0.
         std::fill(output, output + elements, 0.0f);
