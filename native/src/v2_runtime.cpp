@@ -1079,6 +1079,15 @@ struct FlyweightV2QwenRuntime {
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
+    // Minimum routed-token count before densest-first staging admits an expert
+    // into the prefill stream arena. Scaled from a pinned→device bandwidth
+    // probe (ExLlama-style): a slow PCIe link needs more reuse to break even.
+    // 1 keeps today's "any routed expert may stage" behaviour.
+    std::uint32_t prefill_stream_token_floor = 1;
+    // Last probe result in GB/s (0 = not probed / disabled / failed).
+    float prefill_stream_pcie_gbs = 0.0f;
+    // One-shot hugepage collapse after the first prompt has faulted expert pages.
+    std::atomic<bool> hugepage_collapse_started{false};
     // Pinned host mirror of the arena. The staged experts of a half-layer
     // are packed into it by the OpenMP team and land on the device as one
     // copy per slice, so the engine thread never blocks on the driver's
@@ -2263,7 +2272,13 @@ std::size_t select_expert_cache_slot(
     const auto slot_end = runtime.expert_slots.size() * (layer + 1) / cache_layers;
     auto begin = runtime.expert_slots.begin() + static_cast<std::ptrdiff_t>(slot_begin);
     auto end = runtime.expert_slots.begin() + static_cast<std::ptrdiff_t>(slot_end);
-    if (begin == end) throw std::runtime_error("native Qwen layer has no expert cache slots");
+    if (begin == end) {
+        // Layer got an empty slice of a starved cache (slots < layers). Soft
+        // reject so hybrid decode runs this expert on the CPU instead of
+        // aborting the request.
+        ++runtime.expert_cache_rejections;
+        return kNoExpertSlot;
+    }
     auto free_slot = std::find_if(begin, end, [](const QwenExpertSlot& slot) {
         return !slot.valid;
     });
@@ -7789,6 +7804,119 @@ void qwen_cpu_moe_rows(
     }
 }
 
+// Sustained pinned→device rate in GB/s. An idle laptop PCIe link often sits at
+// Gen1 and only retrains after a few hundred ms of traffic; a single short copy
+// then under-reads by 2-4x and would pick a too-large stream arena for the life
+// of the process (ExLlama's probe_bandwidth lesson). Returns 0 on failure.
+static double qwen_probe_pinned_h2d_gbs() {
+    constexpr std::uint64_t kProbeBytes = 16ull << 20;
+    constexpr double kFloorS = 0.5;
+    constexpr double kCapS = 2.0;
+    constexpr double kAsleepGbs = 5.0;
+    void* host = nullptr;
+    std::uint64_t device = 0;
+    std::uint64_t stream = 0;
+    std::uint64_t start_ev = 0;
+    std::uint64_t end_ev = 0;
+    auto cleanup = [&] {
+        if (start_ev) flyweight_gpu_event_destroy(start_ev);
+        if (end_ev) flyweight_gpu_event_destroy(end_ev);
+        if (stream) flyweight_gpu_stream_destroy(stream);
+        if (device) flyweight_gpu_free(device);
+        if (host) flyweight_gpu_host_free(host);
+    };
+    if (flyweight_gpu_host_alloc(kProbeBytes, &host) != 0 ||
+        flyweight_gpu_alloc(kProbeBytes, &device) != 0 ||
+        flyweight_gpu_stream_create(&stream) != 0 ||
+        flyweight_gpu_timed_event_create(&start_ev) != 0 ||
+        flyweight_gpu_timed_event_create(&end_ev) != 0) {
+        cleanup();
+        return 0.0;
+    }
+    std::memset(host, 1, static_cast<std::size_t>(kProbeBytes));
+    auto timed_copy = [&]() -> double {
+        if (flyweight_gpu_event_record(start_ev, stream) != 0 ||
+            flyweight_gpu_upload(device, host, kProbeBytes, stream) != 0 ||
+            flyweight_gpu_event_record(end_ev, stream) != 0 ||
+            flyweight_gpu_event_sync(end_ev) != 0)
+            return 0.0;
+        float ms = 0.0f;
+        if (flyweight_gpu_event_elapsed(start_ev, end_ev, &ms) != 0 || ms <= 0.0f)
+            return 0.0;
+        return (static_cast<double>(kProbeBytes) / (static_cast<double>(ms) * 1e-3)) / 1e9;
+    };
+    const auto wall0 = std::chrono::steady_clock::now();
+    std::vector<double> samples;
+    samples.reserve(32);
+    double last = 0.0;
+    for (;;) {
+        const double gbs = timed_copy();
+        if (gbs <= 0.0) {
+            cleanup();
+            return 0.0;
+        }
+        samples.push_back(gbs);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall0).count();
+        const bool warmed = elapsed >= kFloorS &&
+            (gbs >= kAsleepGbs || std::abs(gbs - last) / std::max(gbs, 0.5) < 0.08);
+        last = gbs;
+        if (warmed || elapsed >= kCapS) break;
+    }
+    cleanup();
+    if (samples.empty()) return 0.0;
+    const std::size_t take = std::min<std::size_t>(samples.size(), 5);
+    std::vector<double> tail(samples.end() - static_cast<std::ptrdiff_t>(take), samples.end());
+    std::sort(tail.begin(), tail.end());
+    return tail[tail.size() / 2];
+}
+
+#if !defined(_WIN32)
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+// Best-effort hugepage promotion after expert pages have been faulted in.
+// Synchronous collapse over tens of GiB at open stalls prepare; ExLlama runs
+// the same advise on a background thread after load. File-backed mappings may
+// still refuse (FilePmdMapped stays 0) — that is fine.
+static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime& runtime) {
+    if (const char* off = std::getenv("FLYWEIGHT_V2_HUGEPAGE_COLLAPSE");
+        off && off[0] == '0')
+        return;
+    bool expected = false;
+    if (!runtime.hugepage_collapse_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+        return;
+    // Capture the mapping spans now; the model outlives the detached thread
+    // for the process lifetime of a serve.
+    struct Span { const std::uint8_t* data; std::uint64_t size; };
+    std::vector<Span> spans;
+    if (runtime.model) {
+        runtime.model->for_each_mapping([&](const std::uint8_t* data, std::uint64_t size) {
+            if (data && size) spans.push_back({data, size});
+        });
+    }
+    if (spans.empty()) return;
+    std::thread([spans = std::move(spans)]() mutable {
+        const auto started = std::chrono::steady_clock::now();
+        for (const auto& span : spans) {
+            (void)madvise(const_cast<std::uint8_t*>(span.data),
+                          static_cast<std::size_t>(span.size), MADV_HUGEPAGE);
+            (void)madvise(const_cast<std::uint8_t*>(span.data),
+                          static_cast<std::size_t>(span.size), MADV_COLLAPSE);
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        if (std::getenv("FLYWEIGHT_V2_HUGEPAGE_LOG"))
+            std::fprintf(stderr,
+                "[flyweight] hugepage collapse on %zu mapping(s) in %lld ms\n",
+                spans.size(), static_cast<long long>(ms));
+    }).detach();
+}
+#else
+static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime&) {}
+#endif
+
 int gpu_probe(FlyweightV2GpuInfo& out, int device) {
     std::memset(&out, 0, sizeof(out)); out.device = device;
 #if defined(_WIN32)
@@ -7865,18 +7993,14 @@ void map_file(const char* path, FlyweightV2Model& model) { FlyweightV2Model* m=&
     // applied, so mapping permissions cannot depend on that option.
     m->data=static_cast<const uint8_t*>(mmap(nullptr,m->size,PROT_READ|PROT_WRITE,map_flags,m->fd,0)); if(m->data==MAP_FAILED) throw std::runtime_error("cannot map GGUF");
 #if defined(MADV_HUGEPAGE)
-    // Ask for 2 MiB pages. On the CPU backend the weights are read straight out
-    // of this mapping (see qwen_alias_static_tensor), so a decode walks the
-    // whole non-expert weight set every token -- 2.5 GiB for a 35B MoE, which
-    // is ~650k pages at 4 KiB.
-    //
-    // Measured no effect on the machine this was written on: smaps_rollup
-    // reported FilePmdMapped = 0 afterwards, i.e. the kernel declined to back a
-    // file mapping with large folios despite THP being set to `always`. It is
-    // kept because it is advisory, free, and correct where file THP is
-    // supported -- but do not assume it is doing anything without checking
-    // FilePmdMapped, and do not attribute a speedup to it on that assumption.
-    (void)madvise(const_cast<uint8_t*>(m->data),m->size,MADV_HUGEPAGE);
+    // Opt-in only at map time. A synchronous MADV_HUGEPAGE / MADV_COLLAPSE over
+    // a 70+ GiB GGUF stalls open, and ExLlama measured the same on its arena:
+    // collapse after first touch on a background thread instead (see
+    // qwen_schedule_hugepage_collapse). FLYWEIGHT_V2_HUGEPAGE_AT_MAP=1 restores
+    // the old advise-at-open behaviour for A/B.
+    if(const char* at_map=std::getenv("FLYWEIGHT_V2_HUGEPAGE_AT_MAP");
+       at_map&&at_map[0]=='1')
+        (void)madvise(const_cast<uint8_t*>(m->data),m->size,MADV_HUGEPAGE);
 #endif
     if(lock_model&&mlock(m->data,m->size)!=0) std::fprintf(stderr,"flyweight_v2: mlock(%zu bytes) failed: %s; continuing without pinning (raise RLIMIT_MEMLOCK to pin)\n",m->size,std::strerror(errno));
 #else
@@ -16737,13 +16861,53 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // grows with the budget), 256 MiB where the routed block-table MMQ
         // will take the streamed share (measured optimum on qwen4exp
         // UD-IQ1_S and the 35B Q6_K alike; 512 and above lose to uploads).
-        if(stream_auto){
+        const bool routed_stream=[&]{
             const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
-            const bool routed_requested=routed_env
-                ?routed_env[0]=='1':runtime->options.routed_moe!=0;
-            stream_request=routed_requested&&qwen_routed_mmq_available(*runtime)
-                ?256:48;
+            return (routed_env?routed_env[0]=='1':runtime->options.routed_moe!=0)&&
+                qwen_routed_mmq_available(*runtime);
+        }();
+        if(stream_auto)
+            stream_request=routed_stream?256:48;
+        // Pinned→device bandwidth probe (ExLlama EXL3_MOE_STREAM_T pattern):
+        // scale the auto MiB budget with sqrt(bw/25) and raise the per-expert
+        // token floor when the link is slow. Explicit MiB is left alone; the
+        // floor still adapts unless FLYWEIGHT_STREAM_TOKEN_FLOOR overrides.
+        // FLYWEIGHT_STREAM_PCIE_PROBE=0 disables the probe.
+        runtime->prefill_stream_token_floor=1;
+        runtime->prefill_stream_pcie_gbs=0.0f;
+        const bool probe_enabled=stream_request>0&&!flyweight_backend_is_cpu()&&
+            !(std::getenv("FLYWEIGHT_STREAM_PCIE_PROBE")&&
+              std::getenv("FLYWEIGHT_STREAM_PCIE_PROBE")[0]=='0');
+        if(probe_enabled){
+            const double bw=qwen_probe_pinned_h2d_gbs();
+            if(bw>0.0){
+                runtime->prefill_stream_pcie_gbs=static_cast<float>(bw);
+                if(stream_auto){
+                    const double scale=std::sqrt(bw/25.0);
+                    const std::int64_t lo=routed_stream?48:32;
+                    const std::int64_t hi=routed_stream?384:96;
+                    stream_request=std::clamp<std::int64_t>(
+                        static_cast<std::int64_t>(std::lround(
+                            static_cast<double>(stream_request)*scale)),
+                        lo,hi);
+                }
+                runtime->prefill_stream_token_floor=static_cast<std::uint32_t>(
+                    std::max<std::int64_t>(1,std::lround(
+                        4.0*std::sqrt(25.0/std::max(bw,0.5)))));
+            }
         }
+        if(const char*floor_env=std::getenv("FLYWEIGHT_STREAM_TOKEN_FLOOR")){
+            const auto value=std::strtoll(floor_env,nullptr,10);
+            if(value>=0)runtime->prefill_stream_token_floor=
+                static_cast<std::uint32_t>(value);
+        }
+        if(stream_auto&&runtime->prefill_stream_pcie_gbs>0.0f)
+            std::fprintf(stderr,
+                "[flyweight] prefill stream: pinned->device %.1f GB/s, "
+                "auto budget %lld MiB, token floor %u\n",
+                runtime->prefill_stream_pcie_gbs,
+                static_cast<long long>(stream_request),
+                runtime->prefill_stream_token_floor);
         if(stream_request>0&&runtime->model->config.expert_count&&
            !flyweight_backend_is_cpu()&&
            qwen_expert_policy(*runtime,
@@ -17110,7 +17274,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     "[flyweight] Laguna whole-layer placement selected %zu "
                     "layers (%zu expert bundles)\n",layer_count,slot);
             }
-            runtime->expert_cache_bytes=(cache/runtime->expert_slot_bytes<runtime->model->config.expert_used_count)?0:cache;
+            // Need at least one slot per MoE layer: slots are partitioned by
+            // integer ranges, so fewer slots than layers leaves begin==end for
+            // some layers and decode used to throw. Also keep the older floor
+            // of expert_used_count so a layer can cover a full route without
+            // immediate thrash. Below either bar, drop the cache and let the
+            // hybrid→CPU fallback below take over.
+            const auto cache_layers=qwen_cache_layer_count(*runtime);
+            const auto slot_count=cache/runtime->expert_slot_bytes;
+            const auto min_slots=std::max<std::uint64_t>(
+                runtime->model->config.expert_used_count,cache_layers);
+            runtime->expert_cache_bytes=slot_count<min_slots?0:cache;
         }
         const auto resident_expert_bytes=static_cast<std::uint64_t>(
             qwen_cache_layer_count(*runtime))*
@@ -24512,6 +24686,7 @@ static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
     runtime->cache_admission_enabled=true;
     if(runtime->options.mtp_drafts)qwen_mtp_expire_calibration(*runtime);
     qwen_prefetch_cpu_experts(*runtime);
+    qwen_schedule_hugepage_collapse(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
     qwen_seed_prefill_value_experts(*runtime);
     if(!runtime->prefill_snapshot_bytes)return;

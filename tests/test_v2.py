@@ -79,9 +79,9 @@ class V2RuntimeTests(unittest.TestCase):
         # The streaming path packs through a pinned mirror, so it no longer
         # needs direct paging or a cache seed: those stay at their defaults.
         self.assertEqual(native.expert_paging, 0)
-        # The arena the routed kernels measured best with, rather than the
-        # 48 MiB auto tuned for the per-expert path they replace.
-        self.assertEqual(native.prefill_expert_stream_mib, 256)
+        # Auto (-1): native resolves the arena (256 MiB routed / 48 MiB else)
+        # and may scale it from a pinned→device bandwidth probe.
+        self.assertEqual(native.prefill_expert_stream_mib, -1)
 
     def test_routed_moe_refuses_settings_that_would_disable_it(self):
         """Silently not engaging is the failure this flag exists to prevent."""
