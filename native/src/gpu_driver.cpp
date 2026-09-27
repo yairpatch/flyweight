@@ -205,10 +205,10 @@ cublasLtHandle_t g_cublas_lt_handle = nullptr;
 struct Nvfp4Scratch {
     CUdeviceptr weight_values = 0, weight_scales = 0;
     CUdeviceptr input_values = 0, input_scales = 0;
-    CUdeviceptr projected = 0, expert_pointers = 0;
+    CUdeviceptr projected = 0, expert_pointers = 0, activated = 0;
     size_t weight_values_bytes = 0, weight_scales_bytes = 0;
     size_t input_values_bytes = 0, input_scales_bytes = 0;
-    size_t projected_bytes = 0, expert_pointers_bytes = 0;
+    size_t projected_bytes = 0, expert_pointers_bytes = 0, activated_bytes = 0;
     CUstream stream = nullptr;
     // Orders cross-stream reuse of this single-buffered scratch without a
     // host synchronization; see nvfp4_scratch_switch_stream.
@@ -1426,6 +1426,10 @@ extern "C" int flyweight_gpu_compile(
              "nvfp4_repack_concat_down_cublaslt",
              "nvfp4_quantize_weighted_moe_cublaslt",
              "nvfp4_moe_add_first_column",
+             "mxfp4_repack_stacked_moe_cublaslt",
+             "mxfp4_stacked_moe_swiglu",
+             "mxfp4_repack_concat_down_cublaslt",
+             "mxfp4_quantize_weighted_moe_cublaslt",
              "nvfp4_validate_stacked_projection",
              "nvfp4_validate_down_projection",
              "qwen_bf16_embedding", "qwen_bf16_embedding_rows",
@@ -1524,7 +1528,8 @@ extern "C" int flyweight_gpu_compile(
              // source those kernels live in was not compiled in.
              "ds4_q8_matvec", "ds4_q8_grouped_matvec", "ds4_q6k_matvec",
              "ds4_iq1s_matvec", "ds4_iq1s_grouped_swiglu",
-             "ds4_clamped_swiglu",
+             "ds4_mxfp4_grouped_swiglu", "ds4_mxfp4_grouped_accumulate",
+             "ds4_clamped_swiglu", "ds4_mla_attention", "ds4_indexer_scores_kernel",
              // BailingMoE3. Same treatment: resolved if present, absent
              // otherwise, so a build without them still loads.
              "bailing_kda_recurrent_chunk", "bailing_mla_attention",
@@ -1938,6 +1943,7 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
                 release(g_nvfp4_scratch.input_scales);
                 release(g_nvfp4_scratch.projected);
                 release(g_nvfp4_scratch.expert_pointers);
+                release(g_nvfp4_scratch.activated);
                 // The dense repack cache is keyed by arena addresses that die
                 // with the runtime this stream served; a reload would other-
                 // wise hit stale entries at recycled addresses.
@@ -2549,7 +2555,8 @@ static int nvfp4_run_quantized_gemm(
     int input_size, int output_size, int rows, float alpha, float beta,
     std::uint64_t output, CUstream cuda_stream,
     std::uint64_t weight_values = 0, std::uint64_t weight_scales = 0,
-    std::uint64_t input_values = 0, std::uint64_t input_scales = 0
+    std::uint64_t input_values = 0, std::uint64_t input_scales = 0,
+    int scale_mode = 1
 ) {
     constexpr int kCudaR32F = 0;
     constexpr int kCudaR4E2M1 = 33;
@@ -2558,9 +2565,12 @@ static int nvfp4_run_quantized_gemm(
     constexpr int kDescTransA = 3, kDescTransB = 4;
     constexpr int kDescAScalePointer = 17, kDescBScalePointer = 18;
     constexpr int kDescAScaleMode = 31, kDescBScaleMode = 32;
-    constexpr int kScaleVec16Ue4m3 = 1;
     constexpr int kPreferenceMaxWorkspace = 1;
+    // scale_mode 2 is VEC32_UE8M0. It occupies bit 63, which the packed key
+    // below leaves free while K stays under 2^22.
+    if (scale_mode == 2 && input_size >= (1 << 22)) return -1;
     const std::uint64_t key =
+        (scale_mode == 2 ? (2ull << 62) : 0ull) |
         (static_cast<std::uint64_t>(static_cast<std::uint32_t>(input_size))
          << 40) |
         (static_cast<std::uint64_t>(static_cast<std::uint32_t>(output_size))
@@ -2609,11 +2619,11 @@ static int nvfp4_run_quantized_gemm(
             g_cublas_lt.matmul_desc_set(
                 plan.operation, kDescTransB, &kOpN, sizeof(kOpN)) != 0 ||
             g_cublas_lt.matmul_desc_set(
-                plan.operation, kDescAScaleMode, &kScaleVec16Ue4m3,
-                sizeof(kScaleVec16Ue4m3)) != 0 ||
+                plan.operation, kDescAScaleMode, &scale_mode,
+                sizeof(scale_mode)) != 0 ||
             g_cublas_lt.matmul_desc_set(
-                plan.operation, kDescBScaleMode, &kScaleVec16Ue4m3,
-                sizeof(kScaleVec16Ue4m3)) != 0 ||
+                plan.operation, kDescBScaleMode, &scale_mode,
+                sizeof(scale_mode)) != 0 ||
             g_cublas_lt.matmul_desc_set(
                 plan.operation, kDescAScalePointer, &a_scale_pointer,
                 sizeof(a_scale_pointer)) != 0 ||
@@ -3115,6 +3125,160 @@ extern "C" int flyweight_gpu_nvfp4_moe_cublas(
             std::fprintf(stderr, "\n");
         }
     }
+    return 0;
+}
+
+extern "C" int flyweight_gpu_mxfp4_moe_cublas(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t down_pointers, std::uint64_t input,
+    std::uint64_t output, std::uint64_t route_weights,
+    std::uint64_t stream, float limit,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
+) {
+    if (flyweight_backend_is_cpu()) return -1;
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!gate_pointers || !up_pointers || !down_pointers || !input
+        || !output || !route_weights || hidden_size <= 0
+        || intermediate_size <= 0 || experts <= 0
+        || (hidden_size & 31) || (intermediate_size & 31)
+        || !load_cublas_lt()) return -1;
+    const auto stacked_repack =
+        g_functions.find("mxfp4_repack_stacked_moe_cublaslt");
+    const auto input_quantize =
+        g_functions.find("nvfp4_quantize_broadcast16_cublaslt");
+    const auto swiglu = g_functions.find("mxfp4_stacked_moe_swiglu");
+    const auto down_repack =
+        g_functions.find("mxfp4_repack_concat_down_cublaslt");
+    const auto down_quantize =
+        g_functions.find("mxfp4_quantize_weighted_moe_cublaslt");
+    const auto add_first = g_functions.find("nvfp4_moe_add_first_column");
+    if (stacked_repack == g_functions.end() || input_quantize == g_functions.end()
+        || swiglu == g_functions.end() || down_repack == g_functions.end()
+        || down_quantize == g_functions.end() || add_first == g_functions.end())
+        return -2;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (nvfp4_scratch_switch_stream(cuda_stream) != 0) return -3;
+
+    const int gate_rows = 2 * experts * intermediate_size;
+    const int down_input = experts * intermediate_size;
+    const size_t weight_value_bytes = std::max(
+        static_cast<size_t>(gate_rows) * hidden_size / 2,
+        static_cast<size_t>(hidden_size) * down_input / 2);
+    const size_t weight_scale_bytes = std::max(
+        nvfp4_cublas_scale_bytes(gate_rows, hidden_size),
+        nvfp4_cublas_scale_bytes(hidden_size, down_input));
+    const size_t input_value_bytes = std::max(
+        static_cast<size_t>(16) * hidden_size / 2,
+        static_cast<size_t>(16) * down_input / 2);
+    const size_t input_scale_bytes = std::max(
+        nvfp4_cublas_scale_bytes(16, hidden_size),
+        nvfp4_cublas_scale_bytes(16, down_input));
+    const size_t projected_bytes =
+        static_cast<size_t>(gate_rows) * 16 * sizeof(float);
+    const size_t activated_bytes =
+        static_cast<size_t>(down_input) * sizeof(float);
+    const bool grow =
+        weight_value_bytes > g_nvfp4_scratch.weight_values_bytes ||
+        weight_scale_bytes > g_nvfp4_scratch.weight_scales_bytes ||
+        input_value_bytes > g_nvfp4_scratch.input_values_bytes ||
+        input_scale_bytes > g_nvfp4_scratch.input_scales_bytes ||
+        projected_bytes > g_nvfp4_scratch.projected_bytes ||
+        activated_bytes > g_nvfp4_scratch.activated_bytes;
+    if (grow && g_nvfp4_scratch.stream != nullptr
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -4;
+    if (grow) nvfp4_clear_cublas_plans();
+    auto reserve = [&](CUdeviceptr& pointer, size_t& capacity, size_t bytes) {
+        if (bytes <= capacity) return true;
+        if (pointer && g_api.cuMemFree(pointer) != 0) return false;
+        pointer = 0;
+        capacity = 0;
+        if (g_api.cuMemAlloc(&pointer, bytes) != 0) return false;
+        capacity = bytes;
+        return true;
+    };
+    if (!reserve(g_nvfp4_scratch.weight_values,
+                 g_nvfp4_scratch.weight_values_bytes, weight_value_bytes) ||
+        !reserve(g_nvfp4_scratch.weight_scales,
+                 g_nvfp4_scratch.weight_scales_bytes, weight_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.input_values,
+                 g_nvfp4_scratch.input_values_bytes, input_value_bytes) ||
+        !reserve(g_nvfp4_scratch.input_scales,
+                 g_nvfp4_scratch.input_scales_bytes, input_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.projected,
+                 g_nvfp4_scratch.projected_bytes, projected_bytes) ||
+        !reserve(g_nvfp4_scratch.activated,
+                 g_nvfp4_scratch.activated_bytes, activated_bytes))
+        return -5;
+    g_nvfp4_scratch.stream = cuda_stream;
+
+    std::uint64_t weight_values = g_nvfp4_scratch.weight_values;
+    std::uint64_t weight_scales = g_nvfp4_scratch.weight_scales;
+    if (g_api.cuMemsetD8Async(
+            weight_scales, 0, weight_scale_bytes, cuda_stream) != 0)
+        return -6;
+    void* stacked_args[] = {
+        &gate_pointers, &up_pointers, &weight_values, &weight_scales,
+        &hidden_size, &intermediate_size, &experts};
+    const unsigned int gate_blocks = static_cast<unsigned int>(
+        (static_cast<std::uint64_t>(gate_rows) * hidden_size / 32 + 255) / 256);
+    if (launch(stacked_repack->second, gate_blocks, 1, 256, stacked_args, 0,
+               cuda_stream) != 0) return -6;
+
+    std::uint64_t input_values = g_nvfp4_scratch.input_values;
+    std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
+    if (g_api.cuMemsetD8Async(
+            input_scales, 0, input_scale_bytes, cuda_stream) != 0)
+        return -7;
+    void* input_args[] = {
+        &input, &input_values, &input_scales, &hidden_size};
+    if (launch(input_quantize->second,
+               static_cast<unsigned int>(hidden_size), 1, 32,
+               input_args, 0, cuda_stream) != 0) return -7;
+    const std::uint64_t projected = g_nvfp4_scratch.projected;
+    const int gate_gemm_status = nvfp4_run_quantized_gemm(
+        hidden_size, gate_rows, 16, 1.0f, 0.0f, projected, cuda_stream,
+        weight_values, weight_scales, input_values, input_scales);
+    if (gate_gemm_status != 0) return -80 + gate_gemm_status;
+
+    std::uint64_t activated = g_nvfp4_scratch.activated;
+    void* swiglu_args[] = {
+        const_cast<std::uint64_t*>(&projected), &activated,
+        &intermediate_size, &experts, &limit};
+    if (launch(swiglu->second,
+               static_cast<unsigned int>(
+                   (static_cast<std::uint64_t>(experts) * intermediate_size
+                    + 255) / 256),
+               1, 256, swiglu_args, 0, cuda_stream) != 0) return -9;
+
+    if (g_api.cuMemsetD8Async(
+            weight_scales, 0, weight_scale_bytes, cuda_stream) != 0)
+        return -10;
+    void* down_repack_args[] = {
+        &down_pointers, &weight_values, &weight_scales, &intermediate_size,
+        &hidden_size, &experts};
+    const unsigned int down_blocks = static_cast<unsigned int>(
+        (static_cast<std::uint64_t>(hidden_size) * down_input / 32 + 255) / 256);
+    if (launch(down_repack->second, down_blocks, 1, 256, down_repack_args, 0,
+               cuda_stream) != 0) return -10;
+    if (g_api.cuMemsetD8Async(
+            input_scales, 0, input_scale_bytes, cuda_stream) != 0)
+        return -11;
+    void* down_quantize_args[] = {
+        &activated, &route_weights, &input_values, &input_scales,
+        &intermediate_size, &experts};
+    if (launch(down_quantize->second,
+               static_cast<unsigned int>(down_input), 1, 32,
+               down_quantize_args, 0, cuda_stream) != 0) return -11;
+    const int down_gemm_status = nvfp4_run_quantized_gemm(
+        down_input, hidden_size, 16, 1.0f, 0.0f, projected, cuda_stream,
+        weight_values, weight_scales, input_values, input_scales);
+    if (down_gemm_status != 0) return -120 + down_gemm_status;
+    void* add_args[] = {
+        const_cast<std::uint64_t*>(&projected), &output, &hidden_size};
+    if (launch(add_first->second,
+               static_cast<unsigned int>((hidden_size + 255) / 256),
+               1, 256, add_args, 0, cuda_stream) != 0) return -13;
     return 0;
 }
 

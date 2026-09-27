@@ -565,6 +565,14 @@ typedef struct FlyweightV2Deepseek4Info {
     uint64_t prefill_calls, prefill_tokens, prefill_nanoseconds;
     uint64_t expert_cache_bytes, expert_cache_slots;
     uint64_t expert_cache_hits, expert_cache_misses, expert_cache_evictions;
+    /* Resolved MLA cache codec: 0 f32, 1 f16, 2 bf16, 3 q8_0. One latent is
+       both key and value, so the two match. gpu_cache_bytes is the requested
+       expert-cache budget; the bytes actually reserved are expert_cache_bytes. */
+    int32_t cache_type_k, cache_type_v;
+    uint64_t gpu_cache_bytes;
+    /* Cached MXFP4 experts completed by the FP4 tensor-core GEMM, and the
+       times that GEMM was declined and the float unpack kernel ran instead. */
+    uint64_t mxfp4_tensor_core_calls, mxfp4_tensor_core_fallbacks;
 } FlyweightV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
@@ -572,6 +580,13 @@ typedef struct FlyweightV2Deepseek4Info {
    the footprint is far below the context length would suggest. */
 FLYWEIGHT_V2_API int flyweight_v2_deepseek4_runtime_create(FlyweightV2Model* model,
     uint32_t context_limit, FlyweightV2Deepseek4Runtime** out);
+/* Set the MLA cache codec and the expert-cache budget. Call before the first
+   token. cache_type is 0 f32, 1 f16, 2 bf16, 3 q8_0, 6 auto. turbo3/turbo4 are
+   refused: they are the Qwen GPU KV codecs. gpu_cache_bytes 0 keeps the
+   FLYWEIGHT_DS4_EXPERT_CACHE_MIB opt-in. */
+FLYWEIGHT_V2_API int flyweight_v2_deepseek4_runtime_configure(
+    FlyweightV2Deepseek4Runtime* runtime, int32_t cache_type_k, int32_t cache_type_v,
+    uint64_t gpu_cache_bytes);
 FLYWEIGHT_V2_API void flyweight_v2_deepseek4_runtime_free(FlyweightV2Deepseek4Runtime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_deepseek4_runtime_reset(FlyweightV2Deepseek4Runtime* runtime);
 /* Run one token through the stack, advancing the sequence. `logits` may be
@@ -620,7 +635,8 @@ FLYWEIGHT_V2_API int flyweight_v2_deepseek4_visible_keys(int32_t position, int32
    built from it. Exposed so the ranking can be checked without a prompt long
    enough to make the runtime run it. */
 /* Upload the dense half of the model to the device and run its matvecs there.
-   FLYWEIGHT_DS4_EXPERT_CACHE_MIB optionally enables a per-layer routed cache. */
+   The expert cache uses --gpu-cache-mib when set, otherwise
+   FLYWEIGHT_DS4_EXPERT_CACHE_MIB. */
 FLYWEIGHT_V2_API int flyweight_v2_deepseek4_runtime_gpu(FlyweightV2Deepseek4Runtime* runtime,
     int32_t device);
 /* Borrow immutable device weights and the serialized scheduler workspace from

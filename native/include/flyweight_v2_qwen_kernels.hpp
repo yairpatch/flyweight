@@ -9474,6 +9474,193 @@ void nvfp4_moe_add_first_column(
     if (index < elements) output[index] += matrix[index];
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// GGML MXFP4 (type 39) is E2M1 nibbles with one E8M0 scale per 32 values.
+// Its codebook is the E2M1 codebook doubled and its scale is 2^(e-128), which
+// is the same number as a hardware E2M1 times a UE8M0 scale 2^(e-127). The
+// nibble bits can therefore be handed to the FP4 tensor cores once they are
+// reordered into adjacent pairs. sm_120 cuBLAS accepts that GEMM only as
+// VEC16_UE4M3, so each 32-wide scale is stored twice, once per 16 values, as
+// the nearest in-range UE4M3 power of two. Byte 0 of a block is the scale.
+// Bytes 1..16 hold element i in the low nibble and element i+16 in the high.
+__device__ __forceinline__ void mxfp4_copy_gguf_values_cublaslt(
+    const unsigned char* nibbles, unsigned char* destination
+) {
+    for (int pair = 0; pair < 8; ++pair) {
+        const unsigned char first = nibbles[pair * 2] & 0x0f;
+        const unsigned char second = nibbles[pair * 2 + 1] & 0x0f;
+        destination[pair] = (unsigned char)(first | (second << 4));
+        const unsigned char high_first = nibbles[pair * 2] >> 4;
+        const unsigned char high_second = nibbles[pair * 2 + 1] >> 4;
+        destination[8 + pair] =
+            (unsigned char)(high_first | (high_second << 4));
+    }
+}
+
+// UE8M0 byte e means 2^(e-127). UE4M3 holds powers of two from 2^-9 to 2^7.
+__device__ __forceinline__ unsigned char mxfp4_ue8m0_as_ue4m3(
+    unsigned char ue8m0
+) {
+    if (ue8m0 == 0) return 0;
+    int power = (int)ue8m0 - 127;
+    if (power > 7) power = 7;
+    if (power < -9) return 0;
+    __nv_fp8_e4m3 encoded(ldexpf(1.0f, power));
+    return encoded.__x;
+}
+
+__device__ __forceinline__ void mxfp4_store_split_scales(
+    unsigned char* scales, int outer, int block32, int inner_scales,
+    unsigned char ue8m0
+) {
+    const unsigned char encoded = mxfp4_ue8m0_as_ue4m3(ue8m0);
+    const int inner = block32 << 1;
+    scales[nvfp4_scale_offset(outer, inner, inner_scales)] = encoded;
+    scales[nvfp4_scale_offset(outer, inner + 1, inner_scales)] = encoded;
+}
+
+extern "C" __global__
+void mxfp4_repack_stacked_moe_cublaslt(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    unsigned char* values,
+    unsigned char* scales,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int rows = 2 * experts * output_size;
+    const int blocks_per_row = input_size >> 5;
+    const int block_count = rows * blocks_per_row;
+    for (int block = blockIdx.x * blockDim.x + threadIdx.x;
+         block < block_count; block += blockDim.x * gridDim.x) {
+        const int stacked_row = block / blocks_per_row;
+        const int column_block = block - stacked_row * blocks_per_row;
+        const int matrix = stacked_row / output_size;
+        const int row = stacked_row - matrix * output_size;
+        const int expert = matrix < experts ? matrix : matrix - experts;
+        const unsigned char* source_matrix = (const unsigned char*)(
+            matrix < experts ? gate_ptrs[expert] : up_ptrs[expert]);
+        const unsigned char* source = source_matrix
+            + ((unsigned long long)row * blocks_per_row + column_block) * 17ull;
+        unsigned char* destination = values
+            + (unsigned long long)stacked_row * (input_size >> 1)
+            + (unsigned long long)column_block * 16ull;
+        mxfp4_copy_gguf_values_cublaslt(source + 1, destination);
+        mxfp4_store_split_scales(
+            scales, stacked_row, column_block, input_size >> 4, source[0]);
+    }
+}
+
+extern "C" __global__
+void mxfp4_stacked_moe_swiglu(
+    const float* projected,
+    float* activated,
+    const int output_size,
+    const int experts,
+    const float limit
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements = experts * output_size;
+    if (index >= elements) return;
+    float gate = fminf(fmaxf(projected[index], -limit), limit);
+    float up = fminf(fmaxf(projected[elements + index], -limit), limit);
+    activated[index] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+extern "C" __global__
+void mxfp4_repack_concat_down_cublaslt(
+    const unsigned long long* down_ptrs,
+    unsigned char* values,
+    unsigned char* scales,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int source_blocks_per_row = input_size >> 5;
+    const int blocks_per_row = experts * source_blocks_per_row;
+    const int block_count = output_size * blocks_per_row;
+    const int combined_input = experts * input_size;
+    for (int block = blockIdx.x * blockDim.x + threadIdx.x;
+         block < block_count; block += blockDim.x * gridDim.x) {
+        const int row = block / blocks_per_row;
+        const int combined_block = block - row * blocks_per_row;
+        const int expert = combined_block / source_blocks_per_row;
+        const int column_block =
+            combined_block - expert * source_blocks_per_row;
+        const unsigned char* source_matrix =
+            (const unsigned char*)down_ptrs[expert];
+        const unsigned char* source = source_matrix
+            + ((unsigned long long)row * source_blocks_per_row + column_block)
+                * 17ull;
+        unsigned char* destination = values
+            + (unsigned long long)row * (combined_input >> 1)
+            + (unsigned long long)combined_block * 16ull;
+        mxfp4_copy_gguf_values_cublaslt(source + 1, destination);
+        mxfp4_store_split_scales(
+            scales, row, combined_block, combined_input >> 4, source[0]);
+    }
+}
+
+// Route weight only. MXFP4 down scales already live in the weight tensor, so
+// the NVFP4 32768 shift is not applied here and the GEMM alpha stays 1.
+extern "C" __global__
+void mxfp4_quantize_weighted_moe_cublaslt(
+    const float* activated,
+    const float* weights,
+    unsigned char* values,
+    unsigned char* scales,
+    const int input_size,
+    const int experts
+) {
+    const int scaled_block = blockIdx.x;
+    const int blocks_per_expert = input_size >> 4;
+    const int blocks_per_row = experts * blocks_per_expert;
+    const int row = scaled_block / blocks_per_row;
+    const int row_block = scaled_block - row * blocks_per_row;
+    const int expert = row_block / blocks_per_expert;
+    const int expert_block = row_block - expert * blocks_per_expert;
+    if (row >= 16 || expert >= experts) return;
+    const int lane = threadIdx.x & 31;
+    const int base = expert * input_size + expert_block * 16;
+    const float route_weight = weights[expert];
+    float value = row == 0 && lane < 16
+        ? activated[base + lane] * route_weight : 0.0f;
+    float maximum = fabsf(value);
+    for (int offset = 16; offset; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
+    maximum = __shfl_sync(0xffffffff, maximum, 0);
+    unsigned int scale_code = 0;
+    float quant_scale = 1.0f;
+    if (lane == 0 && maximum > 0.0f) {
+        __nv_fp8_e4m3 encoded(maximum * (1.0f / 6.0f));
+        scale_code = encoded.__x;
+        quant_scale = static_cast<float>(encoded);
+        if (quant_scale == 0.0f) {
+            scale_code = 1;
+            __nv_fp8_e4m3 smallest;
+            smallest.__x = 1;
+            quant_scale = static_cast<float>(smallest);
+        }
+    }
+    scale_code = __shfl_sync(0xffffffff, scale_code, 0);
+    quant_scale = __shfl_sync(0xffffffff, quant_scale, 0);
+    if (lane == 0)
+        scales[nvfp4_scale_offset(row, row_block, blocks_per_row)] =
+            (unsigned char)scale_code;
+    if (lane < 8) {
+        const float inverse = scale_code ? 1.0f / quant_scale : 0.0f;
+        const float first = row == 0
+            ? activated[base + lane * 2] * route_weight : 0.0f;
+        const float second = row == 0
+            ? activated[base + lane * 2 + 1] * route_weight : 0.0f;
+        values[(unsigned long long)row * (experts * input_size >> 1)
+               + expert * (input_size >> 1) + expert_block * 8 + lane] =
+            fp4x2_e2m1_encode(first * inverse, second * inverse);
+    }
+}
+
 extern "C" __global__
 void nvfp4_validate_down_projection(
     const unsigned long long* down_ptrs,

@@ -1395,6 +1395,85 @@ void half_dot_quad(const std::uint8_t* row, const float* const inputs[4],
     }
 }
 
+alignas(16) constexpr std::int8_t kMxfp4Codes[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+float mxfp4_e8m0(std::uint8_t exponent) {
+    const std::uint32_t bits = exponent < 2
+        ? (0x00200000u << exponent)
+        : (static_cast<std::uint32_t>(exponent - 1) << 23);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+void mxfp4_expand(__m128i nibbles, __m256 scale, __m256& lo, __m256& hi) {
+    const __m128i table = _mm_load_si128(reinterpret_cast<const __m128i*>(kMxfp4Codes));
+    const __m128i codes = _mm_shuffle_epi8(table, nibbles);
+    lo = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(codes)));
+    hi = _mm256_mul_ps(
+        scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(codes, 8))));
+}
+
+void mxfp4_block(const std::uint8_t* base, __m256 decoded[4]) {
+    const __m256 scale = _mm256_set1_ps(mxfp4_e8m0(base[0]));
+    const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 1));
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m128i low = _mm_and_si128(bytes, mask);
+    const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+    mxfp4_expand(low, scale, decoded[0], decoded[1]);
+    mxfp4_expand(high, scale, decoded[2], decoded[3]);
+}
+
+float mxfp4_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps(), sum3 = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 32; ++block) {
+        __m256 decoded[4];
+        mxfp4_block(row_data + block * 17, decoded);
+        const float* vector = input + block * 32;
+        sum0 = _mm256_fmadd_ps(decoded[0], _mm256_loadu_ps(vector), sum0);
+        sum1 = _mm256_fmadd_ps(decoded[1], _mm256_loadu_ps(vector + 8), sum1);
+        sum2 = _mm256_fmadd_ps(decoded[2], _mm256_loadu_ps(vector + 16), sum2);
+        sum3 = _mm256_fmadd_ps(decoded[3], _mm256_loadu_ps(vector + 24), sum3);
+    }
+    return horizontal_sum(_mm256_add_ps(
+        _mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3)));
+}
+
+void mxfp4_dot_quad(
+    const std::uint8_t* row_data, const float* const inputs[4],
+    int elements, float outputs[4]
+) {
+    __m256 sums[4][4];
+    for (auto& token : sums)
+        for (auto& sum : token) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 32; ++block) {
+        __m256 decoded[4];
+        mxfp4_block(row_data + block * 17, decoded);
+        for (int token = 0; token < 4; ++token) {
+            const float* vector = inputs[token] + block * 32;
+            for (int part = 0; part < 4; ++part)
+                sums[token][part] = _mm256_fmadd_ps(
+                    decoded[part], _mm256_loadu_ps(vector + part * 8), sums[token][part]);
+        }
+    }
+    for (int token = 0; token < 4; ++token)
+        outputs[token] = horizontal_sum(_mm256_add_ps(
+            _mm256_add_ps(sums[token][0], sums[token][1]),
+            _mm256_add_ps(sums[token][2], sums[token][3])));
+}
+
+void mxfp4_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 32; ++block) {
+        __m256 decoded[4];
+        mxfp4_block(row_data + block * 17, decoded);
+        for (int part = 0; part < 4; ++part)
+            _mm256_storeu_ps(output + block * 32 + part * 8, decoded[part]);
+    }
+}
+
 } // namespace
 
 bool qwen_quant_dot_iq_multi_avx2(
@@ -1429,6 +1508,7 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==13)return q5_dot(packed+row*static_cast<std::uint64_t>(elements/256)*176,input,elements);
     if(type==14)return q6_dot(packed+row*static_cast<std::uint64_t>(elements/256)*210,input,elements);
     if(type==40)return nvfp4_dot(packed+row*static_cast<std::uint64_t>(elements/64)*36,input,elements);
+    if(type==39)return mxfp4_dot(packed+row*static_cast<std::uint64_t>(elements/32)*17,input,elements);
     if(type==8)return q8_dot(packed+row*static_cast<std::uint64_t>(elements/32)*34,input,elements);
     // An unknown type must not be read as Q8_0: the row stride would be wrong
     // and the walk runs past the tensor. The admission allowlists keep this
@@ -1466,6 +1546,7 @@ void qwen_quant_dot_quad_avx2(
     else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
+    else if(type==39)mxfp4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*17,inputs,elements,outputs);
     else if(type==8)q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
     // Same rule as the single-row dispatch: a type this path does not know
     // must not be read with Q8_0's stride. Zero outputs are diagnosable; an
@@ -1910,6 +1991,7 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==42)q20_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*18,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
+    else if(type==39)mxfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*17,output,elements);
     else if(type==8)q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
     else std::fill(output,output+elements,0.0f); // unknown type: never walk it as Q8_0
 }

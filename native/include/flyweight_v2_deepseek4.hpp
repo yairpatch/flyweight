@@ -89,6 +89,88 @@ inline std::uint16_t half_bits(float value) {
         sign | (static_cast<std::uint32_t>(exponent) << 10) | ((rounded >> 13) & 0x3FFu));
 }
 
+inline float half_value(std::uint16_t bits);
+
+// One MLA latent is both the key and the value, so a request for two cache
+// types resolves to a single codec. f32, f16 and bf16 are raw rows. q8_0 is
+// GGML's layout: an f16 scale and 32 int8 codes per block. turbo3/turbo4 are
+// the Qwen GPU KV codecs and are not stored here.
+inline std::uint32_t cache_row_bytes(std::int32_t type, std::uint32_t dim) {
+    switch (type) {
+        case 0: return dim * 4u;
+        case 1:
+        case 2: return dim * 2u;
+        case 3: return (dim / 32u) * 34u;
+        default: return 0;
+    }
+}
+
+inline void cache_store(std::uint8_t* dst, const float* src, std::uint32_t dim, std::int32_t type) {
+    if (type == 0) {
+        std::memcpy(dst, src, static_cast<std::size_t>(dim) * sizeof(float));
+        return;
+    }
+    if (type == 1) {
+        auto* out = reinterpret_cast<std::uint16_t*>(dst);
+        for (std::uint32_t i = 0; i < dim; ++i) out[i] = half_bits(src[i]);
+        return;
+    }
+    if (type == 2) {
+        auto* out = reinterpret_cast<std::uint16_t*>(dst);
+        for (std::uint32_t i = 0; i < dim; ++i) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, src + i, sizeof(bits));
+            out[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
+        return;
+    }
+    for (std::uint32_t block = 0; block < dim / 32u; ++block) {
+        const float* values = src + block * 32u;
+        float peak = 0.0f;
+        for (std::uint32_t lane = 0; lane < 32u; ++lane)
+            peak = std::max(peak, std::fabs(values[lane]));
+        const float scale = peak / 127.0f;
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const std::uint16_t scale_bits = half_bits(scale);
+        std::memcpy(dst + block * 34u, &scale_bits, sizeof(scale_bits));
+        auto* codes = reinterpret_cast<std::int8_t*>(dst + block * 34u + 2u);
+        for (std::uint32_t lane = 0; lane < 32u; ++lane) {
+            const float rounded = std::nearbyint(values[lane] * inverse);
+            const int code = static_cast<int>(std::max(-128.0f, std::min(127.0f, rounded)));
+            codes[lane] = static_cast<std::int8_t>(code);
+        }
+    }
+}
+
+inline void cache_load(float* dst, const std::uint8_t* src, std::uint32_t dim, std::int32_t type) {
+    if (type == 0) {
+        std::memcpy(dst, src, static_cast<std::size_t>(dim) * sizeof(float));
+        return;
+    }
+    if (type == 1) {
+        const auto* in = reinterpret_cast<const std::uint16_t*>(src);
+        for (std::uint32_t i = 0; i < dim; ++i) dst[i] = half_value(in[i]);
+        return;
+    }
+    if (type == 2) {
+        const auto* in = reinterpret_cast<const std::uint16_t*>(src);
+        for (std::uint32_t i = 0; i < dim; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(in[i]) << 16;
+            std::memcpy(dst + i, &bits, sizeof(bits));
+        }
+        return;
+    }
+    for (std::uint32_t block = 0; block < dim / 32u; ++block) {
+        std::uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, src + block * 34u, sizeof(scale_bits));
+        const float scale = half_value(scale_bits);
+        const auto* codes = reinterpret_cast<const std::int8_t*>(src + block * 34u + 2u);
+        float* out = dst + block * 32u;
+        for (std::uint32_t lane = 0; lane < 32u; ++lane)
+            out[lane] = scale * static_cast<float>(codes[lane]);
+    }
+}
+
 inline float half_value(std::uint16_t bits) {
     const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
     const std::uint32_t exponent = (bits >> 10) & 0x1Fu;
@@ -151,6 +233,14 @@ inline void sinkhorn(float* comb, std::size_t hc, std::uint32_t iterations, floa
     }
 }
 
+inline void hyper_connection_from_mixes(
+    const float* mixes, const float* scale, const float* base,
+    std::size_t hc, std::uint32_t sinkhorn_iterations, float hc_epsilon,
+    float* pre, float* post, float* comb);
+inline void hyper_connection_head_from_mixes(
+    const float* mixes, const float* streams, const float* scale, const float* base,
+    std::size_t n_embd, std::size_t hc, float hc_epsilon, float* pre, float* output);
+
 // Derive the three mixing weights a block needs from its stream state.
 //
 // `streams` is [hc][n_embd]; `fn` is the [(2+hc)*hc] x [hc*n_embd] mixer with
@@ -192,6 +282,23 @@ inline void hyper_connection_weights(
     }
     if (mixes_out) std::copy(mixes.begin(), mixes.end(), mixes_out);
 
+    hyper_connection_from_mixes(
+        mixes.data(), scale, base, hc, sinkhorn_iterations, hc_epsilon, pre, post, comb);
+}
+
+// Scale, sigmoid, and Sinkhorn after the mixer dot. The dot itself may run on
+// the device; this tail is a few dozen values.
+inline void hyper_connection_from_mixes(
+    const float* mixes,
+    const float* scale,
+    const float* base,
+    std::size_t hc,
+    std::uint32_t sinkhorn_iterations,
+    float hc_epsilon,
+    float* pre,
+    float* post,
+    float* comb
+) {
     for (std::size_t i = 0; i < hc; ++i)
         pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + hc_epsilon;
     for (std::size_t i = 0; i < hc; ++i)
@@ -222,13 +329,31 @@ inline void hyper_connection_head(
     const std::size_t width = hc * n_embd;
     std::vector<float> normalized(width);
     rms_norm(streams, width, rms_epsilon, normalized.data());
+    std::vector<float> mixes(hc);
     for (std::size_t row = 0; row < hc; ++row) {
         const float* weights = fn + row * width;
         double total = 0.0;
         for (std::size_t i = 0; i < width; ++i)
             total += static_cast<double>(weights[i]) * normalized[i];
-        pre[row] = sigmoid(static_cast<float>(total) * scale[0] + base[row]) + hc_epsilon;
+        mixes[row] = static_cast<float>(total);
     }
+    hyper_connection_head_from_mixes(
+        mixes.data(), streams, scale, base, n_embd, hc, hc_epsilon, pre, output);
+}
+
+inline void hyper_connection_head_from_mixes(
+    const float* mixes,
+    const float* streams,
+    const float* scale,
+    const float* base,
+    std::size_t n_embd,
+    std::size_t hc,
+    float hc_epsilon,
+    float* pre,
+    float* output
+) {
+    for (std::size_t row = 0; row < hc; ++row)
+        pre[row] = sigmoid(mixes[row] * scale[0] + base[row]) + hc_epsilon;
     for (std::size_t i = 0; i < n_embd; ++i) output[i] = 0.0f;
     for (std::size_t stream = 0; stream < hc; ++stream) {
         const float weight = pre[stream];

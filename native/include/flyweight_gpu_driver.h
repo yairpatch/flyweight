@@ -433,6 +433,19 @@ FLYWEIGHT_API int flyweight_gpu_nvfp4_moe_cublas(
     std::int32_t hidden_size, std::int32_t intermediate_size,
     std::int32_t experts
 );
+// MXFP4 (GGUF type 39) routed-MoE decode on the same FP4 tensor cores.
+// Weights stay in the GGUF block layout; the driver repacks them into
+// cuBLASLt's VEC32_UE8M0 layout and quantizes the activation to E2M1.
+// Nonzero means the caller should use its float unpack fallback. `limit` is
+// the SwiGLU clamp. The GEMM adds into `output`, which the caller zeroes.
+FLYWEIGHT_API int flyweight_gpu_mxfp4_moe_cublas(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t down_pointers, std::uint64_t input,
+    std::uint64_t output, std::uint64_t route_weights,
+    std::uint64_t stream, float limit,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
+);
 // Convert one cached GGUF expert bundle to persistent Tensor-Core layout.
 FLYWEIGHT_API int flyweight_gpu_nvfp4_prepare_expert(
     std::uint64_t gate, std::uint64_t up, std::uint64_t down,

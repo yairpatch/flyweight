@@ -373,10 +373,29 @@ class ServiceTests(unittest.TestCase):
             thread.join(timeout=300)
         self.assertEqual(sorted(results), [0, 1])
 
+    def test_cache_type_and_gpu_budget_are_honoured(self):
+        service = self.service(cache_type_k="q8_0", cache_type_v="bf16", gpu_cache_mib=128)
+        execution = service.health()["execution"]
+        # bf16 is finer than q8_0, and one latent is both key and value.
+        self.assertEqual(execution["cache_type_k"], 2)
+        self.assertEqual(execution["cache_type_v"], 2)
+        self.assertEqual(execution["gpu_cache_bytes"], 128 * 1024**2)
+        response = service.chat_completion({
+            "model": service.model_name,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+        })
+        self.assertEqual(response["usage"]["completion_tokens"], 1)
+
+    def test_turbo_kv_is_refused(self):
+        with self.assertRaises(Exception) as raised:
+            self.service(cache_type_k="turbo4", cache_type_v="turbo4")
+        self.assertIn("q8_0", str(raised.exception))
+
     def test_a_runtime_knob_this_path_cannot_honour_is_refused(self):
         with self.assertRaises(ValueError) as raised:
-            self.service(cache_type_k="q8_0")
-        self.assertIn("cache_type_k", str(raised.exception))
+            self.service(expert_mode="cpu")
+        self.assertIn("expert_mode", str(raised.exception))
 
     def test_an_untouched_knob_is_accepted(self):
         # Its default matches the Qwen service's, so it asked for nothing.

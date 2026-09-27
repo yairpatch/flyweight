@@ -1442,13 +1442,13 @@ def _benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
-# Knobs for Qwen-specific placement, paging, KV formats or drafting. DeepSeek-V4
-# has its own CPU/hybrid placement and half-precision compressed state, so these
-# are reported rather than accepted and ignored.
+# Knobs for Qwen-specific placement, paging, or drafting. DeepSeek-V4 has its
+# own CPU/hybrid placement. MLA cache type and the expert-cache budget are
+# honoured separately; these are reported rather than accepted and ignored.
 _DEEPSEEK4_UNSUPPORTED = (
-    "gpu_cache_mib", "expert_mode", "hybrid_prefill",
+    "expert_mode", "hybrid_prefill",
     "expert_residency", "dense_requant",
-    "cache_type_k", "cache_type_v", "prompt_cache_mib", "swa_full",
+    "prompt_cache_mib", "swa_full",
     "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
     "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
     "prefill_checkpoint_interval", "prefill_checkpoint_slots",
@@ -1525,7 +1525,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
         raise SystemExit(
             "the DeepSeek-V4 runtime does not support "
             + ", ".join("--" + name.replace("_", "-") for name in sorted(requested))
-            + " yet; it uses its dedicated CPU/hybrid runtime with half-precision caches"
+            + " yet; it uses its dedicated CPU/hybrid runtime"
         )
     # The dense half goes to the GPU when there is one and nothing said
     # otherwise; the routed experts stay on the CPU whatever happens, because
@@ -1542,10 +1542,18 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
             device = int(getattr(args, "device", 0) or 0)
         elif backend == "cuda":
             raise SystemExit("no CUDA device is available")
+    cache_type_k = args.cache_type_k
+    cache_type_v = args.cache_type_v
+    if getattr(args, "kv_dtype", None):
+        cache_type_k = args.kv_dtype
+        cache_type_v = args.kv_dtype
     return NativeDeepseek4InferenceService(
         args.model,
         dspark_model_path=getattr(args, "mtp_model", None),
         dspark_drafts=getattr(args, "mtp_drafts", 0),
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
+        gpu_cache_mib=args.gpu_cache_mib,
         device=device,
         model_name=getattr(args, "model_name", None),
         context_window=args.context_window,

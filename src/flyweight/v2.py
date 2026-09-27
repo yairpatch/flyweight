@@ -238,6 +238,11 @@ class _Deepseek4Info(ctypes.Structure):
         ("expert_cache_hits", ctypes.c_uint64),
         ("expert_cache_misses", ctypes.c_uint64),
         ("expert_cache_evictions", ctypes.c_uint64),
+        ("cache_type_k", ctypes.c_int32),
+        ("cache_type_v", ctypes.c_int32),
+        ("gpu_cache_bytes", ctypes.c_uint64),
+        ("mxfp4_tensor_core_calls", ctypes.c_uint64),
+        ("mxfp4_tensor_core_fallbacks", ctypes.c_uint64),
     ]
 
 
@@ -866,6 +871,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
                 ]
                 lib.flyweight_v2_deepseek4_runtime_create.restype = ctypes.c_int
+                lib.flyweight_v2_deepseek4_runtime_configure.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_deepseek4_runtime_configure.restype = ctypes.c_int
                 lib.flyweight_v2_deepseek4_runtime_free.argtypes = [ctypes.c_void_p]
                 lib.flyweight_v2_deepseek4_runtime_free.restype = None
                 lib.flyweight_v2_deepseek4_runtime_reset.argtypes = [ctypes.c_void_p]

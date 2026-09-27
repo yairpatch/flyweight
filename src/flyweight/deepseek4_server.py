@@ -174,7 +174,9 @@ class Deepseek4Engine:
     def __init__(
         self, model: V2Model, context_limit: int, slots: int = 1,
         device: int | None = None, dspark_model: V2Model | None = None,
-        dspark_drafts: int = 0,
+        dspark_drafts: int = 0, *,
+        cache_type_k: str = "f16", cache_type_v: str = "f16",
+        gpu_cache_bytes: int = 0,
     ):
         if slots <= 0:
             raise ValueError("slots must be positive")
@@ -184,8 +186,16 @@ class Deepseek4Engine:
             raise ValueError("DSpark draft count must be non-negative")
         self.dspark_drafts = int(dspark_drafts)
         self._slots: list[Deepseek4Runtime | DsparkSession] = [
-            DsparkSession(model, dspark_model, context_limit) if dspark_model is not None
-            else Deepseek4Runtime(model, context_limit)
+            DsparkSession(
+                model, dspark_model, context_limit,
+                cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+                gpu_cache_bytes=gpu_cache_bytes,
+            ) if dspark_model is not None
+            else Deepseek4Runtime(
+                model, context_limit,
+                cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+                gpu_cache_bytes=gpu_cache_bytes,
+            )
             for _ in range(slots)
         ]
         if device is not None:
@@ -532,10 +542,15 @@ class Deepseek4Generator(ChatGenerator):
         device: int | None = None,
         dspark_model: V2Model | None = None,
         dspark_drafts: int = 0,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
+        gpu_cache_bytes: int = 0,
     ):
         super().__init__(
             model, Deepseek4Engine(
-                model, context_limit, slots, device, dspark_model, dspark_drafts
+                model, context_limit, slots, device, dspark_model, dspark_drafts,
+                cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+                gpu_cache_bytes=gpu_cache_bytes,
             ), tokenizer
         )
 
@@ -578,7 +593,7 @@ def _reject_unsupported(options: Mapping[str, object]) -> None:
         raise ValueError(
             "the DeepSeek-V4 runtime does not support "
             + ", ".join(sorted(requested))
-            + " yet; it uses its dedicated CPU/hybrid runtime with half-precision caches"
+            + " yet; it uses its dedicated CPU/hybrid runtime"
         )
 
 
@@ -589,9 +604,10 @@ class NativeDeepseek4InferenceService(InferenceService):
     read in full on every token -- is resident on the GPU, and the routed
     experts stay on the CPU because they are 90 GiB. Immutable device weights
     and the serialized activation workspace are shared by all sequence slots.
-    The other runtime knobs the
-    Qwen service accepts (GPU cache, expert placement, KV quantization, MTP
-    drafts) still have no counterpart here, and are rejected rather than
+    ``cache_type_k`` / ``cache_type_v`` select the MLA latent codec (one
+    latent is both key and value; the finer of the two is stored).
+    ``gpu_cache_mib`` is the routed-expert cache budget. The other Qwen
+    knobs still have no counterpart here and are rejected rather than
     accepted and ignored.
     """
 
@@ -606,6 +622,9 @@ class NativeDeepseek4InferenceService(InferenceService):
         device: int | None = None,
         dspark_model_path: Path | str | None = None,
         dspark_drafts: int = 0,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
+        gpu_cache_mib: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -636,6 +655,9 @@ class NativeDeepseek4InferenceService(InferenceService):
                 device=device,
                 dspark_model=self.dspark_model,
                 dspark_drafts=dspark_drafts,
+                cache_type_k=cache_type_k,
+                cache_type_v=cache_type_v,
+                gpu_cache_bytes=gpu_cache_mib * 1024**2,
             )
         except Exception:
             if self.dspark_model is not None:

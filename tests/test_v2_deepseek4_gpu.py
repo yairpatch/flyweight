@@ -239,5 +239,162 @@ class HybridServiceTests(unittest.TestCase):
         self.assertGreater(runtimes[0].info["gpu_weight_bytes"], 4 * 1024**3)
 
 
+@unittest.skipUnless(gpu_present(), "no CUDA device available")
+class Mxfp4TensorCoreTests(unittest.TestCase):
+    """GGML MXFP4 experts on the FP4 tensor cores.
+
+    This GPU's cuBLAS rejects UE8M0 block-32 scales, so a cache hit repacks
+    the MXFP4 nibbles and stores each scale twice as UE4M3, one per 16
+    values. The activation is quantized on the way in, which is the error
+    the cosine floor allows. A declined GEMM used to return before this
+    matched anything.
+    """
+
+    def test_repacked_experts_track_the_float_unpack(self):
+        import ctypes
+        import tempfile
+        from pathlib import Path
+
+        from flyweight.deepseek4 import Deepseek4Runtime
+        from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "ds4.gguf"
+        build_deepseek4_gguf(path, DeepSeek4Spec(layers=2, hash_layers=0))
+        model = V2Model(path)
+        self.addCleanup(model.close)
+        runtime = Deepseek4Runtime(model, 64)
+        self.addCleanup(runtime.close)
+        runtime.use_gpu(0)
+        lib = runtime._library
+        lib.flyweight_gpu_mxfp4_moe_cublas.argtypes = [
+            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_float,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+        ]
+        lib.flyweight_gpu_mxfp4_moe_cublas.restype = ctypes.c_int
+        lib.flyweight_gpu_alloc.argtypes = [
+            ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+        lib.flyweight_gpu_alloc.restype = ctypes.c_int
+        lib.flyweight_gpu_upload.argtypes = [
+            ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
+        lib.flyweight_gpu_upload.restype = ctypes.c_int
+        lib.flyweight_gpu_download.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
+        lib.flyweight_gpu_download.restype = ctypes.c_int
+        lib.flyweight_gpu_sync.restype = ctypes.c_int
+
+        hidden, intermediate, experts = 256, 128, 2
+        rng = np.random.default_rng(7)
+        lut = np.array(
+            [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
+            dtype=np.float32)
+
+        def decode(packed, rows, cols):
+            blocks = cols // 32
+            raw = np.frombuffer(packed, dtype=np.uint8).reshape(rows, blocks, 17)
+            codes = np.concatenate(
+                [raw[:, :, 1:] & 0x0F, raw[:, :, 1:] >> 4], axis=2)
+            exponents = raw[:, :, 0].astype(np.int32)
+            scale = np.ldexp(np.float32(1.0), exponents - 128)
+            return (lut[codes] * scale[:, :, None]).reshape(rows, cols)
+
+        def pack(rows, cols):
+            blocks = cols // 32
+            raw = np.empty((rows, blocks, 17), dtype=np.uint8)
+            raw[:, :, 0] = rng.integers(121, 135, size=(rows, blocks))
+            raw[:, :, 1:] = rng.integers(0, 256, size=(rows, blocks, 16))
+            return np.ascontiguousarray(raw).reshape(-1)
+
+        def upload(host):
+            pointer = ctypes.c_uint64()
+            self.assertEqual(lib.flyweight_gpu_alloc(host.nbytes, ctypes.byref(pointer)), 0)
+            self.assertEqual(
+                lib.flyweight_gpu_upload(pointer.value, host.ctypes.data, host.nbytes, 0), 0)
+            return pointer.value
+
+        matrices = [
+            [pack(intermediate, hidden), pack(intermediate, hidden), pack(hidden, intermediate)]
+            for _ in range(experts)
+        ]
+        activation = rng.standard_normal(hidden).astype(np.float32) * np.float32(0.02)
+        weights = np.full(experts, np.float32(1.0 / experts))
+        limit = np.float32(7.0)
+        reference = np.zeros(hidden, dtype=np.float32)
+        for expert in range(experts):
+            gate, up, down = matrices[expert]
+            gated = np.clip(decode(gate, intermediate, hidden) @ activation, -limit, limit)
+            upped = np.clip(decode(up, intermediate, hidden) @ activation, -limit, limit)
+            hidden_act = (gated / (1.0 + np.exp(-gated))) * upped
+            reference += weights[expert] * (decode(down, hidden, intermediate) @ hidden_act)
+        pointers = np.array(
+            [[upload(matrices[expert][kind]) for expert in range(experts)] for kind in range(3)],
+            dtype=np.uint64)
+        output = upload(np.zeros(hidden, dtype=np.float32))
+        status = lib.flyweight_gpu_mxfp4_moe_cublas(
+            upload(np.ascontiguousarray(pointers[0])),
+            upload(np.ascontiguousarray(pointers[1])),
+            upload(np.ascontiguousarray(pointers[2])),
+            upload(np.ascontiguousarray(activation)),
+            output, upload(np.ascontiguousarray(weights)),
+            0, float(limit), hidden, intermediate, experts)
+        self.assertEqual(status, 0)
+        self.assertEqual(lib.flyweight_gpu_sync(), 0)
+        got = np.zeros(hidden, dtype=np.float32)
+        self.assertEqual(
+            lib.flyweight_gpu_download(got.ctypes.data, output, got.nbytes, 0), 0)
+        self.assertEqual(lib.flyweight_gpu_sync(), 0)
+        cosine = float(np.dot(reference, got) / (
+            np.linalg.norm(reference) * np.linalg.norm(got)))
+        relative = float(
+            np.linalg.norm(reference - got) / np.linalg.norm(reference))
+        self.assertGreater(cosine, 0.95)
+        self.assertLess(relative, 0.40)
+
+
+@unittest.skipUnless(gpu_present(), "no CUDA device available")
+class FixtureDeviceForwardTests(unittest.TestCase):
+    """The composed device forward on a float fixture.
+
+    The grouped output projection has a Q8_0 kernel. A float copy of that
+    tensor must stay on the host path, and the device attention, indexer, and
+    hyper-connection mixer have to agree with the CPU on the tokens that
+    actually exercise them.
+    """
+
+    def test_gpu_logits_track_the_cpu(self):
+        import tempfile
+        from pathlib import Path
+
+        from flyweight.deepseek4 import Deepseek4Runtime
+        from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "ds4.gguf"
+        build_deepseek4_gguf(
+            path, DeepSeek4Spec(layers=3, hash_layers=0, indexer_top_k=1))
+        model = V2Model(path)
+        self.addCleanup(model.close)
+        cpu = Deepseek4Runtime(model, 64)
+        gpu = Deepseek4Runtime(model, 64)
+        self.addCleanup(cpu.close)
+        self.addCleanup(gpu.close)
+        gpu.use_gpu(0)
+        self.assertEqual(gpu.info["gpu_cache_bytes"], 0)
+        cpu_logits = gpu_logits = None
+        for token in range(1, 12):
+            cpu_logits = np.asarray(cpu.forward(token), dtype=np.float32)
+            gpu_logits = np.asarray(gpu.forward(token), dtype=np.float32)
+        self.assertTrue(np.isfinite(gpu_logits).all())
+        # The mixer and the dense matvecs accumulate in float on the device
+        # and in double on the host. A short fixture stays within a couple of
+        # ten-thousandths; an all-NaN or a wrong kernel does not.
+        np.testing.assert_allclose(gpu_logits, cpu_logits, rtol=2e-3, atol=2e-4)
+        self.assertEqual(int(gpu_logits.argmax()), int(cpu_logits.argmax()))
+        self.assertGreater(gpu.info["gpu_matvec_calls"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

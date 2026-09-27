@@ -142,7 +142,11 @@ class DsparkRuntime:
 class DsparkSession:
     """Keep target capture, feature fusion, and draft KV injection in lockstep."""
 
-    def __init__(self, target_model, sidecar_model, context_limit: int):
+    def __init__(
+        self, target_model, sidecar_model, context_limit: int, *,
+        cache_type_k: str = "f16", cache_type_v: str = "f16",
+        gpu_cache_bytes: int = 0,
+    ):
         from .deepseek4 import Deepseek4Runtime
 
         if sidecar_model.config["architecture"] != "dflash":
@@ -150,7 +154,11 @@ class DsparkSession:
         target_layers = tuple(sidecar_model.target_layers)
         if not target_layers:
             raise ValueError("sidecar does not declare target layers")
-        self.target = Deepseek4Runtime(target_model, context_limit)
+        self.target = Deepseek4Runtime(
+            target_model, context_limit,
+            cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+            gpu_cache_bytes=gpu_cache_bytes,
+        )
         try:
             self.target.capture_layers(target_layers)
             self.draft = DsparkRuntime(sidecar_model, context_limit)
