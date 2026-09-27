@@ -233,6 +233,14 @@ inline void sinkhorn(float* comb, std::size_t hc, std::uint32_t iterations, floa
     }
 }
 
+inline void hyper_connection_from_mixes(
+    const float* mixes, const float* scale, const float* base,
+    std::size_t hc, std::uint32_t sinkhorn_iterations, float hc_epsilon,
+    float* pre, float* post, float* comb);
+inline void hyper_connection_head_from_mixes(
+    const float* mixes, const float* streams, const float* scale, const float* base,
+    std::size_t n_embd, std::size_t hc, float hc_epsilon, float* pre, float* output);
+
 // Derive the three mixing weights a block needs from its stream state.
 //
 // `streams` is [hc][n_embd]; `fn` is the [(2+hc)*hc] x [hc*n_embd] mixer with
@@ -274,6 +282,23 @@ inline void hyper_connection_weights(
     }
     if (mixes_out) std::copy(mixes.begin(), mixes.end(), mixes_out);
 
+    hyper_connection_from_mixes(
+        mixes.data(), scale, base, hc, sinkhorn_iterations, hc_epsilon, pre, post, comb);
+}
+
+// Scale, sigmoid, and Sinkhorn after the mixer dot. The dot itself may run on
+// the device; this tail is a few dozen values.
+inline void hyper_connection_from_mixes(
+    const float* mixes,
+    const float* scale,
+    const float* base,
+    std::size_t hc,
+    std::uint32_t sinkhorn_iterations,
+    float hc_epsilon,
+    float* pre,
+    float* post,
+    float* comb
+) {
     for (std::size_t i = 0; i < hc; ++i)
         pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + hc_epsilon;
     for (std::size_t i = 0; i < hc; ++i)
@@ -304,13 +329,31 @@ inline void hyper_connection_head(
     const std::size_t width = hc * n_embd;
     std::vector<float> normalized(width);
     rms_norm(streams, width, rms_epsilon, normalized.data());
+    std::vector<float> mixes(hc);
     for (std::size_t row = 0; row < hc; ++row) {
         const float* weights = fn + row * width;
         double total = 0.0;
         for (std::size_t i = 0; i < width; ++i)
             total += static_cast<double>(weights[i]) * normalized[i];
-        pre[row] = sigmoid(static_cast<float>(total) * scale[0] + base[row]) + hc_epsilon;
+        mixes[row] = static_cast<float>(total);
     }
+    hyper_connection_head_from_mixes(
+        mixes.data(), streams, scale, base, n_embd, hc, hc_epsilon, pre, output);
+}
+
+inline void hyper_connection_head_from_mixes(
+    const float* mixes,
+    const float* streams,
+    const float* scale,
+    const float* base,
+    std::size_t n_embd,
+    std::size_t hc,
+    float hc_epsilon,
+    float* pre,
+    float* output
+) {
+    for (std::size_t row = 0; row < hc; ++row)
+        pre[row] = sigmoid(mixes[row] * scale[0] + base[row]) + hc_epsilon;
     for (std::size_t i = 0; i < n_embd; ++i) output[i] = 0.0f;
     for (std::size_t stream = 0; stream < hc; ++stream) {
         const float weight = pre[stream];

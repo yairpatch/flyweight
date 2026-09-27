@@ -1529,7 +1529,7 @@ extern "C" int flyweight_gpu_compile(
              "ds4_q8_matvec", "ds4_q8_grouped_matvec", "ds4_q6k_matvec",
              "ds4_iq1s_matvec", "ds4_iq1s_grouped_swiglu",
              "ds4_mxfp4_grouped_swiglu", "ds4_mxfp4_grouped_accumulate",
-             "ds4_clamped_swiglu",
+             "ds4_clamped_swiglu", "ds4_mla_attention", "ds4_indexer_scores_kernel",
              // BailingMoE3. Same treatment: resolved if present, absent
              // otherwise, so a build without them still loads.
              "bailing_kda_recurrent_chunk", "bailing_mla_attention",

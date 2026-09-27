@@ -353,5 +353,48 @@ class Mxfp4TensorCoreTests(unittest.TestCase):
         self.assertLess(relative, 0.40)
 
 
+@unittest.skipUnless(gpu_present(), "no CUDA device available")
+class FixtureDeviceForwardTests(unittest.TestCase):
+    """The composed device forward on a float fixture.
+
+    The grouped output projection has a Q8_0 kernel. A float copy of that
+    tensor must stay on the host path, and the device attention, indexer, and
+    hyper-connection mixer have to agree with the CPU on the tokens that
+    actually exercise them.
+    """
+
+    def test_gpu_logits_track_the_cpu(self):
+        import tempfile
+        from pathlib import Path
+
+        from flyweight.deepseek4 import Deepseek4Runtime
+        from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "ds4.gguf"
+        build_deepseek4_gguf(
+            path, DeepSeek4Spec(layers=3, hash_layers=0, indexer_top_k=1))
+        model = V2Model(path)
+        self.addCleanup(model.close)
+        cpu = Deepseek4Runtime(model, 64)
+        gpu = Deepseek4Runtime(model, 64)
+        self.addCleanup(cpu.close)
+        self.addCleanup(gpu.close)
+        gpu.use_gpu(0)
+        self.assertEqual(gpu.info["gpu_cache_bytes"], 0)
+        cpu_logits = gpu_logits = None
+        for token in range(1, 12):
+            cpu_logits = np.asarray(cpu.forward(token), dtype=np.float32)
+            gpu_logits = np.asarray(gpu.forward(token), dtype=np.float32)
+        self.assertTrue(np.isfinite(gpu_logits).all())
+        # The mixer and the dense matvecs accumulate in float on the device
+        # and in double on the host. A short fixture stays within a couple of
+        # ten-thousandths; an all-NaN or a wrong kernel does not.
+        np.testing.assert_allclose(gpu_logits, cpu_logits, rtol=2e-3, atol=2e-4)
+        self.assertEqual(int(gpu_logits.argmax()), int(cpu_logits.argmax()))
+        self.assertGreater(gpu.info["gpu_matvec_calls"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

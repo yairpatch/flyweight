@@ -328,11 +328,12 @@ class Deepseek4Runtime:
     def use_gpu(self, device: int = 0) -> None:
         """Move the dense half of the model onto the device.
 
-        Routed experts remain on the CPU unless a GPU cache budget was set
-        (``--gpu-cache-mib`` or ``FLYWEIGHT_DS4_EXPERT_CACHE_MIB``). The cache
-        admits the IQ1_S/IQ3_XXS mix and an all-MXFP4 expert triple. MXFP4
-        hits run on the FP4 tensor cores as block-16 UE4M3 GEMMs, which is
-        the FP4 mode this GPU's cuBLAS accepts; a declined GEMM unpacks to float.
+        A zero cache budget fills the expert cache from the VRAM left after the
+        dense weights, for an MXFP4 triple or the IQ1_S/IQ3_XXS mix.
+        ``FLYWEIGHT_DS4_EXPERT_CACHE_MIB=off`` leaves it empty. MXFP4 hits run
+        on the FP4 tensor cores as block-16 UE4M3 GEMMs; a declined GEMM
+        unpacks to float. Attention, the lightning indexer, and the
+        hyper-connection mixer run on the device when it is enabled.
         """
         status = self._library.flyweight_v2_deepseek4_runtime_gpu(self._handle, int(device))
         if status:

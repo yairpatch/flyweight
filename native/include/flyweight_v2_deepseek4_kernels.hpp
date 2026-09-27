@@ -382,3 +382,86 @@ void ds4_mxfp4_grouped_accumulate(
 }
 
 )FLYWEIGHT_CUDA";
+
+inline constexpr char deepseek4_cuda_attention_source[] = R"FLYWEIGHT_CUDA(
+
+__device__ double ds4_block_sum_double(double value) {
+    __shared__ double buffer[256];
+    const int tid = threadIdx.x;
+    buffer[tid] = value;
+    __syncthreads();
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) buffer[tid] += buffer[tid + offset];
+        __syncthreads();
+    }
+    return buffer[0];
+}
+
+// MLA over one latent per position, shared by every head, plus one sink logit.
+// The dot matches the host path's double accumulation; the softmax is float.
+extern "C" __global__
+void ds4_mla_attention(
+    const float* queries, const float* keys, const float* sinks,
+    float* logits, float* output,
+    const int heads, const int head_dim, const int positions, const float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= heads || threadIdx.x >= 256) return;
+    const float* query = queries + (long long)head * head_dim;
+    float* row_logits = logits + (long long)head * positions;
+    float peak = sinks ? sinks[head] : -1.0e30f;
+    for (int position = 0; position < positions; ++position) {
+        const float* key = keys + (long long)position * head_dim;
+        double dot = 0.0;
+        for (int column = threadIdx.x; column < head_dim; column += blockDim.x)
+            dot += (double)query[column] * (double)key[column];
+        dot = ds4_block_sum_double(dot);
+        if (threadIdx.x == 0) {
+            const float logit = (float)dot * scale;
+            row_logits[position] = logit;
+            peak = fmaxf(peak, logit);
+        }
+    }
+    if (threadIdx.x == 0) {
+        float denominator = sinks ? expf(sinks[head] - peak) : 0.0f;
+        for (int position = 0; position < positions; ++position) {
+            const float weight = expf(row_logits[position] - peak);
+            row_logits[position] = weight;
+            denominator += weight;
+        }
+        const float inverse = denominator != 0.0f ? 1.0f / denominator : 0.0f;
+        for (int position = 0; position < positions; ++position)
+            row_logits[position] *= inverse;
+    }
+    __syncthreads();
+    float* target = output + (long long)head * head_dim;
+    for (int column = threadIdx.x; column < head_dim; column += blockDim.x) {
+        float acc = 0.0f;
+        for (int position = 0; position < positions; ++position)
+            acc += keys[(long long)position * head_dim + column] * row_logits[position];
+        target[column] = acc;
+    }
+}
+
+// Lightning indexer: rectified per-head dots against one key per block.
+extern "C" __global__
+void ds4_indexer_scores_kernel(
+    const float* queries, const float* keys, const float* weights,
+    float* scores, const int heads, const int dim, const int entries
+) {
+    const int entry = blockIdx.x;
+    if (entry >= entries || threadIdx.x >= 256) return;
+    const float* key = keys + (long long)entry * dim;
+    double total = 0.0;
+    for (int head = 0; head < heads; ++head) {
+        const float* query = queries + (long long)head * dim;
+        double dot = 0.0;
+        for (int column = threadIdx.x; column < dim; column += blockDim.x)
+            dot += (double)query[column] * (double)key[column];
+        dot = ds4_block_sum_double(dot);
+        if (threadIdx.x == 0 && dot > 0.0) total += dot * (double)weights[head];
+    }
+    if (threadIdx.x == 0) scores[entry] = (float)total;
+}
+
+)FLYWEIGHT_CUDA";

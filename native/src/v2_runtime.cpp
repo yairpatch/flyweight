@@ -11691,6 +11691,7 @@ struct FlyweightV2Deepseek4Runtime {
     std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0, gpu_batches = 0;
     std::uint64_t gpu_batch = 0, gpu_batch_capacity = 0;
     std::uint64_t expert_cache = 0, expert_cache_bytes = 0, expert_slot_bytes = 0;
+    std::uint64_t gpu_attn = 0, gpu_attn_bytes = 0;
     std::uint32_t expert_slots_per_layer = 0;
     std::uint64_t expert_cache_clock = 0, expert_cache_hits = 0;
     std::uint64_t expert_cache_misses = 0, expert_cache_evictions = 0;
@@ -11702,7 +11703,8 @@ struct FlyweightV2Deepseek4Runtime {
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
     std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
     // Resolved MLA cache codec (0 f32, 1 f16, 2 bf16, 3 q8_0) and the expert
-    // cache budget from --gpu-cache-mib. Zero budget leaves the env opt-in.
+    // cache budget from --gpu-cache-mib. Zero budget fills a cacheable expert
+    // triple from the VRAM left after the dense weights.
     std::int32_t cache_type = 1, cache_type_k = 1, cache_type_v = 1;
     std::uint64_t gpu_cache_bytes_request = 0;
     std::vector<std::uint32_t> capture_layers;
@@ -11932,6 +11934,7 @@ void flyweight_v2_deepseek4_runtime_free(FlyweightV2Deepseek4Runtime* runtime){
             if(runtime->gpu_output)flyweight_gpu_free(runtime->gpu_output);
             if(runtime->gpu_batch)flyweight_gpu_free(runtime->gpu_batch);
             if(runtime->expert_cache)flyweight_gpu_free(runtime->expert_cache);
+            if(runtime->gpu_attn)flyweight_gpu_free(runtime->gpu_attn);
         }
         delete runtime;
     }catch(...){}
@@ -12104,7 +12107,7 @@ void ds4_gpu_compile(std::int32_t device) {
     iq1_grid += "};\n";
     const std::string source =
         std::string(flyweight::v2::qwen_cuda_source) + flyweight::v2::qwen_native_cuda_source +
-        iq1_grid + deepseek4_cuda_source;
+        iq1_grid + deepseek4_cuda_source + deepseek4_cuda_attention_source;
     if (flyweight_gpu_compile(source.c_str(), options.data(),
                             static_cast<std::int32_t>(options.size()), device,
                             log.data(), static_cast<std::int32_t>(log.size())) != 0)
@@ -12292,14 +12295,16 @@ void ds4_cached_experts(
             ++cache->expert_cache_misses;
             auto& frequency=cache->expert_frequency[key];
             if(frequency!=std::numeric_limits<std::uint32_t>::max())++frequency;
-            // A one-off route is cheaper on the fused CPU path than a PCIe
-            // upload. Admit only after recurrence proves there is reuse.
-            if(frequency<2)continue;
+            // An empty slot takes the expert on sight: the upload overlaps this
+            // token's CPU multiply and the next token hits. Evicting a resident
+            // expert still waits for a repeat, so a one-off route cannot thrash
+            // the cache.
             auto free=std::find_if(cache->expert_slots.begin()+begin,
                 cache->expert_slots.begin()+end,
                 [](const Deepseek4ExpertSlot& slot){return !slot.valid;});
             auto victim=free;
             if(victim==cache->expert_slots.begin()+end){
+                if(frequency<2)continue;
                 victim=std::min_element(cache->expert_slots.begin()+begin,
                     cache->expert_slots.begin()+end,
                     [&](const Deepseek4ExpertSlot& a,const Deepseek4ExpertSlot& b){
@@ -12621,6 +12626,130 @@ void ds4_close_block(const FlyweightV2Deepseek4Runtime& rt, Deepseek4LayerState&
 }
 
 // Run one block over one position, reading and updating its cache.
+bool ds4_attn_reserve(FlyweightV2Deepseek4Runtime& rt, std::size_t bytes) {
+    auto* owner = rt.gpu_cache_owner ? rt.gpu_cache_owner : &rt;
+    if (owner->gpu_attn_bytes >= bytes) return true;
+    if (owner->gpu_attn && flyweight_gpu_free(owner->gpu_attn) != 0) return false;
+    owner->gpu_attn = 0;
+    owner->gpu_attn_bytes = 0;
+    std::uint64_t pointer = 0;
+    if (flyweight_gpu_alloc(bytes, &pointer) != 0) return false;
+    owner->gpu_attn = pointer;
+    owner->gpu_attn_bytes = bytes;
+    return true;
+}
+
+bool ds4_hyper_weights_device(
+    FlyweightV2Deepseek4Runtime& rt, std::uint64_t fn,
+    const float* scale, const float* base, const float* streams,
+    float* pre, float* post, float* comb
+) {
+    if (!rt.gpu || rt.resident.find(fn) == rt.resident.end()) return false;
+    namespace ds4 = flyweight::v2::deepseek4;
+    const auto width = static_cast<std::size_t>(rt.hc) * rt.n_embd;
+    const auto mix_dim = (2u + rt.hc) * rt.hc;
+    std::vector<float> normalized(width), mixes(mix_dim);
+    ds4::rms_norm(streams, width, rt.epsilon, normalized.data());
+    ds4_matvec(rt, fn, normalized.data(), static_cast<std::int32_t>(width),
+               mixes.data(), static_cast<std::int32_t>(mix_dim));
+    ds4::hyper_connection_from_mixes(
+        mixes.data(), scale, base, rt.hc, rt.sinkhorn_iterations, rt.epsilon,
+        pre, post, comb);
+    return true;
+}
+
+bool ds4_hyper_head_device(
+    FlyweightV2Deepseek4Runtime& rt, const float* streams,
+    float* pre, float* output
+) {
+    if (!rt.gpu || rt.resident.find(rt.head_fn) == rt.resident.end()) return false;
+    namespace ds4 = flyweight::v2::deepseek4;
+    const auto width = static_cast<std::size_t>(rt.hc) * rt.n_embd;
+    std::vector<float> normalized(width), mixes(rt.hc);
+    ds4::rms_norm(streams, width, rt.epsilon, normalized.data());
+    ds4_matvec(rt, rt.head_fn, normalized.data(), static_cast<std::int32_t>(width),
+               mixes.data(), static_cast<std::int32_t>(rt.hc));
+    ds4::hyper_connection_head_from_mixes(
+        mixes.data(), streams, ds4_f32(*rt.model, rt.head_scale),
+        ds4_f32(*rt.model, rt.head_base), rt.n_embd, rt.hc, rt.epsilon, pre, output);
+    return true;
+}
+
+bool ds4_attention_device(
+    FlyweightV2Deepseek4Runtime& rt,
+    const float* queries, const float* keys, const float* sinks,
+    std::uint32_t heads, std::uint32_t head_dim, std::uint32_t positions,
+    float scale, float* output
+) {
+    if (!rt.gpu || !heads || !head_dim || !positions) return false;
+    const auto q_bytes = static_cast<std::uint64_t>(heads) * head_dim * sizeof(float);
+    const auto k_bytes = static_cast<std::uint64_t>(positions) * head_dim * sizeof(float);
+    const auto logit_bytes = static_cast<std::uint64_t>(heads) * positions * sizeof(float);
+    const auto sink_bytes = static_cast<std::uint64_t>(heads) * sizeof(float);
+    if (!ds4_attn_reserve(rt, q_bytes + k_bytes + logit_bytes + q_bytes + sink_bytes))
+        return false;
+    auto* owner = rt.gpu_cache_owner ? rt.gpu_cache_owner : &rt;
+    const std::uint64_t q = owner->gpu_attn;
+    const std::uint64_t k = q + q_bytes;
+    const std::uint64_t logits = k + k_bytes;
+    const std::uint64_t out = logits + logit_bytes;
+    const std::uint64_t sink_device = out + q_bytes;
+    int status = flyweight_gpu_upload(q, queries, q_bytes, 0);
+    if (status == 0) status = flyweight_gpu_upload(k, keys, k_bytes, 0);
+    std::uint64_t sinks_arg = 0;
+    if (status == 0 && sinks) {
+        status = flyweight_gpu_upload(sink_device, sinks, sink_bytes, 0);
+        sinks_arg = sink_device;
+    }
+    std::int32_t heads_arg = static_cast<std::int32_t>(heads);
+    std::int32_t dim_arg = static_cast<std::int32_t>(head_dim);
+    std::int32_t pos_arg = static_cast<std::int32_t>(positions);
+    void* args[] = {
+        const_cast<std::uint64_t*>(&q), const_cast<std::uint64_t*>(&k), &sinks_arg,
+        const_cast<std::uint64_t*>(&logits), const_cast<std::uint64_t*>(&out),
+        &heads_arg, &dim_arg, &pos_arg, &scale};
+    if (status == 0)
+        status = flyweight_gpu_launch_named(
+            "ds4_mla_attention", heads, 1, 256, 0, 0, args);
+    if (status == 0) status = flyweight_gpu_download(output, out, q_bytes, 0);
+    if (status == 0) status = flyweight_gpu_sync();
+    return status == 0;
+}
+
+bool ds4_indexer_device(
+    FlyweightV2Deepseek4Runtime& rt,
+    const float* queries, const float* keys, const float* weights,
+    std::uint32_t heads, std::uint32_t dim, std::uint32_t entries, float* scores
+) {
+    if (!rt.gpu || !heads || !dim || !entries) return false;
+    const auto q_bytes = static_cast<std::uint64_t>(heads) * dim * sizeof(float);
+    const auto k_bytes = static_cast<std::uint64_t>(entries) * dim * sizeof(float);
+    const auto w_bytes = static_cast<std::uint64_t>(heads) * sizeof(float);
+    const auto s_bytes = static_cast<std::uint64_t>(entries) * sizeof(float);
+    if (!ds4_attn_reserve(rt, q_bytes + k_bytes + w_bytes + s_bytes)) return false;
+    auto* owner = rt.gpu_cache_owner ? rt.gpu_cache_owner : &rt;
+    const std::uint64_t q = owner->gpu_attn;
+    const std::uint64_t k = q + q_bytes;
+    const std::uint64_t w = k + k_bytes;
+    const std::uint64_t s = w + w_bytes;
+    int status = flyweight_gpu_upload(q, queries, q_bytes, 0);
+    if (status == 0) status = flyweight_gpu_upload(k, keys, k_bytes, 0);
+    if (status == 0) status = flyweight_gpu_upload(w, weights, w_bytes, 0);
+    std::int32_t heads_arg = static_cast<std::int32_t>(heads);
+    std::int32_t dim_arg = static_cast<std::int32_t>(dim);
+    std::int32_t entries_arg = static_cast<std::int32_t>(entries);
+    void* args[] = {
+        const_cast<std::uint64_t*>(&q), const_cast<std::uint64_t*>(&k),
+        const_cast<std::uint64_t*>(&w), const_cast<std::uint64_t*>(&s),
+        &heads_arg, &dim_arg, &entries_arg};
+    if (status == 0)
+        status = flyweight_gpu_launch_named(
+            "ds4_indexer_scores_kernel", entries, 1, 256, 0, 0, args);
+    if (status == 0) status = flyweight_gpu_download(scores, s, s_bytes, 0);
+    if (status == 0) status = flyweight_gpu_sync();
+    return status == 0;
+}
+
 void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t index,
                                  std::uint32_t position, std::uint32_t token,
                                  const float* streams, float* out_streams,
@@ -12643,10 +12772,14 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
 
     // Attention side of the hyper-connection.
     const auto hyper_started = ds4_now();
-    ds4::hyper_connection_weights(
-        streams, ds4_f32(model, plan.hc_attn_fn), ds4_f32(model, plan.hc_attn_scale),
-        ds4_f32(model, plan.hc_attn_base), n_embd, hc, rt.sinkhorn_iterations,
-        rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
+    if (!ds4_hyper_weights_device(
+            rt, plan.hc_attn_fn, ds4_f32(model, plan.hc_attn_scale),
+            ds4_f32(model, plan.hc_attn_base), streams,
+            sc.pre.data(), sc.post.data(), sc.comb.data()))
+        ds4::hyper_connection_weights(
+            streams, ds4_f32(model, plan.hc_attn_fn), ds4_f32(model, plan.hc_attn_scale),
+            ds4_f32(model, plan.hc_attn_base), n_embd, hc, rt.sinkhorn_iterations,
+            rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
     ds4::hyper_connection_collapse(streams, sc.pre.data(), n_embd, hc, sc.collapsed.data());
     ds4::rms_norm(sc.collapsed.data(), n_embd, rt.epsilon, sc.hidden.data());
     {
@@ -12822,6 +12955,20 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
         const auto indexer_row = ds4::cache_row_bytes(rt.cache_type, indexer_dim);
         if (indexer_dim > 512)
             throw std::runtime_error("indexer key exceeds the score buffer");
+        std::vector<float> packed_keys(
+            static_cast<std::size_t>(visible_blocks) * indexer_dim);
+        bool indexer_on_device = false;
+        if (rt.gpu) {
+            for (std::uint32_t block = 0; block < visible_blocks; ++block)
+                ds4::cache_load(
+                    packed_keys.data() + static_cast<std::size_t>(block) * indexer_dim,
+                    layer.indexer_compressed.data() + static_cast<std::size_t>(block) * indexer_row,
+                    indexer_dim, rt.cache_type);
+            indexer_on_device = ds4_indexer_device(
+                rt, sc.indexer_query.data(), packed_keys.data(), sc.indexer_weights.data(),
+                rt.indexer_heads, indexer_dim, visible_blocks, sc.indexer_scores.data());
+        }
+        if (!indexer_on_device) {
 #pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for (std::int64_t block = 0; block < static_cast<std::int64_t>(visible_blocks); ++block) {
             float key[512];
@@ -12839,6 +12986,7 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
                 if (dot > 0.0) total += dot * sc.indexer_weights[head];
             }
             sc.indexer_scores[static_cast<std::size_t>(block)] = static_cast<float>(total);
+        }
         }
         ds4::top_k_select(sc.indexer_scores.data(), visible_blocks, rt.indexer_top_k,
                           sc.indexer_keep.data());
@@ -12869,9 +13017,13 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
         ++keys;
     }
 
-    ds4::attention_with_sinks(sc.query.data(), sc.keys.data(), ds4_f32(model, plan.sinks),
-                              nullptr, rt.heads, head_dim, keys,
-                              1.0f / std::sqrt(static_cast<float>(head_dim)), sc.attn.data());
+    if (!ds4_attention_device(
+            rt, sc.query.data(), sc.keys.data(), ds4_f32(model, plan.sinks),
+            rt.heads, head_dim, keys, 1.0f / std::sqrt(static_cast<float>(head_dim)),
+            sc.attn.data()))
+        ds4::attention_with_sinks(sc.query.data(), sc.keys.data(), ds4_f32(model, plan.sinks),
+                                  nullptr, rt.heads, head_dim, keys,
+                                  1.0f / std::sqrt(static_cast<float>(head_dim)), sc.attn.data());
     rt.attention_core_nanoseconds += ds4_now() - core_started;
 
     // Undo the rotation, then the grouped output projection.
@@ -12886,7 +13038,9 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
         const auto grouped_input_bytes = static_cast<std::uint64_t>(wide) * sizeof(float);
         const auto grouped_output_bytes =
             static_cast<std::uint64_t>(rt.groups * rt.lora_rank) * sizeof(float);
-        if (rt.gpu && resident != rt.resident.end() &&
+        // The device kernel reads Q8_0 blocks. A resident float copy of the
+        // same tensor is a different layout, so it stays on the host path.
+        if (rt.gpu && resident != rt.resident.end() && tensor.type == 8 &&
             grouped_input_bytes <= rt.gpu_input_capacity &&
             grouped_output_bytes <= rt.gpu_output_capacity) {
             const auto rows = static_cast<std::int32_t>(rt.groups * rt.lora_rank);
@@ -12934,10 +13088,14 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
 
     // Feed-forward side.
     const auto hyper_ffn_started = ds4_now();
-    ds4::hyper_connection_weights(
-        out_streams, ds4_f32(model, plan.hc_ffn_fn), ds4_f32(model, plan.hc_ffn_scale),
-        ds4_f32(model, plan.hc_ffn_base), n_embd, hc, rt.sinkhorn_iterations,
-        rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
+    if (!ds4_hyper_weights_device(
+            rt, plan.hc_ffn_fn, ds4_f32(model, plan.hc_ffn_scale),
+            ds4_f32(model, plan.hc_ffn_base), out_streams,
+            sc.pre.data(), sc.post.data(), sc.comb.data()))
+        ds4::hyper_connection_weights(
+            out_streams, ds4_f32(model, plan.hc_ffn_fn), ds4_f32(model, plan.hc_ffn_scale),
+            ds4_f32(model, plan.hc_ffn_base), n_embd, hc, rt.sinkhorn_iterations,
+            rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
     ds4::hyper_connection_collapse(out_streams, sc.pre.data(), n_embd, hc, sc.collapsed.data());
     ds4::rms_norm(sc.collapsed.data(), n_embd, rt.epsilon, sc.hidden.data());
     {
@@ -13137,7 +13295,8 @@ int flyweight_v2_deepseek4_runtime_info(
     out->expert_cache_evictions=cache->expert_cache_evictions;
     out->cache_type_k=runtime->cache_type_k;
     out->cache_type_v=runtime->cache_type_v;
-    out->gpu_cache_bytes=runtime->gpu_cache_bytes_request;
+    out->gpu_cache_bytes=runtime->gpu_cache_bytes_request
+        ?runtime->gpu_cache_bytes_request:runtime->expert_cache_bytes;
     out->mxfp4_tensor_core_calls=runtime->mxfp4_tensor_core_calls;
     out->mxfp4_tensor_core_fallbacks=runtime->mxfp4_tensor_core_fallbacks;
     out->indexer_selections=runtime->indexer_selections;
@@ -13208,9 +13367,10 @@ int flyweight_v2_deepseek4_forward(
 
     if(logits){
         const auto head_started=ds4_now();
-        ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
-            ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),
-            rt.n_embd,rt.hc,rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
+        if(!ds4_hyper_head_device(rt,sc.streams.data(),sc.head_pre.data(),sc.collapsed.data()))
+            ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
+                ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),
+                rt.n_embd,rt.hc,rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
         ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
         const float* gain=ds4_f32(model,rt.output_norm);
         for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
@@ -13347,9 +13507,10 @@ static int ds4_prefill_impl(
             namespace ds4=flyweight::v2::deepseek4;
             for(std::uint32_t row=0;row<rows;++row){
                 auto&sc=scratch[row];
-                ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
-                    ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),rt.n_embd,rt.hc,
-                    rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
+                if(!ds4_hyper_head_device(rt,sc.streams.data(),sc.head_pre.data(),sc.collapsed.data()))
+                    ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
+                        ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),rt.n_embd,rt.hc,
+                        rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
                 ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
                 const auto*gain=ds4_f32(model,rt.output_norm);
                 for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
@@ -13439,13 +13600,15 @@ int flyweight_v2_deepseek4_runtime_gpu(
         }();
         for(const auto index:{plan.q_a,plan.q_a_norm,plan.q_b,plan.kv,plan.output_b,plan.comp_kv,
                               plan.comp_gate,plan.gate_inp,plan.indexer_proj,plan.indexer_q_b,
-                              plan.indexer_comp_kv,plan.indexer_comp_gate,plan.output_a})
+                              plan.indexer_comp_kv,plan.indexer_comp_gate,plan.output_a,
+                              plan.hc_attn_fn,plan.hc_ffn_fn})
             want(index);
         if(shexp_on_device)
             for(const auto index:{plan.gate_shexp,plan.up_shexp,plan.down_shexp})
                 want(index);
     }
     want(rt.output);
+    want(rt.head_fn);
     std::sort(wanted.begin(),wanted.end());
     wanted.erase(std::unique(wanted.begin(),wanted.end()),wanted.end());
 
@@ -13515,26 +13678,43 @@ int flyweight_v2_deepseek4_runtime_gpu(
         expert_slot_bytes=std::max(expert_slot_bytes,bytes);
     }
     expert_slot_bytes=device_align(expert_slot_bytes);
-    // Opt-in on this hardware: even grouped execution is slightly slower than
-    // the 16-core IQ path at its measured route recurrence. Larger-memory GPUs
-    // can enable it explicitly and inspect the exported hit-rate counters.
+    // A zero request means the same thing the flag documents: fill the cache
+    // from whatever VRAM is left after the dense weights. An explicit budget,
+    // including FLYWEIGHT_DS4_EXPERT_CACHE_MIB=off, still wins. Only the expert
+    // triples the device can run (MXFP4 and the IQ1_S/IQ3_XXS mix) take that
+    // automatic budget; anything else would reserve VRAM the cache never reads.
     std::uint64_t requested_mib=0;
+    bool explicit_budget=false;
     if(const char* setting=std::getenv("FLYWEIGHT_DS4_EXPERT_CACHE_MIB")){
-        if(std::string(setting)=="off")requested_mib=0;
-        else requested_mib=std::strtoull(setting,nullptr,10);
-    }else if(rt.gpu_cache_bytes_request)
+        explicit_budget=true;
+        if(std::string(setting)!="off")requested_mib=std::strtoull(setting,nullptr,10);
+    }else if(rt.gpu_cache_bytes_request){
+        explicit_budget=true;
         requested_mib=rt.gpu_cache_bytes_request/(1024ull*1024ull);
+    }
     FlyweightV2GpuInfo gpu_info{};
     gpu_probe(gpu_info,device);
     constexpr std::uint64_t reserve=768ull*1024*1024;
     const auto available=gpu_info.free_memory>reserve?gpu_info.free_memory-reserve:0;
+    if(!explicit_budget&&!rt.layers.empty()
+       &&rt.layers[0].plan.gate_exps!=Deepseek4LayerPlan::kAbsent){
+        const auto& plan=rt.layers[0].plan;
+        const auto gate=rt.model->tensors[plan.gate_exps].type;
+        const auto up=rt.model->tensors[plan.up_exps].type;
+        const auto down=rt.model->tensors[plan.down_exps].type;
+        const bool cacheable=(gate==39&&up==39&&down==39)||(gate==19&&up==19&&down==18);
+        if(cacheable)requested_mib=available/(1024ull*1024ull);
+    }
     const auto budget=std::min<std::uint64_t>(requested_mib*1024ull*1024ull,available);
     if(expert_slot_bytes&&!rt.layers.empty()){
         expert_slots_per_layer=static_cast<std::uint32_t>(
             budget/expert_slot_bytes/rt.layers.size());
         expert_cache_bytes=static_cast<std::uint64_t>(expert_slots_per_layer)*
             rt.layers.size()*expert_slot_bytes;
-        if(expert_slots_per_layer<rt.experts_used)expert_cache_bytes=0;
+        if(expert_slots_per_layer<rt.experts_used){
+            expert_cache_bytes=0;
+            expert_slots_per_layer=0;
+        }
     }
     if(expert_cache_bytes&&flyweight_gpu_alloc(expert_cache_bytes,&expert_cache)!=0){
         // Caching is an optimization. Dense placement remains useful when a
@@ -14060,9 +14240,11 @@ int flyweight_v2_dspark_attention_stage(FlyweightV2DsparkRuntime*r,uint32_t laye
     std::vector<float>attended(static_cast<std::size_t>(rows)*wide);
     for(std::uint32_t row=0;row<rows;++row){
         auto&sc=scratch[row];const auto*input=streams+static_cast<std::size_t>(row)*stream_width;
-        ds4::hyper_connection_weights(input,ds4_f32(model,plan.hc_attn_fn),ds4_f32(model,plan.hc_attn_scale),
-            ds4_f32(model,plan.hc_attn_base),rt.n_embd,rt.hc,rt.sinkhorn_iterations,rt.epsilon,rt.epsilon,
-            sc.pre.data(),sc.post.data(),sc.comb.data());
+        if(!ds4_hyper_weights_device(rt,plan.hc_attn_fn,ds4_f32(model,plan.hc_attn_scale),
+            ds4_f32(model,plan.hc_attn_base),input,sc.pre.data(),sc.post.data(),sc.comb.data()))
+            ds4::hyper_connection_weights(input,ds4_f32(model,plan.hc_attn_fn),ds4_f32(model,plan.hc_attn_scale),
+                ds4_f32(model,plan.hc_attn_base),rt.n_embd,rt.hc,rt.sinkhorn_iterations,rt.epsilon,rt.epsilon,
+                sc.pre.data(),sc.post.data(),sc.comb.data());
         ds4::hyper_connection_collapse(input,sc.pre.data(),rt.n_embd,rt.hc,sc.collapsed.data());
         ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
         const auto*attn_gain=ds4_f32(model,plan.attn_norm);
