@@ -385,6 +385,44 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertEqual(captured_kwargs.get("cache_type_v"), "q8_0")
         mock_serve_http.assert_called_once_with(args, service)
 
+    def test_deepseek_serve_honours_cache_type_and_gpu_budget(self) -> None:
+        args = _parser().parse_args([
+            "serve", "model.gguf", "--backend", "cpu",
+            "--cache-type-k", "q8_0", "--cache-type-v", "bf16",
+            "--gpu-cache-mib", "128",
+        ])
+        service = MagicMock()
+        captured_kwargs: dict[str, object] = {}
+
+        def build(*args_, **kwargs):
+            captured_kwargs.update(kwargs)
+            return service
+
+        with patch("flyweight.cli._architecture", return_value="deepseek4"), \
+                patch("flyweight.deepseek4_server.NativeDeepseek4InferenceService", build), \
+                patch("flyweight.cli._serve_http", return_value=0):
+            self.assertEqual(_serve(args), 0)
+        self.assertEqual(captured_kwargs.get("cache_type_k"), "q8_0")
+        self.assertEqual(captured_kwargs.get("cache_type_v"), "bf16")
+        self.assertEqual(captured_kwargs.get("gpu_cache_mib"), 128)
+
+    def test_deepseek_kv_dtype_sets_both_cache_types(self) -> None:
+        args = _parser().parse_args([
+            "serve", "model.gguf", "--backend", "cpu", "--kv-dtype", "q8_0",
+        ])
+        captured_kwargs: dict[str, object] = {}
+
+        def build(*args_, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        with patch("flyweight.cli._architecture", return_value="deepseek4"), \
+                patch("flyweight.deepseek4_server.NativeDeepseek4InferenceService", build), \
+                patch("flyweight.cli._serve_http", return_value=0):
+            _serve(args)
+        self.assertEqual(captured_kwargs.get("cache_type_k"), "q8_0")
+        self.assertEqual(captured_kwargs.get("cache_type_v"), "q8_0")
+
 
 class PromptTokenTests(unittest.TestCase):
     def test_probe_probes_the_token_it_was_given(self) -> None:

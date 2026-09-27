@@ -4056,6 +4056,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==2&&(flyweight_cpu_features()&1u)!=0&&elements%32==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+    if(type==39&&(flyweight_cpu_features()&1u)!=0&&elements%kMxfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
     if((type==16||type==17||type==18||type==19||type==21||type==22||type==23||type==29)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
@@ -5679,6 +5680,7 @@ constexpr std::uint32_t kScalarDequantTypeLimit = 64;
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,std::uint64_t row,float*output){
     if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(type==39&&(flyweight_cpu_features()&1u)!=0&&elements%kMxfp4BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // qwen4exp's expert formats: IQ1_S super-blocks, IQ4_NL 32-wide blocks
     // (the 640-wide expert down rows fail a 256 gate). Chunked prefill decodes
     // every routed expert's rows through here once per chunk, so the scalar
@@ -5817,6 +5819,9 @@ void qwen_quant_dot_quad(
         qwen_quant_dot_quad_avx512(packed,type,inputs,elements,row,outputs);return;
     }
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%64==0){
+        qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
+    }
+    if(type==39&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){
         qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
     }
     if(qwen_simd_multi_type(type)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0){
@@ -11596,10 +11601,10 @@ struct Deepseek4LayerState {
     Deepseek4LayerPlan plan;
     std::uint32_t ratio = 0, window = 0, head_dim = 0;
     std::uint32_t state_width = 0, state_rows = 0, block_capacity = 0;
-    // Half precision, as the reference stores them. The composed model rounds
-    // its latents the same way, so nothing is lost by matching.
-    std::vector<std::uint16_t> latents;    // window x head_dim, ring
-    std::vector<std::uint16_t> compressed; // block_capacity x head_dim
+    // Packed rows of `cache_type`. f16 matches the reference; f32, bf16 and
+    // q8_0 are the other codecs --cache-type-k/v can ask for.
+    std::vector<std::uint8_t> latents;    // window rows, ring
+    std::vector<std::uint8_t> compressed; // one row per closed block
     std::vector<float> state_values;  // state_rows x state_width, ring
     std::vector<float> state_scores;
     std::uint32_t positions = 0, blocks = 0;
@@ -11607,12 +11612,11 @@ struct Deepseek4LayerState {
     // same shape as the pair above at a narrower width -- 128 against 512 --
     // because it only has to rank blocks, not answer with them.
     std::uint32_t indexer_dim = 0, indexer_width = 0;
-    std::vector<std::uint16_t> indexer_compressed;
+    std::vector<std::uint8_t> indexer_compressed;
     std::vector<float> indexer_state_values, indexer_state_scores;
 
     std::uint64_t bytes() const {
-        return (latents.capacity() + compressed.capacity() + indexer_compressed.capacity())
-                   * sizeof(std::uint16_t) +
+        return latents.capacity() + compressed.capacity() + indexer_compressed.capacity() +
                (state_values.capacity() + state_scores.capacity() +
                 indexer_state_values.capacity() + indexer_state_scores.capacity()) * sizeof(float);
     }
@@ -11690,12 +11694,17 @@ struct FlyweightV2Deepseek4Runtime {
     std::uint32_t expert_slots_per_layer = 0;
     std::uint64_t expert_cache_clock = 0, expert_cache_hits = 0;
     std::uint64_t expert_cache_misses = 0, expert_cache_evictions = 0;
+    std::uint64_t mxfp4_tensor_core_calls = 0, mxfp4_tensor_core_fallbacks = 0;
     std::vector<Deepseek4ExpertSlot> expert_slots;
     std::unordered_map<std::uint64_t, std::size_t> expert_residency;
     std::unordered_map<std::uint64_t, std::uint32_t> expert_frequency;
     FlyweightV2Deepseek4Runtime* gpu_cache_owner = nullptr;
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
     std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
+    // Resolved MLA cache codec (0 f32, 1 f16, 2 bf16, 3 q8_0) and the expert
+    // cache budget from --gpu-cache-mib. Zero budget leaves the env opt-in.
+    std::int32_t cache_type = 1, cache_type_k = 1, cache_type_v = 1;
+    std::uint64_t gpu_cache_bytes_request = 0;
     std::vector<std::uint32_t> capture_layers;
     std::vector<float> captured;
 
@@ -11746,7 +11755,10 @@ int flyweight_v2_deepseek4_runtime_create(
         layer.ratio=config.compress_ratios[index];
         layer.window=std::min(window,context_limit);
         layer.head_dim=head_dim;
-        layer.latents.assign(static_cast<std::size_t>(layer.window)*head_dim,0u);
+        layer.latents.assign(
+            static_cast<std::size_t>(layer.window)*
+                flyweight::v2::deepseek4::cache_row_bytes(runtime->cache_type, head_dim),
+            0u);
 
         const std::string prefix="blk."+std::to_string(index)+".";
         auto find=[&](const char* suffix,bool required)->std::uint64_t{
@@ -11928,6 +11940,64 @@ void flyweight_v2_deepseek4_runtime_free(FlyweightV2Deepseek4Runtime* runtime){
 int flyweight_v2_deepseek4_runtime_reset(FlyweightV2Deepseek4Runtime* runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid runtime");
     runtime->reset();
+    return 0;});}
+
+int flyweight_v2_deepseek4_runtime_configure(
+    FlyweightV2Deepseek4Runtime* runtime, int32_t cache_type_k, int32_t cache_type_v,
+    uint64_t gpu_cache_bytes
+){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid runtime");
+    for(const auto& layer:runtime->layers)
+        if(layer.positions||layer.blocks)
+            throw std::runtime_error("deepseek4 cache type cannot change after the first token");
+    auto resolve=[&](std::int32_t requested)->std::int32_t{
+        using flyweight::v2::attention::auto_cache_type;
+        using flyweight::v2::attention::kCacheTypeAuto;
+        using flyweight::v2::attention::kCacheTypeTurbo4;
+        using flyweight::v2::attention::turbo_head_dim_ok;
+        if(requested==4||requested==5)
+            throw std::runtime_error(
+                "DeepSeek-V4 stores one MLA latent, and turbo3/turbo4 are the Qwen GPU KV codecs; use q8_0");
+        std::int32_t type=requested;
+        if(requested==kCacheTypeAuto){
+            const auto chosen=auto_cache_type(
+                runtime->context_limit, runtime->experts!=0,
+                turbo_head_dim_ok(runtime->head_dim));
+            // Turbo's Hadamard kernels belong to the Qwen GPU attention path.
+            // Past the same context threshold, q8_0 is the compression this
+            // latent can actually be scored from.
+            type=chosen==kCacheTypeTurbo4?3:chosen;
+        }
+        if(type<0||type>3)
+            throw std::runtime_error(
+                "deepseek4 cache type must be f32, f16, bf16, q8_0, or auto");
+        if(type==3&&(runtime->head_dim%32u)!=0)
+            throw std::runtime_error("q8_0 MLA cache needs a latent width divisible by 32");
+        for(const auto& layer:runtime->layers)
+            if(type==3&&layer.indexer_dim&&(layer.indexer_dim%32u)!=0)
+                throw std::runtime_error("q8_0 MLA cache needs an indexer width divisible by 32");
+        return type;
+    };
+    // One latent is both key and value, so the stored codec is the finer of
+    // the two requests: f32, then f16, then bf16, then q8_0.
+    auto rank=[](std::int32_t type){
+        switch(type){case 0:return 4;case 1:return 3;case 2:return 2;default:return 1;}
+    };
+    const auto key=resolve(cache_type_k), value=resolve(cache_type_v);
+    const auto stored=rank(key)>=rank(value)?key:value;
+    namespace ds4=flyweight::v2::deepseek4;
+    runtime->cache_type=stored;
+    runtime->cache_type_k=stored;
+    runtime->cache_type_v=stored;
+    runtime->gpu_cache_bytes_request=gpu_cache_bytes;
+    const auto row=ds4::cache_row_bytes(stored, runtime->head_dim);
+    for(auto& layer:runtime->layers){
+        layer.latents.assign(static_cast<std::size_t>(layer.window)*row, 0);
+        layer.compressed.clear();
+        layer.indexer_compressed.clear();
+        layer.positions=0;
+        layer.blocks=0;
+    }
     return 0;});}
 
 namespace {
@@ -12197,7 +12267,9 @@ void ds4_cached_experts(
     // The profitable path groups every hit into two launches. IQ2_XXS has only
     // a scalar matvec kernel, and the launch-heavy version benchmarked slower
     // than the fused host loop, so those layers deliberately remain on CPU.
-    if(gate.type!=19||up.type!=19||down.type!=18)return;
+    const bool iq=gate.type==19&&up.type==19&&down.type==18;
+    const bool mxfp4=gate.type==39&&up.type==39&&down.type==39;
+    if(!iq&&!mxfp4)return;
     const std::uint64_t gate_bytes=gate.size/rt.experts;
     const std::uint64_t up_bytes=up.size/rt.experts;
     const std::uint64_t down_bytes=down.size/rt.experts;
@@ -12291,14 +12363,28 @@ void ds4_cached_experts(
     if(status==0)status=flyweight_gpu_upload(pointer_buffer,&bundle,sizeof(bundle),0);
     if(status==0)status=flyweight_gpu_memset(
         aggregate,0,static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
-    void* gate_args[]={&gate_device,&up_device,&rt.gpu_input,&rt.gpu_output,
-        &input_size,&intermediate,&count,&rt.clamp};
-    if(status==0)status=flyweight_gpu_launch_named("ds4_iq1s_grouped_swiglu",
-        rt.expert_ffn,gpu_count,256,0,0,gate_args);
-    void* down_args[]={&down_device,&rt.gpu_output,&aggregate,&weights_device,
-        &intermediate,&output_size,&count};
-    if(status==0)status=flyweight_gpu_launch_named("iq3xxs_grouped_accumulate",
-        rt.n_embd,1,256,0,0,down_args);
+    bool tensor_cores=false;
+    if(status==0&&mxfp4&&(rt.n_embd%32u)==0&&(rt.expert_ffn%32u)==0){
+        const int tc=flyweight_gpu_mxfp4_moe_cublas(
+            gate_device,up_device,down_device,rt.gpu_input,aggregate,
+            weights_device,0,rt.clamp,input_size,intermediate,count);
+        if(tc==0){
+            tensor_cores=true;
+            ++rt.mxfp4_tensor_core_calls;
+        }else ++rt.mxfp4_tensor_core_fallbacks;
+    }
+    if(!tensor_cores){
+        void* gate_args[]={&gate_device,&up_device,&rt.gpu_input,&rt.gpu_output,
+            &input_size,&intermediate,&count,&rt.clamp};
+        if(status==0)status=flyweight_gpu_launch_named(
+            mxfp4?"ds4_mxfp4_grouped_swiglu":"ds4_iq1s_grouped_swiglu",
+            rt.expert_ffn,gpu_count,256,0,0,gate_args);
+        void* down_args[]={&down_device,&rt.gpu_output,&aggregate,&weights_device,
+            &intermediate,&output_size,&count};
+        if(status==0)status=flyweight_gpu_launch_named(
+            mxfp4?"ds4_mxfp4_grouped_accumulate":"iq3xxs_grouped_accumulate",
+            rt.n_embd,1,256,0,0,down_args);
+    }
     if(status==0)status=flyweight_gpu_download(sc.expert_out.data(),aggregate,
         static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
     if(status==0)status=flyweight_gpu_sync();
@@ -12490,7 +12576,7 @@ void ds4_close_block(const FlyweightV2Deepseek4Runtime& rt, Deepseek4LayerState&
                      std::uint32_t block, std::uint32_t dim, std::uint32_t width,
                      const std::vector<float>& source_values,
                      const std::vector<float>& source_scores,
-                     std::uint64_t norm, std::vector<std::uint16_t>& target) {
+                     std::uint64_t norm, std::vector<std::uint8_t>& target) {
     namespace ds4 = flyweight::v2::deepseek4;
     const auto& model = *rt.model;
     const bool overlapped = layer.ratio == 4;
@@ -12529,8 +12615,9 @@ void ds4_close_block(const FlyweightV2Deepseek4Runtime& rt, Deepseek4LayerState&
     ds4::rope(pooled.data() + (dim - rt.rope_dim), rt.rope_dim,
               static_cast<std::int32_t>(block), rt.compress_base, rt.freq_scale, false,
               {1.0f, rt.attn_factor, rt.beta_fast, rt.beta_slow, rt.original_context});
-    std::uint16_t* slot = target.data() + static_cast<std::size_t>(block) * dim;
-    for (std::uint32_t i = 0; i < dim; ++i) slot[i] = ds4::half_bits(pooled[i]);
+    ds4::cache_store(
+        target.data() + static_cast<std::size_t>(block) * ds4::cache_row_bytes(rt.cache_type, dim),
+        pooled.data(), dim, rt.cache_type);
 }
 
 // Run one block over one position, reading and updating its cache.
@@ -12637,8 +12724,8 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
                   base, scale, false, yarn);
     }
 
-    // Key and value are the same latent, stored half precision. Its projection
-    // went out with the batch above.
+    // Key and value are the same latent. The cache codec is the resolved
+    // --cache-type; f16 is what the reference stores.
     ds4::rms_norm(sc.latent.data(), head_dim, rt.epsilon, sc.latent.data());
     {
         const float* gain = ds4_f32(model, plan.kv_a_norm);
@@ -12647,9 +12734,11 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
     ds4::rope(sc.latent.data() + (head_dim - rt.rope_dim), rt.rope_dim,
               static_cast<std::int32_t>(position), base, scale, false, yarn);
     {
-        std::uint16_t* slot = layer.latents.data() +
-            static_cast<std::size_t>(position % layer.window) * head_dim;
-        for (std::uint32_t i = 0; i < head_dim; ++i) slot[i] = ds4::half_bits(sc.latent[i]);
+        ds4::cache_store(
+            layer.latents.data() +
+                static_cast<std::size_t>(position % layer.window) *
+                    ds4::cache_row_bytes(rt.cache_type, head_dim),
+            sc.latent.data(), head_dim, rt.cache_type);
     }
 
     // The indexer's compressor, kept on every 4:1 layer whatever the length.
@@ -12668,7 +12757,8 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
         if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
             layer.indexer_compressed.resize(
-                (static_cast<std::size_t>(layer.blocks)+1)*layer.indexer_dim);
+                (static_cast<std::size_t>(layer.blocks)+1)*
+                ds4::cache_row_bytes(rt.cache_type, layer.indexer_dim));
             ds4_close_block(rt, layer, layer.blocks, layer.indexer_dim, width,
                             layer.indexer_state_values, layer.indexer_state_scores,
                             plan.indexer_comp_norm, layer.indexer_compressed);
@@ -12685,7 +12775,8 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
         if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
             layer.compressed.resize(
-                (static_cast<std::size_t>(layer.blocks)+1)*head_dim);
+                (static_cast<std::size_t>(layer.blocks)+1)*
+                ds4::cache_row_bytes(rt.cache_type, head_dim));
             ds4_close_block(rt, layer, layer.blocks, head_dim, width,
                             layer.state_values, layer.state_scores,
                             plan.comp_norm, layer.compressed);
@@ -12725,19 +12816,26 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
             1.0f / std::sqrt(static_cast<float>(indexer_dim * rt.indexer_heads));
         for (std::uint32_t head = 0; head < rt.indexer_heads; ++head)
             sc.indexer_weights[head] *= scale_weights;
-        // Score directly from the half cache. Expanding every candidate into a
-        // context-sized float scratch buffer added another ~128 MiB at 1M.
+        // Score from the packed cache, one key at a time. Expanding every
+        // candidate into a context-sized float scratch buffer added another
+        // ~128 MiB at 1M.
+        const auto indexer_row = ds4::cache_row_bytes(rt.cache_type, indexer_dim);
+        if (indexer_dim > 512)
+            throw std::runtime_error("indexer key exceeds the score buffer");
 #pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for (std::int64_t block = 0; block < static_cast<std::int64_t>(visible_blocks); ++block) {
-            const std::uint16_t* key = layer.indexer_compressed.data() +
-                static_cast<std::size_t>(block) * indexer_dim;
+            float key[512];
+            ds4::cache_load(
+                key,
+                layer.indexer_compressed.data() + static_cast<std::size_t>(block) * indexer_row,
+                indexer_dim, rt.cache_type);
             double total = 0.0;
             for (std::uint32_t head = 0; head < rt.indexer_heads; ++head) {
                 const float* query = sc.indexer_query.data() +
                     static_cast<std::size_t>(head) * indexer_dim;
                 double dot = 0.0;
                 for (std::uint32_t i = 0; i < indexer_dim; ++i)
-                    dot += static_cast<double>(query[i]) * ds4::half_value(key[i]);
+                    dot += static_cast<double>(query[i]) * key[i];
                 if (dot > 0.0) total += dot * sc.indexer_weights[head];
             }
             sc.indexer_scores[static_cast<std::size_t>(block)] = static_cast<float>(total);
@@ -12751,20 +12849,23 @@ void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t 
     // Gather the keys this position may see, raw window then compressed blocks.
     const auto core_started = ds4_now();
     std::uint32_t keys = 0;
+    const auto latent_row = ds4::cache_row_bytes(rt.cache_type, head_dim);
     const std::uint32_t first = position + 1 > layer.window ? position + 1 - layer.window : 0;
     for (std::uint32_t p = first; p <= position; ++p) {
-        const std::uint16_t* slot = layer.latents.data() +
-            static_cast<std::size_t>(p % layer.window) * head_dim;
         float* target = sc.keys.data() + static_cast<std::size_t>(keys) * head_dim;
-        for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_value(slot[i]);
+        ds4::cache_load(
+            target,
+            layer.latents.data() + static_cast<std::size_t>(p % layer.window) * latent_row,
+            head_dim, rt.cache_type);
         ++keys;
     }
     for (std::uint32_t block = 0; block < visible_blocks; ++block) {
         if (selecting && !sc.indexer_keep[block]) continue;
-        const std::uint16_t* slot = layer.compressed.data() +
-            static_cast<std::size_t>(block) * head_dim;
         float* target = sc.keys.data() + static_cast<std::size_t>(keys) * head_dim;
-        for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_value(slot[i]);
+        ds4::cache_load(
+            target,
+            layer.compressed.data() + static_cast<std::size_t>(block) * latent_row,
+            head_dim, rt.cache_type);
         ++keys;
     }
 
@@ -13034,6 +13135,11 @@ int flyweight_v2_deepseek4_runtime_info(
     out->expert_cache_hits=cache->expert_cache_hits;
     out->expert_cache_misses=cache->expert_cache_misses;
     out->expert_cache_evictions=cache->expert_cache_evictions;
+    out->cache_type_k=runtime->cache_type_k;
+    out->cache_type_v=runtime->cache_type_v;
+    out->gpu_cache_bytes=runtime->gpu_cache_bytes_request;
+    out->mxfp4_tensor_core_calls=runtime->mxfp4_tensor_core_calls;
+    out->mxfp4_tensor_core_fallbacks=runtime->mxfp4_tensor_core_fallbacks;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -13416,7 +13522,8 @@ int flyweight_v2_deepseek4_runtime_gpu(
     if(const char* setting=std::getenv("FLYWEIGHT_DS4_EXPERT_CACHE_MIB")){
         if(std::string(setting)=="off")requested_mib=0;
         else requested_mib=std::strtoull(setting,nullptr,10);
-    }
+    }else if(rt.gpu_cache_bytes_request)
+        requested_mib=rt.gpu_cache_bytes_request/(1024ull*1024ull);
     FlyweightV2GpuInfo gpu_info{};
     gpu_probe(gpu_info,device);
     constexpr std::uint64_t reserve=768ull*1024*1024;
@@ -13559,10 +13666,12 @@ int flyweight_v2_deepseek4_indexer_key(
     if(block>=state.blocks)throw std::runtime_error("that block has not been compressed yet");
     if(outputs!=static_cast<std::int32_t>(state.indexer_dim))
         throw std::runtime_error("output size does not match the indexer key length");
-    const std::uint16_t* stored=state.indexer_compressed.data()+
-        static_cast<std::size_t>(block)*state.indexer_dim;
-    for(std::uint32_t i=0;i<state.indexer_dim;++i)
-        out[i]=flyweight::v2::deepseek4::half_value(stored[i]);
+    flyweight::v2::deepseek4::cache_load(
+        out,
+        state.indexer_compressed.data()+
+            static_cast<std::size_t>(block)*
+                flyweight::v2::deepseek4::cache_row_bytes(runtime->cache_type, state.indexer_dim),
+        state.indexer_dim, runtime->cache_type);
     return 0;});}
 
 int flyweight_v2_deepseek4_indexer_scores(
@@ -13840,9 +13949,14 @@ int flyweight_v2_dspark_inject(FlyweightV2DsparkRuntime*r,const float*fused,uint
         flyweight::v2::deepseek4::rope(r->projected.data()+r->width-r->rope_dim,r->rope_dim,
             static_cast<std::int32_t>(r->position),r->freq_base,1.0f,false);
         auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+r->position%r->window)*r->width;
-        auto*decoder_slot=r->decoder->layers[layer].latents.data()+
-            static_cast<std::size_t>(r->position%r->window)*r->width;
-        for(std::uint32_t i=0;i<r->width;++i)slot[i]=decoder_slot[i]=flyweight::v2::deepseek4::half_bits(r->projected[i]);
+        for(std::uint32_t i=0;i<r->width;++i)
+            slot[i]=flyweight::v2::deepseek4::half_bits(r->projected[i]);
+        auto& decoder_layer=r->decoder->layers[layer];
+        flyweight::v2::deepseek4::cache_store(
+            decoder_layer.latents.data()+
+                static_cast<std::size_t>(r->position%r->window)*
+                    flyweight::v2::deepseek4::cache_row_bytes(r->decoder->cache_type, r->width),
+            r->projected.data(), r->width, r->decoder->cache_type);
         r->decoder->layers[layer].positions=r->position+1;
     }
     ++r->position;return 0;});}

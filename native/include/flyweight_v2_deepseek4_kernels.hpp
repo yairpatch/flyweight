@@ -302,4 +302,83 @@ void ds4_q6k_matvec(
     if (lane == 0) output[row] = partial;
 }
 
+__device__ __forceinline__ float ds4_mxfp4_scale(unsigned char exponent) {
+    const unsigned int bits = exponent < 2
+        ? (0x00200000u << exponent)
+        : ((unsigned int)(exponent - 1) << 23);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float ds4_mxfp4_value(
+    const unsigned char* packed, long long index
+) {
+    const int block = (int)(index >> 5);
+    const int lane = (int)(index & 31);
+    const unsigned char* base = packed + (long long)block * 17;
+    const unsigned char nibbles = base[1 + (lane & 15)];
+    const int code = lane < 16 ? (nibbles & 15) : (nibbles >> 4);
+    const float lut[16] = {
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+        0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
+    };
+    return lut[code] * ds4_mxfp4_scale(base[0]);
+}
+
+extern "C" __global__
+void ds4_mxfp4_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector, float* activated,
+    const int input_size, const int output_size,
+    const int experts, const float limit
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate = (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up = (const unsigned char*)up_ptrs[expert];
+    const long long base = (long long)row * input_size;
+    float g = 0.0f, u = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        g += ds4_mxfp4_value(gate, base + input) * value;
+        u += ds4_mxfp4_value(up, base + input) * value;
+    }
+    g = block_reduce_sum(g);
+    u = block_reduce_sum(u);
+    if (threadIdx.x == 0) {
+        g = fminf(fmaxf(g, -limit), limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        activated[expert * output_size + row] =
+            (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+extern "C" __global__
+void ds4_mxfp4_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const long long absolute = (long long)row * input_size + input;
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            combined += weights[expert]
+                * ds4_mxfp4_value((const unsigned char*)down_ptrs[expert], absolute)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
 )FLYWEIGHT_CUDA";

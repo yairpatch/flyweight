@@ -90,8 +90,12 @@ class Deepseek4Runtime:
     still read. Only the compressed caches grow with the context limit.
     """
 
-    def __init__(self, model, context_limit: int):
-        from flyweight.v2 import _Deepseek4Info
+    def __init__(
+        self, model, context_limit: int, *,
+        cache_type_k: str = "f16", cache_type_v: str = "f16",
+        gpu_cache_bytes: int = 0,
+    ):
+        from flyweight.v2 import CACHE_TYPE_CODES, _Deepseek4Info
         self._info_type = _Deepseek4Info
         self._library = _library()
         handle = ctypes.c_void_p()
@@ -103,6 +107,22 @@ class Deepseek4Runtime:
                 (self._library.flyweight_v2_last_error() or b"runtime create failed").decode(errors="replace")
             )
         self._handle = handle
+        codes = CACHE_TYPE_CODES
+        if cache_type_k not in codes or cache_type_v not in codes:
+            self.close()
+            raise V2Error(
+                "cache_type_k/v must be one of " + ", ".join(sorted(codes))
+            )
+        status = self._library.flyweight_v2_deepseek4_runtime_configure(
+            self._handle, codes[cache_type_k], codes[cache_type_v],
+            int(gpu_cache_bytes),
+        )
+        if status:
+            message = (
+                self._library.flyweight_v2_last_error() or b"runtime configure failed"
+            ).decode(errors="replace")
+            self.close()
+            raise V2Error(message)
         # Native state addresses tensors through the model's mmap. Retain the
         # owner so a standalone runtime cannot outlive and dereference it.
         self._model = model
@@ -308,10 +328,11 @@ class Deepseek4Runtime:
     def use_gpu(self, device: int = 0) -> None:
         """Move the dense half of the model onto the device.
 
-        Routed experts remain on the CPU by default. Set
-        ``FLYWEIGHT_DS4_EXPERT_CACHE_MIB`` before this call to opt into the
-        measured, per-layer GPU cache on a device where its hit rate and PCIe
-        bandwidth make it profitable.
+        Routed experts remain on the CPU unless a GPU cache budget was set
+        (``--gpu-cache-mib`` or ``FLYWEIGHT_DS4_EXPERT_CACHE_MIB``). The cache
+        admits the IQ1_S/IQ3_XXS mix and an all-MXFP4 expert triple. MXFP4
+        hits run on the FP4 tensor cores as block-16 UE4M3 GEMMs, which is
+        the FP4 mode this GPU's cuBLAS accepts; a declined GEMM unpacks to float.
         """
         status = self._library.flyweight_v2_deepseek4_runtime_gpu(self._handle, int(device))
         if status:

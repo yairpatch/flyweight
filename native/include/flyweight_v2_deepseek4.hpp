@@ -89,6 +89,88 @@ inline std::uint16_t half_bits(float value) {
         sign | (static_cast<std::uint32_t>(exponent) << 10) | ((rounded >> 13) & 0x3FFu));
 }
 
+inline float half_value(std::uint16_t bits);
+
+// One MLA latent is both the key and the value, so a request for two cache
+// types resolves to a single codec. f32, f16 and bf16 are raw rows. q8_0 is
+// GGML's layout: an f16 scale and 32 int8 codes per block. turbo3/turbo4 are
+// the Qwen GPU KV codecs and are not stored here.
+inline std::uint32_t cache_row_bytes(std::int32_t type, std::uint32_t dim) {
+    switch (type) {
+        case 0: return dim * 4u;
+        case 1:
+        case 2: return dim * 2u;
+        case 3: return (dim / 32u) * 34u;
+        default: return 0;
+    }
+}
+
+inline void cache_store(std::uint8_t* dst, const float* src, std::uint32_t dim, std::int32_t type) {
+    if (type == 0) {
+        std::memcpy(dst, src, static_cast<std::size_t>(dim) * sizeof(float));
+        return;
+    }
+    if (type == 1) {
+        auto* out = reinterpret_cast<std::uint16_t*>(dst);
+        for (std::uint32_t i = 0; i < dim; ++i) out[i] = half_bits(src[i]);
+        return;
+    }
+    if (type == 2) {
+        auto* out = reinterpret_cast<std::uint16_t*>(dst);
+        for (std::uint32_t i = 0; i < dim; ++i) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, src + i, sizeof(bits));
+            out[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
+        return;
+    }
+    for (std::uint32_t block = 0; block < dim / 32u; ++block) {
+        const float* values = src + block * 32u;
+        float peak = 0.0f;
+        for (std::uint32_t lane = 0; lane < 32u; ++lane)
+            peak = std::max(peak, std::fabs(values[lane]));
+        const float scale = peak / 127.0f;
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const std::uint16_t scale_bits = half_bits(scale);
+        std::memcpy(dst + block * 34u, &scale_bits, sizeof(scale_bits));
+        auto* codes = reinterpret_cast<std::int8_t*>(dst + block * 34u + 2u);
+        for (std::uint32_t lane = 0; lane < 32u; ++lane) {
+            const float rounded = std::nearbyint(values[lane] * inverse);
+            const int code = static_cast<int>(std::max(-128.0f, std::min(127.0f, rounded)));
+            codes[lane] = static_cast<std::int8_t>(code);
+        }
+    }
+}
+
+inline void cache_load(float* dst, const std::uint8_t* src, std::uint32_t dim, std::int32_t type) {
+    if (type == 0) {
+        std::memcpy(dst, src, static_cast<std::size_t>(dim) * sizeof(float));
+        return;
+    }
+    if (type == 1) {
+        const auto* in = reinterpret_cast<const std::uint16_t*>(src);
+        for (std::uint32_t i = 0; i < dim; ++i) dst[i] = half_value(in[i]);
+        return;
+    }
+    if (type == 2) {
+        const auto* in = reinterpret_cast<const std::uint16_t*>(src);
+        for (std::uint32_t i = 0; i < dim; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(in[i]) << 16;
+            std::memcpy(dst + i, &bits, sizeof(bits));
+        }
+        return;
+    }
+    for (std::uint32_t block = 0; block < dim / 32u; ++block) {
+        std::uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, src + block * 34u, sizeof(scale_bits));
+        const float scale = half_value(scale_bits);
+        const auto* codes = reinterpret_cast<const std::int8_t*>(src + block * 34u + 2u);
+        float* out = dst + block * 32u;
+        for (std::uint32_t lane = 0; lane < 32u; ++lane)
+            out[lane] = scale * static_cast<float>(codes[lane]);
+    }
+}
+
 inline float half_value(std::uint16_t bits) {
     const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
     const std::uint32_t exponent = (bits >> 10) & 0x1Fu;
