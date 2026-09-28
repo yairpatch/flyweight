@@ -10713,6 +10713,37 @@ KV_DEQUANT_TURBO(kv_dequant_turbo3_f16, 3)
 KV_DEQUANT_TURBO(kv_dequant_turbo4_f16, 4)
 #undef KV_DEQUANT_TURBO
 
+template<int BITS>
+__device__ void kv_dequant_turbo_append_impl(
+    const unsigned char* cache, __half* out,
+    const int kv_heads, const int head_dim, const int tokens,
+    const int cache_capacity, const int first,
+    const int output_capacity, const int output_first
+) {
+    constexpr int tokens_per_block = 8;
+    const int kv_head = blockIdx.x;
+    if (kv_head >= kv_heads) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int token = blockIdx.y * tokens_per_block + warp;
+    if (token >= tokens) return;
+    const int row_bytes = (head_dim / 32) * turbo_block_bytes<BITS>();
+    int slot = first + token;
+    if (slot >= cache_capacity) slot -= cache_capacity;
+    const unsigned char* row = cache + ((long long)kv_head * cache_capacity + slot) * row_bytes;
+    __half* destination = out + ((long long)kv_head * output_capacity + output_first + token) * head_dim;
+    for (int d = lane; d < head_dim; d += 32)
+        destination[d] = __float2half(kv_ld_turbo<BITS>(row, d));
+}
+extern "C" __global__ void kv_dequant_turbo4_f16_append(
+    const unsigned char* cache, __half* out,
+    const int kv_heads, const int head_dim, const int tokens,
+    const int cache_capacity, const int first,
+    const int output_capacity, const int output_first
+) {
+    kv_dequant_turbo_append_impl<4>(cache, out, kv_heads, head_dim, tokens,
+        cache_capacity, first, output_capacity, output_first);
+}
+
 // Rotate (stream 0, for queries) or inverse-rotate (stream 1, for the attention
 // output) `rows` vectors of `dim` floats in place, one block per row. Forward is
 // R = H*S, inverse is R^-1 = R^T = S*H, so the two differ only in the order of
@@ -11252,7 +11283,7 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_f16(
     const int tile_start, const int tile_rows,
     const int heads, const int kv_heads,
     const int block_start, const int block_tokens,
-    const int base_position
+    const int base_position, const int attention_window
 ) {
     const int head = blockIdx.x;
     const int row_index = blockIdx.y;
@@ -11269,10 +11300,14 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_f16(
         + (long long)column * block_tokens;
     const int visible_global = base_position + tile_start + row_index + 1;
     const int visible = min(block_tokens, visible_global - block_start);
+    const int first_visible = attention_window > 0
+        ? max(0, base_position + tile_start + row_index - attention_window + 1)
+        : 0;
+    const int skip = max(0, first_visible - block_start);
     const int slot = row_index * heads + head;
     __shared__ float reduction[256];
     float maximum = -3.402823466e+38F;
-    for (int token = threadIdx.x; token < visible; token += blockDim.x)
+    for (int token = max(static_cast<int>(threadIdx.x), skip); token < visible; token += blockDim.x)
         maximum = fmaxf(maximum, row[token]);
     reduction[threadIdx.x] = maximum;
     __syncthreads();
@@ -11287,14 +11322,14 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_f16(
     const float previous_sum = first ? 0.0f : state[slot * 2 + 1];
     const float new_maximum = fmaxf(previous_maximum, reduction[0]);
     float denominator = 0.0f;
-    for (int token = threadIdx.x; token < visible; token += blockDim.x) {
+    for (int token = max(static_cast<int>(threadIdx.x), skip); token < visible; token += blockDim.x) {
         const float probability = __expf(row[token] - new_maximum);
         output[token] = __float2half(probability);
         denominator += probability;
     }
-    for (int token = max(visible, 0) + threadIdx.x; token < block_tokens;
-         token += blockDim.x)
-        output[token] = __float2half(0.0f);
+    for (int token = threadIdx.x; token < block_tokens; token += blockDim.x)
+        if (token < skip || token >= visible)
+            output[token] = __float2half(0.0f);
     reduction[threadIdx.x] = denominator;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -11348,7 +11383,7 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_##SUFFIX(        \
     const int tile_start, const int tile_rows,                                 \
     const int heads, const int kv_heads,                                       \
     const int block_start, const int block_tokens,                             \
-    const int base_position                                                    \
+    const int base_position, const int attention_window                       \
 ) {                                                                            \
     const int head = blockIdx.x;                                               \
     const int row_index = blockIdx.y;                                          \
@@ -11365,10 +11400,14 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_##SUFFIX(        \
         + (long long)column * block_tokens;                                    \
     const int visible_global = base_position + tile_start + row_index + 1;     \
     const int visible = min(block_tokens, visible_global - block_start);       \
+    const int first_visible = attention_window > 0                         \
+        ? max(0, base_position + tile_start + row_index - attention_window + 1) \
+        : 0;                                                                  \
+    const int skip = max(0, first_visible - block_start);                    \
     const int slot = row_index * heads + head;                                 \
     __shared__ float reduction[256];                                           \
     float maximum = -3.402823466e+38F;                                         \
-    for (int token = threadIdx.x; token < visible; token += blockDim.x)        \
+    for (int token = max(static_cast<int>(threadIdx.x), skip); token < visible; token += blockDim.x) \
         maximum = fmaxf(maximum, row[token]);                                  \
     reduction[threadIdx.x] = maximum;                                          \
     __syncthreads();                                                           \
@@ -11383,14 +11422,14 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_##SUFFIX(        \
     const float previous_sum = first ? 0.0f : state[slot * 2 + 1];             \
     const float new_maximum = fmaxf(previous_maximum, reduction[0]);           \
     float denominator = 0.0f;                                                  \
-    for (int token = threadIdx.x; token < visible; token += blockDim.x) {      \
+    for (int token = max(static_cast<int>(threadIdx.x), skip); token < visible; token += blockDim.x) { \
         const float probability = __expf(row[token] - new_maximum);            \
         output[token] = TO_ELEMENT(probability);                               \
         denominator += probability;                                            \
     }                                                                          \
-    for (int token = max(visible, 0) + threadIdx.x; token < block_tokens;      \
-         token += blockDim.x)                                                  \
-        output[token] = TO_ELEMENT(0.0f);                                      \
+    for (int token = threadIdx.x; token < block_tokens; token += blockDim.x)   \
+        if (token < skip || token >= visible)                                  \
+            output[token] = TO_ELEMENT(0.0f);                                  \
     reduction[threadIdx.x] = denominator;                                      \
     __syncthreads();                                                           \
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {              \

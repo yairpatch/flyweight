@@ -188,6 +188,7 @@ FLYWEIGHT_API int flyweight_gpu_attention_prefill_cublas(
     std::int32_t rows,
     std::int32_t capacity,
     std::int32_t base_position,
+    std::int32_t attention_window,
     std::int32_t tile_rows,
     /* KV positions materialized per score tile; bounds the workspace so the
        query tile no longer shrinks with context length. */

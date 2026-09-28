@@ -3639,7 +3639,7 @@ __device__ void kv_prefill_impl(
     const float* queries, const KT* keys, const VT* values,
     float* output, const int heads, const int kv_heads,
     const int head_dim, const int base_position, const int rows,
-    const int capacity, const float scale
+    const int capacity, const float scale, const int attention_window
 ) {
     // Chunked-prefill attention: each warp owns 4 consecutive query rows for
     // one head and streams the KV cache ONCE for all of them with an online
@@ -3680,6 +3680,8 @@ __device__ void kv_prefill_impl(
         }
         for (int i = 0; i < count; ++i) {
             if (position > base_position + tile + i) continue;
+            if (attention_window > 0 &&
+                position < base_position + tile + i - attention_window + 1) continue;
             float partial = 0.0f;
             for (int d = 0; d < 8; ++d) partial += q[i][d] * k[d];
             for (int offset = 16; offset > 0; offset >>= 1)
@@ -3706,8 +3708,8 @@ extern "C" __global__ void name( \
     const float* queries, const KT* keys, const VT* values, \
     float* output, const int heads, const int kv_heads, \
     const int head_dim, const int base_position, const int rows, \
-    const int capacity, const float scale \
-) { kv_prefill_impl<KT, VT>(queries, keys, values, output, heads, kv_heads, head_dim, base_position, rows, capacity, scale); }
+    const int capacity, const float scale, const int attention_window \
+) { kv_prefill_impl<KT, VT>(queries, keys, values, output, heads, kv_heads, head_dim, base_position, rows, capacity, scale, attention_window); }
 // Fused prefill only for matched K/V precision; the host uses the per-token
 // score/value path when cache_type_k != cache_type_v.
 KV_PREFILL(kv_attention_prefill, float, float)
