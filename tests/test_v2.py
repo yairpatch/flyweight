@@ -531,6 +531,17 @@ class V2RuntimeTests(unittest.TestCase):
                 self.assertIn(symbol, kernels)
                 self.assertIn(symbol, driver)
                 self.assertIn(symbol, runtime)
+        # Flash-Next is 12 query heads per KV head at dim 256: one full mma
+        # tile of 8 and a partial tile of 4, sharing one cache load. Tiles
+        # start at 128 for the same reason as Muse (two KV heads). Turbo is
+        # a cache type here, so it has its own instantiations rather than a
+        # widening of the f16/q8 load.
+        for precision in ("f16", "bf16", "q8", "turbo3", "turbo4"):
+            for tile in (128, 256, 512):
+                symbol = f"kv_attention_gqa_mma_{precision}_256_s12_t{tile}"
+                self.assertIn(symbol, kernels)
+                self.assertIn(symbol, driver)
+                self.assertIn(symbol, runtime)
         # Below the instruction floor the kernels are not defined at all, and
         # the host asks the module rather than re-deriving the rule.
         self.assertIn("flyweight_gpu_kernel_available", driver)

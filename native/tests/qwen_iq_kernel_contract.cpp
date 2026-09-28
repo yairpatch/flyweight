@@ -1134,6 +1134,13 @@ int main() {
     // itself (nothing else in the suite did).
     failures += check("iq3s_matvec_transposed", kIq3s, false, 256);
     failures += check_rows("iq3s_matmul_rows", kIq3s);
+    // IQ1_M gate/up on the GSQ-RCO mix. The octet layout is not IQ1_S's, so
+    // these compare the grouped kernels to qwen_iq1m_value directly.
+    failures += check_grouped_swiglu("iq1m_grouped_swiglu", kIq1m, false);
+    failures += check_grouped_swiglu("iq1m_grouped_swiglu_rows", kIq1m, true);
+    failures += check_grouped_accumulate("iq1m_grouped_accumulate", kIq1m, false);
+    failures += check_grouped_accumulate("iq1m_grouped_accumulate_rows", kIq1m,
+                                         true);
     failures += check_grouped_swiglu("iq3s_grouped_swiglu", kIq3s, false);
     failures += check_grouped_swiglu("iq3s_grouped_swiglu_rows", kIq3s, true);
     failures += check_grouped_accumulate("iq3s_grouped_accumulate", kIq3s, false);
