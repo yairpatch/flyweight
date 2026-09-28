@@ -341,8 +341,8 @@ quantization type llama.cpp writes is readable, plus NVFP4 and the Q2_0
 type. Which kernel serves a tensor depends on where it runs:
 
 - **Dense projections on the GPU**: all of F32, F16, BF16, the K-quants,
-  Q4_0, Q8_0, the IQ family, IQ1_S and IQ1_M. Q2_0 and IQ4_NL dense tensors
-  are requantized to Q8_0 on upload.
+  Q4_0, Q8_0, the IQ family including IQ4_NL, IQ1_S and IQ1_M. Q2_0 dense
+  tensors are requantized to Q8_0 on upload.
 - **Routed experts on the GPU** (grouped kernels): Q2_K, Q4_K, Q5_K, Q6_K,
   Q4_0, Q8_0, Q2_0, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
   IQ4_NL and NVFP4. Q3_K experts run on the CPU.

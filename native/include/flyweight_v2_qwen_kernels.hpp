@@ -2127,6 +2127,21 @@ __device__ __forceinline__ float q5k_value(
     return d * (float)scale * (float)quant - dmin * (float)minimum;
 }
 
+// Row base for the Q8-activation matvecs. `stride` is bytes per 256 values.
+// Super-block formats only arrive with input_size a multiple of 256, so the
+// tail is zero and this is `row * (input_size/256) * stride`. A flat 32-wide
+// block whose stride is eight independent groups (IQ4_NL, 144 = 8*18) may
+// leave a tail, and that tail is stride/8 bytes per group.
+__device__ __forceinline__ const unsigned char* q8_weight_row(
+    const unsigned char* packed, int row, int input_size, int stride
+) {
+    const int groups = input_size >> 5;
+    const int full = groups >> 3;
+    const int tail = groups & 7;
+    return packed + (long long)row * ((long long)full * stride
+                                      + (long long)tail * (stride / 8));
+}
+
 // One block per output row: each thread walks a stride of 32-value groups and
 // the block reduces. Right for the wide-but-short projections in a layer.
 #define FLYWEIGHT_Q8_MATVEC(name, group_fn, stride)                              \
@@ -2137,10 +2152,9 @@ extern "C" __global__ void name(                                               \
 ) {                                                                            \
     const int row = blockIdx.x;                                                \
     if (row >= output_size) return;                                            \
-    const int blocks_per_row = input_size >> 8;                                \
-    const int groups_per_row = blocks_per_row << 3;                            \
+    const int groups_per_row = input_size >> 5;                                \
     const unsigned char* row_data =                                            \
-        packed + (long long)row * blocks_per_row * stride;                     \
+        q8_weight_row(packed, row, input_size, stride);                        \
     float partial = 0.0f;                                                      \
     for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x)             \
         partial += group_fn(row_data, vector, vector_scales, g);               \
@@ -2196,10 +2210,9 @@ extern "C" __global__ void name(                                               \
 ) {                                                                            \
     const int row = blockIdx.x;                                                \
     if (row >= output_size) return;                                            \
-    const int blocks_per_row = input_size >> 8;                                \
-    const int groups_per_row = blocks_per_row << 3;                            \
+    const int groups_per_row = input_size >> 5;                                \
     const unsigned char* row_data =                                            \
-        packed + (long long)row * blocks_per_row * stride;                     \
+        q8_weight_row(packed, row, input_size, stride);                        \
     float partial[FLYWEIGHT_Q8_ROWS];                                            \
     _Pragma("unroll")                                                          \
     for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) partial[r] = 0.0f;               \
@@ -2524,8 +2537,7 @@ extern "C" __global__ void name(                                               \
 ) {                                                                            \
     const int row_base = blockIdx.x * FLYWEIGHT_Q8_TILE_ROWS;                    \
     if (row_base >= output_size) return;                                       \
-    const int blocks_per_row = input_size >> 8;                                \
-    const int groups_per_row = blocks_per_row << 3;                            \
+    const int groups_per_row = input_size >> 5;                                \
     /* [.][9] not [.][8]: lane l reads word k at l*9+k, and 9 is coprime with  */\
     /* the 32 banks, so the eight reads stay conflict-free. At [.][8] lanes    */\
     /* l and l+4 collide four ways.                                            */\
@@ -2550,8 +2562,8 @@ extern "C" __global__ void name(                                               \
             const int r = i / count;                                           \
             const int g = i - r * count;                                       \
             if (row_base + r >= output_size) continue;                         \
-            const unsigned char* row_data = packed                             \
-                + (long long)(row_base + r) * blocks_per_row * stride;         \
+            const unsigned char* row_data = q8_weight_row(                     \
+                packed, row_base + r, input_size, stride);                     \
             float low = 0.0f, high = 0.0f;                                     \
             decode_fn(row_data, base + g, tile_words[r][g], &low, &high);      \
             tile_low[r][g] = low;                                              \
@@ -4092,11 +4104,10 @@ extern "C" __global__ void name(                                               \
     if (lane == 0) warp_best[warp] = 0ull;                                     \
     __syncthreads();                                                           \
     if (row < output_size) {                                                   \
-        const int blocks_per_row = input_size >> 8;                            \
-        const int groups_per_row = blocks_per_row << 3;                        \
+        const int groups_per_row = input_size >> 5;                            \
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(        const unsigned char* row_data =                                        \
-            packed + (long long)row * blocks_per_row * stride;                 \
+            q8_weight_row(packed, row, input_size, stride);                    \
         float partial = 0.0f;                                                  \
         for (int g = lane; g < groups_per_row; g += 32)                        \
             partial += group_fn(row_data, vector, vector_scales, g);           \
@@ -6000,6 +6011,55 @@ __device__ __forceinline__ void iq4nl_q8_decode(
     *scale_high = d;
 }
 
+// Dense twin of the decode above. One 18-byte block is one Q8 group, so the
+// row stride the matvec macros take is 8*18 = 144 bytes per 256 values. The
+// same nibble split as IQ4_XS: byte j holds element j and element j+16.
+__device__ __forceinline__ float iq4nl_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const unsigned char* base = row_data + linear_group * 18;
+    unsigned int codes[4];
+    memcpy(codes, base + 2, 16);
+    const signed char* activations = vector + linear_group * 32;
+    const int4* activation_vectors = (const int4*)activations;
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y, activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y, activation_high.z,
+        activation_high.w};
+
+    int dot = 0;
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int word = codes[step];
+        const int low_weights =
+            ((int)(unsigned char)kIq4nlValues[(word >> 0) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 8) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 16) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 24) & 15] << 24);
+        const int high_weights =
+            ((int)(unsigned char)kIq4nlValues[(word >> 4) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 12) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 20) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 28) & 15] << 24);
+        dot = __dp4a(low_weights, acts[step], dot);
+        dot = __dp4a(high_weights, acts[step + 4], dot);
+    }
+    const float d = __half2float(*((const __half*)base));
+    return __half2float(vector_scales[linear_group]) * d * (float)dot;
+}
+
+// Stride 144 is eight flat blocks. q8_weight_row keeps a tail that is only a
+// multiple of 32, which is the row width IQ4_NL exists for.
+FLYWEIGHT_Q8_MATVEC(iq4nl_q8_matvec_transposed_warp, iq4nl_q8_group, 144)
+FLYWEIGHT_Q8_MATVEC_ROWS(iq4nl_q8_matvec_transposed_rows, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_MATMUL_TILED(iq4nl_q8_matmul_tiled, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_MMQ_ONE(iq4nl_q8_mmq, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_LM_HEAD(iq4nl_q8_lm_head_argmax_warp, iq4nl_q8_group, 144)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq4nl_q8_mmq_routed, iq4nl_q8_decode, 18, 5, 0)
 
 // Q2_0 for the routed MMQ: the same 18-byte flat block as IQ4_NL, but 64
@@ -8439,6 +8499,7 @@ FLYWEIGHT_LM_HEAD_ARGMAX(iq2s_lm_head_argmax_warp, iq2s_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq3s_lm_head_argmax_warp, iq3s_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq2xs_lm_head_argmax_warp, iq2xs_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq4xs_lm_head_argmax_warp, iq4xs_value)
+FLYWEIGHT_LM_HEAD_ARGMAX(iq4nl_lm_head_argmax_warp, iq4nl_value)
 FLYWEIGHT_LM_HEAD_ARGMAX(iq1s_lm_head_argmax_warp, iq1s_value)
 
 #undef FLYWEIGHT_LM_HEAD_ARGMAX
@@ -9844,16 +9905,18 @@ R"FLYWEIGHT_CUDA(
 // tile once into shared memory and reuses it across all 32 tokens. The
 // per-token rows kernel re-read the whole matrix per token and measured
 // prefill at half the Q8 build's speed; this shape restores the reuse.
-// weight_scale_2 is folded into the E4M3 block scales for dense tensors
-// (both known all-NVFP4 quantizers ship no `.scale` tensors for them), so
-// no scale argument -- which is also what lets the generic six-argument
-// format-table launch name this kernel. The decode avoids nvfp4_value on
-// purpose: its __shfl_sync broadcasts assume contiguous lanes on contiguous
-// elements of one row, and the tile fill walks (row, column) pairs instead.
+// `scale` is weight_scale_2. Checkpoints that fold it into the E4M3 block
+// scales pass 1. Ones that store it as a sibling `.scale` tensor (Muse
+// Glimmer NVFP4) pass the f32 value: it sits near 1e-4, under E4M3's
+// smallest subnormal, so it cannot be baked into the block scales. The
+// decode avoids nvfp4_value on purpose: its __shfl_sync broadcasts assume
+// contiguous lanes on contiguous elements of one row, and the tile fill
+// walks (row, column) pairs instead.
 extern "C" __global__
 void nvfp4_matmul_tiled(
     const unsigned char* packed, const float* input, float* output,
-    const int input_size, const int output_size, const int rows
+    const int input_size, const int output_size, const int rows,
+    const float scale
 ) {
     __shared__ float weight_tile[32][33];
     __shared__ float input_tile[32][33];
@@ -9897,7 +9960,7 @@ void nvfp4_matmul_tiled(
     for (int r = 0; r < 4; ++r) {
         const int row = row_base + row_group * 4 + r;
         if (row < output_size)
-            output[(long long)token * output_size + row] = acc[r];
+            output[(long long)token * output_size + row] = acc[r] * scale;
     }
 }
 
@@ -10586,6 +10649,32 @@ __device__ void kv_dequant_turbo_impl(
     __half* destination = out + ((long long)kv_head * tokens + token) * head_dim;
     for (int d = lane; d < head_dim; d += 32)
         destination[d] = __float2half(kv_ld_turbo<BITS>(row, d));
+}
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// Copy one f16 or bf16 KV window out of a ring into [kv_head][tokens][head_dim].
+// cuBLAS attention reads a contiguous span (first + tokens <= capacity); a
+// sliding window that has wrapped the ring is not one, and the serial
+// per-head fallback that used to take over is what makes decode fall off
+// with context. The bits are copied unchanged, so the same kernel serves
+// both 16-bit cache types. The caller then runs cuBLAS with first == 0 and
+// capacity == tokens.
+extern "C" __global__ void kv_ring_unwrap_16(
+    const unsigned short* cache, unsigned short* out,
+    const int kv_heads, const int head_dim, const int tokens,
+    const int capacity, const int first
+) {
+    const int token = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    if (token >= tokens || kv_head >= kv_heads || head_dim <= 0) return;
+    int slot = first + token;
+    if (slot >= capacity) slot -= capacity;
+    const unsigned short* source =
+        cache + ((long long)kv_head * capacity + slot) * head_dim;
+    unsigned short* destination =
+        out + ((long long)kv_head * tokens + token) * head_dim;
+    for (int dimension = threadIdx.x; dimension < head_dim; dimension += blockDim.x)
+        destination[dimension] = source[dimension];
 }
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
@@ -11609,6 +11698,7 @@ FLYWEIGHT_LOWBIT_MATVEC_WARP(iq2s_matvec_transposed_warp, iq2s_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq3s_matvec_transposed_warp, iq3s_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq2xs_matvec_transposed_warp, iq2xs_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq4xs_matvec_transposed_warp, iq4xs_value)
+FLYWEIGHT_LOWBIT_MATVEC_WARP(iq4nl_matvec_transposed_warp, iq4nl_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq1m_matvec_transposed_warp, iq1m_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq1s_matvec_transposed_warp, iq1s_value)
 // Q4_0 has no q40_value of its own: ggml_q4_0_load above is that decoder,
@@ -12641,6 +12731,304 @@ R"FLYWEIGHT_CUDA(
     (void)scale;
 #endif
 }
+
+// 16 query heads per KV head (Muse Glimmer: 32/2 at head_dim 128). m16n8k16's
+// N is 8, so the group is two bands of 8 that share one load of K and of V.
+// The softmax state and the output accumulator stay in f32, one pair per
+// band; the score matrix is never written out. A 128-token tile is the
+// grain that keeps all eight warps busy (8 * 16 keys) while still giving a
+// 2-KV-head model enough blocks to occupy the GPU.
+template<typename KT, typename VT, typename Operand, int maximum_head_dim,
+         int tokens_per_tile>
+__device__ void kv_attention_gqa_mma16_impl(
+    const float* query,
+    const KT* keys,
+    const VT* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int warp_count = 8;
+    constexpr int keys_per_step = 16;
+    constexpr int chunk_dims = 64;
+    constexpr int chunks = maximum_head_dim / chunk_dims;
+    constexpr int fragments = maximum_head_dim / 16;
+    constexpr int stride = chunk_dims + 8;
+    constexpr int bands = 2;
+    constexpr int band_share = 8;
+    constexpr float negative = -3.402823466e+38F / 2.0f;
+
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = lane >> 2;
+    const int quad = lane & 3;
+    const int block = lane >> 3;
+    if (kv_head >= kv_heads || head_dim != maximum_head_dim ||
+        heads != kv_heads * (bands * band_share))
+        return;
+
+    __shared__ Operand staged[warp_count][keys_per_step * stride];
+    __shared__ float merged[warp_count][maximum_head_dim];
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float tile_maximum;
+    __shared__ float tile_denominator;
+    Operand* stage = staged[warp];
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int head_base = kv_head * (bands * band_share);
+
+    unsigned int query_operand[bands][fragments][2];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        const float* row = query
+            + (long long)(head_base + band * band_share + group) * head_dim;
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            const int start = fragment * 16 + 2 * quad;
+            query_operand[band][fragment][0] = kv_mma_pack<Operand>(
+                row[start] * scale, row[start + 1] * scale);
+            query_operand[band][fragment][1] = kv_mma_pack<Operand>(
+                row[start + 8] * scale, row[start + 9] * scale);
+        }
+    }
+
+    float output[bands][fragments][4];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                output[band][fragment][element] = 0.0f;
+        }
+    }
+    float running_maximum[bands][2];
+    float running_denominator[bands][2];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        running_maximum[band][0] = running_maximum[band][1] = negative;
+        running_denominator[band][0] = running_denominator[band][1] = 0.0f;
+    }
+
+    for (int base = tile_begin + warp * keys_per_step;
+         base < tile_end;
+         base += warp_count * keys_per_step) {
+        const int live = min(keys_per_step, tile_end - base);
+        float score[bands][4];
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                score[band][element] = 0.0f;
+        }
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            kv_mma_stage<KT, Operand, chunk_dims, stride>(
+                keys, stage, kv_head, capacity, first, base, live,
+                chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix(
+                    operand,
+                    stage + ((block & 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block >> 1) * 8);
+                const int fragment = chunk * (chunk_dims / 16) + step;
+                #pragma unroll
+                for (int band = 0; band < bands; ++band)
+                    kv_mma_m16n8k16(
+                        score[band], operand, query_operand[band][fragment],
+                        (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+        unsigned int probability_operand[bands][2];
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element) {
+                if (8 * (element / 2) + group >= live)
+                    score[band][element] = negative;
+            }
+            float updated[2] = {
+                fmaxf(score[band][0], score[band][2]),
+                fmaxf(score[band][1], score[band][3])};
+            #pragma unroll
+            for (int offset = 4; offset <= 16; offset <<= 1) {
+                updated[0] = fmaxf(updated[0],
+                    __shfl_xor_sync(0xffffffff, updated[0], offset));
+                updated[1] = fmaxf(updated[1],
+                    __shfl_xor_sync(0xffffffff, updated[1], offset));
+            }
+            float rescale[2];
+            #pragma unroll
+            for (int column = 0; column < 2; ++column) {
+                updated[column] = fmaxf(
+                    running_maximum[band][column], updated[column]);
+                rescale[column] = __expf(
+                    running_maximum[band][column] - updated[column]);
+                running_maximum[band][column] = updated[column];
+                running_denominator[band][column] *= rescale[column];
+            }
+            #pragma unroll
+            for (int fragment = 0; fragment < fragments; ++fragment) {
+                #pragma unroll
+                for (int element = 0; element < 4; ++element)
+                    output[band][fragment][element] *= rescale[element & 1];
+            }
+            float probability[4];
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                probability[element] = __expf(
+                    score[band][element] - running_maximum[band][element & 1]);
+            float sum[2] = {probability[0] + probability[2],
+                            probability[1] + probability[3]};
+            #pragma unroll
+            for (int offset = 4; offset <= 16; offset <<= 1) {
+                sum[0] += __shfl_xor_sync(0xffffffff, sum[0], offset);
+                sum[1] += __shfl_xor_sync(0xffffffff, sum[1], offset);
+            }
+            running_denominator[band][0] += sum[0];
+            running_denominator[band][1] += sum[1];
+            probability_operand[band][0] = kv_mma_movmatrix(
+                kv_mma_pack<Operand>(probability[0], probability[1]));
+            probability_operand[band][1] = kv_mma_movmatrix(
+                kv_mma_pack<Operand>(probability[2], probability[3]));
+        }
+
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            kv_mma_stage<VT, Operand, chunk_dims, stride>(
+                values, stage, kv_head, capacity, first, base, live,
+                chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix_trans(
+                    operand,
+                    stage + ((block >> 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block & 1) * 8);
+                const int fragment = chunk * (chunk_dims / 16) + step;
+                #pragma unroll
+                for (int band = 0; band < bands; ++band)
+                    kv_mma_m16n8k16(
+                        output[band][fragment], operand,
+                        probability_operand[band], (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+    }
+
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        #pragma unroll
+        for (int index = 0; index < band_share; ++index) {
+            __syncthreads();
+            if (quad == index / 2) {
+                if (group == 0) {
+                    warp_maximum[warp] = running_maximum[band][index & 1];
+                    warp_denominator[warp] = running_denominator[band][index & 1];
+                }
+                #pragma unroll
+                for (int fragment = 0; fragment < fragments; ++fragment) {
+                    merged[warp][fragment * 16 + group] =
+                        output[band][fragment][index & 1];
+                    merged[warp][fragment * 16 + 8 + group] =
+                        output[band][fragment][2 + (index & 1)];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float maximum = warp_maximum[0];
+                #pragma unroll
+                for (int other = 1; other < warp_count; ++other)
+                    maximum = fmaxf(maximum, warp_maximum[other]);
+                float denominator = 0.0f;
+                #pragma unroll
+                for (int other = 0; other < warp_count; ++other) {
+                    const float factor = warp_denominator[other] == 0.0f
+                        ? 0.0f : __expf(warp_maximum[other] - maximum);
+                    warp_scale[other] = factor;
+                    denominator += warp_denominator[other] * factor;
+                }
+                tile_maximum = maximum;
+                tile_denominator = denominator;
+            }
+            __syncthreads();
+            float* record = partial
+                + ((long long)(head_base + band * band_share + index)
+                        * tile_count + tile)
+                    * (maximum_head_dim + 2);
+            if (threadIdx.x == 0) {
+                record[0] = tile_maximum;
+                record[1] = tile_denominator;
+            }
+            for (int dimension = threadIdx.x;
+                 dimension < head_dim;
+                 dimension += blockDim.x) {
+                float result = 0.0f;
+                #pragma unroll
+                for (int other = 0; other < warp_count; ++other)
+                    result += merged[other][dimension] * warp_scale[other];
+                record[dimension + 2] = result;
+            }
+        }
+    }
+#else
+    (void)query; (void)keys; (void)values; (void)partial; (void)heads;
+    (void)kv_heads; (void)head_dim; (void)tokens; (void)capacity; (void)first;
+    (void)scale;
+#endif
+}
+
+#define KV_ATTENTION_GQA_MMA16(name, KT, VT, OPERAND, DIM, TILE) \
+extern "C" __global__ __launch_bounds__(256, 1) void name( \
+    const float* query, const KT* keys, const VT* values, float* partial, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale \
+) { \
+    kv_attention_gqa_mma16_impl<KT, VT, OPERAND, DIM, TILE>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_f16_128_s16_t128, __half, __half, __half, 128, 128)
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_f16_128_s16_t256, __half, __half, __half, 128, 256)
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_q8_128_s16_t128, unsigned char, unsigned char, __half,
+    128, 128)
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_q8_128_s16_t256, unsigned char, unsigned char, __half,
+    128, 256)
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_bf16_128_s16_t128, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 128, 128)
+KV_ATTENTION_GQA_MMA16(
+    kv_attention_gqa_mma_bf16_128_s16_t256, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 128, 256)
+#endif
+#undef KV_ATTENTION_GQA_MMA16
 
 #define KV_ATTENTION_GQA_MMA(name, KT, VT, OPERAND, DIM, SHARE, TILE) \
 extern "C" __global__ __launch_bounds__(256, 1) void name( \

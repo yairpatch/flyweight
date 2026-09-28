@@ -892,6 +892,11 @@ class InferenceService:
         # endpoint (see `_TOTAL_TOKENS_RE`). Set by the CLI after construction
         # rather than threaded through three subclass constructors.
         self.freeze_total_tokens = False
+        # Stronger, and what the CLI's --strip-total-tokens sets: delete the
+        # counter from the rendered history (see `_TOTAL_TOKENS_STRIP_RE`).
+        # Pinning cannot follow a counter the client INSERTS or moves between
+        # requests, only one it rewrites in place.
+        self.strip_total_tokens = False
         # Whether an image part may name an http(s) URL for the server to
         # fetch; data URLs are always accepted.
         self.allow_remote_images = True
@@ -2018,6 +2023,7 @@ class InferenceService:
             {**payload, "max_tokens": payload.get("max_tokens", 1)},
             architecture=getattr(self.generator.tokenizer, "architecture", None),
             freeze_total_tokens=self.freeze_total_tokens,
+            strip_total_tokens=self.strip_total_tokens,
             allow_remote_images=self.allow_remote_images,
         )
         enable_thinking, reasoning_effort = self._reasoning_request(options)
@@ -2405,6 +2411,7 @@ class InferenceService:
             payload,
             architecture=getattr(self.generator.tokenizer, "architecture", None),
             freeze_total_tokens=self.freeze_total_tokens,
+            strip_total_tokens=self.strip_total_tokens,
             allow_remote_images=self.allow_remote_images,
         )
         tools = tuple(_selected_tools(options)) if tools_enabled else ()
@@ -4774,6 +4781,22 @@ _ANTHROPIC_STOP_REASONS = {
 _TOTAL_TOKENS_RE = re.compile(r"<total_tokens>\d+ tokens left</total_tokens>")
 _FROZEN_TOTAL_TOKENS = "<total_tokens>1000000 tokens left</total_tokens>"
 
+# The same counter, deleted from the rendered history instead of pinned.
+# Pinning absorbs the VALUE rewrite but not placement: measured live on a
+# 93k-token Claude Code session, every request INSERTED a fresh
+# `counter + blank line` mid-history, so the divergence point marched 18
+# tokens per turn (42926 -> 42944 -> 42962 -> ...) and reuse sat on the
+# checkpoint rung below it no matter how dense the ladder got. Removing the
+# block -- the tag plus the blank line the client appends with it -- makes a
+# turn that only moved or added a counter render byte-identically to the one
+# before, which on a recurrent arch is the difference between an exact
+# prefix hit and a rung fallback. What is lost is a line the model cannot
+# act on anyway (the context limit is this server's, not the counter's, as
+# argued for the frozen value below).
+_TOTAL_TOKENS_STRIP_RE = re.compile(
+    r"<total_tokens>\d+ tokens left</total_tokens>(?:[ \t]*\r?\n)*"
+)
+
 
 def _freeze_total_tokens(value: Any) -> Any:
     """Return `value` with every total_tokens counter pinned, recursively.
@@ -4801,9 +4824,36 @@ def _freeze_total_tokens(value: Any) -> Any:
     return value
 
 
+def _strip_total_tokens(value: Any) -> Any:
+    """Return `value` with every total_tokens counter removed, recursively.
+
+    The same walk as `_freeze_total_tokens` -- strings, lists, mappings,
+    identity passthrough when nothing matched, so a request without counters
+    costs one substring test per string -- deleting instead of substituting.
+    Determinism across turns is the point: whatever the client inserted,
+    moved or rewrote, the render after this walk does not depend on it.
+    """
+    if isinstance(value, str):
+        if "<total_tokens>" not in value:
+            return value
+        return _TOTAL_TOKENS_STRIP_RE.sub("", value)
+    if isinstance(value, list):
+        stripped = [_strip_total_tokens(item) for item in value]
+        return value if all(a is b for a, b in zip(stripped, value)) else stripped
+    if isinstance(value, Mapping):
+        stripped_map = {key: _strip_total_tokens(item) for key, item in value.items()}
+        return (
+            value
+            if all(stripped_map[key] is value[key] for key in value)
+            else stripped_map
+        )
+    return value
+
+
 def _anthropic_request(
     payload: Mapping[str, Any], *, architecture: str | None = None,
-    freeze_total_tokens: bool = False, allow_remote_images: bool = True,
+    freeze_total_tokens: bool = False, strip_total_tokens: bool = False,
+    allow_remote_images: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     """Parse an Anthropic messages request straight into prompt messages.
 
@@ -4817,8 +4867,17 @@ def _anthropic_request(
 
     `freeze_total_tokens` pins Claude Code's per-request context counter (see
     `_TOTAL_TOKENS_RE`) before any text is read, so the prompt cache sees the
-    same history turn after turn.
+    same history turn after turn. `strip_total_tokens` deletes the counter
+    instead (`_TOTAL_TOKENS_STRIP_RE`), which subsumes the pinning -- a value
+    that is not rendered cannot be rewritten -- and also absorbs counters the
+    client inserts or moves between requests; when both are set, strip wins.
     """
+    if strip_total_tokens:
+        payload = {
+            **payload,
+            "system": _strip_total_tokens(payload.get("system")),
+            "messages": _strip_total_tokens(payload.get("messages")),
+        }
     if freeze_total_tokens:
         payload = {
             **payload,

@@ -955,6 +955,13 @@ struct FlyweightV2QwenRuntime {
     // dispatch must read this rather than model->tensors[i].type; the host
     // paths still decode the mapping with the original type.
     std::vector<std::uint32_t> device_tensor_types;
+    // Per-tensor NVFP4 weight_scale_2, indexed like model->tensors. 1 when the
+    // checkpoint folded that factor into the E4M3 block scales (no sibling
+    // `.scale` tensor). Out-of-line scales run ~1e-4 and cannot be folded:
+    // E4M3's smallest subnormal is 2^-9, so multiplying them in would flush
+    // most blocks to zero. Dense launches read this; routed experts keep
+    // their own per-expert tables.
+    std::vector<float> nvfp4_weight_scale;
     // sm_75 is where mma.*.s8 appears. Below it the MMQ kernels still compile
     // (the instruction is guarded) but fall back to a shuffle emulation that is
     // far slower than the dp4a tile kernel, so the host must not pick them.
@@ -5012,6 +5019,44 @@ void gemma_cpu_moe_rows(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan
 // costs no VRAM at all -- this is what lets a dense model exceed the card.
 // Weights for a spilled block's feed-forward as the host should read them:
 // the Q8_0 re-encoding when prepare made one, otherwise the checkpoint bytes.
+// Sibling `.scale` of an NVFP4 `.weight`, or 1 when the quantizer folded
+// weight_scale_2 into the block scales. See nvfp4_weight_scale.
+float qwen_nvfp4_weight_scale(const FlyweightV2QwenRuntime& runtime, std::size_t index) {
+    if (index >= runtime.nvfp4_weight_scale.size()) return 1.0f;
+    return runtime.nvfp4_weight_scale[index];
+}
+
+void qwen_load_nvfp4_weight_scales(FlyweightV2QwenRuntime& runtime) {
+    const auto count = runtime.model->tensors.size();
+    runtime.nvfp4_weight_scale.assign(count, 1.0f);
+    std::unordered_map<std::string, std::uint64_t> by_name;
+    by_name.reserve(count);
+    for (std::uint64_t index = 0; index < count; ++index)
+        by_name.emplace(runtime.model->tensors[index].name, index);
+    std::uint32_t found = 0;
+    for (std::uint64_t index = 0; index < count; ++index) {
+        const auto& tensor = runtime.model->tensors[index];
+        if (tensor.type != 40 || tensor.name.size() <= 7 ||
+            tensor.name.compare(tensor.name.size() - 7, 7, ".weight") != 0)
+            continue;
+        const auto scale_name = tensor.name.substr(0, tensor.name.size() - 7) + ".scale";
+        const auto it = by_name.find(scale_name);
+        if (it == by_name.end()) continue;
+        const auto& scale = runtime.model->tensors[it->second];
+        if (scale.type != 0 || scale.size < sizeof(float)) continue;
+        float value = 1.0f;
+        std::memcpy(&value, tensor_data(*runtime.model, scale), sizeof(float));
+        if (!std::isfinite(value)) continue;
+        runtime.nvfp4_weight_scale[index] = value;
+        ++found;
+    }
+    if (found)
+        std::fprintf(stderr,
+            "[flyweight] NVFP4 weight scales: %u tensors carry an out-of-line "
+            "weight_scale_2\n",
+            found);
+}
+
 const std::uint8_t* qwen_host_ffn_weights(
     const FlyweightV2QwenRuntime& runtime, std::size_t index, std::uint32_t& type
 ) {
@@ -5039,6 +5084,13 @@ void qwen_cpu_dense_ffn(
         runtime,layer.static_tensors[ffn_base+2],up_type);
     const auto*down_data=qwen_host_ffn_weights(
         runtime,layer.static_tensors[ffn_base+3],down_type);
+    // weight_scale_2 is a single f32 per tensor. The host dot decodes the
+    // block scales only, so the factor is applied to each projection. It is
+    // 1 for every format that is not out-of-line NVFP4. Gate and up have to
+    // be scaled before SiLU; the nonlinearity does not commute with it.
+    const float gate_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+1]);
+    const float up_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+2]);
+    const float down_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+3]);
     // The pinned buffers the caller hands over are DMA staging, and every
     // output row re-reads the whole activation vector -- roughly 700 MiB of
     // re-reads per block. Doing that against page-locked memory costs ~5x, so
@@ -5059,13 +5111,13 @@ void qwen_cpu_dense_ffn(
         qwen_pin_decode_member();
         #pragma omp for schedule(static)
         for(int row=0;row<intermediate;++row){
-            const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
-            const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
+            const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row)*gate_scale;
+            const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row)*up_scale;
             activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
         }
         #pragma omp for schedule(static)
         for(int row=0;row<hidden;++row)
-            output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
+            output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row)*down_scale;
     }
 }
 
@@ -5101,6 +5153,9 @@ void qwen_cpu_dense_ffn_rows(
         runtime,layer.static_tensors[ffn_base+2],up_type);
     const auto*down_data=qwen_host_ffn_weights(
         runtime,layer.static_tensors[ffn_base+3],down_type);
+    const float gate_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+1]);
+    const float up_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+2]);
+    const float down_scale=qwen_nvfp4_weight_scale(runtime,layer.static_tensors[ffn_base+3]);
     const std::size_t batch=static_cast<std::size_t>(rows);
 
     // Batching pays only where a weight row can be *decoded* quickly. The
@@ -5176,10 +5231,11 @@ void qwen_cpu_dense_ffn_rows(
             dot_multi(decoded.data(),input_rows.data(),
                       static_cast<int>(batch),hidden,up_dots.data());
             for(std::size_t token=0;token<batch;++token){
-                const float gate=gate_dots[token];
+                const float gate=gate_dots[token]*gate_scale;
+                const float up=up_dots[token]*up_scale;
                 activated[token*intermediate+row]=
                     gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))
-                    *up_dots[token];
+                    *up;
             }
         }
     }
@@ -5196,7 +5252,7 @@ void qwen_cpu_dense_ffn_rows(
             dot_multi(decoded.data(),activated_rows.data(),
                       static_cast<int>(batch),intermediate,dots.data());
             for(std::size_t token=0;token<batch;++token)
-                output[token*hidden+row]=dots[token];
+                output[token*hidden+row]=dots[token]*down_scale;
         }
     }
 }
@@ -5865,7 +5921,8 @@ void qwen_quant_dot_oct(
 // batched kernel of its own. Returns nonzero when the type has no kernel.
 int qwen_gpu_matvec_by_type(
     std::uint32_t type, std::uint64_t matrix, std::uint64_t input,
-    std::uint64_t output, int input_size, int output_size, std::uint64_t stream
+    std::uint64_t output, int input_size, int output_size, std::uint64_t stream,
+    float nvfp4_scale = 1.0f
 ) {
     switch (type) {
         // F32 matters to the sampler: the greedy path has a fused f32 argmax,
@@ -5920,6 +5977,12 @@ int qwen_gpu_matvec_by_type(
         case 17: return flyweight_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 22: return flyweight_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 20: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "iq4nl_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 19: return flyweight_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         // Dense NVFP4 (all-NVFP4 checkpoints): weight_scale_2 is folded into
@@ -5927,8 +5990,7 @@ int qwen_gpu_matvec_by_type(
         // scale argument is fixed at 1. The expert paths never come through
         // here -- they pass the real per-expert scales themselves.
         case 40: {
-            float scale = 1.0f;
-            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &scale};
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &nvfp4_scale};
             return flyweight_gpu_launch_named(
                 "nvfp4_matvec_transposed_warp", (output_size + 7) / 8, 1, 256,
                 0, stream, args);
@@ -5955,7 +6017,7 @@ constexpr int kQwenMatvecUnsupported = -1000000;
 bool qwen_matvec_supported(std::uint32_t type) {
     switch (type) {
         case 1: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
-        case 16: case 17: case 18: case 19: case 21: case 22: case 23:
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23:
         case 29: case 30: case 40:
             return true;
         default:
@@ -5965,7 +6027,8 @@ bool qwen_matvec_supported(std::uint32_t type) {
 
 int qwen_matvec_driver(
     std::uint32_t type, std::uint64_t matrix, std::uint64_t input,
-    std::uint64_t output, int input_size, int output_size, std::uint64_t stream
+    std::uint64_t output, int input_size, int output_size, std::uint64_t stream,
+    float nvfp4_scale = 1.0f
 ) {
     switch (type) {
         case 1: {
@@ -6002,11 +6065,16 @@ int qwen_matvec_driver(
         case 21: return flyweight_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 22: return flyweight_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 20: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "iq4nl_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         // Dense NVFP4, scale folded into the blocks -- see qwen_gpu_matvec_by_type.
         case 40: {
-            float scale = 1.0f;
-            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &scale};
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &nvfp4_scale};
             return flyweight_gpu_launch_named(
                 "nvfp4_matvec_transposed_warp", (output_size + 7) / 8, 1, 256,
                 0, stream, args);
@@ -6055,7 +6123,10 @@ std::uint32_t qwen_q8_matvec_block(int input_size) {
         return (value >= 32 && value <= 128 && (value & 31) == 0) ? value : 0u;
     }();
     if (pinned) return pinned;
-    if (input_size & 255) return 128;  // Not this kernel's shape; caller gates.
+    // A row that is not a whole number of 32-value groups is not this kernel's
+    // shape. Multiples of 32 that are not multiples of 256 are, for the flat
+    // formats (IQ4_NL); super-block formats never reach here with one.
+    if (input_size & 31) return 128;
     const std::uint32_t groups = static_cast<std::uint32_t>(input_size >> 5);
     std::uint32_t best = 128, best_waste = ~0u;
     for (const std::uint32_t block : {std::uint32_t{64}, std::uint32_t{96},
@@ -6076,6 +6147,15 @@ std::uint32_t qwen_q8_matvec_block(int input_size) {
 bool qwen_q8_head_enabled() {
     const char* setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
     return !setting || setting[0] != '0';
+}
+
+// Super-block Q8 kernels need a multiple of 256. Flat 32-wide formats (IQ4_NL)
+// line one block up with one Q8 group, so a multiple of 32 is a whole row.
+bool qwen_q8_row_fits(std::uint32_t type, int input_size) {
+    const auto* format = flyweight::v2::qwen_format(type);
+    if (format && format->q8_flat32)
+        return input_size > 0 && (input_size & 31) == 0;
+    return (input_size & 255) == 0;
 }
 
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
@@ -15274,6 +15354,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     else if(qwen4exp)build_qwen4exp_plan(*runtime);
     else if(k2horizon)build_k2horizon_plan(*runtime);
     else build_qwen_plan(*runtime);
+    qwen_load_nvfp4_weight_scales(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
     // flyweight::v2::attention so they can be pinned by a contract test.
@@ -16360,6 +16441,55 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 spill_pass(true);
                 spill_pass(false);
             }
+            // The spill above keeps every block the tight margin can hold.
+            // The allocation check further down reserves max(2 GiB, VRAM/8)
+            // and refuses a plan that misses it, after the host re-encode.
+            // Spill more only when that check would fail. A model the check
+            // already accepts does not move another block, so its tokens stay
+            // where the tight margin put them.
+            if(!forced_env&&!runtime->options.gpu_cache_bytes){
+                FlyweightV2GpuInfo check{};
+                if(gpu_probe(check,runtime->options.device)==0&&check.free_memory>0){
+                    const std::uint64_t check_margin=std::max<std::uint64_t>(
+                        2048ull*1024*1024,check.total_memory/8);
+                    const std::uint64_t check_budget=check.free_memory>check_margin
+                        ?check.free_memory-check_margin:0;
+                    // Alignment and the prefill-stream arena are sized after
+                    // this point. A small pad keeps a plan that lands on the
+                    // budget from failing the check by a rounding error.
+                    constexpr std::uint64_t pad=64ull*1024*1024;
+                    const auto overhead=[&]{
+                        return runtime->workspace_bytes+runtime->slots_state_bytes
+                            +runtime->expert_staging_bytes
+                            +(runtime->host_ffn_layers?ffn_stage:0)+pad;
+                    };
+                    const std::uint32_t before=runtime->host_ffn_layers;
+                    while(resident+overhead()>check_budget){
+                        bool spilled=false;
+                        for(auto layer=runtime->layers.rbegin();
+                            layer!=runtime->layers.rend();++layer){
+                            if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                            const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                            std::uint64_t freed=0;
+                            for(std::size_t role=1;role<=3;++role)
+                                freed+=device_align(runtime->model->tensors[
+                                    layer->static_tensors[ffn_base+role]].size);
+                            layer->ffn_on_host=true;
+                            resident-=freed;
+                            runtime->host_ffn_bytes+=freed;
+                            ++runtime->host_ffn_layers;
+                            spilled=true;
+                            break;
+                        }
+                        if(!spilled)break;
+                    }
+                    if(runtime->host_ffn_layers>before)
+                        std::fprintf(stderr,
+                            "[flyweight] dense feed-forward: %u more blocks on CPU "
+                            "so the weights fit the VRAM check\n",
+                            runtime->host_ffn_layers-before);
+                }
+            }
             if(runtime->host_ffn_layers)runtime->host_ffn_stage_bytes=ffn_stage;
             // Re-encode the spilled feed-forward as Q8_0 for the host dot; see
             // host_ffn_q8. Bounded because the expansion is ~3.3x and a fully
@@ -16680,33 +16810,27 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
             }
         }
-        // Static tensors in a format that only the CPU expert path and the
-        // prefill expert GEMM decode: Q2_0 (type 42) and IQ4_NL (type 20).
-        // ISTA DASLab's GSQ-RCO qwen4exp builds store the shared-expert down
-        // projection in one or the other on every layer, and the decode
-        // matvec dispatch has no kernel for either (the unsloth builds only
-        // ever put IQ4_NL on the routed experts and the PLE table). Convert
-        // to Q8_0 here, like the IQ1_M head above; the tensors are small
-        // (640x2560) and Q8_0 holds either codebook to within one int8 step.
-        // The PLE table is host row-gathered from the mapping and keeps its
-        // type.
+        // Q2_0 (type 42) static tensors have no dense matvec. ISTA DASLab's
+        // GSQ-RCO qwen4exp builds store the shared-expert down projection in
+        // it, 640x2560, and Q8_0 holds that codebook to within one int8 step.
+        // IQ4_NL used to take the same path; it now has dense kernels, including
+        // for rows that are only a multiple of 32.
         {
             std::uint64_t converted=0,growth=0;
             for(std::uint64_t index=0;index<persistent.size();++index){
                 if(!persistent[index])continue;
                 if(index==runtime->ple_table)continue;
                 const auto type=runtime->device_tensor_types[index];
-                if(type!=42&&type!=20)continue;
+                if(type!=42)continue;
                 const auto&tensor=runtime->model->tensors[index];
                 std::uint64_t elements=1;
                 for(auto dimension:tensor.shape)elements*=dimension;
-                const std::uint64_t block=type==42?64:32;
-                if(elements==0||elements%block)
+                if(elements==0||elements%64)
                     throw std::runtime_error(
-                        (type==42?"Q2_0 tensor \"":"IQ4_NL tensor \"")+tensor.name+
-                        "\" is not a whole number of "+std::to_string(block)+
-                        "-value blocks and cannot be converted to Q8_0, which "
-                        "is the only form its consumer can read");
+                        "Q2_0 tensor \""+tensor.name+
+                        "\" is not a whole number of 64-value blocks and "
+                        "cannot be converted to Q8_0, which is the only form "
+                        "its consumer can read");
                 runtime->device_tensor_types[index]=8;
                 ++converted;
                 growth+=(elements/32)*kQ8BlockSize-tensor.size;
@@ -16714,7 +16838,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             if(converted){
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
-                    "[flyweight] Q2_0/IQ4_NL dense requant: %llu tensors to "
+                    "[flyweight] Q2_0 dense requant: %llu tensors to "
                     "Q8_0 (%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
@@ -17408,14 +17532,28 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // attention layer's live window (K and V), not the whole cache.
         // q8_0 shares the buffer: staged for the same reason, and the same
         // f16 window once expanded.
+        // A 16-bit sliding window that has wrapped its ring is copied here
+        // too, then fed to the same GEMM. Only the window is staged, not the
+        // full-context layers: those stay contiguous until the context itself
+        // is full, and sizing the buffer to that would be the KV cache again.
         auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
-        if(stages_kv(runtime->options.cache_type_k)
-           ||stages_kv(runtime->options.cache_type_v)){
+        const bool stage_quant=stages_kv(runtime->options.cache_type_k)
+            ||stages_kv(runtime->options.cache_type_v);
+        const int stage_k=runtime->options.cache_type_k;
+        const int stage_v=runtime->options.cache_type_v;
+        const bool stage_swa=(stage_k==1||stage_k==2)&&stage_k==stage_v&&
+            std::any_of(runtime->layers.begin(),runtime->layers.end(),
+                [](const QwenLayerPlan& layer){return layer.attention_window!=0;});
+        if(stage_quant||stage_swa){
             std::uint64_t widest=0;
             for(const auto& layer:runtime->layers){
                 if(!layer.attention)continue;
-                widest=std::max<std::uint64_t>(widest,
-                    static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
+                if(stage_quant)
+                    widest=std::max<std::uint64_t>(widest,
+                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
+                else if(layer.attention_window)
+                    widest=std::max<std::uint64_t>(widest,
+                        static_cast<std::uint64_t>(layer.kv_heads)*layer.attention_window*layer.head_dim);
             }
             if(widest){
                 runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
@@ -17655,8 +17793,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     for(std::uint64_t i=0;i<elements;++i)
                         widened[i]=qwen_bf16_value(halves[i]);
                 }else{
+                    // NVFP4's weight_scale_2 is not in the block. Q8_0 has to
+                    // carry it or an NVFP4 head (the one dense consumer that
+                    // still converts) is ~1e4 times too large.
+                    const float nvfp4_scale=t.type==40
+                        ?qwen_nvfp4_weight_scale(*runtime,static_cast<std::size_t>(index))
+                        :1.0f;
                     for(std::uint64_t i=0;i<elements;++i)
-                        widened[i]=tensor_value(source,t.type,i);
+                        widened[i]=tensor_value(source,t.type,i)*nvfp4_scale;
                 }
                 pack_q8_0(widened.data(),elements,packed.data());
                 if(flyweight_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
@@ -18151,13 +18295,26 @@ inline const char* kv_gqa_mma_kernel(
     if(!enabled||kv_heads<=0)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
-    // Two instantiated shapes: 256-dim heads in groups of 8, which fill the
-    // mma's 8-wide query tile exactly, and 128-dim heads in groups of 4,
-    // which leave half of it idle and still come out ahead of the per-head
-    // kernels. Anything else falls through to the grouped-rows kernel.
+    // Three instantiated shapes: 256-dim heads in groups of 8, which fill the
+    // mma's 8-wide query tile exactly; 128-dim heads in groups of 4, which
+    // leave half of it idle; and 128-dim heads in groups of 16 (Muse), which
+    // are two full tiles of 8 sharing one load of the cache row. Anything
+    // else falls through to the grouped-rows kernel.
     const bool wide=head_dim==256&&heads==kv_heads*8;
     const bool narrow_heads=head_dim==128&&heads==kv_heads*4;
-    if(!wide&&!narrow_heads)return nullptr;
+    const bool group16=head_dim==128&&heads==kv_heads*16;
+    if(!wide&&!narrow_heads&&!group16)return nullptr;
+    if(group16){
+        const char* name=
+            t==3?(tile==128?"kv_attention_gqa_mma_q8_128_s16_t128":
+                  tile==256?"kv_attention_gqa_mma_q8_128_s16_t256":nullptr):
+            t==2?(tile==128?"kv_attention_gqa_mma_bf16_128_s16_t128":
+                  tile==256?"kv_attention_gqa_mma_bf16_128_s16_t256":nullptr):
+            t==1?(tile==128?"kv_attention_gqa_mma_f16_128_s16_t128":
+                  tile==256?"kv_attention_gqa_mma_f16_128_s16_t256":nullptr):
+            nullptr;
+        return name&&flyweight_gpu_kernel_available(name)?name:nullptr;
+    }
     if(tile!=256&&tile!=512)return nullptr;
     const bool narrow=tile==256;
     const char* name=wide?(
@@ -18184,17 +18341,27 @@ inline int kv_fused_record_stride(int width){return width+2;}
 // head_dim + 2 of them, so a 256-token tile overruns a *full* context by a
 // fraction of a percent -- which is exactly when the 512 twin is picked.
 inline int kv_gqa_rows_tile_tokens(
-    const FlyweightV2QwenRuntime& r,int tokens
+    const FlyweightV2QwenRuntime& r,int tokens,
+    int head_dim=0,int heads=0,int kv_heads=0
 ){
     // Narrowest first: the narrow tile is faster at every measured context
     // because it fills the device, where a wide tile on two KV heads is a
     // handful of blocks. The wide twin exists for the case the narrow one
     // cannot serve rather than because it is ever preferred.
-    for(const int tile:{256,512}){
+    // A 16-way group starts at 128. That is one 16-key step per warp, and on
+    // two KV heads a 256-token tile is only a few blocks.
+    const int share=kv_heads>0&&heads%kv_heads==0?heads/kv_heads:0;
+    const bool group16=head_dim==128&&share==16;
+    const int stride=kv_fused_record_stride(group16?128:256);
+    const int candidates[3]={group16?128:256,group16?256:512,512};
+    int previous=-1;
+    for(const int tile:candidates){
+        if(tile==previous)continue;
+        previous=tile;
         const std::uint64_t records=
             (static_cast<std::uint64_t>(tokens)+tile-1)/tile;
         if(records==0||records>512)continue;
-        if(records*kv_fused_record_stride(256)>
+        if(records*static_cast<std::uint64_t>(stride)>
            static_cast<std::uint64_t>(r.options.context_limit))continue;
         return tile;
     }
@@ -18369,6 +18536,44 @@ inline bool qwen_turbo_cublas_attention(
     return true;
 }
 
+// cuBLAS attention for a 16-bit cache whose live window has wrapped the ring.
+// The linear entry point declines that case (it needs first + tokens <=
+// capacity). Copy K and V into the staging buffer, then run the same GEMM
+// on the unwrapped span. A false return leaves the query untouched so the
+// caller can take the fused or serial path. Below the cuBLAS token threshold
+// this stays out of the way: the short window is cheaper on the other kernels.
+inline bool qwen_unwrap_cublas_attention(
+    FlyweightV2QwenRuntime& runtime, std::uint64_t queries, std::uint64_t query_f16,
+    std::uint64_t cache_keys, std::uint64_t cache_values, std::uint64_t scores_f16,
+    std::uint64_t attended, int heads, int kv_heads, int head_dim,
+    int tokens, int capacity, int first_slot, float scale
+){
+    const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
+    if(ck!=cv||(ck!=1&&ck!=2))return false;
+    if(tokens<qwen_cublas_attention_min_tokens())return false;
+    if(first_slot<0||tokens<=0||capacity<=0||kv_heads<=0||heads%kv_heads!=0)
+        return false;
+    if(first_slot+tokens<=capacity)return false;
+    if(!runtime.turbo_kv_stage)return false;
+    const std::uint64_t bytes=static_cast<std::uint64_t>(kv_heads)
+        *static_cast<std::uint64_t>(tokens)*static_cast<std::uint64_t>(head_dim)
+        *sizeof(std::uint16_t);
+    if(bytes>runtime.turbo_kv_stage_stride)return false;
+    std::uint64_t stage_keys=runtime.turbo_kv_stage;
+    std::uint64_t stage_values=runtime.turbo_kv_stage+runtime.turbo_kv_stage_stride;
+    auto copy=[&](std::uint64_t source,std::uint64_t destination){
+        void*args[]={&source,&destination,&kv_heads,&head_dim,&tokens,&capacity,&first_slot};
+        return flyweight_gpu_launch_named(
+            "kv_ring_unwrap_16",static_cast<std::uint32_t>(tokens),
+            static_cast<std::uint32_t>(kv_heads),128,0,runtime.stream,args)==0;
+    };
+    if(!copy(cache_keys,stage_keys)||!copy(cache_values,stage_values))return false;
+    const int linear=tokens,origin=0;
+    return flyweight_gpu_attention_16bit_cublas(
+        ck,queries,query_f16,stage_keys,stage_values,scores_f16,attended,
+        runtime.stream,heads,kv_heads,head_dim,tokens,linear,origin,scale)==0;
+}
+
 extern "C++" {
 // Decode attention for a 128-dim head: the paths the Qwen dispatch takes at
 // that width, in the same order -- cuBLAS tensor-core GQA where the cache is
@@ -18392,7 +18597,7 @@ void qwen_decode_attention_128(
     // (same tile rule and partial-record layout as the fused tiles, so the
     // 128-dim merge serves both).
     const int gqa_tile_tokens=runtime.fused_attention
-        ? kv_gqa_rows_tile_tokens(runtime,tokens) : 0;
+        ? kv_gqa_rows_tile_tokens(runtime,tokens,head_dim,heads,kv_heads) : 0;
     const char* mma_tiles=gqa_tile_tokens
         ? kv_gqa_mma_kernel(runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
         : nullptr;
@@ -18424,7 +18629,11 @@ void qwen_decode_attention_128(
             runtime.options.cache_type_k,
             queries,scratch,cache_keys,cache_values,attention_scores,attended,
             runtime.stream,heads,kv_heads,head_dim,tokens,capacity,first_slot,
-            scale)==0);
+            scale)==0)||
+        qwen_unwrap_cublas_attention(
+            runtime,queries,scratch,cache_keys,cache_values,
+            attention_scores,attended,heads,kv_heads,head_dim,
+            tokens,capacity,first_slot,scale);
     const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
     const bool fused_ok=runtime.fused_attention&&fused_tiles&&head_dim==128&&
         heads/kv_heads<=8&&tile_count<=512&&
@@ -18492,7 +18701,8 @@ void qwen_mtp_dense_projection(
         default: {
             const int status = qwen_matvec_driver(
                 type, matrix, input, output, input_size, output_size,
-                runtime.stream);
+                runtime.stream,
+                qwen_nvfp4_weight_scale(runtime, tensor_index_value));
             if (status == 0) return;
             if (status == kQwenMatvecUnsupported)
                 throw std::runtime_error(
@@ -19178,7 +19388,8 @@ std::uint32_t qwen4exp_mtp_draft(
     int vocabulary = static_cast<int>(config.vocabulary_size);
     auto lm_head = runtime.device_tensors[runtime.lm_head];
     if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime.lm_head_type);
-        lm_q8_kernel && qwen_q8_head_enabled() && (hidden_size & 255) == 0) {
+        lm_q8_kernel && qwen_q8_head_enabled() &&
+        qwen_q8_row_fits(runtime.lm_head_type, hidden_size)) {
         void* quant_args[] = {const_cast<std::uint64_t*>(&normalized),
                               const_cast<std::uint64_t*>(&draft_q8),
                               const_cast<std::uint64_t*>(&draft_q8_scales),
@@ -19370,7 +19581,8 @@ std::uint32_t qwen_mtp_draft(
     if(flyweight_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native MTP argmax reset failed");
     int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
     if(const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
-       lm_q8_kernel&&qwen_q8_head_enabled()&&(hidden_size&255)==0){
+       lm_q8_kernel&&qwen_q8_head_enabled()&&
+       qwen_q8_row_fits(runtime.lm_head_type, hidden_size)){
         void*quant_args[]={const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&draft_q8),const_cast<std::uint64_t*>(&draft_q8_scales),const_cast<int*>(&hidden_size)};
         if(flyweight_gpu_launch_named("quantize_q8_blocks",(hidden_size+31)/32,1,32,0,runtime.stream,quant_args)!=0)throw std::runtime_error("native MTP activation quantization failed");
         void*lm_args[]={&lm_head,const_cast<std::uint64_t*>(&draft_q8),const_cast<std::uint64_t*>(&draft_q8_scales),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};
@@ -21389,8 +21601,11 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     // DP4A matvec instead of reconstructing every weight in f32. Requires a
     // superblock-aligned row so the Q8 blocks line up with the weight groups.
     auto q8_decode=[&](const char*kernel,std::uint64_t matrix,std::uint64_t input,
-                       std::uint64_t output,int input_size,int output_size){
-        if(!iq2_q8_enabled||(input_size&255))return false;
+                       std::uint64_t output,int input_size,int output_size,
+                       bool flat32){
+        // Super-block formats need a multiple of 256. Flat 32-wide blocks
+        // (IQ4_NL) line up with one Q8 group, so a multiple of 32 is enough.
+        if(!iq2_q8_enabled||(flat32?(input_size&31):(input_size&255)))return false;
         // q/k/v and gate/up all project the same normalized vector, so the
         // quantization is hoisted out of the repeats. Only `normalized` is
         // memoized: every other source buffer is rewritten in place by kernels
@@ -21429,8 +21644,11 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
         const auto*format=flyweight::v2::qwen_format(type);
         if(format&&format->matvec_q8_warp&&
-           q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size))return;
-        const int status=qwen_matvec_driver(type,matrix,input,output,input_size,output_size,launch_stream);
+           q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size,
+                     format->q8_flat32))return;
+        const int status=qwen_matvec_driver(
+            type,matrix,input,output,input_size,output_size,launch_stream,
+            qwen_nvfp4_weight_scale(*runtime,index));
         if(status==0)return;
         if(status==kQwenMatvecUnsupported)
             throw std::runtime_error("native Qwen dense projection type is unsupported: "+std::to_string(type));
@@ -21832,12 +22050,16 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
             std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
             // The q_norm weights already carry qk_scale_factor, so the score
-            // scale is the plain 1/sqrt(head_dim).
+            // scale is the plain 1/sqrt(head_dim). `first` is free: the roped
+            // key was stored above. It is the f16 query scratch the cuBLAS
+            // path writes. GQA here is 16, so the fused tiles decline and the
+            // 16-way tensor-core kernel runs (f32 softmax, one shared load of
+            // the cache row). cuBLAS, including a wrapped window, is the
+            // fallback when that kernel's partial records do not fit.
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            void*score_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
-            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
-            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            qwen_decode_attention_128(*runtime,launch_named,queries,first,
+                cache_keys,cache_values,attention_scores,attended,
+                heads,kv_heads,head_dim,tokens,capacity,first_slot,scale);
             std::uint64_t gated=third;
             int gate_elements=q_size;
             void*gate_args[]={&attended,const_cast<std::uint64_t*>(&gates),&gated,
@@ -22074,7 +22296,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             // mutates `attended` on the way through and turbo staging rotates
             // the query in place, neither of which is worth undoing.
             const int gqa_tile_tokens=runtime->fused_attention
-                ? kv_gqa_rows_tile_tokens(*runtime,tokens) : 0;
+                ? kv_gqa_rows_tile_tokens(*runtime,tokens,head_dim,heads,kv_heads) : 0;
             const char* mma_tiles=gqa_tile_tokens
                 ? kv_gqa_mma_kernel(
                       *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
@@ -22593,7 +22815,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     // has a group-decode kernel, quantize the activation once and use it; the
     // fused per-element head remains the fallback.
     const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime->lm_head_type);
-    if(lm_q8_kernel&&iq2_q8_enabled&&(hidden_size&255)==0){
+    if(lm_q8_kernel&&iq2_q8_enabled&&
+       qwen_q8_row_fits(runtime->lm_head_type, hidden_size)){
         if(normalized!=q8_cached_input){
             void*quant_args[]={const_cast<std::uint64_t*>(&normalized),
                 const_cast<std::uint64_t*>(&dense_q8),
@@ -22804,7 +23027,8 @@ static std::uint32_t qwen_sample_last_logits(
         if(projected!=0)
             throw std::runtime_error(
                 "native Gemma 4 sampling LM-head projection failed");
-    }else if(q8_kernel&&(hidden&255)==0&&q8_input&&q8_scales){
+    }else if(q8_kernel&&qwen_q8_row_fits(runtime.lm_head_type, hidden)&&
+            q8_input&&q8_scales){
         void*quantize_args[]={
             const_cast<std::uint64_t*>(&runtime.last_sampling_normalized),
             const_cast<std::uint64_t*>(&q8_input),
@@ -25743,8 +25967,8 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
     std::uint64_t active_dense_q8 = 0, active_dense_q8_scales = 0;
     auto q8_decode = [&](const char* kernel, std::uint64_t matrix,
                          std::uint64_t input, std::uint64_t output,
-                         int in_size, int out_size) {
-        if (!iq2_q8_enabled || (in_size & 255) ||
+                         int in_size, int out_size, bool flat32) {
+        if (!iq2_q8_enabled || (flat32 ? (in_size & 31) : (in_size & 255)) ||
             !active_dense_q8 || !active_dense_q8_scales) return false;
         if (input != q8_cached_normalized || input != q8_cached_input) {
             void* quant_args[] = {
@@ -25769,9 +25993,11 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         if (type == 30) { void* args[] = {&matrix, &input, &output, &out_size, &in_size}; launch_named("bf16_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
         const auto* format = flyweight::v2::qwen_format(type);
         if (format && format->matvec_q8_warp &&
-            q8_decode(format->matvec_q8_warp, matrix, input, output, in_size, out_size)) return;
+            q8_decode(format->matvec_q8_warp, matrix, input, output, in_size, out_size,
+                      format->q8_flat32)) return;
         const int status = qwen_matvec_driver(
-            type, matrix, input, output, in_size, out_size, runtime->stream);
+            type, matrix, input, output, in_size, out_size, runtime->stream,
+            qwen_nvfp4_weight_scale(*runtime, index));
         if (status == 0) return;
         if (status == kQwenMatvecUnsupported)
             throw std::runtime_error("native Qwen dense projection type is unsupported: " + std::to_string(type));
@@ -26347,7 +26573,9 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         // one place the batched decode still reconstructed the head in float,
         // per sequence, per token.
         if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime->lm_head_type);
-            lm_q8_kernel && iq2_q8_enabled && (hidden_size & 255) == 0 && s.dense_q8 && s.dense_q8_scales) {
+            lm_q8_kernel && iq2_q8_enabled &&
+            qwen_q8_row_fits(runtime->lm_head_type, hidden_size) &&
+            s.dense_q8 && s.dense_q8_scales) {
             void* quant_args[] = {const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.dense_q8), const_cast<std::uint64_t*>(&s.dense_q8_scales), const_cast<int*>(&hidden_size)};
             launch_named("quantize_q8_blocks", (hidden_size + 31) / 32, 1, 32, quant_args);
             void* lm_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.dense_q8), const_cast<std::uint64_t*>(&s.dense_q8_scales), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};

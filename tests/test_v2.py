@@ -521,6 +521,16 @@ class V2RuntimeTests(unittest.TestCase):
                 self.assertIn(symbol, kernels)
                 self.assertIn(symbol, driver)
                 self.assertIn(symbol, runtime)
+        # Muse Glimmer is 16 query heads per KV head at dim 128. m16n8k16's N
+        # is 8, so that group is two bands sharing one cache load, with the
+        # softmax still in f32 registers. Tiles start at 128 because two KV
+        # heads do not fill the GPU with a 256-token tile.
+        for precision in ("f16", "bf16", "q8"):
+            for tile in (128, 256):
+                symbol = f"kv_attention_gqa_mma_{precision}_128_s16_t{tile}"
+                self.assertIn(symbol, kernels)
+                self.assertIn(symbol, driver)
+                self.assertIn(symbol, runtime)
         # Below the instruction floor the kernels are not defined at all, and
         # the host asks the module rather than re-deriving the rule.
         self.assertIn("flyweight_gpu_kernel_available", driver)

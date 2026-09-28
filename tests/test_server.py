@@ -1551,6 +1551,66 @@ class InferenceServiceTests(unittest.TestCase):
             len(self.generator.tokenizer.encode_messages(frozen)),
         )
 
+    def test_anthropic_strip_total_tokens_absorbs_inserted_counters(self) -> None:
+        # Measured live on a 93k-token Claude Code session: pinning the
+        # counter's value left the client free to INSERT a fresh
+        # `counter + blank line` block mid-history on every request, so the
+        # divergence point marched 18 tokens per turn (42926 -> 42944 ->
+        # 42962 -> ...) and reuse sat on the checkpoint rung below it no
+        # matter how dense the ladder was. Stripped, the turn that gained
+        # only a counter renders byte for byte as the turn before it did,
+        # and the prompt stays a pure extension of the history -- the
+        # property a prefix cache needs, which pinning alone cannot buy.
+        counter = "<total_tokens>14904921 tokens left</total_tokens>\n\n"
+        turn_a = {
+            "system": "Rules.\n\n<total_tokens>14904636 tokens left</total_tokens>",
+            "messages": [
+                {"role": "user", "content": "Fix it"},
+                {"role": "assistant", "content": "On it"},
+            ],
+            "max_tokens": 4,
+        }
+        turn_b = {
+            "system": "Rules.\n\n<total_tokens>14904636 tokens left</total_tokens>",
+            "messages": [
+                {"role": "user", "content": counter + "Fix it"},
+                {"role": "assistant", "content": "On it"},
+                {"role": "user", "content": "Next?"},
+            ],
+            "max_tokens": 4,
+        }
+        self.service.strip_total_tokens = True
+        self.service.anthropic_message(turn_a)
+        stripped_a = self.generator.calls[-1][0]
+        self.service.anthropic_message(turn_b)
+        stripped_b = self.generator.calls[-1][0]
+
+        self.assertNotIn(
+            "<total_tokens>", "\n".join(str(turn) for turn in stripped_b)
+        )
+        # The system field keeps its text minus the trailing counter, and
+        # turn B's rendered history is turn A's, byte for byte, plus the
+        # new turn.
+        self.assertEqual(stripped_a[0]["content"], "Rules.\n\n")
+        self.assertEqual(stripped_b[: len(stripped_a)], stripped_a)
+        # The count path renders the same way, so the client's own context
+        # arithmetic agrees with the prompt the model will see.
+        self.assertEqual(
+            self.service.count_anthropic_input(turn_b)["input_tokens"],
+            len(self.generator.tokenizer.encode_messages(stripped_b)),
+        )
+        # And the client's payload is not mutated behind its back.
+        self.assertIn("14904921", turn_b["messages"][0]["content"])
+
+        # Pinning beside it changes nothing: strip already ran and there is
+        # nothing left to pin.
+        self.service.freeze_total_tokens = True
+        self.service.anthropic_message(turn_b)
+        self.assertNotIn(
+            "<total_tokens>",
+            "\n".join(str(turn) for turn in self.generator.calls[-1][0]),
+        )
+
     def test_anthropic_protocol_validation_and_options(self) -> None:
         with self.assertRaisesRegex(APIError, "max_tokens"):
             self.service.anthropic_message(

@@ -422,7 +422,11 @@ void qwen_forward_rows(
         // path-parity harness compare chunked against single-token prefill
         // bit for bit; with the Q8 kernels on, the tensor-core MMQ and the
         // warp kernel accumulate in different orders.
-        if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0&&
+        // Flat 32-wide formats (IQ4_NL) take this block for any multiple of 32.
+        // Super-block formats still need a multiple of 256: their Q8 kernels
+        // address a tail as if it were eight independent groups.
+        const bool q8_width_ok=format&&qwen_q8_row_fits(type,input_size);
+        if((experts>0?(rows<=8||batched_kernel):true)&&q8_width_ok&&
            format&&format->rows_q8_gate&&qwen_q8_head_enabled())
             q8_kernel=format->matvec_q8_warp;
         if(q8_kernel){
@@ -478,7 +482,10 @@ void qwen_forward_rows(
                 if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                     small_narrow=it->second.c_str();
             }
-            if((rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&runtime.int8_tensor_cores){
+            // MMQ tiles K in super-blocks, so a row that is only a multiple of
+            // 32 stays on the tiled or rows kernel below.
+            if((input_size&255)==0&&(rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&
+               runtime.int8_tensor_cores){
                 const auto mmq_shape=qwen_mmq_shape();
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
                 const int mmq_threads=mmq_min?kQ8MmqMinThreads:mmq_shape.threads();
@@ -621,25 +628,29 @@ void qwen_forward_rows(
             }
             return;
         }
-        // Dense NVFP4 through the Blackwell FP4 tensor cores, same path and
-        // threshold as the streamed experts (scale is 1: dense tensors fold
-        // weight_scale_2 into their E4M3 block scales). Declines -- pre-FP4
-        // hardware, or a chunk below the threshold -- fall through to the
-        // shared-tile kernel the format table names.
-        // The cached variant, never the plain one: dense matrices sit at
-        // fixed arena addresses, so their cuBLASLt repack is done once and
-        // every later chunk skips straight to the GEMM. `staged` weights are
-        // excluded -- a staging buffer's address does not identify its
-        // contents, which is exactly the aliasing the cache must never see.
-        if(type==40&&!staged){
+        // Dense NVFP4. weight_scale_2 is 1 when the quantizer folded it into
+        // the E4M3 blocks, and the sibling `.scale` value otherwise. The
+        // cached cuBLAS path is the Blackwell GEMM; it declines on pre-FP4
+        // hardware, on a short chunk, and on staged weights (a staging
+        // buffer's address does not identify its contents). The tile kernel
+        // takes the same scale and covers every other case, including a
+        // spilled block uploaded for this batch.
+        if(type==40){
+            const float scale=qwen_nvfp4_weight_scale(runtime,index);
             const int tc_min_rows=qwen_nvfp4_prefill_tc_rows(runtime);
-            if(tc_min_rows>0&&rows>=tc_min_rows&&
+            if(!staged&&tc_min_rows>0&&rows>=tc_min_rows&&
                flyweight_gpu_nvfp4_matmul_cublas_cached(
                    matrix,input,output,runtime.stream,
-                   input_size,output_size,rows,1.0f)==0){
+                   input_size,output_size,rows,scale)==0){
                 dense_trace("nvfp4_matmul_cublas");
                 return;
             }
+            void*nvfp4_args[]={&matrix,&input,&output,&input_size,&output_size,
+                               &rows,const_cast<float*>(&scale)};
+            launch("nvfp4_matmul_tiled",(output_size+31)/32,
+                   (static_cast<std::uint32_t>(rows)+31)/32,256,nvfp4_args);
+            dense_trace("nvfp4_matmul_tiled");
+            return;
         }
         // The reconstruct-in-float batch matmul, one launch for the whole
         // chunk. A format without one (a *future* format: every current type
@@ -3012,7 +3023,8 @@ void qwen_forward_rows(
             const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
             const char*lm_setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
             const bool lm_q8_enabled=!lm_setting||lm_setting[0]!='0';
-            if(lm_q8_kernel&&lm_q8_enabled&&(hidden_size&255)==0){
+            if(lm_q8_kernel&&lm_q8_enabled&&
+               qwen_q8_row_fits(runtime.lm_head_type, hidden_size)){
                 // Same trade the decode path makes: quantize the activation to
                 // Q8 blocks and run the group-decode head instead of
                 // reconstructing every weight in float. The head is the largest

@@ -903,8 +903,16 @@ checkpoint's generation_config.json says.\
         help="pin the <total_tokens>N tokens left</total_tokens> counter "
              "Claude Code rewrites in the history on every request, so the "
              "prompt cache reuses the whole conversation instead of "
-             "re-evaluating everything after the counter each turn; "
-             "/v1/messages only",
+             "re-evaluating everything after the counter each turn; prefer "
+             "--strip-total-tokens, which also covers a counter the client "
+             "inserts rather than rewrites; /v1/messages only",
+    )
+    limits.add_argument(
+        "--strip-total-tokens", action="store_true",
+        help="delete those counters from the rendered history instead of "
+             "pinning them, so a counter Claude Code inserts or moves "
+             "mid-history cannot split the prompt either; supersedes "
+             "--freeze-total-tokens when both are given; /v1/messages only",
     )
     _add_backend_option(
         serve.add_argument_group(
@@ -1729,6 +1737,7 @@ def _serve_http(args: argparse.Namespace, service) -> int:
     # Every service class inherits the attribute from InferenceService; one
     # assignment here beats threading a keyword through their constructors.
     service.freeze_total_tokens = bool(getattr(args, "freeze_total_tokens", False))
+    service.strip_total_tokens = bool(getattr(args, "strip_total_tokens", False))
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(
