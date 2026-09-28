@@ -15,7 +15,7 @@ split between the two, and the runtime measures what fits rather than asking.
 | K2-Horizon (dense, MoVA) | GGUF | Grouped norms, softplus attention gate; the MoVA value experts page through their own cache |
 | Gemma 4 | GGUF | Routed experts must be Q4_0 (the QAT release); no MTP |
 | Laguna 2.1 | GGUF | Per-head attention gate; no MTP |
-| Muse Glimmer | GGUF | Channel-tagged reasoning; no speculative decoding |
+| Muse Glimmer | GGUF | Channel-tagged reasoning; native ATEM tool calls; no speculative decoding |
 
 Image generation with [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
 or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (RGBA out)
@@ -192,6 +192,38 @@ studio when `--image-model` is set, and an inspector that keeps each
 request's body, SSE frames and an equivalent `curl` line. Conversations live
 in the browser's IndexedDB; the API key lives in session storage.
 
+### Codex CLI
+
+Codex CLI can use Flyweight as a custom provider through its Responses API.
+Start Flyweight with an API key if you want the local endpoint authenticated:
+
+~~~bash
+FLYWEIGHT_API_KEY=local-dev-key flyweight serve model.gguf
+~~~
+
+Add a provider to `~/.codex/config.toml`:
+
+~~~toml
+model_provider = "flyweight"
+model = "local"
+model_reasoning_effort = "medium"
+
+[model_providers.flyweight]
+name = "Flyweight"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+~~~
+
+Set `OPENAI_API_KEY=local-dev-key` in the shell that launches Codex when the
+server uses `FLYWEIGHT_API_KEY`. If the server has no API key configured,
+`env_key` can be omitted. Use the model name reported by `GET /v1/models` if
+you enabled `--strict-model`.
+
+Codex may include built-in Responses tools such as hosted web search in its
+request. Flyweight ignores non-function tool entries; function tools are
+passed through to the model and returned for Codex to execute.
+
 ## API
 
 | Route | Protocol |
@@ -246,9 +278,11 @@ Declared tools are enforced by a sampler grammar: the name must be declared,
 required parameters present, array and object values well-formed JSON.
 `response_format` (`json_object`, `json_schema`; `text.format` on
 `/v1/responses`) is enforced the same way. Tool-call arguments stream
-incrementally. DeepSeek-V4, BailingMoE3 and K2-Horizon render tools through
-their own templates and are parsed but not grammar-enforced; every other
-family gets the Hermes-style tool prompt and the grammar.
+incrementally where the format supports it. DeepSeek-V4, BailingMoE3 and
+K2-Horizon render tools through their own templates and are parsed but not
+grammar-enforced; Muse Glimmer uses its native ATEM format and supports one
+tool call per turn. Other families get the Hermes-style tool prompt and
+grammar.
 `parallel_tool_calls: false` caps a turn at one call, and
 `--max-tool-call-tokens` bounds a runaway one.
 

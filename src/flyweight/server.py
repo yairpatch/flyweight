@@ -209,6 +209,17 @@ DSML_PARAMETER_PATTERN = re.compile(
     r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)">'
     r'(.*?)</｜DSML｜parameter>', re.DOTALL
 )
+ATEM_TOOL_CALL_MARKER = "<atem:function_calls>"
+ATEM_TOOL_CALL_END_MARKER = "</atem:function_calls>"
+ATEM_TOOL_CALL_BLOCK_PATTERN = re.compile(
+    r"<atem:function_calls>\s*(.*?)\s*</atem:function_calls>", re.DOTALL
+)
+ATEM_INVOKE_PATTERN = re.compile(
+    r'<atem:invoke\s+name="([^"]+)">\s*(.*?)\s*</atem:invoke>', re.DOTALL
+)
+ATEM_PARAMETER_PATTERN = re.compile(
+    r'<atem:parameter\s+name="([^"]+)">(.*?)</atem:parameter>', re.DOTALL
+)
 
 
 def _tool_markers(architecture: str | None) -> tuple[str, str]:
@@ -221,6 +232,8 @@ def _tool_markers(architecture: str | None) -> tuple[str, str]:
     """
     if architecture == "k2-horizon":
         return K2_TOOL_CALLS_MARKER, K2_TOOL_CALLS_END_MARKER
+    if architecture == "muse-glimmer":
+        return ATEM_TOOL_CALL_MARKER, ATEM_TOOL_CALL_END_MARKER
     return TOOL_CALL_MARKER, TOOL_CALL_END_MARKER
 
 
@@ -2005,10 +2018,16 @@ class InferenceService:
 
     def count_response_input(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         messages = _response_messages(
-            payload, allow_remote_images=self.allow_remote_images)
+            payload,
+            allow_remote_images=self.allow_remote_images,
+            architecture=getattr(self.generator.tokenizer, "architecture", None),
+        )
         tools = _response_tools(payload)
         if tools:
-            _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
+            _attach_response_tools(
+                messages, tools, payload.get("tool_choice"),
+                getattr(self.generator.tokenizer, "architecture", None),
+            )
         enable_thinking, reasoning_effort = self._reasoning_request(payload)
         tokens = self.generator.tokenizer.encode_messages(
             messages,
@@ -2131,7 +2150,10 @@ class InferenceService:
         history_messages = [dict(message) for message in messages]
         tools = _response_tools(payload)
         if tools:
-            _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
+            _attach_response_tools(
+                messages, tools, payload.get("tool_choice"),
+                getattr(self.generator.tokenizer, "architecture", None),
+            )
         request = self._prepare_generation(
             payload,
             messages,
@@ -2142,7 +2164,7 @@ class InferenceService:
         with self._generation_guard():
             result = self._generate_request(request, tools=tools, progress=progress)
         response = self._response_object(payload, result)
-        self._store_response(response, history_messages, result)
+        self._store_response(response, history_messages, result, tools=tools)
         return response
 
     def stream_response(
@@ -2157,7 +2179,10 @@ class InferenceService:
         history_messages = [dict(message) for message in messages]
         tools = _response_tools(payload)
         if tools:
-            _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
+            _attach_response_tools(
+                messages, tools, payload.get("tool_choice"),
+                getattr(self.generator.tokenizer, "architecture", None),
+            )
         request = self._prepare_generation(
             payload,
             messages,
@@ -2392,7 +2417,9 @@ class InferenceService:
                 message_id=message_id,
                 created_at=created_at,
             )
-            self._store_response(completed_response, history_messages, finish.result)
+            self._store_response(
+                completed_response, history_messages, finish.result, tools=tools
+            )
             yield numbered(
                 {
                     "type": (
@@ -2701,7 +2728,10 @@ class InferenceService:
         self, payload: Mapping[str, Any]
     ) -> list[dict[str, str]]:
         current = _response_messages(
-            payload, allow_remote_images=self.allow_remote_images)
+            payload,
+            allow_remote_images=self.allow_remote_images,
+            architecture=getattr(self.generator.tokenizer, "architecture", None),
+        )
         previous_id = payload.get("previous_response_id")
         if previous_id is None:
             return current
@@ -2729,11 +2759,21 @@ class InferenceService:
         response: dict[str, Any],
         messages: list[dict[str, str]],
         result: GenerationResult,
+        *,
+        tools: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         if not response["store"]:
             return
         history = [dict(message) for message in messages]
-        history.append({"role": "assistant", "content": result.text})
+        architecture = getattr(self.generator.tokenizer, "architecture", None)
+        if architecture == "muse-glimmer" and tools:
+            content, calls = _parse_tool_calls(result.text, tools=tools)
+            assistant: dict[str, Any] = {"role": "assistant", "content": content or ""}
+            if calls:
+                assistant["tool_calls"] = _template_tool_calls(calls, architecture)
+            history.append(assistant)
+        else:
+            history.append({"role": "assistant", "content": result.text})
         with self._response_lock:
             self._response_records[response["id"]] = (response, history)
             self._response_records.move_to_end(response["id"])
@@ -2902,6 +2942,8 @@ class InferenceService:
             single_tool_call=(
                 payload.get("parallel_tool_calls") is False
                 or payload.get("disable_parallel_tool_use") is True
+                or getattr(self.generator.tokenizer, "architecture", None)
+                == "muse-glimmer"
             ),
         )
 
@@ -4184,6 +4226,30 @@ def create_handler(
                         self.log_message("request decoding")
                         decoding_logged = True
                     if isinstance(event, dict):
+                        if event.get("type") in (
+                            "response.completed", "response.incomplete"
+                        ):
+                            response = event.get("response")
+                            if isinstance(response, Mapping):
+                                usage = response.get("usage")
+                                if isinstance(usage, Mapping):
+                                    produced = usage.get("output_tokens")
+                                    if isinstance(produced, int):
+                                        self._fw_decode_tokens = produced
+                                output = response.get("output")
+                                has_tool_call = (
+                                    isinstance(output, list)
+                                    and any(
+                                        isinstance(item, Mapping)
+                                        and item.get("type") == "function_call"
+                                        for item in output
+                                    )
+                                )
+                                self._fw_finish = (
+                                    "tool_calls" if has_tool_call
+                                    else "length" if response.get("status") == "incomplete"
+                                    else "stop"
+                                )
                         flyweight = event.get("flyweight")
                         if isinstance(flyweight, dict):
                             tokens = flyweight.get("generated_tokens")
@@ -4538,7 +4604,9 @@ def serve(
 # Architectures whose own chat template renders tools: the schemas, the call
 # markup and the result blocks. Anything else gets the generic Hermes prompt and
 # our own rendering, which is what a checkpoint without tool support needs.
-NATIVE_TOOL_ARCHITECTURES = ("deepseek4", "bailingmoe3", "k2-horizon")
+NATIVE_TOOL_ARCHITECTURES = (
+    "deepseek4", "bailingmoe3", "k2-horizon", "muse-glimmer"
+)
 
 
 def _template_tool_calls(
@@ -5470,6 +5538,13 @@ def _parse_tool_calls(
                     except json.JSONDecodeError:
                         arguments[key] = raw
             decoded.append((invoke.group(1), arguments, ""))
+    for block in ATEM_TOOL_CALL_BLOCK_PATTERN.finditer(text):
+        for invoke in ATEM_INVOKE_PATTERN.finditer(block.group(1)):
+            arguments = {
+                key: _infer_tool_value(value)
+                for key, value in ATEM_PARAMETER_PATTERN.findall(invoke.group(2))
+            }
+            decoded.append((invoke.group(1), arguments, ""))
     for name, arguments, following in decoded:
         if name is None:
             continue
@@ -5540,6 +5615,7 @@ def _parse_tool_calls(
         position for position in (
             text.find(TOOL_CALL_MARKER), text.find(DSML_TOOL_CALL_MARKER),
             text.find(K2_TOOL_CALLS_MARKER),
+            text.find(ATEM_TOOL_CALL_MARKER),
         ) if position != -1
     ]
     marker = min(markers) if markers else -1
@@ -6638,12 +6714,18 @@ def _response_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise APIError(400, "tools must be an array", parameter="tools")
     tools: list[dict[str, Any]] = []
     for index, tool in enumerate(value):
-        if not isinstance(tool, dict) or tool.get("type") != "function":
+        if not isinstance(tool, dict):
             raise APIError(
                 400,
-                f"tools[{index}] must be a function",
+                f"tools[{index}] must be an object",
                 parameter="tools",
             )
+        # Clients such as Codex include server-side built-ins (web search,
+        # code interpreter, etc.) in the same list as function tools. Those
+        # tools are executed by the client/provider, not by this local model
+        # runtime, so leave them out of the model's callable tool set.
+        if tool.get("type") != "function":
+            continue
         name = tool.get("name")
         parameters = tool.get("parameters", {})
         if not isinstance(name, str) or not name or not isinstance(parameters, dict):
@@ -6685,6 +6767,20 @@ def _prepend_tool_prompt(
         }
         return
     messages.insert(0, {"role": "system", "content": prompt})
+
+
+def _attach_response_tools(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+    architecture: str | None,
+) -> None:
+    """Give Responses tools to the architecture's own template when it has one."""
+    if architecture in NATIVE_TOOL_ARCHITECTURES:
+        if messages:
+            messages[0]["tools"] = list(tools)
+        return
+    _prepend_tool_prompt(messages, tools, tool_choice)
 
 
 def _response_output(
@@ -6736,7 +6832,8 @@ def _response_output(
 
 
 def _validate_response_input(
-    value: Any, *, allow_remote_images: bool = True
+    value: Any, *, allow_remote_images: bool = True,
+    architecture: str | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise APIError(400, "input must be a non-empty array", parameter="input")
@@ -6745,20 +6842,38 @@ def _validate_response_input(
         if not isinstance(item, dict):
             raise APIError(400, f"input[{index}] must be an object", parameter="input")
         item_type = item.get("type")
+        # Codex may replay the reasoning item returned by an earlier
+        # Responses call when it builds the next input array. Reasoning is
+        # model-private state rather than a user/assistant message, and this
+        # server does not accept caller-supplied reasoning as prompt text. Drop
+        # the item while retaining the surrounding messages and tool results.
+        if item_type == "reasoning":
+            continue
         if item_type == "function_call_output":
             output = item.get("output")
             if not isinstance(output, str):
                 raise APIError(400, "function output must be text", parameter="input")
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"<tool_response>\n{output}\n</tool_response>",
-                }
-            )
+            messages.append(_tool_turn(
+                output,
+                architecture=architecture,
+                tool_call_id=item.get("call_id"),
+            ))
             continue
         if item_type == "function_call":
             name = item.get("name")
             arguments = item.get("arguments", "{}")
+            if architecture in NATIVE_TOOL_ARCHITECTURES:
+                call = {
+                    "id": item.get("call_id", f"call_{uuid.uuid4().hex}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": _template_tool_calls([call], architecture),
+                })
+                continue
             rendered = _render_tool_calls(
                 "",
                 [{"function": {"name": name, "arguments": arguments}}],
@@ -6789,7 +6904,8 @@ def _validate_response_input(
 
 
 def _response_messages(
-    payload: Mapping[str, Any], *, allow_remote_images: bool = True
+    payload: Mapping[str, Any], *, allow_remote_images: bool = True,
+    architecture: str | None = None,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     instructions = payload.get("instructions")
@@ -6804,14 +6920,20 @@ def _response_messages(
         messages.append({"role": "user", "content": input_value})
     elif isinstance(input_value, list):
         messages.extend(_validate_response_input(
-            input_value, allow_remote_images=allow_remote_images))
+            input_value,
+            allow_remote_images=allow_remote_images,
+            architecture=architecture,
+        ))
     else:
         raise APIError(
             400, "input must be text or an array of messages", parameter="input"
         )
-    if messages[-1]["role"] != "user":
+    valid_last_roles = ("user", "tool") if architecture in NATIVE_TOOL_ARCHITECTURES else ("user",)
+    if not messages or messages[-1]["role"] not in valid_last_roles:
         raise APIError(
-            400, "the last input message must have role 'user'", parameter="input"
+            400,
+            "the last input message must be a user message or tool result",
+            parameter="input",
         )
     return messages
 
