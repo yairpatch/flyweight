@@ -94,8 +94,9 @@ class Q20Tests(unittest.TestCase):
         cls.both_path = root / "both.gguf"
         cls.both_spec = build_qwen4exp_gguf(
             cls.both_path, Qwen4ExpSpec(**SPEC), quantize=both)
-        # The GSQ-RCO layout on its other layers: IQ4_NL shared-expert down,
-        # a format with expert kernels but no dense matvec.
+        # The GSQ-RCO layout on its other layers: IQ4_NL shared-expert down.
+        # The row is 64 wide, a multiple of 32 and not of 256, which is the
+        # width the dense IQ4_NL kernels exist for.
         cls.iq4nl_path = root / "iq4nl.gguf"
         cls.iq4nl_spec = build_qwen4exp_gguf(
             cls.iq4nl_path, Qwen4ExpSpec(**SPEC),
@@ -200,8 +201,8 @@ class Q20Tests(unittest.TestCase):
         self.assertEqual(_generate_on_gpu(self.iq2s_path), _generate(self.iq2s_path))
 
     def test_an_iq4_nl_shared_expert_runs(self) -> None:
-        # Same requant for IQ4_NL, which until now only ever appeared on the
-        # routed experts and the PLE table.
+        # Dense IQ4_NL stays in its own type: the Q8 matvec covers a row that
+        # is only a multiple of 32, so prepare no longer expands it to Q8_0.
         rng = np.random.default_rng(5)
         name = "blk.2.ffn_down_shexp.weight"
         weights = self.iq4nl_spec.tensors[name]

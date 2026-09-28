@@ -21,8 +21,10 @@
 #include <cstring>
 #include "flyweight_v2_moe_align.hpp"
 
+#include <array>
 #include <cstdio>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "qwen_kquant.h"
@@ -149,6 +151,11 @@ const Format kQ20{
 const Format kQ80{
     kQ8BlockSize, fill_leading_scale<kQ8BlockSize>, qwen_q8_value, 32};
 
+std::size_t packed_row_bytes(const Format& format, int input_size) {
+    return static_cast<std::size_t>(input_size) / format.block_elements *
+           format.block_bytes;
+}
+
 // The kernel accumulates a row in f32 in a tree; the reference here does it in
 // double, elementwise, through the other decoder. The error that separates them
 // is bounded by the f32 epsilon times the magnitude *accumulated*, not the
@@ -192,18 +199,30 @@ const int kShapes[][2] = {
     {256, 8}, {512, 33}, {1024, 1}, {2048, 17},
 };
 
+// Super-block formats are only handed multiples of 256. A flat 32-wide block
+// (IQ4_NL) also has to be right when the row leaves a tail of groups.
+std::vector<std::pair<int, int>> matvec_shapes(const Format& format) {
+    std::vector<std::pair<int, int>> shapes;
+    for (const auto& shape : kShapes)
+        shapes.emplace_back(shape[0], shape[1]);
+    if (format.block_elements != 256) {
+        shapes.emplace_back(static_cast<int>(format.block_elements) * 9, 5);
+        shapes.emplace_back(static_cast<int>(format.block_elements) * 17, 3);
+    }
+    return shapes;
+}
+
 int check(const char* kernel, const Format& format, bool warp_tiled,
           std::uint32_t block) {
     std::mt19937 rng(20260816);
     std::uniform_real_distribution<float> real(-1.0f, 1.0f);
     float worst = 0.0f;
 
-    for (const auto& shape : kShapes) {
-        int input_size = shape[0];
-        int output_size = shape[1];
+    for (const auto& shape : matvec_shapes(format)) {
+        int input_size = shape.first;
+        int output_size = shape.second;
         std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(input_size) / 256 * output_size *
-            format.block_bytes);
+            packed_row_bytes(format, input_size) * output_size);
         format.fill(rng, packed);
         std::vector<float> vector(input_size);
         for (auto& value : vector) value = real(rng);
@@ -348,12 +367,11 @@ double reference_row(const Format& format,
 int check_q8(const char* kernel, const Format& format) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
-    for (const auto& shape : kShapes) {
-        int input_size = shape[0];
-        int output_size = shape[1];
+    for (const auto& shape : matvec_shapes(format)) {
+        int input_size = shape.first;
+        int output_size = shape.second;
         std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(input_size) / 256 * output_size *
-            format.block_bytes);
+            packed_row_bytes(format, input_size) * output_size);
         format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, 1);
 
@@ -384,14 +402,17 @@ int check_q8(const char* kernel, const Format& format) {
 int check_q8_rows(const char* kernel, const Format& format) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
-    // Row counts on and off the kernel's compile-time cap of 8.
+    // Row counts on and off the kernel's compile-time cap of 8. 512 is a
+    // whole number of super-blocks; a flat format also runs a tailed row.
+    std::vector<int> widths = {512};
+    if (format.block_elements != 256)
+        widths.push_back(static_cast<int>(format.block_elements) * 9);
+    for (int input_size : widths)
     for (int rows : {1, 5, 8}) {
-        int input_size = 512;
         int output_size = 9;
         int scale_stride = input_size / 32;
         std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(input_size) / 256 * output_size *
-            format.block_bytes);
+            packed_row_bytes(format, input_size) * output_size);
         format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, rows);
 
@@ -444,7 +465,7 @@ int check_q8_rows(const char* kernel, const Format& format) {
 // looking ~0.2 error. Must track FLYWEIGHT_Q8_TILE_* / FLYWEIGHT_MMQ_* in
 // native/include/flyweight_v2_qwen_kernels.hpp, like kQ8Tile*/kQ8Mmq* on the host.
 int check_tiled(const char* kernel, const Format& format,
-                std::uint32_t threads) {
+                std::uint32_t threads, bool tail = false) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
     // {input_size, output_size, tokens}. rows must stay <=
@@ -453,16 +474,17 @@ int check_tiled(const char* kernel, const Format& format,
     // with FLYWEIGHT_Q8_ROWS. A wider batch is dropped, not wrapped, so these sit
     // at and just under the cap. output_size values straddle the row tile and
     // input sizes straddle the 32-group K tile.
-    const int kCases[][3] = {
+    std::vector<std::array<int, 3>> cases = {
         {512, 9, 1},   {512, 9, 8},   {512, 9, 17},  {512, 9, 32},
         {2304, 5, 31}, {256, 3, 32},  {1024, 17, 7}, {512, 64, 32},
     };
-    for (const auto& c : kCases) {
+    if (tail)
+        cases.push_back({static_cast<int>(format.block_elements) * 9, 9, 7});
+    for (const auto& c : cases) {
         int input_size = c[0], output_size = c[1], rows = c[2];
         int scale_stride = input_size / 32;
         std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(input_size) / 256 * output_size *
-            format.block_bytes);
+            packed_row_bytes(format, input_size) * output_size);
         format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, rows);
 
@@ -492,12 +514,11 @@ int check_tiled(const char* kernel, const Format& format,
                                  threads, threads == 256 ? kMmqDynamicShared : 0, 0,
                                  arguments);
 
-        const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
+        const std::size_t row_bytes = packed_row_bytes(format, input_size);
         for (int token = 0; token < rows; ++token) {
             for (int out = 0; out < output_size; ++out) {
                 const std::uint8_t* base =
-                    packed.data() +
-                    static_cast<std::size_t>(out) * blocks * format.block_bytes;
+                    packed.data() + static_cast<std::size_t>(out) * row_bytes;
                 double dot = 0.0, magnitude = 0.0;
                 for (int index = 0; index < input_size; ++index) {
                     const std::size_t code_at =
@@ -1078,6 +1099,13 @@ int main() {
                                        "iq2xxs_grouped_accumulate_rows", kIq2xxs);
     failures += check_q8("iq4xs_q8_matvec_transposed_warp", kIq4xs);
     failures += check_q8_rows("iq4xs_q8_matvec_transposed_rows", kIq4xs);
+    // IQ4_NL's dense path, including rows that are not a multiple of 256.
+    // The float warp matvec is the fallback when the Q8 path is switched off.
+    failures += check("iq4nl_matvec_transposed_warp", kIq4nl, true, 256);
+    failures += check_q8("iq4nl_q8_matvec_transposed_warp", kIq4nl);
+    failures += check_q8_rows("iq4nl_q8_matvec_transposed_rows", kIq4nl);
+    failures += check_tiled("iq4nl_q8_matmul_tiled", kIq4nl, kTiledThreads, true);
+    failures += check_tiled("iq4nl_q8_mmq", kIq4nl, kMmqThreads);
     // The IQ1 pair through the Q8 path, where the delta is folded into the int8
     // weights: a sign error there is invisible to the f32 kernels above, which
     // never separate the delta from the weight. IQ1_M is the stricter of the

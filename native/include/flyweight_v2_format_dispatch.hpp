@@ -82,6 +82,11 @@ struct QwenFormatKernels {
 
     // Whether qwen_quant_dot can execute this type on the CPU expert path.
     bool cpu_expert = false;
+
+    // The Q8-activation kernels accept a row that is only a multiple of 32.
+    // Super-block formats stay on the 256-wide gate: their stride is not eight
+    // independent groups, so a tail would address off the end of a block.
+    bool q8_flat32 = false;
 };
 
 inline constexpr QwenFormatKernels kQwenFormats[] = {
@@ -267,18 +272,24 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .grouped_expert_prefix = "iq4xs", .cpu_expert = true},
     // IQ4_NL: IQ4_XS's non-superblock sibling (18B per 32 values, same
     // codebook, no sub-block scales). qwen4exp carries its ffn_down_exps and
-    // the PLE n-gram table in it; the table is host row-gathered, the experts
-    // run on the CPU dots or the grouped device kernels below.
+    // the PLE n-gram table in it; dense checkpoints (Muse Glimmer quant mixes)
+    // put it on the projections whose row is not a multiple of 256. The table
+    // is host row-gathered. The Q8 dense kernels take stride 144 and keep a
+    // 32-wide tail (q8_flat32); MMQ itself still requires a multiple of 256,
+    // and an unaligned row falls through to the tiled kernel.
     {.type = 20, .family = "iq4nl",
-     // No MMQ entry on purpose: the MMQ branch needs (in_size % 256) == 0 and
-     // this format's consumer here is the 640-wide expert down projection.
-     // The rows matmul is what puts IQ4_NL experts on the prefill expert-GEMM
-     // path -- stream_role_ok is a conjunction over gate/up/down, so without it
-     // a whole checkpoint's experts fall back to the decode-shaped grouped
-     // kernels that re-decode weights once per routed token.
+     .matvec_q8_warp = "iq4nl_q8_matvec_transposed_warp", .rows_q8_gate = true,
+     .matvec_q8_rows = "iq4nl_q8_matvec_transposed_rows",
+     .matmul_q8_tiled = "iq4nl_q8_matmul_tiled",
+     .matmul_q8_mmq = "iq4nl_q8_mmq", .mmq_dynamic_shared = true,
      .matmul_rows = "iq4nl_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     .grouped_expert_prefix = "iq4nl", .cpu_expert = true},
+     .lm_head_argmax = "iq4nl_lm_head_argmax_warp",
+     .lm_head_argmax_q8 = "iq4nl_q8_lm_head_argmax_warp",
+     .embedding = "qwen_iq4nl_embedding",
+     .embedding_rows = "qwen_iq4nl_embedding_rows",
+     .grouped_expert_prefix = "iq4nl", .cpu_expert = true,
+     .q8_flat32 = true},
     {.type = 29, .family = "iq1m",
      .matvec_q8_warp = "iq1m_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq1m_q8_matvec_transposed_rows",
@@ -313,10 +324,14 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     // expert stream short-circuits on type 40 before consulting this table,
     // because the expert kernels carry weight_scale_2). The entries below are
     // for the DENSE tensors of an all-NVFP4 checkpoint -- embedding table,
-    // attention/DeltaNet projections -- whose scales are folded into the E4M3
-    // blocks. The decode matvec lives in qwen_matvec_driver (its trailing
-    // scale argument does not fit the generic table launch); no LM-head
-    // argmax, so an NVFP4 head still converts to Q8_0 at prepare.
+    // attention projections. weight_scale_2 is either folded into the E4M3
+    // blocks or stored as a sibling `.scale` f32; the dense launches pass
+    // that factor (1 when it was folded). The decode matvec lives in
+    // qwen_matvec_driver (its trailing scale argument does not fit the
+    // generic table launch); no LM-head argmax, so an NVFP4 head still
+    // converts to Q8_0 at prepare. The tiled prefill kernel takes the same
+    // scale, so dense_rows launches it directly rather than through the
+    // six-argument format-table call.
     {.type = 40, .family = "nvfp4",
      .matmul_rows = "nvfp4_matmul_tiled",
      .matmul_rows_grid = RowsMatmulGrid::tiled32,
