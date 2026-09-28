@@ -373,6 +373,10 @@ struct QwenLayerPlan {
     bool ffn_on_host = false;
     std::uint32_t attention_window = 0; // 0 = global attention
     std::uint64_t cache_capacity = 0;
+    std::uint64_t prefill_expanded_offset = 0;
+    std::uint64_t prefill_expanded_bytes = 0;
+    std::uint64_t prefill_expanded_state = 0;
+    int prefill_expanded_tokens = 0;
     std::uint32_t attention_heads = 0, kv_heads = 0, head_dim = 0;
     std::uint32_t rotary_dim = 0, expert_tensor_count = 3;
     float rope_theta = 0.0f;
@@ -934,6 +938,8 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t turbo_kv_stage = 0;
     std::uint64_t turbo_kv_stage_bytes = 0;
     std::uint64_t turbo_kv_stage_stride = 0;  // bytes from the K half to the V half
+    std::uint64_t turbo_prefill_expanded = 0;
+    std::uint64_t turbo_prefill_expanded_bytes = 0;
     void* embedding_host = nullptr;           // pinned mirror of the above
     std::uint64_t embedding_row_index = 0;    // device [0,1,..capacity-1]
     std::uint64_t embedding_event = 0;        // guards reuse of embedding_host
@@ -2337,6 +2343,9 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_free(runtime.turbo_kv_stage);
     runtime.turbo_kv_stage = 0;
     runtime.turbo_kv_stage_bytes = 0;
+    flyweight_gpu_free(runtime.turbo_prefill_expanded);
+    runtime.turbo_prefill_expanded = 0;
+    runtime.turbo_prefill_expanded_bytes = 0;
     flyweight_gpu_free(runtime.embedding_stage);
     flyweight_gpu_free(runtime.embedding_row_index);
     runtime.embedding_event = 0;
@@ -17553,13 +17562,43 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                         static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
                 else if(layer.attention_window)
                     widest=std::max<std::uint64_t>(widest,
-                        static_cast<std::uint64_t>(layer.kv_heads)*layer.attention_window*layer.head_dim);
+                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
             }
             if(widest){
                 runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
                 runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
                 if(flyweight_gpu_alloc(runtime->turbo_kv_stage_bytes,&runtime->turbo_kv_stage)!=0)
                     throw std::runtime_error("failed to allocate native Qwen turbo KV staging");
+            }
+        }
+        if(runtime->options.cache_type_k==5&&runtime->options.cache_type_v==5&&
+           runtime->sequences.size()==1&&runtime->geometries.size()==1){
+            std::uint64_t expanded_stride=0;
+            for(auto& layer:runtime->layers){
+                layer.prefill_expanded_offset=0;
+                layer.prefill_expanded_bytes=0;
+                layer.prefill_expanded_tokens=0;
+                layer.prefill_expanded_state=0;
+                if(!layer.attention||layer.attention_window)continue;
+                layer.prefill_expanded_offset=expanded_stride;
+                layer.prefill_expanded_bytes=device_align(
+                    static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*
+                    layer.head_dim*sizeof(std::uint16_t));
+                if(layer.prefill_expanded_bytes>std::numeric_limits<std::uint64_t>::max()-expanded_stride)
+                    throw std::runtime_error("turbo prefill expansion size overflow");
+                expanded_stride+=layer.prefill_expanded_bytes;
+            }
+            if(expanded_stride&&expanded_stride<=std::numeric_limits<std::uint64_t>::max()/2){
+                runtime->turbo_prefill_expanded_bytes=expanded_stride*2;
+                if(flyweight_gpu_alloc(runtime->turbo_prefill_expanded_bytes,
+                                       &runtime->turbo_prefill_expanded)!=0){
+                    runtime->turbo_prefill_expanded=0;
+                    runtime->turbo_prefill_expanded_bytes=0;
+                    for(auto& layer:runtime->layers){
+                        layer.prefill_expanded_offset=0;
+                        layer.prefill_expanded_bytes=0;
+                    }
+                }
             }
         }
         // Importance-matrix capture. A slot per input channel of every 2-D
@@ -18389,7 +18428,7 @@ inline int kv_gqa_rows_tile_tokens(
 // what was done. A code rather than an out-parameter because the call sits in
 // an if-init, which holds one declaration statement.
 inline int qwen_kv_prefill_stage(
-    FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    FlyweightV2QwenRuntime& runtime, QwenLayerPlan& layer,
     std::uint64_t queries, std::uint64_t cache_keys, std::uint64_t cache_values,
     int heads, int kv_heads, int head_dim, int rows, int base,
     bool cublas_available,
@@ -18398,13 +18437,16 @@ inline int qwen_kv_prefill_stage(
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
     if(ck!=cv)return 0;
     const bool turbo=kv_type_is_turbo(ck);
-    if(!turbo&&!(ck==3&&cublas_available))return 0;
+    const bool swa=layer.attention_window!=0;
+    const bool sixteen=ck==1||ck==2;
+    if(!turbo&&!(ck==3&&cublas_available)&&!(swa&&sixteen&&cublas_available))return 0;
     if(!runtime.turbo_kv_stage||rows<=0||heads<=0||kv_heads<=0)return 0;
     if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0||head_dim>256)return 0;
-    if(layer.attention_window)return 0;  // ring layers keep the per-token path
     const char*env=std::getenv("FLYWEIGHT_TURBO_CUBLAS");
     if(env&&env[0]=='0')return 0;
-    const int window=base+rows;
+    const int first_absolute=swa?std::max(0,base-static_cast<int>(layer.attention_window)+1):0;
+    const int prefix=base-first_absolute;
+    const int window=prefix+rows;
     if(window<=0||static_cast<std::uint64_t>(window)>layer.cache_capacity)return 0;
     const std::uint64_t needed=
         static_cast<std::uint64_t>(kv_heads)*window*head_dim*sizeof(std::uint16_t);
@@ -18414,16 +18456,58 @@ inline int qwen_kv_prefill_stage(
         if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen turbo prefill kernel failed: ")+name);
     };
+    int slot_capacity=static_cast<int>(layer.cache_capacity);
+    if(!swa&&ck==5&&cv==5&&runtime.turbo_prefill_expanded&&
+       layer.prefill_expanded_bytes&&base+rows<=static_cast<int>(layer.cache_capacity)){
+        const std::uint64_t state_key=runtime.state;
+        const bool append=layer.prefill_expanded_state==state_key&&
+            layer.prefill_expanded_tokens==base;
+        const int source_first=append?base:0;
+        int source_tokens=append?rows:base+rows;
+        int output_first=append?base:0;
+        auto stage_k=runtime.turbo_prefill_expanded+layer.prefill_expanded_offset;
+        auto stage_v=runtime.turbo_prefill_expanded+
+            runtime.turbo_prefill_expanded_bytes/2+layer.prefill_expanded_offset;
+        int output_capacity=static_cast<int>(layer.cache_capacity);
+        int source_origin=static_cast<int>(static_cast<std::uint64_t>(source_first)%layer.cache_capacity);
+        const int token_blocks=(source_tokens+7)/8;
+        void*key_args[]={&cache_keys,&stage_k,&kv_heads,&head_dim,
+            &source_tokens,&slot_capacity,&source_origin,&output_capacity,&output_first};
+        launch("kv_dequant_turbo4_f16_append",kv_heads,token_blocks,key_args);
+        void*value_args[]={&cache_values,&stage_v,&kv_heads,&head_dim,
+            &source_tokens,&slot_capacity,&source_origin,&output_capacity,&output_first};
+        launch("kv_dequant_turbo4_f16_append",kv_heads,token_blocks,value_args);
+        layer.prefill_expanded_state=state_key;
+        layer.prefill_expanded_tokens=base+rows;
+        stage_keys=stage_k;
+        stage_values=stage_v;
+        int vectors=rows*heads,key_stream=0;
+        void*rotate_args[]={&queries,&vectors,&head_dim,&key_stream};
+        launch("turbo_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
+        return 2;
+    }
     stage_keys=runtime.turbo_kv_stage;
     stage_values=runtime.turbo_kv_stage+runtime.turbo_kv_stage_stride;
+    int origin=static_cast<int>(static_cast<std::uint64_t>(first_absolute)%layer.cache_capacity);
+    if(sixteen){
+        auto copy=[&](std::uint64_t source,std::uint64_t destination){
+            void*args[]={&source,&destination,&kv_heads,&head_dim,
+                const_cast<int*>(&window),const_cast<int*>(&slot_capacity),const_cast<int*>(&origin)};
+            return flyweight_gpu_launch_named("kv_ring_unwrap_16",
+                static_cast<std::uint32_t>(window),static_cast<std::uint32_t>(kv_heads),
+                128,0,runtime.stream,args)==0;
+        };
+        if(!copy(cache_keys,stage_keys)||!copy(cache_values,stage_values))return 0;
+    }else{
     const char*dequant=ck==5?"kv_dequant_turbo4_f16":
                        ck==4?"kv_dequant_turbo3_f16":"kv_dequant_q8_f16";
     const std::uint32_t token_blocks=(static_cast<std::uint32_t>(window)+7)/8;
-    int tokens=window,slot_capacity=static_cast<int>(layer.cache_capacity),origin=0;
+    int tokens=window;
     void*key_args[]={&cache_keys,&stage_keys,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
     launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,key_args);
     void*value_args[]={&cache_values,&stage_values,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
     launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,value_args);
+    }
 
     // Only turbo stores rotated: q8_0 is a plain codec, so its staged window
     // is already in the query's basis and the gate can be left to the

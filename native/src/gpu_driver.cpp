@@ -1487,6 +1487,7 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_scores_turbo3_ring", "kv_attention_scores_turbo4_ring",
              "kv_attention_values_turbo3_ring", "kv_attention_values_turbo4_ring",
              "kv_dequant_turbo3_f16", "kv_dequant_turbo4_f16",
+             "kv_dequant_turbo4_f16_append",
             "kv_ring_unwrap_16",
              "turbo_rotate_rows", "turbo_unrotate_rows",
              "kv_attention_fused_f16_tiles", "kv_attention_fused_bf16_tiles",
@@ -3747,7 +3748,8 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
     std::uint64_t output,
     std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
     std::int32_t head_dim, std::int32_t rows, std::int32_t capacity,
-    std::int32_t base_position, std::int32_t tile_rows_limit,
+    std::int32_t base_position, std::int32_t attention_window,
+    std::int32_t tile_rows_limit,
     std::int32_t block_tokens, float scale,
     std::int32_t apply_gate
 ) {
@@ -3777,6 +3779,7 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
         || !flash_state || heads <= 0
         || kv_heads <= 0 || heads % kv_heads != 0 || head_dim <= 0
         || rows <= 0 || capacity <= 0 || base_position < 0
+        || attention_window < 0
         || base_position + rows > capacity || tile_rows_limit <= 0
         || block_tokens <= 0 || !load_cublas())
         return -1;
@@ -3883,7 +3886,7 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
                 const_cast<std::uint64_t*>(&rescale_buffer),
                 &tile_start, &tile_rows, &heads, &kv_heads,
                 const_cast<int*>(&block_start), const_cast<int*>(&block),
-                &base_position
+            &base_position, &attention_window
             };
             if (launch(softmax->second, heads, tile_rows, 256, softmax_args, 0,
                        cuda_stream) != 0)

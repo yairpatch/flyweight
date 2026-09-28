@@ -1604,6 +1604,7 @@ void qwen_forward_rows(
                     attention_scores+packed_query_bytes,flash_state,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position)+span_begin,
+                    0,
                     cublas_tile_rows,cublas_block_tokens,scale,k2horizon?0:1)==0;
             // FLYWEIGHT_ATTN_PREFILL_TRACE=1: which attention path actually ran,
             // printed for the first few layers. The cuBLAS attempt fails
@@ -1730,31 +1731,41 @@ void qwen_forward_rows(
                              cublas_workspace_ok,
                          stage_keys,stage_values))!=0){
                 const bool rotated=staged==2;
-                // The staged window is dense and ring-free, so it is indexed
-                // with capacity == window. cuBLAS runs ungated here because the
+                // Staged keys are contiguous. The retained full-prefix buffer
+                // keeps the cache's layer stride; compact ring staging uses
+                // capacity == window. cuBLAS runs ungated here because the
                 // values are still rotated: the gate is a sigmoid and has to
                 // wait until after the inverse rotation below.
-                const int window=static_cast<int>(runtime.position)+span_begin+rows;
-                int base=static_cast<int>(runtime.position)+span_begin,staged_capacity=window;
+                const int absolute_base=static_cast<int>(runtime.position)+span_begin;
+                const int first_absolute=layer.attention_window
+                    ?std::max(0,absolute_base-static_cast<int>(layer.attention_window)+1):0;
+                const int base=absolute_base-first_absolute;
+                const int window=base+rows;
+                int staged_capacity=(runtime.options.cache_type_k==5&&
+                    runtime.options.cache_type_v==5&&runtime.turbo_prefill_expanded&&
+                    !layer.attention_window&&layer.prefill_expanded_bytes)
+                    ?static_cast<int>(layer.cache_capacity):window;
+                const int staged_kv_type=(runtime.options.cache_type_k==2&&
+                    runtime.options.cache_type_v==2)?2:1;
+                int staged_attention_window=static_cast<int>(layer.attention_window);
                 int vectors=rows*heads,value_stream=1,elements=rows*query_elements;
                 const bool staged_cublas=
                     cublas_prefill_requested&&cublas_tile_rows>0&&
                     cublas_workspace_ok&&
                     flyweight_gpu_attention_prefill_cublas(
-                        // The staged window is ALREADY f16: the dequant above
-                        // is what this path exists for. Passing the cache's own
-                        // type here would describe the source, not the buffers
-                        // the GEMM is handed.
-                        1,
+                        // Quantized caches are expanded to f16; a 16-bit cache
+                        // is unwrapped without changing its representation.
+                        staged_kv_type,
                         queries,gates,stage_keys,stage_values,
                         attention_scores,first,second,
                         attention_scores+packed_query_bytes,flash_state,third,
-                        runtime.stream,heads,kv_heads,head_dim,rows,window,
-                        base,cublas_tile_rows,cublas_block_tokens,scale,
+                        runtime.stream,heads,kv_heads,head_dim,rows,staged_capacity,
+                        base,staged_attention_window,
+                        cublas_tile_rows,cublas_block_tokens,scale,
                         (rotated||k2horizon)?0:1)==0;
                 if(!staged_cublas){
-                    void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&staged_capacity,&scale};
-                    launch("kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
+                    void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&base),const_cast<int*>(&rows),&staged_capacity,&scale,&staged_attention_window};
+                    launch(staged_kv_type==2?"kv_attention_prefill_bf16":"kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 }
                 // Undo exactly what the staging did. A rotated cache owes an
                 // inverse transform and then the gate; an unrotated one was
