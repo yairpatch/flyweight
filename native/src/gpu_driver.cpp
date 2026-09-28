@@ -1375,6 +1375,8 @@ extern "C" int flyweight_gpu_compile(
              "iq4xs_grouped_accumulate", "iq4xs_grouped_accumulate_rows",
              "iq1s_grouped_swiglu", "iq1s_grouped_swiglu_rows",
              "iq1s_grouped_accumulate", "iq1s_grouped_accumulate_rows",
+             "iq1m_grouped_swiglu", "iq1m_grouped_swiglu_rows",
+             "iq1m_grouped_accumulate", "iq1m_grouped_accumulate_rows",
              "iq4nl_grouped_swiglu", "iq4nl_grouped_swiglu_rows",
              "iq4nl_grouped_accumulate", "iq4nl_grouped_accumulate_rows",
              "iq2xxs_grouped_swiglu", "iq2xxs_grouped_swiglu_rows",
@@ -1524,6 +1526,19 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_gqa_mma_q8_128_s16_t128", "kv_attention_gqa_mma_q8_128_s16_t256",
              "kv_attention_gqa_mma_bf16_128_s4_t256", "kv_attention_gqa_mma_bf16_128_s4_t512",
              "kv_attention_gqa_mma_q8_128_s4_t256", "kv_attention_gqa_mma_q8_128_s4_t512",
+             // Flash-Next: 256-dim heads, 12 query heads per KV head. One full
+             // mma tile of 8 plus a partial tile of 4, sharing one cache load.
+             // Turbo variants decode the codebook in that load.
+             "kv_attention_gqa_mma_f16_256_s12_t128", "kv_attention_gqa_mma_f16_256_s12_t256",
+             "kv_attention_gqa_mma_f16_256_s12_t512",
+             "kv_attention_gqa_mma_bf16_256_s12_t128", "kv_attention_gqa_mma_bf16_256_s12_t256",
+             "kv_attention_gqa_mma_bf16_256_s12_t512",
+             "kv_attention_gqa_mma_q8_256_s12_t128", "kv_attention_gqa_mma_q8_256_s12_t256",
+             "kv_attention_gqa_mma_q8_256_s12_t512",
+             "kv_attention_gqa_mma_turbo3_256_s12_t128", "kv_attention_gqa_mma_turbo3_256_s12_t256",
+             "kv_attention_gqa_mma_turbo3_256_s12_t512",
+             "kv_attention_gqa_mma_turbo4_256_s12_t128", "kv_attention_gqa_mma_turbo4_256_s12_t256",
+             "kv_attention_gqa_mma_turbo4_256_s12_t512",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
              "gemma_q4_0_matvec", "gemma_q4_0_embedding", "gemma_q4_0_geglu",
              "gemma_q4_0_grouped_geglu", "gemma_q4_0_grouped_accumulate",

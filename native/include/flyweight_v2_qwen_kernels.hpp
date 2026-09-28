@@ -7567,8 +7567,33 @@ FLYWEIGHT_GROUPED_EXPERTS(iq2xxs, iq2xxs_octet)
 // The K-quant/flat pair a Q2_K MoE checkpoint needs: Q2_K gate/up, Q4_0 down.
 FLYWEIGHT_GROUPED_EXPERTS(q2k, q2k_octet)
 FLYWEIGHT_GROUPED_EXPERTS(q40, q40_octet)
-// GSQ-RCO qwen4exp: IQ2_S gate/up stacks and Q2_0 down stacks.
+// GSQ-RCO qwen4exp: IQ2_S and IQ1_M gate/up stacks, Q2_0 down stacks.
+// IQ1_M's octet is qwen_iq1m_value over eight lanes. The macro's octet index
+// is (absolute & 255) >> 3, which is the 32-value sub-block times four plus
+// the group of eight inside it.
+__device__ __forceinline__ void iq1m_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 56;
+    unsigned short sc[4];
+    memcpy(sc, base + 48, 8);
+    const int ib = octet >> 2;
+    const int group = octet & 3;
+    const unsigned char qh = base[32 + ib * 2 + group / 2];
+    const unsigned int index = (unsigned int)base[ib * 4 + group] |
+        (((unsigned int)qh << ((group & 1) ? 4 : 8)) & 0x700u);
+    const float delta = (qh & ((group & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+    const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+    const float scale =
+        iq1m_scale(base) * (float)(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+    const unsigned long long entry = kIq1sGrid[index];
+    for (int k = 0; k < 8; ++k)
+        out[k] = scale *
+            ((float)(signed char)((entry >> (8 * k)) & 0xffULL) + delta);
+}
+
 FLYWEIGHT_GROUPED_EXPERTS(iq2s, iq2s_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq1m, iq1m_octet)
 FLYWEIGHT_GROUPED_EXPERTS(q20, q20_octet)
 
 #undef FLYWEIGHT_GROUPED_EXPERTS
@@ -12499,6 +12524,27 @@ __device__ __forceinline__ void kv_mma_load8(
     for (int step = 0; step < 8; ++step)
         out[step] = __float2half(factor * (float)quantized[step]);
 }
+// Turbo is the same eight-wide load, but the row is a blocked codebook rather
+// than q8_0. Eight consecutive elements stay inside one 32-wide block (the
+// caller steps by 8), so the scale is read once, matching the q8 overload.
+// The values are already in the rotated domain; the caller rotates the query
+// to match and the turbo merge undoes it on the way out.
+template<int BITS>
+__device__ __forceinline__ void kv_mma_load8_turbo(
+    const unsigned char* cache, long long row, int dimension, int head_dim,
+    __half* out
+) {
+    const int bytes = turbo_block_bytes<BITS>();
+    const unsigned char* block =
+        cache + row * (head_dim / 32) * bytes + (dimension >> 5) * bytes;
+    const float factor = __half2float(*reinterpret_cast<const __half*>(block));
+    const int base = dimension & 31;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step)
+        out[step] = __float2half(
+            factor * turbo_cb<BITS>(
+                (int)turbo_unpack_d(block + 2, base + step, BITS)));
+}
 
 // One warp's 16-key window of the cache, widened into shared memory as f16.
 // The row stride is padded so the eight rows an `ldmatrix` reads at once land
@@ -12525,6 +12571,33 @@ __device__ __forceinline__ void kv_mma_stage(
         if (slot >= capacity) slot -= capacity;
         kv_mma_load8(cache, (long long)kv_head * capacity + slot,
                      dimension + column, head_dim, out);
+    }
+}
+// Turbo twin of kv_mma_stage. Same padded layout, so the ldmatrix offsets in
+// the attention kernel do not change with the codec.
+template<int BITS, int chunk_dims, int stride>
+__device__ __forceinline__ void kv_mma_stage_turbo(
+    const unsigned char* cache, __half* destination, const int kv_head,
+    const int capacity, const int first, const int base, const int live,
+    const int dimension, const int head_dim, const int lane
+) {
+    constexpr int rows = 16;
+    constexpr int groups = chunk_dims / 8;
+    #pragma unroll
+    for (int index = lane; index < rows * groups; index += 32) {
+        const int row = index / groups;
+        const int column = (index - row * groups) * 8;
+        __half* out = destination + row * stride + column;
+        if (row >= live) {
+            const uint4 zero = {0u, 0u, 0u, 0u};
+            *reinterpret_cast<uint4*>(out) = zero;
+            continue;
+        }
+        int slot = first + base + row;
+        if (slot >= capacity) slot -= capacity;
+        kv_mma_load8_turbo<BITS>(
+            cache, (long long)kv_head * capacity + slot,
+            dimension + column, head_dim, out);
     }
 }
 
@@ -13068,6 +13141,387 @@ KV_ATTENTION_GQA_MMA16(
     __nv_bfloat16, 128, 256)
 #endif
 #undef KV_ATTENTION_GQA_MMA16
+
+// 12 query heads per KV head (Qwen3.8-Flash-Next: 24/2 at head_dim 256).
+// m16n8k16's N is 8, so the group is a full band of 8 plus a partial band of
+// 4 that zeroes the spare columns, the same way 4-way GQA does. Both bands
+// share one load of K and of V. turbo_bits != 0 decodes a turbo row into that
+// load: the query is rotated once per head (the dot is invariant under the
+// shared rotation) and the partial stays rotated for the turbo merge.
+template<typename KT, typename VT, typename Operand, int maximum_head_dim,
+         int tokens_per_tile, int turbo_bits>
+__device__ void kv_attention_gqa_mma12_impl(
+    const float* query,
+    const KT* keys,
+    const VT* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int warp_count = 8;
+    constexpr int keys_per_step = 16;
+    constexpr int chunk_dims = 64;
+    constexpr int chunks = maximum_head_dim / chunk_dims;
+    constexpr int fragments = maximum_head_dim / 16;
+    constexpr int stride = chunk_dims + 8;
+    constexpr int bands = 2;
+    constexpr int full_band = 8;
+    constexpr int partial_band = 4;
+    constexpr float negative = -3.402823466e+38F / 2.0f;
+
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = lane >> 2;
+    const int quad = lane & 3;
+    const int block = lane >> 3;
+    if (kv_head >= kv_heads || head_dim != maximum_head_dim ||
+        heads != kv_heads * (full_band + partial_band))
+        return;
+
+    __shared__ Operand staged[warp_count][keys_per_step * stride];
+    __shared__ float merged[warp_count][maximum_head_dim];
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float tile_maximum;
+    __shared__ float tile_denominator;
+    Operand* stage = staged[warp];
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int head_base = kv_head * (full_band + partial_band);
+
+    unsigned int query_operand[bands][fragments][2];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            query_operand[band][fragment][0] = 0u;
+            query_operand[band][fragment][1] = 0u;
+        }
+    }
+    if constexpr (turbo_bits > 0) {
+        __shared__ float rotated_query[maximum_head_dim];
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            const int width = band == 0 ? full_band : partial_band;
+            const int origin = band == 0 ? 0 : full_band;
+            for (int local = 0; local < width; ++local) {
+                const float* src = query
+                    + (long long)(head_base + origin + local) * head_dim;
+                for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+                    rotated_query[d] = src[d] * turbo_sign_d(d, 0u);
+                __syncthreads();
+                turbo_fwht_shared(rotated_query, head_dim);
+                if (group == local) {
+                    #pragma unroll
+                    for (int fragment = 0; fragment < fragments; ++fragment) {
+                        const int start = fragment * 16 + 2 * quad;
+                        query_operand[band][fragment][0] = kv_mma_pack<Operand>(
+                            rotated_query[start] * scale,
+                            rotated_query[start + 1] * scale);
+                        query_operand[band][fragment][1] = kv_mma_pack<Operand>(
+                            rotated_query[start + 8] * scale,
+                            rotated_query[start + 9] * scale);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    } else {
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            const int width = band == 0 ? full_band : partial_band;
+            const int origin = band == 0 ? 0 : full_band;
+            const bool live_q = group < width;
+            const float* row = query
+                + (long long)(head_base + origin + (live_q ? group : 0))
+                    * head_dim;
+            const float column_scale = live_q ? scale : 0.0f;
+            #pragma unroll
+            for (int fragment = 0; fragment < fragments; ++fragment) {
+                const int start = fragment * 16 + 2 * quad;
+                query_operand[band][fragment][0] = kv_mma_pack<Operand>(
+                    row[start] * column_scale, row[start + 1] * column_scale);
+                query_operand[band][fragment][1] = kv_mma_pack<Operand>(
+                    row[start + 8] * column_scale,
+                    row[start + 9] * column_scale);
+            }
+        }
+    }
+
+    float output[bands][fragments][4];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                output[band][fragment][element] = 0.0f;
+        }
+    }
+    float running_maximum[bands][2];
+    float running_denominator[bands][2];
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        running_maximum[band][0] = running_maximum[band][1] = negative;
+        running_denominator[band][0] = running_denominator[band][1] = 0.0f;
+    }
+
+    for (int base = tile_begin + warp * keys_per_step;
+         base < tile_end;
+         base += warp_count * keys_per_step) {
+        const int live = min(keys_per_step, tile_end - base);
+        float score[bands][4];
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                score[band][element] = 0.0f;
+        }
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            if constexpr (turbo_bits > 0)
+                kv_mma_stage_turbo<turbo_bits, chunk_dims, stride>(
+                    reinterpret_cast<const unsigned char*>(keys), stage,
+                    kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            else
+                kv_mma_stage<KT, Operand, chunk_dims, stride>(
+                    keys, stage, kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix(
+                    operand,
+                    stage + ((block & 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block >> 1) * 8);
+                const int fragment = chunk * (chunk_dims / 16) + step;
+                #pragma unroll
+                for (int band = 0; band < bands; ++band)
+                    kv_mma_m16n8k16(
+                        score[band], operand, query_operand[band][fragment],
+                        (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+        unsigned int probability_operand[bands][2];
+        #pragma unroll
+        for (int band = 0; band < bands; ++band) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element) {
+                if (8 * (element / 2) + group >= live)
+                    score[band][element] = negative;
+            }
+            float updated[2] = {
+                fmaxf(score[band][0], score[band][2]),
+                fmaxf(score[band][1], score[band][3])};
+            #pragma unroll
+            for (int offset = 4; offset <= 16; offset <<= 1) {
+                updated[0] = fmaxf(updated[0],
+                    __shfl_xor_sync(0xffffffff, updated[0], offset));
+                updated[1] = fmaxf(updated[1],
+                    __shfl_xor_sync(0xffffffff, updated[1], offset));
+            }
+            float rescale[2];
+            #pragma unroll
+            for (int column = 0; column < 2; ++column) {
+                updated[column] = fmaxf(
+                    running_maximum[band][column], updated[column]);
+                rescale[column] = __expf(
+                    running_maximum[band][column] - updated[column]);
+                running_maximum[band][column] = updated[column];
+                running_denominator[band][column] *= rescale[column];
+            }
+            #pragma unroll
+            for (int fragment = 0; fragment < fragments; ++fragment) {
+                #pragma unroll
+                for (int element = 0; element < 4; ++element)
+                    output[band][fragment][element] *= rescale[element & 1];
+            }
+            float probability[4];
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                probability[element] = __expf(
+                    score[band][element] - running_maximum[band][element & 1]);
+            float sum[2] = {probability[0] + probability[2],
+                            probability[1] + probability[3]};
+            #pragma unroll
+            for (int offset = 4; offset <= 16; offset <<= 1) {
+                sum[0] += __shfl_xor_sync(0xffffffff, sum[0], offset);
+                sum[1] += __shfl_xor_sync(0xffffffff, sum[1], offset);
+            }
+            running_denominator[band][0] += sum[0];
+            running_denominator[band][1] += sum[1];
+            probability_operand[band][0] = kv_mma_movmatrix(
+                kv_mma_pack<Operand>(probability[0], probability[1]));
+            probability_operand[band][1] = kv_mma_movmatrix(
+                kv_mma_pack<Operand>(probability[2], probability[3]));
+        }
+
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            if constexpr (turbo_bits > 0)
+                kv_mma_stage_turbo<turbo_bits, chunk_dims, stride>(
+                    reinterpret_cast<const unsigned char*>(values), stage,
+                    kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            else
+                kv_mma_stage<VT, Operand, chunk_dims, stride>(
+                    values, stage, kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix_trans(
+                    operand,
+                    stage + ((block >> 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block & 1) * 8);
+                const int fragment = chunk * (chunk_dims / 16) + step;
+                #pragma unroll
+                for (int band = 0; band < bands; ++band)
+                    kv_mma_m16n8k16(
+                        output[band][fragment], operand,
+                        probability_operand[band], (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+    }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    #pragma unroll
+    for (int band = 0; band < bands; ++band) {
+        const int width = band == 0 ? full_band : partial_band;
+        const int origin = band == 0 ? 0 : full_band;
+        for (int index = 0; index < width; ++index) {
+            __syncthreads();
+            if (quad == index / 2) {
+                if (group == 0) {
+                    warp_maximum[warp] = running_maximum[band][index & 1];
+                    warp_denominator[warp] = running_denominator[band][index & 1];
+                }
+                #pragma unroll
+                for (int fragment = 0; fragment < fragments; ++fragment) {
+                    merged[warp][fragment * 16 + group] =
+                        output[band][fragment][index & 1];
+                    merged[warp][fragment * 16 + 8 + group] =
+                        output[band][fragment][2 + (index & 1)];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float maximum = warp_maximum[0];
+                #pragma unroll
+                for (int other = 1; other < warp_count; ++other)
+                    maximum = fmaxf(maximum, warp_maximum[other]);
+                float denominator = 0.0f;
+                #pragma unroll
+                for (int other = 0; other < warp_count; ++other) {
+                    const float factor = warp_denominator[other] == 0.0f
+                        ? 0.0f : __expf(warp_maximum[other] - maximum);
+                    warp_scale[other] = factor;
+                    denominator += warp_denominator[other] * factor;
+                }
+                tile_maximum = maximum;
+                tile_denominator = denominator;
+            }
+            __syncthreads();
+            float* record = partial
+                + ((long long)(head_base + origin + index)
+                        * tile_count + tile)
+                    * (maximum_head_dim + 2);
+            if (threadIdx.x == 0) {
+                record[0] = tile_maximum;
+                record[1] = tile_denominator;
+            }
+            for (int dimension = threadIdx.x;
+                 dimension < head_dim;
+                 dimension += blockDim.x) {
+                float result = 0.0f;
+                #pragma unroll
+                for (int other = 0; other < warp_count; ++other)
+                    result += merged[other][dimension] * warp_scale[other];
+                record[dimension + 2] = result;
+            }
+        }
+    }
+#else
+    (void)query; (void)keys; (void)values; (void)partial; (void)heads;
+    (void)kv_heads; (void)head_dim; (void)tokens; (void)capacity; (void)first;
+    (void)scale;
+#endif
+}
+
+#define KV_ATTENTION_GQA_MMA12(name, KT, VT, OPERAND, TILE, TURBO) \
+extern "C" __global__ __launch_bounds__(256, 1) void name( \
+    const float* query, const KT* keys, const VT* values, float* partial, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale \
+) { \
+    kv_attention_gqa_mma12_impl<KT, VT, OPERAND, 256, TILE, TURBO>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_f16_256_s12_t128, __half, __half, __half, 128, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_f16_256_s12_t256, __half, __half, __half, 256, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_f16_256_s12_t512, __half, __half, __half, 512, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_q8_256_s12_t128, unsigned char, unsigned char, __half,
+    128, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_q8_256_s12_t256, unsigned char, unsigned char, __half,
+    256, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_q8_256_s12_t512, unsigned char, unsigned char, __half,
+    512, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo3_256_s12_t128, unsigned char, unsigned char,
+    __half, 128, 3)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo3_256_s12_t256, unsigned char, unsigned char,
+    __half, 256, 3)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo3_256_s12_t512, unsigned char, unsigned char,
+    __half, 512, 3)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo4_256_s12_t128, unsigned char, unsigned char,
+    __half, 128, 4)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo4_256_s12_t256, unsigned char, unsigned char,
+    __half, 256, 4)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_turbo4_256_s12_t512, unsigned char, unsigned char,
+    __half, 512, 4)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_bf16_256_s12_t128, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 128, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_bf16_256_s12_t256, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 256, 0)
+KV_ATTENTION_GQA_MMA12(
+    kv_attention_gqa_mma_bf16_256_s12_t512, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 512, 0)
+#endif
+#undef KV_ATTENTION_GQA_MMA12
 
 #define KV_ATTENTION_GQA_MMA(name, KT, VT, OPERAND, DIM, SHARE, TILE) \
 extern "C" __global__ __launch_bounds__(256, 1) void name( \

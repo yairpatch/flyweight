@@ -4292,10 +4292,10 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 // that path decodes every type qwen_quant_dot supports.
 const char* qwen_grouped_expert_prefix(std::uint32_t type) {
     // Only the formats with a device octet decoder. IQ2_S has one
-    // (`iq2s_octet` / FLYWEIGHT_GROUPED_EXPERTS) since 2026-09-16. IQ1_M
-    // still packs signs and grid indices differently and has none, so its
-    // decode-shaped experts stay on the CPU; prefill can take the routed
-    // MMQ kernel when the width divides.
+    // (`iq2s_octet` / FLYWEIGHT_GROUPED_EXPERTS) since 2026-09-16. IQ1_M's
+    // scale nibbles are scattered, so it got its own `iq1m_octet` rather
+    // than sharing IQ1_S's; prefill can also take the routed MMQ kernel
+    // when the width divides.
     const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->grouped_expert_prefix : nullptr;
 }
@@ -17294,27 +17294,33 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // native Qwen prefill snapshots") instead of the cause. The same
         // arithmetic is known here, one message earlier, with the shortfall in
         // it.
-        // FLYWEIGHT_GPU_PLAN=1 prints what prepare thinks it needs against what
-        // it thinks it has. Every "failed to allocate ..." is one of these two
-        // numbers being wrong, and without them the only evidence is which
-        // allocation happened to be next.
-        if(const char*plan=std::getenv("FLYWEIGHT_GPU_PLAN");plan&&plan[0]=='1'){
-            FlyweightV2GpuInfo now{};
-            gpu_probe(now,runtime->options.device);
-            auto m=[](std::uint64_t b){return static_cast<double>(b)/(1024.0*1024.0);};
-            std::fprintf(stderr,
-                "[flyweight] gpu plan: static %.0f + workspace %.0f + slots %.0f"
-                " + staging %.0f + snapshots %.0f + host-ffn stage %.0f"
-                " + stream %.0f = %.0f MiB; budget %.0f MiB (%s); free now %.0f MiB\n",
-                m(runtime->static_arena_bytes),m(runtime->workspace_bytes),
-                m(runtime->slots_state_bytes),m(runtime->expert_staging_bytes),
-                m(slot_count*runtime->prefill_snapshots.size()*
-                  runtime->prefill_snapshot_bytes),
-                m(runtime->host_ffn_stage_bytes),
-                m(runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes),
-                m(base_total_resolved),m(gpu_budget),auto_fit?"auto":"explicit",
-                m(now.free_memory));
-        }
+        // One f16 window of the widest attention layer. Turbo and q8_0 expand
+        // into it for the cuBLAS path; a wrapped 16-bit sliding window is
+        // copied here too. Required once the cache type asks for it, so it is
+        // charged into the budget below rather than taken out of the headroom
+        // the expert cache was sized against.
+        auto plan_kv_stage=[&]{
+            runtime->turbo_kv_stage_bytes=0;
+            runtime->turbo_kv_stage_stride=0;
+            auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
+            const int stage_k=runtime->options.cache_type_k;
+            const int stage_v=runtime->options.cache_type_v;
+            const bool stage_quant=stages_kv(stage_k)||stages_kv(stage_v);
+            const bool stage_swa=(stage_k==1||stage_k==2)&&stage_k==stage_v&&
+                std::any_of(runtime->layers.begin(),runtime->layers.end(),
+                    [](const QwenLayerPlan& layer){return layer.attention_window!=0;});
+            if(!stage_quant&&!stage_swa)return;
+            std::uint64_t widest=0;
+            for(const auto& layer:runtime->layers){
+                if(!layer.attention)continue;
+                if(stage_quant||layer.attention_window)
+                    widest=std::max<std::uint64_t>(widest,
+                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
+            }
+            if(!widest)return;
+            runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
+            runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
+        };
         // Auto-fit shrinks the context to what the card can hold rather than
         // refusing the request. The context is the one term here nobody
         // usually chose -- it defaults to the checkpoint's maximum, which on a
@@ -17344,7 +17350,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 while(low<=high){
                     const auto middle=low+(high-low)/2;
                     plan_slots(middle);
-                    if(runtime->slots_state_bytes<=room){
+                    plan_kv_stage();
+                    if(runtime->slots_state_bytes+runtime->turbo_kv_stage_bytes<=room){
                         best=middle;
                         low=middle+1;
                     }else{
@@ -17369,6 +17376,31 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 }
             }
         }
+        plan_kv_stage();
+        base_total_resolved+=runtime->turbo_kv_stage_bytes;
+        // FLYWEIGHT_GPU_PLAN=1 prints what prepare thinks it needs against what
+        // it thinks it has. Every "failed to allocate ..." is one of these two
+        // numbers being wrong, and without them the only evidence is which
+        // allocation happened to be next.
+        if(const char*plan=std::getenv("FLYWEIGHT_GPU_PLAN");plan&&plan[0]=='1'){
+            FlyweightV2GpuInfo now{};
+            gpu_probe(now,runtime->options.device);
+            auto m=[](std::uint64_t b){return static_cast<double>(b)/(1024.0*1024.0);};
+            std::fprintf(stderr,
+                "[flyweight] gpu plan: static %.0f + workspace %.0f + slots %.0f"
+                " + staging %.0f + snapshots %.0f + host-ffn stage %.0f"
+                " + stream %.0f + kv stage %.0f = %.0f MiB; budget %.0f MiB (%s);"
+                " free now %.0f MiB\n",
+                m(runtime->static_arena_bytes),m(runtime->workspace_bytes),
+                m(runtime->slots_state_bytes),m(runtime->expert_staging_bytes),
+                m(slot_count*runtime->prefill_snapshots.size()*
+                  runtime->prefill_snapshot_bytes),
+                m(runtime->host_ffn_stage_bytes),
+                m(runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes),
+                m(runtime->turbo_kv_stage_bytes),
+                m(base_total_resolved),m(gpu_budget),auto_fit?"auto":"explicit",
+                m(now.free_memory));
+        }
         if(!runtime->options.strict_resident&&
            gpu_budget&&base_total_resolved>gpu_budget){
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
@@ -17383,6 +17415,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                      +mib(runtime->geometries[1].state_bytes)+" ("
                     :std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" (")
                 +mib(runtime->slots_state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
+                +(runtime->turbo_kv_stage_bytes
+                    ?" + kv stage "+mib(runtime->turbo_kv_stage_bytes):"")
                 +") exceed the "
                 +(auto_fit?"VRAM this device has free (":"--gpu-cache-mib budget (")
                 +mib(gpu_budget)+" MiB), before any expert cache. Short by "
@@ -17479,7 +17513,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 if(!layer_count)
                     runtime->whole_expert_layer_slots.clear();
                 std::fprintf(stderr,
-                    "[flyweight] Laguna whole-layer placement selected %zu "
+                    "[flyweight] whole-layer expert placement selected %zu "
                     "layers (%zu expert bundles)\n",layer_count,slot);
             }
             // Need at least one slot per MoE layer: slots are partitioned by
@@ -17536,71 +17570,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                &runtime->prefill_stream_mirror)!=0)||
            (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
-        // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
-        // attention path can run on it, so this only has to hold the widest
-        // attention layer's live window (K and V), not the whole cache.
-        // q8_0 shares the buffer: staged for the same reason, and the same
-        // f16 window once expanded.
-        // A 16-bit sliding window that has wrapped its ring is copied here
-        // too, then fed to the same GEMM. Only the window is staged, not the
-        // full-context layers: those stay contiguous until the context itself
-        // is full, and sizing the buffer to that would be the KV cache again.
-        auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
-        const bool stage_quant=stages_kv(runtime->options.cache_type_k)
-            ||stages_kv(runtime->options.cache_type_v);
-        const int stage_k=runtime->options.cache_type_k;
-        const int stage_v=runtime->options.cache_type_v;
-        const bool stage_swa=(stage_k==1||stage_k==2)&&stage_k==stage_v&&
-            std::any_of(runtime->layers.begin(),runtime->layers.end(),
-                [](const QwenLayerPlan& layer){return layer.attention_window!=0;});
-        if(stage_quant||stage_swa){
-            std::uint64_t widest=0;
-            for(const auto& layer:runtime->layers){
-                if(!layer.attention)continue;
-                if(stage_quant)
-                    widest=std::max<std::uint64_t>(widest,
-                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
-                else if(layer.attention_window)
-                    widest=std::max<std::uint64_t>(widest,
-                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
-            }
-            if(widest){
-                runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
-                runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
-                if(flyweight_gpu_alloc(runtime->turbo_kv_stage_bytes,&runtime->turbo_kv_stage)!=0)
-                    throw std::runtime_error("failed to allocate native Qwen turbo KV staging");
-            }
-        }
-        if(runtime->options.cache_type_k==5&&runtime->options.cache_type_v==5&&
-           runtime->sequences.size()==1&&runtime->geometries.size()==1){
-            std::uint64_t expanded_stride=0;
-            for(auto& layer:runtime->layers){
-                layer.prefill_expanded_offset=0;
-                layer.prefill_expanded_bytes=0;
-                layer.prefill_expanded_tokens=0;
-                layer.prefill_expanded_state=0;
-                if(!layer.attention||layer.attention_window)continue;
-                layer.prefill_expanded_offset=expanded_stride;
-                layer.prefill_expanded_bytes=device_align(
-                    static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*
-                    layer.head_dim*sizeof(std::uint16_t));
-                if(layer.prefill_expanded_bytes>std::numeric_limits<std::uint64_t>::max()-expanded_stride)
-                    throw std::runtime_error("turbo prefill expansion size overflow");
-                expanded_stride+=layer.prefill_expanded_bytes;
-            }
-            if(expanded_stride&&expanded_stride<=std::numeric_limits<std::uint64_t>::max()/2){
-                runtime->turbo_prefill_expanded_bytes=expanded_stride*2;
-                if(flyweight_gpu_alloc(runtime->turbo_prefill_expanded_bytes,
-                                       &runtime->turbo_prefill_expanded)!=0){
-                    runtime->turbo_prefill_expanded=0;
-                    runtime->turbo_prefill_expanded_bytes=0;
-                    for(auto& layer:runtime->layers){
-                        layer.prefill_expanded_offset=0;
-                        layer.prefill_expanded_bytes=0;
-                    }
-                }
-            }
-        }
+        // Sized above, with the expert cache, so this required window cannot
+        // land after the cache has already taken the budget.
+        if(runtime->turbo_kv_stage_bytes&&
+           flyweight_gpu_alloc(runtime->turbo_kv_stage_bytes,&runtime->turbo_kv_stage)!=0)
+            throw std::runtime_error("failed to allocate native Qwen turbo KV staging");
         // Importance-matrix capture. A slot per input channel of every 2-D
         // weight and per (expert, channel) of every stacked 3-D one; tensors
         // the forward never projects through simply stay at zero rows and are
@@ -17719,6 +17693,69 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 for(auto&snapshot:runtime->sequences[i].prefill_snapshots)if(flyweight_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
             }
         }
+        // Turbo4 can keep an f16 copy of every full-attention layer so prefill
+        // appends into it instead of re-expanding the window. That copy is the
+        // live context, several GiB at a long window, and it is optional. It
+        // has to follow the expert cache: allocating it first succeeds by
+        // spending the reservation the cache was sized to, and the cache
+        // allocation then fails. Anything the budget did not leave beside the
+        // cache is skipped; prefill falls back to the shared staging window.
+        if(runtime->options.cache_type_k==5&&runtime->options.cache_type_v==5&&
+           runtime->sequences.size()==1&&runtime->geometries.size()==1){
+            std::uint64_t expanded_stride=0;
+            for(auto& layer:runtime->layers){
+                layer.prefill_expanded_offset=0;
+                layer.prefill_expanded_bytes=0;
+                layer.prefill_expanded_tokens=0;
+                layer.prefill_expanded_state=0;
+                if(!layer.attention||layer.attention_window)continue;
+                layer.prefill_expanded_offset=expanded_stride;
+                layer.prefill_expanded_bytes=device_align(
+                    static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*
+                    layer.head_dim*sizeof(std::uint16_t));
+                if(layer.prefill_expanded_bytes>std::numeric_limits<std::uint64_t>::max()-expanded_stride)
+                    throw std::runtime_error("turbo prefill expansion size overflow");
+                expanded_stride+=layer.prefill_expanded_bytes;
+            }
+            auto clear_expansion=[&]{
+                runtime->turbo_prefill_expanded=0;
+                runtime->turbo_prefill_expanded_bytes=0;
+                for(auto& layer:runtime->layers){
+                    layer.prefill_expanded_offset=0;
+                    layer.prefill_expanded_bytes=0;
+                }
+            };
+            const bool size_ok=expanded_stride&&
+                expanded_stride<=std::numeric_limits<std::uint64_t>::max()/2;
+            const std::uint64_t want=size_ok?expanded_stride*2:0;
+            std::uint64_t room=std::numeric_limits<std::uint64_t>::max();
+            if(gpu_budget){
+                const std::uint64_t committed=base_total_resolved+
+                    runtime->mova_cache_bytes+
+                    runtime->expert_cache_bytes*(persistent_nvfp4_requested?2:1);
+                room=gpu_budget>committed?gpu_budget-committed:0;
+            }
+            if(!want||want>room){
+                if(want)
+                    std::fprintf(stderr,
+                        "[flyweight] turbo4 prefill expansion skipped: %llu MiB "
+                        "does not fit beside the expert cache (%llu MiB left "
+                        "in the GPU budget)\n",
+                        static_cast<unsigned long long>(want/(1024ull*1024)),
+                        static_cast<unsigned long long>(room/(1024ull*1024)));
+                clear_expansion();
+            }else{
+                runtime->turbo_prefill_expanded_bytes=want;
+                if(flyweight_gpu_alloc(runtime->turbo_prefill_expanded_bytes,
+                                       &runtime->turbo_prefill_expanded)!=0){
+                    std::fprintf(stderr,
+                        "[flyweight] turbo4 prefill expansion skipped: %llu MiB "
+                        "allocation failed\n",
+                        static_cast<unsigned long long>(want/(1024ull*1024)));
+                    clear_expansion();
+                }
+            }
+        }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
         // Say how many expert slots this budget bought, and where the budget
         // came from. Slot count decides expert placement, placement decides
@@ -17753,16 +17790,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // and staging are allocated (notably for large Q6 models on 12 GiB
         // cards). In that case, keep the CUDA-resident shared model and execute
         // routed experts on CPU instead of failing on the first decode.
-        // Routed experts in an IQ codebook format have no grouped GPU kernel.
-        // Without this the dispatch below falls through to the k-quant kernel
-        // and decodes codebook bytes as super-block scales, which produces
-        // fluent-looking output for as long as the expert cache stays cold and
-        // then degenerates once experts become resident.
-        // IQ experts do have grouped GPU kernels now, but splitting a layer
-        // between the router on the GPU and the experts on the host costs a
-        // round trip per layer. Laguna therefore concentrates its cache into
-        // complete pinned layers; other IQ models still require an explicitly
-        // seeded set before the GPU path is allowed.
+        // A format with no grouped GPU kernel must not reach the device
+        // dispatch: it used to fall through to the k-quant kernel and decode
+        // codebook bytes as super-block scales. One such stack keeps the whole
+        // MoE on the CPU, because prepare does not split a model across paths.
+        // Formats that do have a kernel still need a placement before decode
+        // will page them: a seed, or whole pinned layers where that placement
+        // exists (Laguna and Gemma 4). Naming the Laguna knob for every other
+        // architecture described a switch the model ignores.
         const bool seeded_placement=runtime->options.prefill_cache_seed!=0||
                                     runtime->options.prefill_cache_seed_auto!=0;
         // Gated on the decode policy, not the prepare one: `auto` prepares as
@@ -17770,19 +17805,46 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // would let IQ experts reach the GPU anyway.
         const bool gpu_at_decode=!qwen_expert_policy(
             *runtime,flyweight::v2::ExpertExecutionPhase::decode).is_cpu();
+        const bool experts_executable=qwen_gpu_experts_executable(*runtime);
+        const bool needs_placement=qwen_model_has_grouped_experts(*runtime)&&
+            !seeded_placement&&runtime->whole_expert_layer_slots.empty();
         if(gpu_at_decode&&runtime->model->config.expert_count&&
-           (!qwen_gpu_experts_executable(*runtime)||
-            (qwen_model_has_grouped_experts(*runtime)&&!seeded_placement&&
-             runtime->whole_expert_layer_slots.empty()))){
+           (!experts_executable||needs_placement)){
             runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
             runtime->options.moe_device=flyweight::v2::expert_execution_mode_value(
                 runtime->expert_mode);
             prepare_policy=qwen_expert_policy(
                 *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
-            std::fprintf(stderr,
-                "[flyweight] routed experts stay on the CPU MoE; set "
-                "--prefill-cache-seed or FLYWEIGHT_LAGUNA_WHOLE_LAYERS to "
-                "place IQ experts on the GPU\n");
+            if(!experts_executable){
+                std::string formats;
+                std::vector<std::uint32_t> seen;
+                for(const auto& layer:runtime->layers){
+                    if(layer.dense_ffn||!layer.expert_tensors[0])continue;
+                    for(const auto index:layer.expert_tensors){
+                        const auto type=runtime->model->tensors[index].type;
+                        if(qwen_gpu_expert_type_supported(type))continue;
+                        if(std::find(seen.begin(),seen.end(),type)!=seen.end())continue;
+                        seen.push_back(type);
+                        if(!formats.empty())formats+=", ";
+                        if(const auto* format=flyweight::v2::qwen_format(type);
+                           format&&format->family)
+                            formats+=format->family;
+                        else formats+="type "+std::to_string(type);
+                    }
+                }
+                std::fprintf(stderr,
+                    "[flyweight] routed experts stay on the CPU MoE: %s has no "
+                    "grouped GPU kernel\n",
+                    formats.empty()?"an expert weight":formats.c_str());
+            }else if(runtime->laguna||runtime->gemma4)
+                std::fprintf(stderr,
+                    "[flyweight] routed experts stay on the CPU MoE; pass "
+                    "--prefill-cache-seed or set FLYWEIGHT_LAGUNA_WHOLE_LAYERS "
+                    "to place them on the GPU\n");
+            else
+                std::fprintf(stderr,
+                    "[flyweight] routed experts stay on the CPU MoE; pass "
+                    "--prefill-cache-seed to place them on the GPU\n");
         }
         if(prepare_policy.is_hybrid()&&runtime->model->config.expert_count&&
            runtime->expert_slots.empty()){
@@ -17941,7 +18003,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 }
             }
             std::fprintf(stderr,
-                "[flyweight] prepared %zu pinned Laguna whole-layer experts "
+                "[flyweight] prepared %zu pinned whole-layer experts "
                 "(%llu MiB)\n",prepared,
                 static_cast<unsigned long long>(
                     runtime->expert_cache_bytes/(1024ull*1024)));
@@ -18334,15 +18396,39 @@ inline const char* kv_gqa_mma_kernel(
     if(!enabled||kv_heads<=0)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
-    // Three instantiated shapes: 256-dim heads in groups of 8, which fill the
+    // Four instantiated shapes: 256-dim heads in groups of 8, which fill the
     // mma's 8-wide query tile exactly; 128-dim heads in groups of 4, which
-    // leave half of it idle; and 128-dim heads in groups of 16 (Muse), which
-    // are two full tiles of 8 sharing one load of the cache row. Anything
-    // else falls through to the grouped-rows kernel.
+    // leave half of it idle; 128-dim heads in groups of 16 (Muse), which are
+    // two full tiles of 8 sharing one load of the cache row; and 256-dim heads
+    // in groups of 12 (Flash-Next), one full tile plus a partial tile of 4,
+    // also sharing one load. Anything else falls through to the grouped-rows
+    // kernel.
     const bool wide=head_dim==256&&heads==kv_heads*8;
     const bool narrow_heads=head_dim==128&&heads==kv_heads*4;
     const bool group16=head_dim==128&&heads==kv_heads*16;
-    if(!wide&&!narrow_heads&&!group16)return nullptr;
+    const bool group12=head_dim==256&&heads==kv_heads*12;
+    if(!wide&&!narrow_heads&&!group16&&!group12)return nullptr;
+    if(group12){
+        if(tile!=128&&tile!=256&&tile!=512)return nullptr;
+        const char* name=
+            t==5?(tile==128?"kv_attention_gqa_mma_turbo4_256_s12_t128":
+                  tile==256?"kv_attention_gqa_mma_turbo4_256_s12_t256":
+                            "kv_attention_gqa_mma_turbo4_256_s12_t512"):
+            t==4?(tile==128?"kv_attention_gqa_mma_turbo3_256_s12_t128":
+                  tile==256?"kv_attention_gqa_mma_turbo3_256_s12_t256":
+                            "kv_attention_gqa_mma_turbo3_256_s12_t512"):
+            t==3?(tile==128?"kv_attention_gqa_mma_q8_256_s12_t128":
+                  tile==256?"kv_attention_gqa_mma_q8_256_s12_t256":
+                            "kv_attention_gqa_mma_q8_256_s12_t512"):
+            t==2?(tile==128?"kv_attention_gqa_mma_bf16_256_s12_t128":
+                  tile==256?"kv_attention_gqa_mma_bf16_256_s12_t256":
+                            "kv_attention_gqa_mma_bf16_256_s12_t512"):
+            t==1?(tile==128?"kv_attention_gqa_mma_f16_256_s12_t128":
+                  tile==256?"kv_attention_gqa_mma_f16_256_s12_t256":
+                            "kv_attention_gqa_mma_f16_256_s12_t512"):
+            nullptr;
+        return name&&flyweight_gpu_kernel_available(name)?name:nullptr;
+    }
     if(group16){
         const char* name=
             t==3?(tile==128?"kv_attention_gqa_mma_q8_128_s16_t128":
@@ -18391,8 +18477,12 @@ inline int kv_gqa_rows_tile_tokens(
     // two KV heads a 256-token tile is only a few blocks.
     const int share=kv_heads>0&&heads%kv_heads==0?heads/kv_heads:0;
     const bool group16=head_dim==128&&share==16;
+    // Flash-Next is two KV heads of 12, the same occupancy problem as Muse:
+    // a 256-token tile is only a few blocks, so the 128-token tile is offered
+    // first and the wider ones exist for when the partial records no longer fit.
+    const bool group12=head_dim==256&&share==12;
     const int stride=kv_fused_record_stride(group16?128:256);
-    const int candidates[3]={group16?128:256,group16?256:512,512};
+    const int candidates[3]={(group16||group12)?128:256,(group16||group12)?256:512,512};
     int previous=-1;
     for(const int tile:candidates){
         if(tile==previous)continue;
@@ -22448,7 +22538,10 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     &attended,const_cast<int*>(&heads),
                     const_cast<int*>(&head_dim),
                     const_cast<int*>(&gqa_tile_count)};
-                launch_named("kv_attention_fused_merge256",heads,1,256,merge_args);
+                // Turbo partials are still in the rotated domain, so they take
+                // the merge that undoes it. f16, bf16 and q8 take the plain one.
+                launch_named(kv_fused_merge_kernel_name(*runtime,256),
+                    heads,1,256,merge_args);
             }else if(runtime->fused_attention&&kv_fused_width(head_dim)&&
                (kv_fused_width(head_dim)==128
                     ? fused_tiles
@@ -26404,6 +26497,34 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                 } else {
                 const char* fused_tiles=kv_fused_tiles_kernel(*runtime);
                 const int fused_tile_tokens=kv_fused_tile_tokens(*runtime);
+                // Same ranking as the single-sequence decode: the tensor-core
+                // group kernel, when this shape has one, shares one load of
+                // the cache row. Flash-Next's group of 12 only exists there.
+                const int gqa_tile_tokens=runtime->fused_attention
+                    ? kv_gqa_rows_tile_tokens(
+                          *runtime,tokens,head_dim,heads,kv_heads)
+                    : 0;
+                const char* mma_tiles=gqa_tile_tokens
+                    ? kv_gqa_mma_kernel(
+                          *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
+                    : nullptr;
+                if(mma_tiles){
+                    const int gqa_tile_count=
+                        (tokens+gqa_tile_tokens-1)/gqa_tile_tokens;
+                    void* gqa_args[]={&queries,&cache_keys,&cache_values,
+                        const_cast<std::uint64_t*>(&s.attention_scores),
+                        const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                        const_cast<int*>(&head_dim),&tokens,&capacity,
+                        &first_slot,&scale};
+                    launch_named(mma_tiles,kv_heads,gqa_tile_count,256,gqa_args);
+                    void* merge_args[]={
+                        const_cast<std::uint64_t*>(&s.attention_scores),
+                        &attended,const_cast<int*>(&heads),
+                        const_cast<int*>(&head_dim),
+                        const_cast<int*>(&gqa_tile_count)};
+                    launch_named(kv_fused_merge_kernel_name(*runtime,head_dim),
+                                 heads,1,256,merge_args);
+                }else{
                 const bool cublas_done=
                     qwen_turbo_cublas_attention(
                         *runtime,queries,s.first,cache_keys,cache_values,
@@ -26444,6 +26565,7 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                     launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
                     void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
                     launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                }
                 }
                 }
                 std::uint64_t gated = s.third; int elements = heads * head_dim;

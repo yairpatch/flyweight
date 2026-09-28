@@ -296,10 +296,9 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1m_q8_matmul_tiled", .matmul_q8_mmq = "iq1m_q8_mmq",
      .matmul_rows = "iq1m_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     // AVX2 row dot and dequant; no grouped octet decoder, so
-     // decode-shaped GPU experts stay on the CPU. Prefill can take
+     // The grouped octet decoder is iq1m_octet. Prefill can also take
      // `iq1m_q8_mmq_routed`.
-     .cpu_expert = true},
+     .grouped_expert_prefix = "iq1m", .cpu_expert = true},
     {.type = 30, .family = "bf16",
      .matmul_rows = "bf16_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::per_token,
