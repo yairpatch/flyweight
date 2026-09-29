@@ -146,6 +146,8 @@ struct QwenMoeProfile {
     double staging = 0;     // memcpy of a missed expert bundle into pinned staging
     double table = 0;       // the seven pointer/scale memcpys + their upload
     double queue = 0;       // grouped kernel launches + deferred cache uploads
+    double cpu_compute = 0; // wall time in qwen_cpu_moe for hybrid cache misses
+    double cpu_output = 0;  // host time to enqueue fallback output upload + add
     // Prefill streaming path: the per-expert-group gather/quantize/GEMM/scatter
     // launches, separated from the staging uploads that precede them. ~200k
     // groups of ~20 tokens each per prompt is the shape under suspicion.
@@ -194,6 +196,9 @@ void qwen_moe_profile_report() {
         std::fprintf(stderr, "  %-26s %7.3f ms/token  %5.1f%%\n",
                      name, ms / t, sum > 0 ? 100.0 * ms / sum : 0.0);
     std::fprintf(stderr, "  %-26s %7.3f ms/token\n", "TOTAL attributed", sum / t);
+    std::fprintf(stderr,
+        "  CPU fallback wall: compute %.3f ms/token, output enqueue %.3f ms/token\n",
+        p.cpu_compute / t, p.cpu_output / t);
     if (p.stream_groups)
         std::fprintf(stderr,
             "  [prefill stream] uploads %.2f s, group compute %.2f s over "
@@ -21609,22 +21614,26 @@ static void qwen_run_hybrid_experts(
         throw std::runtime_error("native Qwen staging event failed");
     if (cpu_count) {
         profile_record(profile?profile->expert_cpu_start:0);
+        const double t_cpu = moe_now();
         const auto compute_started = timing_enabled()
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         qwen_cpu_moe(
             runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
             cpu_count, cpu_input, cpu_activated, cpu_output);
+        if (moe_profile_enabled()) moe_prof.cpu_compute += moe_now() - t_cpu;
         if (timing_enabled())
             runtime.expert_compute_nanoseconds +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - compute_started).count();
+        const double t_output = moe_now();
         if (flyweight_gpu_upload(fourth, cpu_output, hidden_size * sizeof(float), runtime.stream) != 0)
             throw std::runtime_error("native hybrid MoE output upload failed");
         float scale = 1.0f;
         int count = hidden_size;
         void* add_args[] = {&third, &fourth, &scale, &count};
         launch("scaled_add", (hidden_size + 255) / 256, 1, 256, add_args);
+        if (moe_profile_enabled()) moe_prof.cpu_output += moe_now() - t_output;
         profile_record(profile?profile->expert_cpu_end:0);
         if(profile)profile->expert_subprofile_mask|=8;
     }
