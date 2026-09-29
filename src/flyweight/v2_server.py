@@ -2767,7 +2767,7 @@ class NativeV2InferenceService(InferenceService):
         cpu_threads: int = 0,
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
-        dense_requant: str = "auto",
+        dense_requant: str = "off",
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,

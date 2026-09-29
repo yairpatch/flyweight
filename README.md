@@ -105,7 +105,7 @@ knowing. `flyweight serve --help` lists everything, grouped.
 | `--gpu-cache-mib N` | 0 | VRAM for the expert cache; 0 sizes it from what is free at startup |
 | `--expert-mode` | auto | where routed experts run, below |
 | `--cpu-threads N` | 0 | CPU expert workers; 0 picks the physical cores |
-| `--dense-requant auto\|q8\|off` | auto | repack BF16 dense weights to Q8_0 on the GPU when VRAM is tight |
+| `--dense-requant auto\|q8\|off` | off | optionally repack BF16 dense weights to Q8_0 on the GPU; `auto` uses VRAM pressure and `q8` forces conversion |
 | `--mtp-drafts N` | 0 | speculative decode with the checkpoint's draft block, up to 8 |
 | `--mtp-model PATH` | | a standalone draft GGUF (Qwen MTP files, DSpark for DeepSeek-V4) |
 | `--backend auto\|cuda\|cpu` | auto | `cpu` runs every kernel on the host |
