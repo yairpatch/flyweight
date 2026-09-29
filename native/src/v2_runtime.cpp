@@ -146,6 +146,13 @@ struct QwenMoeProfile {
     double staging = 0;     // memcpy of a missed expert bundle into pinned staging
     double table = 0;       // the seven pointer/scale memcpys + their upload
     double queue = 0;       // grouped kernel launches + deferred cache uploads
+    double cpu_compute = 0; // wall time in qwen_cpu_moe for hybrid cache misses
+    double cpu_output = 0;  // host time to enqueue fallback output upload + add
+    // Split of cpu_compute. Setup is the host work before the OpenMP team
+    // (expert pointers, role scales, input quant). Gate/up includes SwiGLU.
+    // act-q8 is the activated-row requant on the Q8 path and stays zero otherwise.
+    // OpenMP fork/join sits outside these and shows up as unaccounted.
+    double cpu_setup = 0, cpu_gate_up = 0, cpu_quant = 0, cpu_down = 0;
     // Prefill streaming path: the per-expert-group gather/quantize/GEMM/scatter
     // launches, separated from the staging uploads that precede them. ~200k
     // groups of ~20 tokens each per prompt is the shape under suspicion.
@@ -168,10 +175,17 @@ inline double moe_now() {
         : 0.0;
 }
 void qwen_moe_profile_report();
+extern "C" void flyweight_moe_profile_dump();
 // Prefill can finish without ever reaching the decode-side report (a probe that
 // generates a handful of tokens never hits the every-50 tick), so guarantee the
-// numbers reach stderr.
-struct QwenMoeProfileAtExit { ~QwenMoeProfileAtExit(){ qwen_moe_profile_report(); } };
+// numbers reach stderr. The dump covers every single-token qwen_cpu_moe call,
+// including ones the per-token hybrid split does not (MTP, pure CPU).
+struct QwenMoeProfileAtExit {
+    ~QwenMoeProfileAtExit(){
+        qwen_moe_profile_report();
+        flyweight_moe_profile_dump();
+    }
+};
 static QwenMoeProfileAtExit qwen_moe_profile_at_exit;
 
 void qwen_moe_profile_report() {
@@ -194,6 +208,17 @@ void qwen_moe_profile_report() {
         std::fprintf(stderr, "  %-26s %7.3f ms/token  %5.1f%%\n",
                      name, ms / t, sum > 0 ? 100.0 * ms / sum : 0.0);
     std::fprintf(stderr, "  %-26s %7.3f ms/token\n", "TOTAL attributed", sum / t);
+    std::fprintf(stderr,
+        "  CPU fallback wall: compute %.3f ms/token, output enqueue %.3f ms/token\n",
+        p.cpu_compute / t, p.cpu_output / t);
+    if (p.cpu_compute > 0.0) {
+        const double split = p.cpu_setup + p.cpu_gate_up + p.cpu_quant + p.cpu_down;
+        std::fprintf(stderr,
+            "    qwen_cpu_moe: setup %.3f, gate+up %.3f, act-q8 %.3f, down %.3f"
+            " ms/token (unaccounted %.3f)\n",
+            p.cpu_setup / t, p.cpu_gate_up / t, p.cpu_quant / t, p.cpu_down / t,
+            (p.cpu_compute - split) / t);
+    }
     if (p.stream_groups)
         std::fprintf(stderr,
             "  [prefill stream] uploads %.2f s, group compute %.2f s over "
@@ -529,6 +554,11 @@ struct QwenCudaLayerProfile {
     std::uint64_t recurrent_start=0,recurrent_end=0;
     std::uint64_t shared_start=0,shared_end=0;
     std::uint64_t expert_start=0,expert_end=0;
+    std::uint64_t expert_setup_start=0,expert_setup_end=0;
+    std::uint64_t expert_gate_up_start=0,expert_gate_up_end=0;
+    std::uint64_t expert_down_start=0,expert_down_end=0;
+    std::uint64_t expert_cpu_start=0,expert_cpu_end=0;
+    std::uint8_t expert_subprofile_mask=0;
 };
 
 // DeltaNet conv+recurrent states captured at the end of a prompt prefill,
@@ -2443,6 +2473,14 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
         flyweight_gpu_event_destroy(profile.shared_end);
         flyweight_gpu_event_destroy(profile.expert_start);
         flyweight_gpu_event_destroy(profile.expert_end);
+        flyweight_gpu_event_destroy(profile.expert_setup_start);
+        flyweight_gpu_event_destroy(profile.expert_setup_end);
+        flyweight_gpu_event_destroy(profile.expert_gate_up_start);
+        flyweight_gpu_event_destroy(profile.expert_gate_up_end);
+        flyweight_gpu_event_destroy(profile.expert_down_start);
+        flyweight_gpu_event_destroy(profile.expert_down_end);
+        flyweight_gpu_event_destroy(profile.expert_cpu_start);
+        flyweight_gpu_event_destroy(profile.expert_cpu_end);
     }
     runtime.cuda_layer_profiles.clear();
     flyweight_gpu_event_destroy(runtime.cuda_tail_start);
@@ -4414,6 +4452,17 @@ std::string qwen_grouped_accumulate_rows_name(std::uint32_t type) {
     if(type==13)return "q5k_grouped_accumulate_rows";
     if(type!=14)throw std::runtime_error(qwen_grouped_expert_unsupported(type));
     return "q6k_grouped_accumulate_rows";
+}
+
+std::string qwen_grouped_accumulate_name(std::uint32_t type) {
+    auto iq=qwen_grouped_expert_kernel(type,"_grouped_accumulate");
+    if(!iq.empty())return iq;
+    if(type==8)return "q8_grouped_accumulate";
+    if(type==40)return "nvfp4_grouped_accumulate";
+    if(type==12)return "q4k_grouped_accumulate";
+    if(type==13)return "q5k_grouped_accumulate";
+    if(type!=14)throw std::runtime_error(qwen_grouped_expert_unsupported(type));
+    return "q6k_grouped_accumulate";
 }
 
 // The k-quant and NVFP4 accumulates go through their own driver entry points;
@@ -6547,8 +6596,11 @@ float qwen_expert_role_scale(
 // Per-phase MoE timing. The expert path does not go through launch_named, so
 // FLYWEIGHT_CPU_PROFILE cannot see inside it; this is the only view of where the
 // ~43% of decode that lands here actually goes. Off unless FLYWEIGHT_MOE_PROFILE=1.
-std::atomic<std::uint64_t> g_moe_gate_up_ns{0}, g_moe_quant_ns{0}, g_moe_down_ns{0};
+// These totals cover every single-token qwen_cpu_moe call. The hybrid decode
+// split on QwenMoeProfile is a subset, gated by qwen_cpu_moe_split_active.
+std::atomic<std::uint64_t> g_moe_setup_ns{0}, g_moe_gate_up_ns{0}, g_moe_quant_ns{0}, g_moe_down_ns{0};
 std::atomic<std::uint64_t> g_moe_calls{0};
+thread_local bool qwen_cpu_moe_split_active = false;
 
 bool moe_profiling() {
     static const bool on = [] {
@@ -6558,19 +6610,34 @@ bool moe_profiling() {
     return on;
 }
 
+void qwen_cpu_moe_note_phase(
+    std::atomic<std::uint64_t>& bucket, double& split_ms,
+    std::chrono::steady_clock::time_point& mark, bool split
+) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+    bucket += ns;
+    if (split) split_ms += static_cast<double>(ns) / 1.0e6;
+    mark = now;
+}
+
 extern "C" FLYWEIGHT_BACKEND_API void flyweight_moe_profile_dump() {
     if (!moe_profiling()) return;
+    const double setup = g_moe_setup_ns.load() / 1e6;
     const double gate_up = g_moe_gate_up_ns.load() / 1e6;
     const double quant = g_moe_quant_ns.load() / 1e6;
     const double down = g_moe_down_ns.load() / 1e6;
-    const double total = gate_up + quant + down;
+    const double total = setup + gate_up + quant + down;
     if (total <= 0.0) return;
     std::fprintf(stderr,
-        "\n[flyweight-moe] %llu calls, %.1f ms total\n"
+        "\n[flyweight-moe] %llu single-token calls, %.1f ms total\n"
+        "  setup          %8.1f ms  %5.1f%%\n"
         "  gate+up+swiglu %8.1f ms  %5.1f%%\n"
         "  activation q8  %8.1f ms  %5.1f%%\n"
         "  down           %8.1f ms  %5.1f%%\n",
         static_cast<unsigned long long>(g_moe_calls.load()), total,
+        setup, 100*setup/total,
         gate_up, 100*gate_up/total, quant, 100*quant/total,
         down, 100*down/total);
 }
@@ -6585,6 +6652,11 @@ void qwen_cpu_moe(
     float* activated,
     float* output
 ) {
+    const bool profile = moe_profiling();
+    const bool split = profile && qwen_cpu_moe_split_active;
+    auto setup_mark = profile
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     const int experts = runtime.model->config.expert_count;
     const int hidden = runtime.model->config.hidden_size;
     const int intermediate = runtime.moe_intermediate;
@@ -6795,6 +6867,9 @@ void qwen_cpu_moe(
         for (int lane = 0; lane < count; ++lane)
             output[first_row + lane] = sums[lane];
     };
+    if (profile)
+        qwen_cpu_moe_note_phase(
+            g_moe_setup_ns, qwen_moe_profile().cpu_setup, setup_mark, split);
     if (use_q8) {
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(team)
@@ -6804,7 +6879,6 @@ void qwen_cpu_moe(
             // `omp for` carries an implicit barrier, so a timestamp taken by one
             // thread between them is a true phase boundary rather than a sample
             // of whichever thread got there first.
-            const bool profile = moe_profiling();
             auto mark = std::chrono::steady_clock::time_point{};
             if (profile) mark = std::chrono::steady_clock::now();
 #if defined(_OPENMP)
@@ -6815,12 +6889,9 @@ void qwen_cpu_moe(
 #if defined(_OPENMP)
 #pragma omp master
 #endif
-            if (profile) {
-                const auto now = std::chrono::steady_clock::now();
-                g_moe_gate_up_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(now-mark).count());
-                mark = now;
-            }
+            if (profile)
+                qwen_cpu_moe_note_phase(
+                    g_moe_gate_up_ns, qwen_moe_profile().cpu_gate_up, mark, split);
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
@@ -6834,12 +6905,9 @@ void qwen_cpu_moe(
 #if defined(_OPENMP)
 #pragma omp master
 #endif
-            if (profile) {
-                const auto now = std::chrono::steady_clock::now();
-                g_moe_quant_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(now-mark).count());
-                mark = now;
-            }
+            if (profile)
+                qwen_cpu_moe_note_phase(
+                    g_moe_quant_ns, qwen_moe_profile().cpu_quant, mark, split);
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
@@ -6848,9 +6916,8 @@ void qwen_cpu_moe(
 #pragma omp master
 #endif
             if (profile) {
-                g_moe_down_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now()-mark).count());
+                qwen_cpu_moe_note_phase(
+                    g_moe_down_ns, qwen_moe_profile().cpu_down, mark, split);
                 ++g_moe_calls;
             }
         }
@@ -6862,6 +6929,10 @@ void qwen_cpu_moe(
 #endif
         {
             qwen_pin_decode_member();
+            // Same barrier as the Q8 path: the timestamp is taken after every
+            // thread has finished gate/up, so it is the phase boundary.
+            auto mark = std::chrono::steady_clock::time_point{};
+            if (profile) mark = std::chrono::steady_clock::now();
             if (q4_tiled) {
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
@@ -6869,10 +6940,6 @@ void qwen_cpu_moe(
                 for (int task = 0;
                      task < routed_count * ((intermediate + 3) / 4); ++task)
                     gate_up_tile(task);
-#if defined(_OPENMP)
-#pragma omp for schedule(static)
-#endif
-                for (int row = 0; row < hidden; row += 4) down_tile(row);
             } else if (iq1s_q8 && gate_type == 19 && (cpu_features & 8u) != 0) {
                 // Four gate/up rows share one load of the Q8 activation, and
                 // four down rows share one load of the activated vector.
@@ -6899,20 +6966,30 @@ void qwen_cpu_moe(
                             gate_value / (1.0f + std::exp(-clipped)) * up_value;
                     }
                 }
-#if defined(_OPENMP)
-#pragma omp for schedule(static)
-#endif
-                for (int row = 0; row < hidden; row += 4) down_tile(row);
             } else {
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
                 for (int task = 0; task < routed_count * intermediate; ++task)
                     gate_up_task(task);
+            }
+#if defined(_OPENMP)
+#pragma omp master
+#endif
+            if (profile)
+                qwen_cpu_moe_note_phase(
+                    g_moe_gate_up_ns, qwen_moe_profile().cpu_gate_up, mark, split);
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
-                for (int row = 0; row < hidden; row += 4) down_tile(row);
+            for (int row = 0; row < hidden; row += 4) down_tile(row);
+#if defined(_OPENMP)
+#pragma omp master
+#endif
+            if (profile) {
+                qwen_cpu_moe_note_phase(
+                    g_moe_down_ns, qwen_moe_profile().cpu_down, mark, split);
+                ++g_moe_calls;
             }
         }
     }
@@ -15914,6 +15991,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             create_profile_event(events.recurrent_start);create_profile_event(events.recurrent_end);
             create_profile_event(events.shared_start);create_profile_event(events.shared_end);
             create_profile_event(events.expert_start);create_profile_event(events.expert_end);
+            create_profile_event(events.expert_setup_start);create_profile_event(events.expert_setup_end);
+            create_profile_event(events.expert_gate_up_start);create_profile_event(events.expert_gate_up_end);
+            create_profile_event(events.expert_down_start);create_profile_event(events.expert_down_end);
+            create_profile_event(events.expert_cpu_start);create_profile_event(events.expert_cpu_end);
         }
         create_profile_event(runtime->cuda_tail_start);
         create_profile_event(runtime->cuda_lm_start);
@@ -21281,8 +21362,14 @@ static void qwen_run_hybrid_experts(
     float* cpu_input, float* cpu_activated, float* cpu_output,
     std::uint64_t normalized, std::uint64_t activated,
     std::uint64_t third, std::uint64_t fourth,
-    bool fence_staging, Launch& launch
+    bool fence_staging, Launch& launch,
+    QwenCudaLayerProfile* profile=nullptr
 ) {
+    auto profile_record=[&](std::uint64_t event){
+        if(profile&&runtime.cuda_profile&&
+           flyweight_gpu_event_record(event,runtime.stream)!=0)
+            throw std::runtime_error("native Qwen expert subprofile event failed");
+    };
     static const bool persistent = [] {
         const char* setting = std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");
         return setting && setting[0] == '1';
@@ -21297,6 +21384,23 @@ static void qwen_run_hybrid_experts(
         const char* setting = std::getenv("FLYWEIGHT_NVFP4_TILED");
         return setting && setting[0] == '1';
     }();
+    // A cache miss is staged into a slot for the next token and computed on
+    // the CPU for this one. That CPU matvec is the decode lead.
+    //   1 — a miss that received a slot is uploaded first and included in
+    //       this token's grouped kernels. A rejected miss stays on the CPU.
+    //   2 — a rejected miss is also computed on the GPU, from the expert
+    //       staging buffer, and is not admitted. The cache policy is unchanged.
+    static const int gpu_miss_mode = [] {
+        const char* setting = std::getenv("FLYWEIGHT_GPU_MISS");
+        if (!setting || !setting[0] || setting[0] == '0') return 0;
+        const int mode = setting[0] == '2' ? 2 : 1;
+        std::fprintf(stderr,
+            "[flyweight] hybrid cache misses compute on the GPU (%s)\n",
+            mode == 2 ? "admitted and rejected" : "admitted only");
+        return mode;
+    }();
+    const bool gpu_miss = gpu_miss_mode >= 1;
+    const bool gpu_miss_scratch = gpu_miss_mode >= 2;
     if (runtime.expert_slots.empty())
         throw std::runtime_error("native hybrid MoE requires an expert cache budget");
     if (fence_staging &&
@@ -21311,9 +21415,15 @@ static void qwen_run_hybrid_experts(
     struct PendingUpload {
         std::uint64_t device, host_offset, bytes;
         std::size_t slot_index;
+        bool in_cache;
     };
     std::array<PendingUpload, 256> pending{};
     int pending_count = 0;
+    // Rejected misses land at the front of the device staging buffer. The
+    // grouped-kernel pointer table keeps the tail, so the two do not alias.
+    std::uint64_t scratch_used = 0;
+    const std::uint64_t scratch_table_reserve = device_align(
+        256ull * (3 * sizeof(std::uint64_t) + 4 * sizeof(float)));
     auto& moe_prof = qwen_moe_profile();
     for (int rank = 0; rank < route_count; ++rank) {
         const int expert = selected[rank];
@@ -21365,25 +21475,110 @@ static void qwen_run_hybrid_experts(
             continue;
         }
         ++runtime.expert_cache_misses;
-        cpu_selected[cpu_count] = expert;
-        cpu_compact_weights[cpu_count] = route_weights[rank];
-        if (layer.expert_down_scale != std::numeric_limits<std::uint64_t>::max()) {
-            const auto& scale_tensor = runtime.model->tensors[layer.expert_down_scale];
-            const auto scale_bytes =
-                scale_tensor.size / runtime.model->config.expert_count;
-            float down_scale = 1.0f;
-            std::memcpy(
-                &down_scale,
-                tensor_data(*runtime.model, scale_tensor) +
-                    static_cast<std::uint64_t>(expert) * scale_bytes,
-                sizeof(float));
-            cpu_compact_weights[cpu_count] *= down_scale;
+        // Admit before choosing the device when misses may run on the GPU:
+        // only a miss that actually received a slot has weights the grouped
+        // kernels can read. The flag-off path keeps the previous order.
+        std::size_t gpu_slot = kNoExpertSlot;
+        if (gpu_miss) {
+            const double t_admit = moe_now();
+            gpu_slot = select_expert_cache_slot(runtime, layer_number, expert, true);
+            if (moe_profile_enabled()) {
+                moe_prof.admission += moe_now() - t_admit;
+                ++moe_prof.admissions;
+            }
         }
-        ++cpu_count;
+        if (gpu_miss_scratch && gpu_slot == kNoExpertSlot &&
+            scratch_used + runtime.expert_slot_bytes + scratch_table_reserve <=
+                runtime.expert_staging_bytes) {
+            const auto scratch_base = runtime.expert_staging + scratch_used;
+            bool placed = false;
+            if (layer.expert_dma) {
+                std::uint64_t role_offset = 0;
+                for (int role = 0; role < 3; ++role) {
+                    const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
+                    const auto bytes = tensor.size / experts;
+                    const auto offset = static_cast<std::uint64_t>(expert) * bytes;
+                    if (flyweight_gpu_upload(
+                            scratch_base + role_offset,
+                            tensor_data(*runtime.model, tensor) + offset, bytes,
+                            runtime.stream) != 0)
+                        throw std::runtime_error(
+                            "native hybrid MoE scratch upload failed");
+                    role_offset += bytes;
+                }
+                placed = true;
+            } else {
+                const auto bundle_start = staging_cursor;
+                std::uint64_t bundle_bytes = 0;
+                for (int role = 0; role < 3; ++role)
+                    bundle_bytes += runtime.model->tensors[layer.expert_tensors[role]].size / experts;
+                if (staging_cursor + bundle_bytes <= runtime.expert_staging_bytes) {
+                    const double t_stage = moe_now();
+                    for (int role = 0; role < 3; ++role) {
+                        const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
+                        const auto bytes = tensor.size / experts;
+                        const auto offset = static_cast<std::uint64_t>(expert) * bytes;
+                        std::memcpy(
+                            staging + staging_cursor,
+                            tensor_data(*runtime.model, tensor) + offset, bytes);
+                        staging_cursor += bytes;
+                    }
+                    if (moe_profile_enabled()) {
+                        moe_prof.staging += moe_now() - t_stage;
+                        moe_prof.staged_bytes += bundle_bytes;
+                    }
+                    pending[pending_count++] = {
+                        scratch_base, bundle_start, bundle_bytes, 0, false};
+                    placed = true;
+                }
+            }
+            if (placed) {
+                scratch_used += runtime.expert_slot_bytes;
+                std::uint64_t role_offset = 0;
+                for (int role = 0; role < 3; ++role) {
+                    const auto bytes =
+                        runtime.model->tensors[layer.expert_tensors[role]].size / experts;
+                    const auto pointer = scratch_base + role_offset;
+                    if (role == 0) gate_pointers[gpu_count] = pointer;
+                    else if (role == 1) up_pointers[gpu_count] = pointer;
+                    else down_pointers[gpu_count] = pointer;
+                    role_offset += bytes;
+                }
+                gpu_compact_weights[gpu_count] = route_weights[rank];
+                const double t_scales = moe_now();
+                gpu_gate_scales[gpu_count] =
+                    qwen_expert_role_scale(runtime, layer.expert_gate_scale, expert);
+                gpu_down_scales[gpu_count] =
+                    qwen_expert_role_scale(runtime, layer.expert_down_scale, expert);
+                gpu_up_scales[gpu_count] =
+                    qwen_expert_role_scale(runtime, layer.expert_up_scale, expert) *
+                    gpu_down_scales[gpu_count];
+                if (moe_profile_enabled()) moe_prof.scales += moe_now() - t_scales;
+                ++gpu_count;
+                continue;
+            }
+        }
+        if (!gpu_miss || gpu_slot == kNoExpertSlot) {
+            cpu_selected[cpu_count] = expert;
+            cpu_compact_weights[cpu_count] = route_weights[rank];
+            if (layer.expert_down_scale != std::numeric_limits<std::uint64_t>::max()) {
+                const auto& scale_tensor = runtime.model->tensors[layer.expert_down_scale];
+                const auto scale_bytes =
+                    scale_tensor.size / runtime.model->config.expert_count;
+                float down_scale = 1.0f;
+                std::memcpy(
+                    &down_scale,
+                    tensor_data(*runtime.model, scale_tensor) +
+                        static_cast<std::uint64_t>(expert) * scale_bytes,
+                    sizeof(float));
+                cpu_compact_weights[cpu_count] *= down_scale;
+            }
+            ++cpu_count;
+        }
         const double t_admit = moe_now();
-        const auto slot_index =
+        const auto slot_index = gpu_miss ? gpu_slot :
             select_expert_cache_slot(runtime, layer_number, expert, true);
-        if (moe_profile_enabled()) {
+        if (!gpu_miss && moe_profile_enabled()) {
             moe_prof.admission += moe_now() - t_admit;
             ++moe_prof.admissions;
         }
@@ -21442,11 +21637,72 @@ static void qwen_run_hybrid_experts(
                 moe_prof.staged_bytes += staging_cursor - bundle_start;
             }
             pending[pending_count++] = {
-                slot_base, bundle_start, staging_cursor - bundle_start, slot_index};
+                slot_base, bundle_start, staging_cursor - bundle_start, slot_index, true};
         }
+        if (!gpu_miss) continue;
+        // Same scale packing as a cache hit: the route weight stays raw and
+        // the down scale rides on the up scale, because the accumulate is
+        // linear. The slot upload is queued before the grouped kernels below.
+        std::uint64_t role_offset = 0;
+        for (int role = 0; role < 3; ++role) {
+            const auto bytes =
+                runtime.model->tensors[layer.expert_tensors[role]].size / experts;
+            const auto pointer = slot_base + role_offset;
+            if (role == 0) gate_pointers[gpu_count] = pointer;
+            else if (role == 1) up_pointers[gpu_count] = pointer;
+            else down_pointers[gpu_count] = pointer;
+            role_offset += bytes;
+        }
+        if (slot.native_valid && runtime.expert_native_cache)
+            native_pointers[gpu_count] = runtime.expert_native_cache +
+                slot_index * runtime.expert_slot_bytes;
+        gpu_compact_weights[gpu_count] = route_weights[rank];
+        const double t_scales = moe_now();
+        gpu_gate_scales[gpu_count] =
+            qwen_expert_role_scale(runtime, layer.expert_gate_scale, expert);
+        gpu_down_scales[gpu_count] =
+            qwen_expert_role_scale(runtime, layer.expert_down_scale, expert);
+        gpu_up_scales[gpu_count] =
+            qwen_expert_role_scale(runtime, layer.expert_up_scale, expert) *
+            gpu_down_scales[gpu_count];
+        if (moe_profile_enabled()) moe_prof.scales += moe_now() - t_scales;
+        ++gpu_count;
+    }
+    auto upload_pending = [&]() {
+        for (int index = 0; index < pending_count; ++index) {
+            const auto& upload = pending[index];
+            if (flyweight_gpu_upload(
+                    upload.device, staging + upload.host_offset, upload.bytes,
+                    runtime.stream) != 0)
+                throw std::runtime_error("native hybrid MoE cache upload failed");
+            if (upload.in_cache && runtime.expert_native_cache) {
+                const auto gate_bytes =
+                    runtime.model->tensors[layer.expert_tensors[0]].size / experts;
+                const auto up_bytes =
+                    runtime.model->tensors[layer.expert_tensors[1]].size / experts;
+                const int status = flyweight_gpu_nvfp4_prepare_expert(
+                    upload.device, upload.device + gate_bytes,
+                    upload.device + gate_bytes + up_bytes,
+                    runtime.expert_native_cache + upload.slot_index * runtime.expert_slot_bytes,
+                    runtime.stream, hidden_size, intermediate);
+                if (status != 0)
+                    throw std::runtime_error("persistent NVFP4 expert preparation failed");
+                runtime.expert_slots[upload.slot_index].native_valid = true;
+            }
+        }
+        pending_count = 0;
+    };
+    // The grouped kernels read the slot. A miss computed this token has to
+    // land there before the launch, on the same stream.
+    if (gpu_miss) {
+        const double t_up = moe_now();
+        upload_pending();
+        if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_up;
     }
     const double t_table = moe_now();
     if (gpu_count) {
+        profile_record(profile?profile->expert_setup_end:0);
+        if(profile)profile->expert_subprofile_mask|=1;
         const auto table_bytes = static_cast<std::uint64_t>(gpu_count) *
             (3 * sizeof(std::uint64_t) + 4 * sizeof(float));
         const auto table_host = device_align(staging_cursor);
@@ -21527,61 +21783,67 @@ static void qwen_run_hybrid_experts(
                 &gpu_count,
                 const_cast<std::uint64_t*>(&gate_scale_table),
                 const_cast<std::uint64_t*>(&up_scale_table)};
+            profile_record(profile?profile->expert_gate_up_start:0);
             launch(
                 qwen_grouped_swiglu_name(gate_type, nvfp4_tiled, false).c_str(),
                 gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate,
                 gpu_count, 256, gate_up_args);
+            profile_record(profile?profile->expert_gate_up_end:0);
+            if(profile)profile->expert_subprofile_mask|=2;
+            profile_record(profile?profile->expert_down_start:0);
             const int status = qwen_launch_grouped_accumulate(
                 runtime.stream, down_type, down_table, activated, third,
                 weight_table, intermediate, hidden_size, gpu_count);
+            profile_record(profile?profile->expert_down_end:0);
+            if(profile)profile->expert_subprofile_mask|=4;
             if (status != 0)
                 throw std::runtime_error("native hybrid MoE down projection failed");
             if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_launch;
         }
     }
     const double t_queue = moe_now();
-    for (int index = 0; index < pending_count; ++index) {
-        const auto& upload = pending[index];
-        if (flyweight_gpu_upload(
-                upload.device, staging + upload.host_offset, upload.bytes,
-                runtime.stream) != 0)
-            throw std::runtime_error("native hybrid MoE cache upload failed");
-        if (runtime.expert_native_cache) {
-            const auto gate_bytes =
-                runtime.model->tensors[layer.expert_tensors[0]].size / experts;
-            const auto up_bytes =
-                runtime.model->tensors[layer.expert_tensors[1]].size / experts;
-            const int status = flyweight_gpu_nvfp4_prepare_expert(
-                upload.device, upload.device + gate_bytes,
-                upload.device + gate_bytes + up_bytes,
-                runtime.expert_native_cache + upload.slot_index * runtime.expert_slot_bytes,
-                runtime.stream, hidden_size, intermediate);
-            if (status != 0)
-                throw std::runtime_error("persistent NVFP4 expert preparation failed");
-            runtime.expert_slots[upload.slot_index].native_valid = true;
-        }
-    }
+    upload_pending();
     if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_queue;
     if (fence_staging &&
         flyweight_gpu_event_record(runtime.staging_event, runtime.stream) != 0)
         throw std::runtime_error("native Qwen staging event failed");
     if (cpu_count) {
+        profile_record(profile?profile->expert_cpu_start:0);
+        const double t_cpu = moe_now();
         const auto compute_started = timing_enabled()
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
+        // Partitions cpu_compute. Cleared on every exit, including a throw
+        // from the expert kernels, so a later MTP or CPU-policy call is not
+        // folded into the hybrid per-token split.
+        struct SplitActive {
+            bool armed = false;
+            SplitActive() {
+                if (moe_profile_enabled() && !qwen_cpu_moe_split_active) {
+                    qwen_cpu_moe_split_active = true;
+                    armed = true;
+                }
+            }
+            ~SplitActive() { if (armed) qwen_cpu_moe_split_active = false; }
+        } split_active;
         qwen_cpu_moe(
             runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
             cpu_count, cpu_input, cpu_activated, cpu_output);
+        if (moe_profile_enabled()) moe_prof.cpu_compute += moe_now() - t_cpu;
         if (timing_enabled())
             runtime.expert_compute_nanoseconds +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - compute_started).count();
+        const double t_output = moe_now();
         if (flyweight_gpu_upload(fourth, cpu_output, hidden_size * sizeof(float), runtime.stream) != 0)
             throw std::runtime_error("native hybrid MoE output upload failed");
         float scale = 1.0f;
         int count = hidden_size;
         void* add_args[] = {&third, &fourth, &scale, &count};
         launch("scaled_add", (hidden_size + 255) / 256, 1, 256, add_args);
+        if (moe_profile_enabled()) moe_prof.cpu_output += moe_now() - t_output;
+        profile_record(profile?profile->expert_cpu_end:0);
+        if(profile)profile->expert_subprofile_mask|=8;
     }
 }
 
@@ -21643,14 +21905,18 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
     std::uint64_t launch_stream=runtime->stream;
     // FLYWEIGHT_KERNEL_PROFILE=1 brackets every decode launch with CUDA events and
-    // accumulates GPU time per kernel name. The events serialize the stream, so
-    // the absolute total runs high; the point is the relative split, which is
-    // what says whether a token is spent reading weights or somewhere else.
+    // accumulates GPU time per kernel name. It also reports wall time and the
+    // final stream-sync wait, making time outside instrumented kernels visible.
     static const bool lm_diagnostics=std::getenv("FLYWEIGHT_LM_DIAG")!=nullptr;
     static const bool kernel_profile=
         std::getenv("FLYWEIGHT_KERNEL_PROFILE")&&
         std::getenv("FLYWEIGHT_KERNEL_PROFILE")[0]=='1';
-    struct KernelProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
+    struct KernelProfileEntry{
+        double milliseconds=0.0;
+        double host_launch_milliseconds=0.0;
+        float max_microseconds=0.0f;
+        std::uint64_t calls=0;
+    };
     static std::map<std::string,KernelProfileEntry> kernel_profile_totals;
     // Events are recorded on the stream and only read back once the token is
     // done. Syncing per launch would stall the CPU, and an idle GPU drops from
@@ -21662,6 +21928,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     static std::size_t kernel_profile_used=0;
     static std::uint64_t kernel_profile_overflow=0;
     static std::uint64_t kernel_profile_decodes=0;
+    static double kernel_profile_wall_ms=0.0;
+    static double kernel_profile_tail_sync_ms=0.0;
     if(kernel_profile&&kernel_profile_events.empty()){
         kernel_profile_events.resize(2*kKernelProfileCapacity);
         kernel_profile_labels.resize(kKernelProfileCapacity);
@@ -21672,7 +21940,18 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         const bool traced=kernel_profile&&kernel_profile_used<kKernelProfileCapacity;
         const std::size_t slot=kernel_profile_used;
         if(traced)flyweight_gpu_event_record(kernel_profile_events[2*slot],launch_stream);
-        if(flyweight_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
+        const auto host_launch_started=kernel_profile
+            ?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const int launch_status=flyweight_gpu_launch_named(
+            name,grid_x,grid_y,block_x,shared,launch_stream,arguments);
+        if(kernel_profile){
+            char key[192];
+            std::snprintf(key,sizeof(key),"%s grid=%u",name,grid_x);
+            kernel_profile_totals[key].host_launch_milliseconds+=
+                std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-host_launch_started).count();
+        }
+        if(launch_status!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
         if(traced){
             flyweight_gpu_event_record(kernel_profile_events[2*slot+1],launch_stream);
             char key[192];
@@ -21680,6 +21959,36 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             kernel_profile_labels[slot]=key;
             ++kernel_profile_used;
         }else if(kernel_profile)++kernel_profile_overflow;
+    };
+    auto launch_grouped_accumulate=[&](std::uint32_t down_type,
+            std::uint64_t down_table,std::uint64_t activated,
+            std::uint64_t output,std::uint64_t weights,int intermediate,
+            int count){
+        const std::string name=qwen_grouped_accumulate_name(down_type);
+        const bool traced=kernel_profile&&kernel_profile_used<kKernelProfileCapacity;
+        const std::size_t slot=kernel_profile_used;
+        if(traced)flyweight_gpu_event_record(kernel_profile_events[2*slot],launch_stream);
+        const auto host_launch_started=kernel_profile
+            ?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const int status=qwen_launch_grouped_accumulate(
+            launch_stream,down_type,down_table,activated,output,weights,
+            intermediate,hidden_size,count);
+        if(kernel_profile){
+            char key[192];
+            std::snprintf(key,sizeof(key),"%s grid=%d",name.c_str(),hidden_size);
+            kernel_profile_totals[key].host_launch_milliseconds+=
+                std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-host_launch_started).count();
+        }
+        if(status!=0)return status;
+        if(traced){
+            flyweight_gpu_event_record(kernel_profile_events[2*slot+1],launch_stream);
+            char key[192];
+            std::snprintf(key,sizeof(key),"%s grid=%d",name.c_str(),hidden_size);
+            kernel_profile_labels[slot]=key;
+            ++kernel_profile_used;
+        }else if(kernel_profile)++kernel_profile_overflow;
+        return 0;
     };
     auto kernel_profile_collect=[&]{
         if(!kernel_profile)return;
@@ -21689,7 +21998,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                                          kernel_profile_events[2*slot+1],
                                          &milliseconds)!=0)continue;
             auto&entry=kernel_profile_totals[kernel_profile_labels[slot]];
-            entry.milliseconds+=milliseconds;++entry.calls;
+            entry.milliseconds+=milliseconds;
+            entry.max_microseconds=std::max(entry.max_microseconds,milliseconds*1000.0f);
+            ++entry.calls;
         }
         kernel_profile_used=0;
     };
@@ -21705,19 +22016,32 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         std::uint64_t calls=0;
         for(const auto&entry:kernel_profile_totals)calls+=entry.second.calls;
         const double decodes=static_cast<double>(kernel_profile_decodes?kernel_profile_decodes:1);
+        double host_launch_total=0.0;
         std::fprintf(stderr,
-            "[kernel-profile] %.2f ms/token of kernel time over %.0f decodes, "
-            "%.0f launches/token across %zu distinct kernels (untraced=%llu)\n",
-            total/decodes,decodes,calls/decodes,kernel_profile_totals.size(),
+            "[kernel-profile] wall %.2f ms/tok, kernels %.2f ms/tok (%.1f%%), "
+            "host-launch %.2f ms/tok, "
+            "tail-sync %.2f ms/tok, outside-kernels %.2f ms/tok; over %.0f decodes, "
+            "%.0f launches/tok, %zu kernels (untraced=%llu)\n",
+            kernel_profile_wall_ms/decodes,total/decodes,
+            kernel_profile_wall_ms>0.0?100.0*total/kernel_profile_wall_ms:0.0,
+            [&]{for(const auto&entry:kernel_profile_totals)
+                    host_launch_total+=entry.second.host_launch_milliseconds;
+                return host_launch_total/decodes;}(),
+            kernel_profile_tail_sync_ms/decodes,
+            std::max(0.0,kernel_profile_wall_ms-total)/decodes,
+            decodes,calls/decodes,kernel_profile_totals.size(),
             static_cast<unsigned long long>(kernel_profile_overflow));
         for(const auto&entry:sorted)
-            std::fprintf(stderr,"[kernel-profile]   %-52s %7.3f ms/tok %6.1f%%  %5.1f calls/tok %7.1f us\n",
+            std::fprintf(stderr,"[kernel-profile]   %-52s %7.3f ms/tok %6.1f%%  %5.1f calls/tok %7.1f us avg %7.1f us max %6.1f us host/tok\n",
                 entry.first.c_str(),entry.second.milliseconds/decodes,
                 100.0*entry.second.milliseconds/total,
                 entry.second.calls/decodes,
-                1000.0*entry.second.milliseconds/entry.second.calls);
+                1000.0*entry.second.milliseconds/entry.second.calls,
+                entry.second.max_microseconds,
+                1000.0*entry.second.host_launch_milliseconds/decodes);
         kernel_profile_totals.clear();
         kernel_profile_overflow=0;kernel_profile_decodes=0;
+        kernel_profile_wall_ms=0.0;kernel_profile_tail_sync_ms=0.0;
     };
     // The Q8 copy of `normalized` is reused across the projections that share
     // it, so rms -- its only writer -- has to drop that memo.
@@ -21957,6 +22281,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
         auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
+        if(profile)profile->expert_subprofile_mask=0;
         // Profiling and diagnostics both inject event records and stream syncs
         // into the block below, neither of which survives capture, so they keep
         // the eager path.
@@ -22741,6 +23066,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(flyweight_gpu_event_sync(runtime->route_event)!=0)throw std::runtime_error("native Qwen route event failed");
         if(timing_enabled())runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         if(profile)profile_record(profile->expert_start);
+        if(profile)profile_record(profile->expert_setup_start);
         // Optional adaptive expert pruning (top-p / hard top-k). Runs only for
         // the CPU/hybrid paths, whose expert weights are the host `cpu_weights`
         // this reorders/renormalizes; the streamed-GPU path keeps its device
@@ -22785,7 +23111,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 hidden_size,intermediate,experts,staging,
                 device_align(cpu_output_offset+hidden_size*sizeof(float)),
                 selected_host,cpu_weights,cpu_input,cpu_activated,cpu_output,
-                normalized,activated,third,fourth,false,launch_named);
+                normalized,activated,third,fourth,false,launch_named,profile);
         }else{
         std::uint64_t staging_cursor=device_align(top_k*sizeof(std::int32_t));
         bool has_uncached_expert=false;
@@ -22872,6 +23198,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             throw std::runtime_error(
                 "native GPU expert quantization is unsupported: "+
                 std::to_string(gate_type)+"/"+std::to_string(down_type));
+        if(profile)profile_record(profile->expert_setup_end);
+        if(profile)profile->expert_subprofile_mask|=1;
         const bool tc_enabled=env_nvfp4_tc;
         bool tc_done=false;
         if(tc_enabled&&gate_type==40&&down_type==40){
@@ -22890,8 +23218,16 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(!tc_done){
             const bool nvfp4_tiled=env_nvfp4_tiled;
             void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
+            if(profile)profile_record(profile->expert_gate_up_start);
             launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,top_k,256,gate_up_args);
-            const int down_status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,route_weights,intermediate,hidden_size,top_k);
+            if(profile)profile_record(profile->expert_gate_up_end);
+            if(profile)profile->expert_subprofile_mask|=2;
+            if(profile)profile_record(profile->expert_down_start);
+            const int down_status=launch_grouped_accumulate(
+                down_type,down_table,activated,third,route_weights,
+                intermediate,top_k);
+            if(profile)profile_record(profile->expert_down_end);
+            if(profile)profile->expert_subprofile_mask|=4;
             if(down_status!=0)throw std::runtime_error("native Qwen expert down projection failed");
         }
         }
@@ -22993,27 +23329,51 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
     if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_end);
-    const auto tail_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    const auto tail_wait_started=(timing_enabled()||kernel_profile)?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
-    if(timing_enabled())runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
+    if(timing_enabled()||kernel_profile){
+        const auto tail_wait_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-tail_wait_started).count();
+        if(timing_enabled())runtime->tail_wait_nanoseconds+=tail_wait_ns;
+        if(kernel_profile)kernel_profile_tail_sync_ms+=static_cast<double>(tail_wait_ns)/1.0e6;
+    }
     kernel_profile_collect();
     if(kernel_profile)++kernel_profile_decodes;
     if(runtime->cuda_profile){
         float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f,lm_ms=0.0f,recurrent_ms=0.0f,attention_core_ms=0.0f;
+        float expert_setup_ms=0.0f,expert_gate_up_ms=0.0f,expert_down_ms=0.0f,expert_cpu_ms=0.0f;
+        std::uint32_t expert_subprofile_event_errors=0;
         std::uint32_t delta_layers=0,attention_layers=0;
         auto elapsed=[](std::uint64_t start,std::uint64_t end){float value=0.0f;if(flyweight_gpu_event_elapsed(start,end,&value)!=0)throw std::runtime_error("native Qwen CUDA profiling measurement failed");return value;};
+        auto elapsed_if_recorded=[&](const QwenCudaLayerProfile& events,std::uint8_t bit,std::uint64_t start,std::uint64_t end){
+            float value=0.0f;
+            if(!(events.expert_subprofile_mask&bit))return 0.0f;
+            if(!start||!end){++expert_subprofile_event_errors;return 0.0f;}
+            if(flyweight_gpu_event_elapsed(start,end,&value)!=0){
+                ++expert_subprofile_event_errors;
+                return 0.0f;
+            }
+            return value;
+        };
         for(std::size_t index=0;index<runtime->layers.size();++index){
             const auto&events=runtime->cuda_layer_profiles[index];
             const float pre=elapsed(events.pre_start,events.pre_end);
             if(runtime->layers[index].attention){attention_ms+=pre;attention_core_ms+=elapsed(events.recurrent_start,events.recurrent_end);++attention_layers;}else{delta_ms+=pre;++delta_layers;recurrent_ms+=elapsed(events.recurrent_start,events.recurrent_end);}
             shared_ms+=elapsed(events.shared_start,events.shared_end);
             expert_ms+=elapsed(events.expert_start,events.expert_end);
+            if(!runtime->layers[index].dense_ffn){
+                expert_setup_ms+=elapsed_if_recorded(events,1,events.expert_setup_start,events.expert_setup_end);
+                expert_gate_up_ms+=elapsed_if_recorded(events,2,events.expert_gate_up_start,events.expert_gate_up_end);
+                expert_down_ms+=elapsed_if_recorded(events,4,events.expert_down_start,events.expert_down_end);
+                expert_cpu_ms+=elapsed_if_recorded(events,8,events.expert_cpu_start,events.expert_cpu_end);
+            }
         }
         tail_ms=elapsed(runtime->cuda_tail_start,runtime->cuda_tail_end);
         lm_ms=elapsed(runtime->cuda_lm_start,runtime->cuda_lm_end);
-        std::fprintf(stderr,"[cuda-profile] position=%llu delta=%.3fms/%u (recurrent=%.3fms) attention=%.3fms/%u (core=%.3fms) shared=%.3fms expert=%.3fms tail=%.3fms (lm=%.3fms) total=%.3fms\n",
+        std::fprintf(stderr,"[cuda-profile] position=%llu delta=%.3fms/%u (recurrent=%.3fms) attention=%.3fms/%u (core=%.3fms) shared=%.3fms expert=%.3fms (setup+upload=%.3f gate+up=%.3f down=%.3f cpu-fallback=%.3f, event-errors=%u) tail=%.3fms (lm=%.3fms) total=%.3fms\n",
             static_cast<unsigned long long>(runtime->position),delta_ms,delta_layers,recurrent_ms,attention_ms,attention_layers,attention_core_ms,
-            shared_ms,expert_ms,tail_ms,lm_ms,delta_ms+attention_ms+shared_ms+expert_ms+tail_ms);
+            shared_ms,expert_ms,expert_setup_ms,expert_gate_up_ms,expert_down_ms,expert_cpu_ms,expert_subprofile_event_errors,
+            tail_ms,lm_ms,delta_ms+attention_ms+shared_ms+expert_ms+tail_ms);
     }
     *output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
     if(std::getenv("FLYWEIGHT_TOK_DEBUG")){
@@ -23043,7 +23403,10 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             static_cast<unsigned long long>(runtime->delta_host_calls));
     }
     ++runtime->decode_calls;
-    runtime->decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-decode_started).count();
+    const auto decode_wall_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-decode_started).count();
+    runtime->decode_nanoseconds+=decode_wall_ns;
+    if(kernel_profile)kernel_profile_wall_ms+=static_cast<double>(decode_wall_ns)/1.0e6;
     if(runtime->decode_calls%50==0)kernel_profile_report();
     if(moe_profile_enabled()){
         ++qwen_moe_profile().tokens;
