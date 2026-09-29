@@ -426,6 +426,44 @@ class _ProgressDelta:
     metrics: _Metrics
 
 
+_DECODE_PROGRESS_TASK_LOCK = threading.Lock()
+_DECODE_PROGRESS_TASK_ID = 0
+
+
+class _DecodeProgressLog:
+    """Emit llama.cpp-style decode checkpoints, including for piped logs."""
+
+    interval_seconds = 3.0
+
+    def __init__(self) -> None:
+        global _DECODE_PROGRESS_TASK_ID
+        with _DECODE_PROGRESS_TASK_LOCK:
+            _DECODE_PROGRESS_TASK_ID += 1
+            self.task_id = _DECODE_PROGRESS_TASK_ID
+        self.last_tokens = 1
+        self.last_elapsed = 0.0
+        self.next_report = self.interval_seconds
+
+    def update(self, metrics: _Metrics) -> None:
+        if metrics.elapsed < self.next_report or metrics.tokens <= self.last_tokens:
+            return
+        elapsed = metrics.elapsed
+        tokens = metrics.tokens
+        average = (tokens - 1) / elapsed if elapsed > 0 else 0.0
+        interval = (
+            (tokens - self.last_tokens) / (elapsed - self.last_elapsed)
+            if elapsed > self.last_elapsed else 0.0
+        )
+        phase = f", phase = {metrics.phase}" if metrics.phase else ""
+        LOG.line(
+            f"task {self.task_id} | n_gen = {tokens:6d}, "
+            f"tg = {average:6.2f} t/s, tg_3s = {interval:6.2f} t/s{phase}"
+        )
+        self.last_tokens = tokens
+        self.last_elapsed = elapsed
+        self.next_report = elapsed + self.interval_seconds
+
+
 @dataclass(frozen=True, slots=True)
 class _ToolCallOpen:
     """A tool call whose name has settled while its arguments still stream."""
@@ -1362,8 +1400,12 @@ class InferenceService:
             if request.tools_enabled
             else self._plain_generation_events(request, meter, admitted)
         )
+        decode_log = _DecodeProgressLog()
         try:
             for event in inner:
+                metrics = getattr(event, "metrics", None)
+                if isinstance(metrics, _Metrics):
+                    decode_log.update(metrics)
                 if isinstance(event, _Finished) and event.result is not None:
                     event = dataclasses.replace(
                         event,
