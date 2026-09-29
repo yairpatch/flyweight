@@ -505,7 +505,7 @@ def _add_runtime_options(
     )
     add(
         placement, "--dense-requant", choices=("auto", "q8", "off"),
-        default="auto",
+        default="off",
         help="whether BF16 dense weights are repacked to Q8_0 for the GPU; "
              "auto decides from VRAM pressure, off keeps checkpoint precision",
     )

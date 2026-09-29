@@ -11756,6 +11756,7 @@ extern "C" __global__ void name( \
 FLYWEIGHT_LOWBIT_MATVEC_WARP(q2k_matvec_transposed_warp, q2k_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(q3k_matvec_transposed_warp, q3k_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(q4k_matvec_transposed_warp, q4k_value)
+FLYWEIGHT_LOWBIT_MATVEC_WARP(q20_matvec_transposed_warp, q20_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq2xxs_matvec_transposed_warp, iq2xxs_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq3xxs_matvec_transposed_warp, iq3xxs_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq2s_matvec_transposed_warp, iq2s_value)

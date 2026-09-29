@@ -1385,7 +1385,7 @@ extern "C" int flyweight_gpu_compile(
              "iq2s_grouped_accumulate", "iq2s_grouped_accumulate_rows",
              "q20_grouped_swiglu", "q20_grouped_swiglu_rows",
              "q20_grouped_accumulate", "q20_grouped_accumulate_rows",
-             "q20_matmul_rows",
+             "q20_matmul_rows", "q20_matvec_transposed_warp",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_query_bf16", "kv_attention_softmax_bf16",
              "qwen_attention_prefill_pack_f16",

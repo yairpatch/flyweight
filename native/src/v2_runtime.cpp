@@ -5967,6 +5967,12 @@ int qwen_gpu_matvec_by_type(
         }
         case 8: return flyweight_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return flyweight_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 42: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "q20_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 11: return flyweight_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         // Q4_K has two kernels: a sub-block one that unpacks each scale once
         // and the generic per-element one. Prefer the fast path and fall back
@@ -6027,7 +6033,7 @@ bool qwen_matvec_supported(std::uint32_t type) {
     switch (type) {
         case 1: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23:
-        case 29: case 30: case 40:
+        case 29: case 30: case 40: case 42:
             return true;
         default:
             return false;
@@ -6078,6 +6084,12 @@ int qwen_matvec_driver(
             void* args[] = {&matrix, &input, &output, &input_size, &output_size};
             return flyweight_gpu_launch_named(
                 "iq4nl_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
+        case 42: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "q20_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
         case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -16815,40 +16827,6 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 std::fprintf(stderr,
                     "[flyweight] NVFP4 head requant: %llu tensor to Q8_0 "
                     "(%llu MiB added)\n",
-                    static_cast<unsigned long long>(converted),
-                    static_cast<unsigned long long>(growth/(1024ull*1024)));
-            }
-        }
-        // Q2_0 (type 42) static tensors have no dense matvec. ISTA DASLab's
-        // GSQ-RCO qwen4exp builds store the shared-expert down projection in
-        // it, 640x2560, and Q8_0 holds that codebook to within one int8 step.
-        // IQ4_NL used to take the same path; it now has dense kernels, including
-        // for rows that are only a multiple of 32.
-        {
-            std::uint64_t converted=0,growth=0;
-            for(std::uint64_t index=0;index<persistent.size();++index){
-                if(!persistent[index])continue;
-                if(index==runtime->ple_table)continue;
-                const auto type=runtime->device_tensor_types[index];
-                if(type!=42)continue;
-                const auto&tensor=runtime->model->tensors[index];
-                std::uint64_t elements=1;
-                for(auto dimension:tensor.shape)elements*=dimension;
-                if(elements==0||elements%64)
-                    throw std::runtime_error(
-                        "Q2_0 tensor \""+tensor.name+
-                        "\" is not a whole number of 64-value blocks and "
-                        "cannot be converted to Q8_0, which is the only form "
-                        "its consumer can read");
-                runtime->device_tensor_types[index]=8;
-                ++converted;
-                growth+=(elements/32)*kQ8BlockSize-tensor.size;
-            }
-            if(converted){
-                runtime->static_tensor_bytes+=growth;
-                std::fprintf(stderr,
-                    "[flyweight] Q2_0 dense requant: %llu tensors to "
-                    "Q8_0 (%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
             }
