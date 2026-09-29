@@ -84,36 +84,103 @@ float nvfp4_dot(const std::uint8_t* row_data, const float* input, int elements) 
     return output;
 }
 
-float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) {
-    __m512 sum = _mm512_setzero_ps();
-    const __m512 zero = _mm512_setzero_ps();
+// IQ2_XS row dots. Eight grid patterns (64 weights) are gathered at once, the
+// same extraction the int16 fold uses, then signed and scaled in integer
+// before the float multiply by the block scale. One activation load serves
+// every row, which is the gate/up pair and the four-row down tile. Four
+// accumulators keep the FMAs off one dependency chain: a single chain was
+// the whole inner loop of the scalar-insert kernel this replaced.
+template <int kRows>
+void iq2xs_dot_rows(
+    const std::uint8_t* const rows[kRows], const float* input,
+    int elements, float outputs[kRows]
+) {
+    __m512 acc[kRows][4];
+    for (int row = 0; row < kRows; ++row)
+        for (auto& partial : acc[row]) partial = _mm512_setzero_ps();
+    const __m512i zero = _mm512_setzero_si512();
+    const __m128i index_mask = _mm_set1_epi16(511);
     for (int block = 0; block < elements / 256; ++block) {
-        const auto* base = row_data + block * kIq2xsBlockBytes;
-        const float d = half_value(base);
+        const std::uint8_t* bases[kRows];
+        float factors[kRows];
+        for (int row = 0; row < kRows; ++row) {
+            bases[row] = rows[row] + static_cast<std::uint64_t>(block) * kIq2xsBlockBytes;
+            factors[row] = half_value(bases[row]) * 0.125f;
+        }
         const float* values = input + block * 256;
-        for (int group = 0; group < 16; ++group) {
-            std::uint16_t first = 0, second = 0;
-            std::memcpy(&first, base + 2 + group * 4, 2);
-            std::memcpy(&second, base + 4 + group * 4, 2);
-            const __m128i packed = _mm_set_epi64x(
-                static_cast<long long>(kIq2xsGrid[second & 511]),
-                static_cast<long long>(kIq2xsGrid[first & 511]));
-            const __mmask16 signs = static_cast<__mmask16>(
-                kIq2xxsSigns[first >> 9]
-                | (static_cast<unsigned>(kIq2xxsSigns[second >> 9]) << 8));
-            const __m512 magnitudes = bytes_to_float(packed);
-            const __m512 signed_magnitudes = _mm512_mask_sub_ps(
-                magnitudes, signs, zero, magnitudes);
-            const int scale =
-                (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
-            const __m512 weights = _mm512_mul_ps(
-                signed_magnitudes,
-                _mm512_set1_ps(d * (0.5f + scale) * 0.25f));
-            sum = _mm512_fmadd_ps(
-                weights, _mm512_loadu_ps(values + group * 16), sum);
+        for (int gather = 0; gather < 4; ++gather) {
+            const __m512 act0 = _mm512_loadu_ps(values + gather * 64);
+            const __m512 act1 = _mm512_loadu_ps(values + gather * 64 + 16);
+            const __m512 act2 = _mm512_loadu_ps(values + gather * 64 + 32);
+            const __m512 act3 = _mm512_loadu_ps(values + gather * 64 + 48);
+            for (int row = 0; row < kRows; ++row) {
+                const auto* base = bases[row];
+                const __m128i entries = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(base + 2 + gather * 16));
+                const __m512i indices = _mm512_cvtepu16_epi64(
+                    _mm_and_si128(entries, index_mask));
+                const __m512i patterns = _mm512_i64gather_epi64(
+                    indices, static_cast<const void*>(kIq2xsGrid), 8);
+                const __m512i mag_lo = _mm512_cvtepu8_epi16(
+                    _mm512_castsi512_si256(patterns));
+                const __m512i mag_hi = _mm512_cvtepu8_epi16(
+                    _mm512_extracti64x4_epi64(patterns, 1));
+                alignas(16) std::uint16_t raw[8];
+                _mm_store_si128(reinterpret_cast<__m128i*>(raw), entries);
+                std::uint64_t sign_mask = 0;
+                int group_scale[4];
+                for (int code = 0; code < 8; ++code) {
+                    sign_mask |= static_cast<std::uint64_t>(
+                        kIq2xxsSigns[(raw[code] >> 9) & 127]) << (8 * code);
+                    if ((code & 1) == 0) {
+                        const int group = gather * 4 + code / 2;
+                        const std::uint8_t byte = base[66 + (group >> 1)];
+                        group_scale[code / 2] =
+                            1 + 2 * ((byte >> (4 * (group & 1))) & 15);
+                    }
+                }
+                const auto signed_groups = [&](
+                    __m512i magnitudes, int scale_low, int scale_high, __mmask32 signs
+                ) {
+                    __m512i folded = _mm512_mullo_epi16(
+                        magnitudes, _mm512_set1_epi16(static_cast<short>(scale_low)));
+                    folded = _mm512_mask_mullo_epi16(
+                        folded, 0xFFFF0000u, magnitudes,
+                        _mm512_set1_epi16(static_cast<short>(scale_high)));
+                    return _mm512_mask_sub_epi16(folded, signs, zero, folded);
+                };
+                const __m512i signed_lo = signed_groups(
+                    mag_lo, group_scale[0], group_scale[1],
+                    static_cast<__mmask32>(sign_mask));
+                const __m512i signed_hi = signed_groups(
+                    mag_hi, group_scale[2], group_scale[3],
+                    static_cast<__mmask32>(sign_mask >> 32));
+                const __m512 factor = _mm512_set1_ps(factors[row]);
+                const auto accumulate = [&](int slot, __m256i half, const __m512& activation) {
+                    const __m512 weights = _mm512_mul_ps(
+                        _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(half)), factor);
+                    acc[row][slot] = _mm512_fmadd_ps(weights, activation, acc[row][slot]);
+                };
+                accumulate(0, _mm512_castsi512_si256(signed_lo), act0);
+                accumulate(1, _mm512_extracti64x4_epi64(signed_lo, 1), act1);
+                accumulate(2, _mm512_castsi512_si256(signed_hi), act2);
+                accumulate(3, _mm512_extracti64x4_epi64(signed_hi, 1), act3);
+            }
         }
     }
-    return _mm512_reduce_add_ps(sum);
+    for (int row = 0; row < kRows; ++row) {
+        const __m512 sum = _mm512_add_ps(
+            _mm512_add_ps(acc[row][0], acc[row][1]),
+            _mm512_add_ps(acc[row][2], acc[row][3]));
+        outputs[row] = _mm512_reduce_add_ps(sum);
+    }
+}
+
+float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    const std::uint8_t* rows[1] = {row_data};
+    float output = 0.0f;
+    iq2xs_dot_rows<1>(rows, input, elements, &output);
+    return output;
 }
 
 void iq2xs_dot_pair(
@@ -159,47 +226,11 @@ void iq2xs_dot_two_rows(
     const std::uint8_t* first_row, const std::uint8_t* second_row,
     const float* input, int elements, float& first, float& second
 ) {
-    __m512 first_sum = _mm512_setzero_ps();
-    __m512 second_sum = _mm512_setzero_ps();
-    const __m512 zero = _mm512_setzero_ps();
-    for (int block = 0; block < elements / 256; ++block) {
-        const auto* first_base = first_row + block * kIq2xsBlockBytes;
-        const auto* second_base = second_row + block * kIq2xsBlockBytes;
-        const float first_d = half_value(first_base);
-        const float second_d = half_value(second_base);
-        const float* values = input + block * 256;
-        for (int group = 0; group < 16; ++group) {
-            const __m512 activation = _mm512_loadu_ps(values + group * 16);
-            std::uint16_t first_codes[2]{}, second_codes[2]{};
-            std::memcpy(first_codes, first_base + 2 + group * 4, 4);
-            std::memcpy(second_codes, second_base + 2 + group * 4, 4);
-            const auto weights = [&](const std::uint8_t* base,
-                                     const std::uint16_t codes[2], float d) {
-                const __m128i packed = _mm_set_epi64x(
-                    static_cast<long long>(kIq2xsGrid[codes[1] & 511]),
-                    static_cast<long long>(kIq2xsGrid[codes[0] & 511]));
-                const __mmask16 signs = static_cast<__mmask16>(
-                    kIq2xxsSigns[codes[0] >> 9]
-                    | (static_cast<unsigned>(kIq2xxsSigns[codes[1] >> 9]) << 8));
-                const __m512 magnitudes = bytes_to_float(packed);
-                const __m512 signed_magnitudes = _mm512_mask_sub_ps(
-                    magnitudes, signs, zero, magnitudes);
-                const int scale =
-                    (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
-                return _mm512_mul_ps(
-                    signed_magnitudes,
-                    _mm512_set1_ps(d * (0.5f + scale) * 0.25f));
-            };
-            first_sum = _mm512_fmadd_ps(
-                weights(first_base, first_codes, first_d),
-                activation, first_sum);
-            second_sum = _mm512_fmadd_ps(
-                weights(second_base, second_codes, second_d),
-                activation, second_sum);
-        }
-    }
-    first = _mm512_reduce_add_ps(first_sum);
-    second = _mm512_reduce_add_ps(second_sum);
+    const std::uint8_t* rows[2] = {first_row, second_row};
+    float outputs[2];
+    iq2xs_dot_rows<2>(rows, input, elements, outputs);
+    first = outputs[0];
+    second = outputs[1];
 }
 
 void nvfp4_dot_two_rows(
@@ -1412,6 +1443,37 @@ void qwen_quant_dot_rows_avx512(
         for (int row = 0; row < row_count; ++row)
             outputs[row] = qwen_quant_dot_avx512(
                 packed, type, input, elements, first_row + row);
+        return;
+    }
+    if (type == 17 && elements % 256 == 0) {
+        const auto row_bytes =
+            static_cast<std::uint64_t>(elements / 256) * kIq2xsBlockBytes;
+        const auto* origin = packed + first_row * row_bytes;
+        switch (row_count) {
+            case 1: {
+                const std::uint8_t* rows[1] = {origin};
+                iq2xs_dot_rows<1>(rows, input, elements, outputs);
+                break;
+            }
+            case 2: {
+                const std::uint8_t* rows[2] = {origin, origin + row_bytes};
+                iq2xs_dot_rows<2>(rows, input, elements, outputs);
+                break;
+            }
+            case 3: {
+                const std::uint8_t* rows[3] = {
+                    origin, origin + row_bytes, origin + 2 * row_bytes};
+                iq2xs_dot_rows<3>(rows, input, elements, outputs);
+                break;
+            }
+            case 4: {
+                const std::uint8_t* rows[4] = {
+                    origin, origin + row_bytes, origin + 2 * row_bytes,
+                    origin + 3 * row_bytes};
+                iq2xs_dot_rows<4>(rows, input, elements, outputs);
+                break;
+            }
+        }
         return;
     }
     if (type == 20 && elements % 32 == 0) {
