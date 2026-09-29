@@ -20594,6 +20594,7 @@ void gemma4_prefill_rows(
                 // so row r still attends to exactly positions 0..base+r.
                 const auto view=attention_cache_view(layer,base_position);
                 int capacity=view.capacity;float attention_scale=1.0f;
+                int attention_window=0;
                 void* attention_args[]={const_cast<std::uint64_t*>(&fourth_rows),
                                         &cache_keys,&cache_values,
                                         const_cast<std::uint64_t*>(&third_rows),
@@ -20602,7 +20603,8 @@ void gemma4_prefill_rows(
                                         const_cast<int*>(&head_dim),
                                         const_cast<int*>(&base_position_int),
                                         const_cast<int*>(&rows),&capacity,
-                                        &attention_scale};
+                                        &attention_scale,
+                                        &attention_window};
                 if(layer_wide_attention)
                     launch("gemma_kv_prefill_wide_f16",heads,
                            (static_cast<std::uint32_t>(rows)+15)/16,256,attention_args);

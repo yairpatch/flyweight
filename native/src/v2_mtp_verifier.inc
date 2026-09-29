@@ -1706,7 +1706,8 @@ void qwen_forward_rows(
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
                 int base=static_cast<int>(runtime.position)+span_begin;
-                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
+                int window=0;
+                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale,&window};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 if(k2horizon){
