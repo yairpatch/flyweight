@@ -15,6 +15,19 @@ static constexpr int kQ8RowBatch=8;
 // instead of an almost empty tile (three launches at most).
 static constexpr int kQ8TailRows=32;
 
+// The FLYWEIGHT_Q8_MATVEC_ROWS twin sized for `rows`, or the full-cap kernel
+// where none is smaller or the module lacks it. Names are interned because the
+// timeline keeps the pointer past the launch.
+inline const char* qwen_q8_rows_kernel(const char* kernel,int rows){
+    static const char* const suffixes[]={nullptr,nullptr,"_r2","_r3","_r4"};
+    if(rows<2||rows>4)return kernel;
+    static std::map<std::string,std::string> interned[5];
+    auto it=interned[rows].find(kernel);
+    if(it==interned[rows].end())
+        it=interned[rows].emplace(kernel,std::string(kernel)+suffixes[rows]).first;
+    return flyweight_gpu_kernel_available(it->second.c_str())?it->second.c_str():kernel;
+}
+
 // Tokens per launch of the tiled prefill matmul. Must match
 // FLYWEIGHT_Q8_TILE_TOKENS in native/include/flyweight_v2_qwen_kernels.hpp -- the
 // kernel's per-warp accumulator slots are sized by it, and a larger batch would
@@ -467,13 +480,24 @@ void qwen_forward_rows(
             // mmq_kernel and tiled_kernel are resolved above the gate.
             // The 32-token MMQ variant also takes small batches whole
             // (2..kQ8TailRows rows) where the family has one and the device
-            // is a real GPU: the per-row kernels below cost a launch per row
-            // per projection. A family without the narrow twin, or the CPU
-            // backend (whose MMQ is a shuffle-emulated MMA, minutes per draft
-            // step on the q6k head test), keeps the per-row paths below
-            // kQ8RowBatch rows exactly as before.
+            // is a real GPU, but only for a family with no rows kernel: the
+            // per-row kernel below costs a launch per row per projection,
+            // whereas the rows kernel reads the weights once for up to
+            // kQ8RowBatch rows. Against that rows kernel a 2-4 row batch on the
+            // narrow tile -- MTP verification -- fills a tenth of a 32-token
+            // tile and measured 69 ms against 52 per verify pass on the 27B
+            // hybrid's IQ2 projections, which alone kept MTP slower than plain
+            // decode there. FLYWEIGHT_SMALL_BATCH_MMQ=1 restores the tile for
+            // A/B. A family without the narrow twin, or the CPU backend (whose
+            // MMQ is a shuffle-emulated MMA, minutes per draft step on the q6k
+            // head test), keeps the per-row paths below kQ8RowBatch rows.
+            static const bool small_batch_mmq=[]{
+                const char*setting=std::getenv("FLYWEIGHT_SMALL_BATCH_MMQ");
+                return setting&&setting[0]=='1';
+            }();
             const char* small_narrow=nullptr;
             if(rows>1&&rows<=kQ8RowBatch&&mmq_kernel&&!mmq_min&&
+               (!rows_kernel||small_batch_mmq)&&
                runtime.int8_tensor_cores&&!flyweight_backend_is_cpu()){
                 static std::map<std::string,std::string> interned_small;
                 auto it=interned_small.find(mmq_kernel);
@@ -577,8 +601,14 @@ void qwen_forward_rows(
                 return;
             }
             if(rows>1&&rows_kernel){
+                // The _r2/_r3/_r4 twins carry partial[] sized to the batch
+                // rather than to kQ8RowBatch; see FLYWEIGHT_Q8_MATVEC_ROWS.
+                // The width is the single-row kernel's: the rows kernel walks
+                // a row's groups in the same blockDim strides.
+                const std::uint32_t rows_block=qwen_q8_matvec_block(input_size);
                 for(int first=0;first<rows;first+=kQ8RowBatch){
                     int batch=std::min(kQ8RowBatch,rows-first);
+                    const char* batch_kernel=qwen_q8_rows_kernel(rows_kernel,batch);
                     auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
                     auto batch_scales=small_q8_scales+
                         static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
@@ -586,7 +616,7 @@ void qwen_forward_rows(
                         static_cast<std::uint64_t>(first)*output_size*sizeof(float);
                     void*rows_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
                         &input_size,&output_size,&batch,&scale_stride};
-                    launch(rows_kernel,output_size,1,128,rows_args);
+                    launch(batch_kernel,output_size,1,rows_block,rows_args);
                 }
                 return;
             }

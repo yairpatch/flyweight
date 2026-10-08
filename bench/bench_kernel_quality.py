@@ -85,6 +85,9 @@ ARMS: dict[str, dict[str, str]] = {
     # Direct-from-packed int16 fold is the default for IQ2/IQ3 gate/up.
     # This arm is the dequant-then-fold path it replaced.
     "rows-i16": {"FLYWEIGHT_ROWS_Q8_IQ3S": "0"},
+    # 2..8-row batches (MTP verify, a prompt's short tail chunk) on the narrow
+    # MMQ tile, which the 8-row Q8 kernel and its row-cap twins replaced.
+    "small-batch-mmq": {"FLYWEIGHT_SMALL_BATCH_MMQ": "1"},
 }
 
 

@@ -50,12 +50,16 @@ FORMATS = {
 # output projection in the checkpoints that use them.
 NO_Q8_LM_HEAD = {"IQ2_S", "IQ2_XS"}
 
-COLUMNS = 512      # two 256-value super-blocks per row
+# The 27B hybrid's hidden width: 160 groups, so every warp of a 128-thread
+# block has work and leaves a nonzero slot in the block reduction.
+COLUMNS = 5120
 ROWS = 96
 
 # Rows per launch of the *_q8_matvec_transposed_rows kernels; FLYWEIGHT_Q8_ROWS
 # in native/include/flyweight_v2_qwen_kernels.hpp.
 Q8_ROW_BATCH = 8
+# Row-cap twins FLYWEIGHT_Q8_MATVEC_ROWS emits next to the full-cap kernel.
+ROW_CAP_TWINS = (2, 3, 4)
 
 # Formats with a batched multi-row matvec. Prefill dispatches on these; see the
 # rows_kernel switch in native/src/v2_mtp_verifier.inc.
@@ -340,8 +344,9 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
             packed_ptr = self._upload_weights(label, seed=41 + index)
             # 1 and the full batch are the edges; 3 leaves the tail of the
             # unrolled row loop predicated off, which is where an unpredicated
-            # accumulator would read another row's activations.
-            for batch in (1, 3, Q8_ROW_BATCH):
+            # accumulator would read another row's activations. 2, 3 and 4
+            # also fill each row-cap twin exactly.
+            for batch in (1, 2, 3, 4, Q8_ROW_BATCH):
                 with self.subTest(quantization=label, batch=batch):
                     activations = np.stack([
                         self._exact_q8_activation(41 + row)
@@ -372,23 +377,40 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
                         "quantize_q8_blocks_rows", (COLUMNS + 31) // 32, 32,
                         [ctypes.c_uint64(vectors_f32), q8_ptr, scale_ptr,
                          columns, stride], grid_y=batch)
-                    self._launch(
-                        f"{prefix}_q8_matvec_transposed_rows", ROWS, 128,
-                        [packed_ptr, q8_ptr, scale_ptr, ctypes.c_uint64(output),
-                         columns, rows, count, stride])
-                    actual = self._download(
-                        output, batch * ROWS).reshape(batch, ROWS)
-
-                    self.assertTrue(
-                        np.isfinite(actual).all(),
-                        f"batched {label} produced non-finite output")
-                    # Both kernels sum the same products in the same order;
-                    # only the final scale multiply is reassociated.
+                    # The full-cap kernel and every row-cap twin that holds
+                    # this batch, at each block width qwen_q8_matvec_block can
+                    # pick. Below 128 threads the block has fewer than four
+                    # warps, and a reduction that reads four warp slots picks
+                    # up whatever an earlier block left in shared memory.
+                    kernels = [f"{prefix}_q8_matvec_transposed_rows"] + [
+                        f"{prefix}_q8_matvec_transposed_rows_r{cap}"
+                        for cap in ROW_CAP_TWINS if batch <= cap]
                     scale = max(1.0, float(np.abs(expected).max()))
-                    np.testing.assert_allclose(
-                        actual, expected, rtol=2e-4, atol=2e-4 * scale,
-                        err_msg=f"batched {label} disagrees with the "
-                                "single-row kernel")
+                    for kernel in kernels:
+                        # 128 first: it fills all four warp slots, so a
+                        # narrower launch that reads four finds stale data.
+                        for threads in (128, 96, 64):
+                            # Unwritten outputs read as 3.4e38, not 0.
+                            self.assertEqual(self._lib.flyweight_gpu_memset(
+                                output, 0x7f, batch * ROWS * 4, 0), 0)
+                            self._launch(
+                                kernel, ROWS, threads,
+                                [packed_ptr, q8_ptr, scale_ptr,
+                                 ctypes.c_uint64(output),
+                                 columns, rows, count, stride])
+                            actual = self._download(
+                                output, batch * ROWS).reshape(batch, ROWS)
+                            self.assertTrue(
+                                np.isfinite(actual).all(),
+                                f"{kernel} at {threads} threads produced "
+                                "non-finite output")
+                            # Both kernels sum the same products in the same
+                            # order; only the final scale multiply is
+                            # reassociated.
+                            np.testing.assert_allclose(
+                                actual, expected, rtol=2e-4, atol=2e-4 * scale,
+                                err_msg=f"{kernel} at {threads} threads "
+                                        "disagrees with the single-row kernel")
 
     def test_reference_rows_are_distinct(self):
         """Guard the guard: identical rows would pass any row-indexing bug."""

@@ -2201,7 +2201,7 @@ R"FLYWEIGHT_CUDA(
 // kQ8RowBatch in native/src/v2_mtp_verifier.inc must match.
 #define FLYWEIGHT_Q8_ROWS 8
 
-#define FLYWEIGHT_Q8_MATVEC_ROWS(name, decode_fn, stride)                        \
+#define FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name, decode_fn, stride, cap)             \
 extern "C" __global__ void name(                                               \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
@@ -2213,9 +2213,9 @@ extern "C" __global__ void name(                                               \
     const int groups_per_row = input_size >> 5;                                \
     const unsigned char* row_data =                                            \
         q8_weight_row(packed, row, input_size, stride);                        \
-    float partial[FLYWEIGHT_Q8_ROWS];                                            \
+    float partial[cap];                                            \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) partial[r] = 0.0f;               \
+    for (int r = 0; r < cap; ++r) partial[r] = 0.0f;               \
     for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x) {           \
         int words[8];                                                          \
         float scale_low = 0.0f, scale_high = 0.0f;                             \
@@ -2224,7 +2224,7 @@ extern "C" __global__ void name(                                               \
         /* row count: a runtime bound would index partial dynamically and     */\
         /* spill the accumulators to local memory.                            */\
         _Pragma("unroll")                                                      \
-        for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                            \
+        for (int r = 0; r < cap; ++r) {                            \
             if (r >= rows) continue;                                           \
             const int4* activation_vectors = (const int4*)(                    \
                 vectors + (long long)r * input_size + (long long)g * 32);      \
@@ -2251,9 +2251,9 @@ extern "C" __global__ void name(                                               \
     }                                                                          \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
-    __shared__ float warp_sums[4][FLYWEIGHT_Q8_ROWS];                            \
+    __shared__ float warp_sums[4][cap];                            \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                                \
+    for (int r = 0; r < cap; ++r) {                                \
         float value = partial[r];                                              \
         for (int offset = 16; offset > 0; offset >>= 1)                        \
             value += __shfl_down_sync(0xffffffffu, value, offset);             \
@@ -2262,8 +2262,9 @@ extern "C" __global__ void name(                                               \
     __syncthreads();                                                           \
     if (warp != 0) return;                                                     \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                                \
-        float value = lane < 4 ? warp_sums[lane][r] : 0.0f;                    \
+    for (int r = 0; r < cap; ++r) {                                \
+        float value = lane < (int)(blockDim.x >> 5)                            \
+            ? warp_sums[lane][r] : 0.0f;                                       \
         for (int offset = 16; offset > 0; offset >>= 1)                        \
             value += __shfl_down_sync(0xffffffffu, value, offset);             \
         if (lane == 0 && r < rows)                                             \
@@ -2285,7 +2286,7 @@ R"FLYWEIGHT_CUDA(
 // Kept separate from FLYWEIGHT_Q8_MATVEC_ROWS rather than folded into it with
 // zero offsets: the symmetric formats would pay the activation sums for
 // nothing, and this loop's whole purpose is that its inner work is small.
-#define FLYWEIGHT_Q8_MATVEC_ROWS_MIN(name, decode_fn, stride)                    \
+#define FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name, decode_fn, stride, cap)         \
 extern "C" __global__ void name(                                               \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
@@ -2298,9 +2299,9 @@ extern "C" __global__ void name(                                               \
     const int groups_per_row = blocks_per_row << 3;                            \
     const unsigned char* row_data =                                            \
         packed + (long long)row * blocks_per_row * stride;                     \
-    float partial[FLYWEIGHT_Q8_ROWS];                                            \
+    float partial[cap];                                            \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) partial[r] = 0.0f;               \
+    for (int r = 0; r < cap; ++r) partial[r] = 0.0f;               \
     for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x) {           \
         int words[8];                                                          \
         float scale_low = 0.0f, scale_high = 0.0f;                             \
@@ -2308,7 +2309,7 @@ extern "C" __global__ void name(                                               \
         decode_fn(row_data, g, words, &scale_low, &scale_high,                 \
                   &offset_low, &offset_high);                                  \
         _Pragma("unroll")                                                      \
-        for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                            \
+        for (int r = 0; r < cap; ++r) {                            \
             if (r >= rows) continue;                                           \
             const int4* activation_vectors = (const int4*)(                    \
                 vectors + (long long)r * input_size + (long long)g * 32);      \
@@ -2340,9 +2341,9 @@ extern "C" __global__ void name(                                               \
     }                                                                          \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
-    __shared__ float warp_sums[4][FLYWEIGHT_Q8_ROWS];                            \
+    __shared__ float warp_sums[4][cap];                            \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                                \
+    for (int r = 0; r < cap; ++r) {                                \
         float value = partial[r];                                              \
         for (int offset = 16; offset > 0; offset >>= 1)                        \
             value += __shfl_down_sync(0xffffffffu, value, offset);             \
@@ -2351,14 +2352,33 @@ extern "C" __global__ void name(                                               \
     __syncthreads();                                                           \
     if (warp != 0) return;                                                     \
     _Pragma("unroll")                                                          \
-    for (int r = 0; r < FLYWEIGHT_Q8_ROWS; ++r) {                                \
-        float value = lane < 4 ? warp_sums[lane][r] : 0.0f;                    \
+    for (int r = 0; r < cap; ++r) {                                \
+        float value = lane < (int)(blockDim.x >> 5)                            \
+            ? warp_sums[lane][r] : 0.0f;                                       \
         for (int offset = 16; offset > 0; offset >>= 1)                        \
             value += __shfl_down_sync(0xffffffffu, value, offset);             \
         if (lane == 0 && r < rows)                                             \
             outputs[(long long)r * output_size + row] = value;                 \
     }                                                                          \
 }
+
+// Each format gets the full-cap kernel under its table name plus _r2/_r3/_r4
+// twins sized for MTP verification, which runs one to three drafts plus the
+// target row. The cap is the length of partial[] and of the unrolled row
+// loops, so a twin carries a quarter to a half of the accumulators: on the 27B
+// hybrid's IQ2 projections the 4-row cap measured 9-13% faster than the 8-row
+// one at the same 2-4 rows, the register file being what the 8-row kernel
+// spends its occupancy on.
+#define FLYWEIGHT_Q8_MATVEC_ROWS(name, decode_fn, stride)                        \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name, decode_fn, stride, FLYWEIGHT_Q8_ROWS)     \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r2, decode_fn, stride, 2)               \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r3, decode_fn, stride, 3)               \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r4, decode_fn, stride, 4)
+#define FLYWEIGHT_Q8_MATVEC_ROWS_MIN(name, decode_fn, stride)                    \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name, decode_fn, stride, FLYWEIGHT_Q8_ROWS) \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r2, decode_fn, stride, 2)           \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r3, decode_fn, stride, 3)           \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r4, decode_fn, stride, 4)
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
