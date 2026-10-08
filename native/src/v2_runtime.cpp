@@ -16334,8 +16334,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // kernel for the FILE type, while every launch site dispatches on
             // the device type. The two only agree when the file type has an
             // embedding kernel of its own; a table the requant loops below
-            // must convert (NVFP4, IQ1_M) has to stay in the arena, where the
-            // staged bytes and the dispatched kernel are both Q8_0.
+            // must convert has to stay in the arena, where the staged bytes and
+            // the dispatched kernel are both Q8_0. Only a tied head converts,
+            // and a tied table is never host-resident.
             const auto* table_format=flyweight::v2::qwen_format(table.type);
             runtime->embeddings_host_resident=
                 runtime->embedding_row_bytes!=0&&
@@ -16804,10 +16805,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // the only IQ1_M weights are the two per-head DeltaNet gate projections
         // (hidden x 48). Those now run from their packed bytes.
         //
-        // The head and the embedding table are the gap. Their kernels decode a
-        // row or a token directly rather than going through the matvec dispatch,
-        // and neither qwen_lm_head_argmax_kernel nor qwen_embedding_kernel has
-        // an IQ1_M entry, so those two are converted to Q8_0 here.
+        // The head is the gap. Its fused argmax decodes rows directly rather
+        // than going through the matvec dispatch, and qwen_lm_head_argmax_kernel
+        // has no IQ1_M entry, so it is converted to Q8_0 here. The embedding
+        // table is not: qwen_iq1m_embedding gathers it packed, which also lets
+        // a dense model keep it host-resident. Converting it cost 1023 MiB of
+        // VRAM on a 27B whose token_embd is IQ1_M, enough to refuse the load on
+        // a 12 GiB card. A tied table is still the head and still converts.
         //
         // Converting is expensive and has to stay bounded. IQ1_M is 56 bytes per
         // 256 values against Q8_0's 272, so a converted tensor costs 4.86x its
@@ -16823,15 +16827,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 const auto& tensor=runtime->model->tensors[index];
                 persistent_source_bytes+=tensor.size;
                 if(tensor.type!=29)continue;
-                // Everything else is read through a matvec dispatch that now
-                // has a case 29, so it stays packed.
-                if(index!=runtime->lm_head&&index!=runtime->token_embeddings)
-                    continue;
+                // Everything else is read through a matvec dispatch or the
+                // embedding gather, both of which have a case 29, so it stays
+                // packed.
+                if(index!=runtime->lm_head)continue;
                 std::uint64_t elements=1;
                 for(auto dimension:tensor.shape)elements*=dimension;
                 // A partial trailing block would need its own padding path that
                 // the packer does not implement. Skipping would leave the tensor
-                // at type 29, which the head and embedding kernels cannot read,
+                // at type 29, which the head kernels cannot read,
                 // so the failure would surface later as an unsupported-type
                 // error naming neither the tensor nor the reason. Stop here.
                 if(elements==0||elements%256)
@@ -16844,7 +16848,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 growth+=(elements/32)*kQ8BlockSize-tensor.size;
             }
             // Warn rather than refuse. This conversion is mandatory -- the
-            // head and embedding kernels cannot read type 29 at all -- so
+            // head kernels cannot read type 29 at all -- so
             // failing here does not save the user anything, it just turns a
             // model that would have run into one that will not load. What the
             // bound is really for is traceability: at 4.86x, an IQ1_M head can
@@ -16852,11 +16856,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // nothing pointing back here, so say so up front and let it run.
             if(converted&&growth>persistent_source_bytes/16)
                 std::fprintf(stderr,
-                    "[flyweight] warning: this checkpoint stores its head or "
-                    "embedding table as IQ1_M, whose kernels cannot read that "
-                    "type. Converting to Q8_0 adds %llu MiB to %llu MiB of "
-                    "static weights (4.86x on those tensors); if the GPU arena "
-                    "allocation fails below, this is why.\n",
+                    "[flyweight] warning: this checkpoint stores its head as "
+                    "IQ1_M, whose kernels cannot read that type. Converting "
+                    "to Q8_0 adds %llu MiB to %llu MiB of static weights "
+                    "(4.86x on those tensors); if the GPU arena allocation "
+                    "fails below, this is why.\n",
                     static_cast<unsigned long long>(growth/(1024ull*1024)),
                     static_cast<unsigned long long>(
                         persistent_source_bytes/(1024ull*1024)));

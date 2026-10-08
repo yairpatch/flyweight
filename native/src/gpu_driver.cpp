@@ -1460,6 +1460,7 @@ extern "C" int flyweight_gpu_compile(
              "qwen_iq3xxs_embedding", "qwen_iq3xxs_embedding_rows",
              "qwen_iq2xxs_embedding", "qwen_iq2xxs_embedding_rows",
              "qwen_iq1s_embedding", "qwen_iq1s_embedding_rows",
+             "qwen_iq1m_embedding", "qwen_iq1m_embedding_rows",
              "q3k_lm_head_argmax_warp", "q5k_lm_head_argmax_warp",
              "qwen_q2k_embedding", "qwen_q2k_embedding_rows",
              "qwen_q3k_embedding", "qwen_q3k_embedding_rows",
