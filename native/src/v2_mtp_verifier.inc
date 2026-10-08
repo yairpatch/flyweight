@@ -15,6 +15,61 @@ static constexpr int kQ8RowBatch=8;
 // instead of an almost empty tile (three launches at most).
 static constexpr int kQ8TailRows=32;
 
+// FLYWEIGHT_VERIFY_DECODE_ATTENTION=0 sends small row batches back to the
+// batched prefill attention; see verify_decode_attention in qwen_forward_rows.
+inline bool qwen_verify_decode_attention_enabled(){
+    static const bool on=[]{
+        const char*setting=std::getenv("FLYWEIGHT_VERIFY_DECODE_ATTENTION");
+        return !setting||setting[0]!='0';
+    }();
+    return on;
+}
+
+// FLYWEIGHT_MOE_PROFILE=1 also splits the routed-expert stage of MTP
+// verification passes, which the decode-side [moe-profile] never sees: host time
+// in each step of cpu_phase, GPU time of the admission uploads and of the
+// grouped expert kernels (timed events, so the queue serializes -- read the
+// split, not the token rate), and what happened to every route.
+struct QwenVerifyMoeProfile{
+    std::uint64_t passes=0,layers=0,rows=0,routes=0,hits=0,misses=0,
+        admitted=0,refused=0,cpu_routes=0,distinct=0;
+    double route_sync=0,route_loop=0,table_launch=0,cpu_sweep=0,combine=0;
+    double gpu_admit_upload=0,gpu_experts=0;
+    std::vector<std::uint64_t> events;   // three per layer
+    std::vector<char> recorded;          // per layer, this pass
+};
+inline QwenVerifyMoeProfile& qwen_verify_moe_profile(){static QwenVerifyMoeProfile p;return p;}
+struct QwenVerifyMoeProfileAtExit{
+    ~QwenVerifyMoeProfileAtExit(){
+        const auto&p=qwen_verify_moe_profile();
+        if(!p.passes)return;
+        const double n=static_cast<double>(p.passes);
+        std::fprintf(stderr,
+            "\n[verify-moe-profile] %llu verify passes, %.1f rows and %.1f MoE layers per pass\n"
+            "  host  route sync %7.3f  routing loop %7.3f  tables+launch %7.3f  cpu sweep %7.3f  combine %7.3f  ms/pass\n"
+            "  gpu   admission uploads %7.3f  expert kernels (tables+grouped) %7.3f  ms/pass\n"
+            "  routes/pass %.1f (distinct experts %.1f): hit %.1f  miss %.1f (admitted %.1f, refused %.1f)  cpu-fallback %.1f\n",
+            static_cast<unsigned long long>(p.passes),p.rows/n,p.layers/n,
+            p.route_sync/n,p.route_loop/n,p.table_launch/n,p.cpu_sweep/n,p.combine/n,
+            p.gpu_admit_upload/n,p.gpu_experts/n,
+            p.routes/n,p.distinct/n,p.hits/n,p.misses/n,p.admitted/n,p.refused/n,p.cpu_routes/n);
+    }
+};
+static QwenVerifyMoeProfileAtExit qwen_verify_moe_profile_at_exit;
+
+// The FLYWEIGHT_Q8_MATVEC_ROWS twin sized for `rows`, or the full-cap kernel
+// where none is smaller or the module lacks it. Names are interned because the
+// timeline keeps the pointer past the launch.
+inline const char* qwen_q8_rows_kernel(const char* kernel,int rows){
+    static const char* const suffixes[]={nullptr,nullptr,"_r2","_r3","_r4"};
+    if(rows<2||rows>4)return kernel;
+    static std::map<std::string,std::string> interned[5];
+    auto it=interned[rows].find(kernel);
+    if(it==interned[rows].end())
+        it=interned[rows].emplace(kernel,std::string(kernel)+suffixes[rows]).first;
+    return flyweight_gpu_kernel_available(it->second.c_str())?it->second.c_str():kernel;
+}
+
 // Tokens per launch of the tiled prefill matmul. Must match
 // FLYWEIGHT_Q8_TILE_TOKENS in native/include/flyweight_v2_qwen_kernels.hpp -- the
 // kernel's per-warp accumulator slots are sized by it, and a larger batch would
@@ -224,6 +279,31 @@ void qwen_forward_rows(
     const bool pipelined=pipeline_enabled&&pipeline_half>0&&experts>0&&
         expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
         !expert_policy.is_streamed_gpu();
+    const bool verify_moe_profile=moe_profile_enabled()&&!pipelined&&
+        expert_phase==flyweight::v2::ExpertExecutionPhase::verification;
+    if(verify_moe_profile){
+        auto&vp=qwen_verify_moe_profile();
+        const auto need=runtime.layers.size()*3;
+        while(vp.events.size()<need){
+            std::uint64_t event=0;
+            if(flyweight_gpu_timed_event_create(&event)!=0)
+                throw std::runtime_error("native Qwen verify profile event failed");
+            vp.events.push_back(event);
+        }
+        vp.recorded.assign(runtime.layers.size(),0);
+        ++vp.passes;vp.rows+=static_cast<std::uint64_t>(rows);
+    }
+    auto verify_profile_mark=[&](std::uint32_t layer_number,int which){
+        if(!verify_moe_profile)return;
+        auto&vp=qwen_verify_moe_profile();
+        if(flyweight_gpu_event_record(vp.events[layer_number*3+which],runtime.stream)!=0)
+            throw std::runtime_error("native Qwen verify profile event failed");
+        if(which==0){vp.recorded[layer_number]=1;++vp.layers;}
+    };
+    auto verify_ms_since=[](std::chrono::steady_clock::time_point started){
+        return std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+    };
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
@@ -312,7 +392,9 @@ void qwen_forward_rows(
             return;
         }
         if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
-            throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
+            throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name+
+                " (grid "+std::to_string(gx)+"x"+std::to_string(gy)+", block "+std::to_string(bx)+
+                ", shared "+std::to_string(shared)+")");
     };
     auto rms_rows=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
         // Invalidate the Q8 activation cache, which is keyed on the source
@@ -467,13 +549,24 @@ void qwen_forward_rows(
             // mmq_kernel and tiled_kernel are resolved above the gate.
             // The 32-token MMQ variant also takes small batches whole
             // (2..kQ8TailRows rows) where the family has one and the device
-            // is a real GPU: the per-row kernels below cost a launch per row
-            // per projection. A family without the narrow twin, or the CPU
-            // backend (whose MMQ is a shuffle-emulated MMA, minutes per draft
-            // step on the q6k head test), keeps the per-row paths below
-            // kQ8RowBatch rows exactly as before.
+            // is a real GPU, but only for a family with no rows kernel: the
+            // per-row kernel below costs a launch per row per projection,
+            // whereas the rows kernel reads the weights once for up to
+            // kQ8RowBatch rows. Against that rows kernel a 2-4 row batch on the
+            // narrow tile -- MTP verification -- fills a tenth of a 32-token
+            // tile and measured 69 ms against 52 per verify pass on the 27B
+            // hybrid's IQ2 projections, which alone kept MTP slower than plain
+            // decode there. FLYWEIGHT_SMALL_BATCH_MMQ=1 restores the tile for
+            // A/B. A family without the narrow twin, or the CPU backend (whose
+            // MMQ is a shuffle-emulated MMA, minutes per draft step on the q6k
+            // head test), keeps the per-row paths below kQ8RowBatch rows.
+            static const bool small_batch_mmq=[]{
+                const char*setting=std::getenv("FLYWEIGHT_SMALL_BATCH_MMQ");
+                return setting&&setting[0]=='1';
+            }();
             const char* small_narrow=nullptr;
             if(rows>1&&rows<=kQ8RowBatch&&mmq_kernel&&!mmq_min&&
+               (!rows_kernel||small_batch_mmq)&&
                runtime.int8_tensor_cores&&!flyweight_backend_is_cpu()){
                 static std::map<std::string,std::string> interned_small;
                 auto it=interned_small.find(mmq_kernel);
@@ -577,8 +670,14 @@ void qwen_forward_rows(
                 return;
             }
             if(rows>1&&rows_kernel){
+                // The _r2/_r3/_r4 twins carry partial[] sized to the batch
+                // rather than to kQ8RowBatch; see FLYWEIGHT_Q8_MATVEC_ROWS.
+                // The width is the single-row kernel's: the rows kernel walks
+                // a row's groups in the same blockDim strides.
+                const std::uint32_t rows_block=qwen_q8_matvec_block(input_size);
                 for(int first=0;first<rows;first+=kQ8RowBatch){
                     int batch=std::min(kQ8RowBatch,rows-first);
+                    const char* batch_kernel=qwen_q8_rows_kernel(rows_kernel,batch);
                     auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
                     auto batch_scales=small_q8_scales+
                         static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
@@ -586,7 +685,7 @@ void qwen_forward_rows(
                         static_cast<std::uint64_t>(first)*output_size*sizeof(float);
                     void*rows_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
                         &input_size,&output_size,&batch,&scale_stride};
-                    launch(rows_kernel,output_size,1,128,rows_args);
+                    launch(batch_kernel,output_size,1,rows_block,rows_args);
                 }
                 return;
             }
@@ -1584,7 +1683,21 @@ void qwen_forward_rows(
             // cannot use them and takes the warp path with its own gate kernel.
             // K2-Horizon runs them ungated (the unpack the rotated turbo path
             // already uses) and applies its softplus gate afterwards.
+            // A handful of rows -- MTP verification, a prompt's last short
+            // chunk -- attends row by row through the decode dispatch instead
+            // of the batched kernels below. Those parallelize over query rows
+            // (one block per head and 32 rows, or a cuBLAS tile of 16-64 rows),
+            // so three rows leave the card idle while each block walks the whole
+            // prefix alone, and a quantized cache is first expanded to f16 over
+            // the full prefix every pass. On the 27B hybrid a 3-row verify pass
+            // grew 43 -> 270 ms between a 300- and a 10k-token context, making
+            // MTP 4x slower than plain decode, whose split-context tiles stay
+            // flat. FLYWEIGHT_VERIFY_DECODE_ATTENTION=0 restores the batched path.
+            const bool verify_decode_attention=
+                rows<=kQ8RowBatch&&!qsa_chunk_selecting&&!laguna&&!k2horizon&&
+                qwen_verify_decode_attention_enabled();
             const bool cublas_prefill_done=
+                !verify_decode_attention&&
                 !qsa_chunk_selecting&&
                 cublas_prefill_requested&&!laguna&&!layer.attention_window&&
                 // f16 and bf16 both: the cache is handed to cuBLAS in
@@ -1683,6 +1796,27 @@ void qwen_forward_rows(
                     void*token_gate_args[]={&attended,&gate,&gated,&elements};
                     launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
                 }
+            }else if(verify_decode_attention){
+                // Each row sees its own causal prefix: the rows' keys and values
+                // are already in the cache (the store loop above), and row t
+                // attends over positions up to its own.
+                for(int token=0;token<rows;++token){
+                    auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    const int position=static_cast<int>(runtime.position)+span_begin+token;
+                    const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
+                    // `first` is free (its roped keys went to the cache) and
+                    // takes the f16 query the cuBLAS route stages.
+                    qwen_decode_attention_full(runtime,launch,query,first,
+                        cache_keys,cache_values,attention_scores,attended,
+                        heads,kv_heads,head_dim,view.tokens,view.capacity,
+                        view.first,scale);
+                    int elements=query_elements;
+                    void*token_gate_args[]={&attended,&gate,&gated,&elements};
+                    launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                }
             }else if(cublas_prefill_done){
                 // Tensor-core attention wrote the rows to third: gated for
                 // Qwen, plain for K2-Horizon, whose gate runs here in place.
@@ -1706,7 +1840,13 @@ void qwen_forward_rows(
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
                 int base=static_cast<int>(runtime.position)+span_begin;
-                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
+                // KV_PREFILL's last parameter is the attention window, 0 on
+                // this branch. Omitting it left the driver reading the twelfth
+                // argument pointer from whatever followed this array on the
+                // stack: harmless until an unrelated change moved the frame,
+                // then cuLaunchKernel returned "invalid argument".
+                int no_window=0;
+                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale,&no_window};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 if(k2horizon){
@@ -2021,6 +2161,7 @@ void qwen_forward_rows(
             runtime.prefill_gpu_transfer_nanoseconds+=static_cast<std::uint64_t>(transfer_ms*1.0e6f);
         }
         const auto route_wait_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
+        if(verify_moe_profile)qwen_verify_moe_profile().route_sync+=route_wait_elapsed/1e6;
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
         if(expert_policy.records_prefill_frequency())
             runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
@@ -2094,11 +2235,22 @@ void qwen_forward_rows(
             std::fill(gpu_up_scales,gpu_up_scales+span_entries,1.0f);
             std::fill(gpu_counts,gpu_counts+rows,0);
         }
+        verify_profile_mark(layer_number,0);
+        const auto verify_loop_started=std::chrono::steady_clock::now();
+        if(verify_moe_profile){
+            std::vector<std::int32_t> seen;
+            for(int route=0;route<rows*top_k;++route)
+                if(weights_host[route]!=0.0f)seen.push_back(selected_host[route]);
+            std::sort(seen.begin(),seen.end());
+            qwen_verify_moe_profile().distinct+=static_cast<std::uint64_t>(
+                std::unique(seen.begin(),seen.end())-seen.begin());
+        }
         if(gpu_rows_allowed){
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
                 const int expert=selected_host[route];
+                if(verify_moe_profile)++qwen_verify_moe_profile().routes;
                 if(expert<0||expert>=experts)
                     throw std::runtime_error("native Qwen rows forward selected an invalid expert");
                 if(expert_policy.records_prefill_frequency())
@@ -2109,8 +2261,10 @@ void qwen_forward_rows(
                 if(resident!=runtime.expert_residency.end()){
                     slot_index=resident->second;
                     record_expert_cache_hit(runtime,runtime.expert_slots[slot_index]);
+                    if(verify_moe_profile)++qwen_verify_moe_profile().hits;
                 }else{
                     ++runtime.expert_cache_misses;
+                    if(verify_moe_profile)++qwen_verify_moe_profile().misses;
                     // Under MTP this path *is* the decode path, so declining to
                     // admit here leaves the cache empty forever and runs every
                     // route on the CPU. Page in exactly as decode does. Only the
@@ -2120,7 +2274,11 @@ void qwen_forward_rows(
                     if(rows_may_admit&&layer.expert_dma)
                         slot_index=select_expert_cache_slot(
                             runtime,layer_number,expert,true);
-                    if(slot_index==kNoExpertSlot)continue;
+                    if(slot_index==kNoExpertSlot){
+                        if(verify_moe_profile)++qwen_verify_moe_profile().refused;
+                        continue;
+                    }
+                    if(verify_moe_profile)++qwen_verify_moe_profile().admitted;
                     auto&admitted=runtime.expert_slots[slot_index];
                     admitted.key=cache_key;
                     admitted.valid=true;
@@ -2465,6 +2623,9 @@ void qwen_forward_rows(
                     "native Qwen prefill expert stream index upload failed");
             }
         }
+        if(verify_moe_profile)qwen_verify_moe_profile().route_loop+=verify_ms_since(verify_loop_started);
+        verify_profile_mark(layer_number,1);
+        const auto verify_table_started=std::chrono::steady_clock::now();
         bool any_gpu=false;
         if(gpu_rows_allowed)
             for(int token=0;token<rows;++token)
@@ -2501,18 +2662,60 @@ void qwen_forward_rows(
             if(any_gpu){
                 void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows,const_cast<std::uint64_t*>(&gpu_gate_scale_table),const_cast<std::uint64_t*>(&gpu_up_scale_table)};
                 const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
+                const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
+                if(const char*q8_swiglu=qwen_q8_grouped_swiglu_kernel(gate_type,up_type,hidden_size)){
+                    // Every row's `normalized` in the rows Q8 scratch, kept as
+                    // the memo so a later projection of it reuses the blocks.
+                    int width=hidden_size,scale_stride=(hidden_size/32)*2;
+                    if(q8_cached_input!=normalized||q8_cached_width!=hidden_size){
+                        std::uint64_t input=normalized;
+                        void*quant_args[]={&input,&small_q8,&small_q8_scales,&width,&scale_stride};
+                        launch("quantize_q8_blocks_rows",(hidden_size+255)/256,
+                               static_cast<std::uint32_t>(rows),256,quant_args);
+                        q8_cached_input=normalized;q8_cached_width=hidden_size;
+                    }
+                    int no_experts=0;
+                    void*q8_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),
+                        &small_q8,&small_q8_scales,const_cast<std::uint64_t*>(&gpu_activated),
+                        const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),
+                        &no_experts,const_cast<std::uint64_t*>(&gpu_count_table),
+                        const_cast<int*>(&top_k),&rows,&scale_stride};
+                    launch(q8_swiglu,intermediate,rows*top_k,qwen_q8_grouped_block(hidden_size),q8_args);
+                }else
                 launch(qwen_grouped_swiglu_name(gate_type,false,true).c_str(),intermediate,rows*top_k,256,gate_up_args);
                 const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
                 void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
+                if(const char*q8_down=qwen_q8_grouped_down_kernel(down_type,intermediate)){
+                    std::uint64_t q8=workspace_layout.expert_q8.address(runtime.workspace);
+                    std::uint64_t q8_scales=workspace_layout.expert_q8_scales.address(runtime.workspace);
+                    std::uint64_t input=gpu_activated;
+                    int width=intermediate,scale_stride=(intermediate/32)*2,entries=rows*top_k,no_experts=0;
+                    void*quant_args[]={&input,&q8,&q8_scales,&width,&scale_stride};
+                    launch("quantize_q8_blocks_rows",(intermediate+255)/256,
+                           static_cast<std::uint32_t>(entries),256,quant_args);
+                    void*q8_down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),&q8,&q8_scales,
+                        const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),
+                        const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),
+                        const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&no_experts,&scale_stride};
+                    launch(q8_down,hidden_size,rows,qwen_q8_grouped_block(intermediate),q8_down_args);
+                }else
                 launch(qwen_grouped_accumulate_rows_name(down_type).c_str(),hidden_size,rows,256,down_args);
             }
         }
         // The CPU sweep runs before the GEMM enqueue so the leader's pack
         // worker overlaps it; the GPU meanwhile has the other half's core
         // work queued, so the later enqueue costs it nothing.
+        verify_profile_mark(layer_number,2);
+        if(verify_moe_profile){
+            auto&vp=qwen_verify_moe_profile();
+            vp.table_launch+=verify_ms_since(verify_table_started);
+            for(int route=0;route<rows*top_k;++route)
+                if(weights_host[route]!=0.0f)++vp.cpu_routes;
+        }
         {
             const auto cpu_expert_started=std::chrono::steady_clock::now();
             qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
+            if(verify_moe_profile)qwen_verify_moe_profile().cpu_sweep+=verify_ms_since(cpu_expert_started);
             if(expert_policy.records_prefill_frequency())
                 runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-cpu_expert_started).count();
@@ -2938,6 +3141,11 @@ void qwen_forward_rows(
     // residual, and swap the span's ping-pong buffers for the next layer.
     auto queue_combine=[&](RowsSpan&span){
         install_span(span);
+        const auto verify_combine_started=std::chrono::steady_clock::now();
+        struct CombineClock{bool on;std::chrono::steady_clock::time_point t;
+            ~CombineClock(){if(on)qwen_verify_moe_profile().combine+=
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();}}
+            combine_clock{verify_moe_profile,verify_combine_started};
         // Set by cpu_phase: whether the span queued GPU expert work (table
         // path or streamed) whose accumulator in `fourth` must fold in here.
         const bool gpu_table_path=span.gpu_experts;
@@ -3070,6 +3278,17 @@ void qwen_forward_rows(
         }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
         if(flyweight_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
+        if(verify_moe_profile){
+            auto&vp=qwen_verify_moe_profile();
+            for(std::size_t l=0;l<vp.recorded.size();++l){
+                if(!vp.recorded[l])continue;
+                float upload_ms=0.0f,expert_ms=0.0f;
+                if(flyweight_gpu_event_elapsed(vp.events[l*3],vp.events[l*3+1],&upload_ms)==0)
+                    vp.gpu_admit_upload+=upload_ms;
+                if(flyweight_gpu_event_elapsed(vp.events[l*3+1],vp.events[l*3+2],&expert_ms)==0)
+                    vp.gpu_experts+=expert_ms;
+            }
+        }
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);
     }
     // Every MTP hand-over out of the rows path -- the per-row states the

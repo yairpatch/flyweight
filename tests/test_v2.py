@@ -580,13 +580,16 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("kCudaR16BF = 14", driver)
         self.assertIn("flyweight_gpu_attention_16bit_cublas", driver)
         self.assertIn("flyweight_gpu_attention_16bit_cublas", runtime)
-        # Both decode call sites pass the cache type rather than assuming f16.
-        self.assertEqual(
-            runtime.count("flyweight_gpu_attention_16bit_cublas(\n"
-                          "                    runtime->options.cache_type_k,")
-            + runtime.count("flyweight_gpu_attention_16bit_cublas(\n"
-                            "                        runtime->options.cache_type_k,"),
-            2)
+        # Both decode call sites -- the 128-dim dispatch and the shared
+        # qwen_decode_attention_full -- pass the cache type rather than assuming
+        # f16; every call that names its type argument names the cache's.
+        calls = re.findall(
+            r"flyweight_gpu_attention_16bit_cublas\(\s*([^,]+),", runtime)
+        # The ring-unwrap route passes the same type through its local `ck`.
+        decode_calls = [arg.strip() for arg in calls if arg.strip() != "ck"]
+        self.assertGreaterEqual(len(decode_calls), 2, calls)
+        for arg in decode_calls:
+            self.assertTrue(arg.endswith("options.cache_type_k"), calls)
         # The turbo path stages to f16 itself, so it keeps the f16 entry point.
         self.assertIn("flyweight_gpu_attention_f16_cublas(queries,query_f16,"
                       "stage_keys,stage_values", runtime)

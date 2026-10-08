@@ -29,6 +29,8 @@ std::uint64_t legacy_decode_bytes(
         ws::align(scratch) +
         ws::align(((scratch + 31) / 32) * sizeof(std::uint16_t)) +
         ws::align(top_k * intermediate * sizeof(float)) +
+        ws::align(top_k * intermediate) +
+        ws::align(top_k * (intermediate / 32 + 1) * sizeof(float)) +
         ws::align(experts * sizeof(float)) +
         ws::align(top_k * sizeof(std::int32_t)) +
         ws::align(top_k * sizeof(float)) +
@@ -64,6 +66,8 @@ std::uint64_t legacy_rows_bytes(
         ws::align(rows * top_k * intermediate * sizeof(float)) +
         ws::align(rows * scratch) +
         ws::align(rows * (scratch / 32 + 1) * sizeof(float)) +
+        ws::align(rows * top_k * intermediate) +
+        ws::align(rows * top_k * (intermediate / 32 + 1) * sizeof(float)) +
         ws::align(rows * top_k * sizeof(std::uint64_t)) * 3 +
         ws::align(rows * top_k * sizeof(float)) * 3 +
         ws::align(rows * sizeof(std::int32_t)) +
@@ -121,7 +125,8 @@ int main() {
         const std::array regions{
             layout.hidden, layout.residual, layout.normalized, layout.first,
             layout.second, layout.third, layout.fourth, layout.dense_q8,
-            layout.dense_q8_scales, layout.activated, layout.router_logits,
+            layout.dense_q8_scales, layout.activated, layout.expert_q8,
+            layout.expert_q8_scales, layout.router_logits,
             layout.selected_device, layout.route_weights, layout.logits,
             layout.sampling_selected, layout.sampling_logits,
             layout.sampling_sort_indices_a, layout.sampling_sort_values_a,
@@ -150,6 +155,7 @@ int main() {
             layout.second, layout.third, layout.fourth, layout.router_logits,
             layout.selected_device, layout.route_weights, layout.gpu_activated,
             layout.rows_q8, layout.rows_q8_scales,
+            layout.expert_q8, layout.expert_q8_scales,
             layout.gpu_gate_table, layout.gpu_up_table, layout.gpu_down_table,
             layout.gpu_weight_table, layout.gpu_gate_scale_table,
             layout.gpu_up_scale_table, layout.gpu_count_table,
