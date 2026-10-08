@@ -2662,9 +2662,43 @@ void qwen_forward_rows(
             if(any_gpu){
                 void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows,const_cast<std::uint64_t*>(&gpu_gate_scale_table),const_cast<std::uint64_t*>(&gpu_up_scale_table)};
                 const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
+                const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
+                if(const char*q8_swiglu=qwen_q8_grouped_swiglu_kernel(gate_type,up_type,hidden_size)){
+                    // Every row's `normalized` in the rows Q8 scratch, kept as
+                    // the memo so a later projection of it reuses the blocks.
+                    int width=hidden_size,scale_stride=(hidden_size/32)*2;
+                    if(q8_cached_input!=normalized||q8_cached_width!=hidden_size){
+                        std::uint64_t input=normalized;
+                        void*quant_args[]={&input,&small_q8,&small_q8_scales,&width,&scale_stride};
+                        launch("quantize_q8_blocks_rows",(hidden_size+255)/256,
+                               static_cast<std::uint32_t>(rows),256,quant_args);
+                        q8_cached_input=normalized;q8_cached_width=hidden_size;
+                    }
+                    int no_experts=0;
+                    void*q8_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),
+                        &small_q8,&small_q8_scales,const_cast<std::uint64_t*>(&gpu_activated),
+                        const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),
+                        &no_experts,const_cast<std::uint64_t*>(&gpu_count_table),
+                        const_cast<int*>(&top_k),&rows,&scale_stride};
+                    launch(q8_swiglu,intermediate,rows*top_k,qwen_q8_grouped_block(hidden_size),q8_args);
+                }else
                 launch(qwen_grouped_swiglu_name(gate_type,false,true).c_str(),intermediate,rows*top_k,256,gate_up_args);
                 const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
                 void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
+                if(const char*q8_down=qwen_q8_grouped_down_kernel(down_type,intermediate)){
+                    std::uint64_t q8=workspace_layout.expert_q8.address(runtime.workspace);
+                    std::uint64_t q8_scales=workspace_layout.expert_q8_scales.address(runtime.workspace);
+                    std::uint64_t input=gpu_activated;
+                    int width=intermediate,scale_stride=(intermediate/32)*2,entries=rows*top_k,no_experts=0;
+                    void*quant_args[]={&input,&q8,&q8_scales,&width,&scale_stride};
+                    launch("quantize_q8_blocks_rows",(intermediate+255)/256,
+                           static_cast<std::uint32_t>(entries),256,quant_args);
+                    void*q8_down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),&q8,&q8_scales,
+                        const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),
+                        const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),
+                        const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&no_experts,&scale_stride};
+                    launch(q8_down,hidden_size,rows,qwen_q8_grouped_block(intermediate),q8_down_args);
+                }else
                 launch(qwen_grouped_accumulate_rows_name(down_type).c_str(),hidden_size,rows,256,down_args);
             }
         }

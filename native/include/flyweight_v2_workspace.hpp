@@ -63,6 +63,10 @@ struct QwenDecodeWorkspaceLayout {
     Region dense_q8;
     Region dense_q8_scales;
     Region activated;
+    // Q8 copies of the routed experts' activated rows, for the DP4A down
+    // projection; scales on a float stride per row (see quantize_q8_blocks_rows).
+    Region expert_q8;
+    Region expert_q8_scales;
     Region router_logits;
     Region selected_device;
     Region route_weights;
@@ -118,6 +122,9 @@ constexpr QwenDecodeWorkspaceLayout qwen_decode(
     layout.dense_q8_scales =
         builder.add(((scratch + 31) / 32) * sizeof(std::uint16_t));
     layout.activated = builder.add(top_k * intermediate * sizeof(float));
+    layout.expert_q8 = builder.add(top_k * intermediate);
+    layout.expert_q8_scales =
+        builder.add(top_k * (intermediate / 32 + 1) * sizeof(float));
     layout.router_logits = builder.add(experts * sizeof(float));
     layout.selected_device = builder.add(top_k * sizeof(std::int32_t));
     layout.route_weights = builder.add(top_k * sizeof(float));
@@ -166,6 +173,9 @@ struct QwenRowsWorkspaceLayout {
     Region gpu_activated;
     Region rows_q8;
     Region rows_q8_scales;
+    // The rows twin of the decode layout's expert_q8: one Q8 row per route.
+    Region expert_q8;
+    Region expert_q8_scales;
     Region gpu_gate_table;
     Region gpu_up_table;
     Region gpu_down_table;
@@ -259,6 +269,9 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     // stride so the region stays aligned for either width.
     layout.rows_q8 = builder.add(rows * scratch);
     layout.rows_q8_scales = builder.add(rows * (scratch / 32 + 1) * sizeof(float));
+    layout.expert_q8 = builder.add(rows * top_k * intermediate);
+    layout.expert_q8_scales =
+        builder.add(rows * top_k * (intermediate / 32 + 1) * sizeof(float));
     layout.gpu_gate_table =
         builder.add(rows * top_k * sizeof(std::uint64_t));
     layout.gpu_up_table =

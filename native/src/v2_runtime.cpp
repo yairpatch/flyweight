@@ -6219,6 +6219,44 @@ bool qwen_q8_head_enabled() {
     return !setting || setting[0] != '0';
 }
 
+// The Q8-activation grouped SwiGLU for a K-quant expert stack, or null where
+// gate and up differ in type, the row is not super-block aligned, the kernel is
+// missing, or FLYWEIGHT_Q8_EXPERTS=0 (or the FLYWEIGHT_IQ2_Q8_DECODE kill
+// switch) asks for the float kernels. Measured on Qwen3.6-35B-A3B UD-Q4_K_XL,
+// where q4k_grouped_swiglu was the largest single decode kernel.
+const char* qwen_q8_grouped_swiglu_kernel(
+    std::uint32_t gate_type, std::uint32_t up_type, int input_size) {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("FLYWEIGHT_Q8_EXPERTS");
+        return !setting || setting[0] != '0';
+    }();
+    if (!enabled || !qwen_q8_head_enabled() || gate_type != up_type ||
+        (input_size & 255))
+        return nullptr;
+    const char* name = gate_type == 12 ? "q4k_q8_grouped_swiglu"
+        : gate_type == 13 ? "q5k_q8_grouped_swiglu"
+        : gate_type == 14 ? "q6k_q8_grouped_swiglu" : nullptr;
+    return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
+}
+
+// The Q8-activation grouped down projection for a K-quant expert stack, under
+// the same switches as qwen_q8_grouped_swiglu_kernel.
+const char* qwen_q8_grouped_down_kernel(std::uint32_t down_type, int input_size) {
+    if (!qwen_q8_grouped_swiglu_kernel(12, 12, 256) || (input_size & 255))
+        return nullptr;
+    const char* name = down_type == 12 ? "q4k_q8_grouped_down"
+        : down_type == 13 ? "q5k_q8_grouped_down"
+        : down_type == 14 ? "q6k_q8_grouped_down" : nullptr;
+    return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
+}
+
+// Threads for a grouped Q8 kernel walking `input_size / 32` groups per row:
+// enough warps to cover them, at most the four its block reduction holds.
+inline std::uint32_t qwen_q8_grouped_block(int input_size) {
+    const int groups = input_size >> 5;
+    return static_cast<std::uint32_t>(std::min(128, std::max(32, (groups + 31) / 32 * 32)));
+}
+
 // Super-block Q8 kernels need a multiple of 256. Flat 32-wide formats (IQ4_NL)
 // line one block up with one Q8 group, so a multiple of 32 is a whole row.
 bool qwen_q8_row_fits(std::uint32_t type, int input_size) {
@@ -21924,6 +21962,30 @@ static void qwen_run_hybrid_experts(
                 const_cast<std::uint64_t*>(&gate_scale_table),
                 const_cast<std::uint64_t*>(&up_scale_table)};
             profile_record(profile?profile->expert_gate_up_start:0);
+            const auto up_type =
+                runtime.model->tensors[layer.expert_tensors[1]].type;
+            if (const char* q8_swiglu =
+                    qwen_q8_grouped_swiglu_kernel(gate_type, up_type, hidden_size)) {
+                // dense_q8 is the decode step's own Q8 copy of `normalized`;
+                // rewriting it with the same vector keeps its memo valid.
+                const auto& layout = runtime.decode_workspace_layout;
+                std::uint64_t q8 = layout.dense_q8.address(runtime.workspace);
+                std::uint64_t q8_scales = layout.dense_q8_scales.address(runtime.workspace);
+                std::uint64_t input = normalized;
+                int width = hidden_size;
+                void* quant_args[] = {&input, &q8, &q8_scales, &width};
+                launch("quantize_q8_blocks", (hidden_size + 31) / 32, 1, 32, quant_args);
+                std::uint64_t no_counts = 0;
+                int top_k_unused = 0, one_row = 1, scale_stride = hidden_size / 32;
+                void* q8_args[] = {
+                    const_cast<std::uint64_t*>(&gate_table),
+                    const_cast<std::uint64_t*>(&up_table), &q8, &q8_scales,
+                    const_cast<std::uint64_t*>(&activated),
+                    const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate),
+                    &gpu_count, &no_counts, &top_k_unused, &one_row, &scale_stride};
+                launch(q8_swiglu, intermediate, gpu_count,
+                       qwen_q8_grouped_block(hidden_size), q8_args);
+            } else
             launch(
                 qwen_grouped_swiglu_name(gate_type, nvfp4_tiled, false).c_str(),
                 gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate,
@@ -21931,9 +21993,29 @@ static void qwen_run_hybrid_experts(
             profile_record(profile?profile->expert_gate_up_end:0);
             if(profile)profile->expert_subprofile_mask|=2;
             profile_record(profile?profile->expert_down_start:0);
-            const int status = qwen_launch_grouped_accumulate(
-                runtime.stream, down_type, down_table, activated, third,
-                weight_table, intermediate, hidden_size, gpu_count);
+            int status = 0;
+            if (const char* q8_down =
+                    qwen_q8_grouped_down_kernel(down_type, intermediate)) {
+                const auto& layout = runtime.decode_workspace_layout;
+                std::uint64_t q8 = layout.expert_q8.address(runtime.workspace);
+                std::uint64_t q8_scales = layout.expert_q8_scales.address(runtime.workspace);
+                std::uint64_t input = activated;
+                int width = intermediate, scale_stride = (intermediate / 32) * 2;
+                void* quant_args[] = {&input, &q8, &q8_scales, &width, &scale_stride};
+                launch("quantize_q8_blocks_rows", (intermediate + 255) / 256,
+                       static_cast<std::uint32_t>(gpu_count), 256, quant_args);
+                std::uint64_t no_counts = 0, output = third;
+                int top_k_unused = 0;
+                void* down_args[] = {
+                    const_cast<std::uint64_t*>(&down_table), &q8, &q8_scales, &output,
+                    const_cast<std::uint64_t*>(&weight_table), &no_counts,
+                    const_cast<int*>(&intermediate), const_cast<int*>(&hidden_size),
+                    &top_k_unused, &gpu_count, &scale_stride};
+                launch(q8_down, hidden_size, 1, qwen_q8_grouped_block(intermediate), down_args);
+            } else
+                status = qwen_launch_grouped_accumulate(
+                    runtime.stream, down_type, down_table, activated, third,
+                    weight_table, intermediate, hidden_size, gpu_count);
             profile_record(profile?profile->expert_down_end:0);
             if(profile)profile->expert_subprofile_mask|=4;
             if (status != 0)

@@ -88,6 +88,11 @@ ARMS: dict[str, dict[str, str]] = {
     # 2..8-row batches (MTP verify, a prompt's short tail chunk) on the narrow
     # MMQ tile, which the 8-row Q8 kernel and its row-cap twins replaced.
     "small-batch-mmq": {"FLYWEIGHT_SMALL_BATCH_MMQ": "1"},
+    # K-quant routed experts on the float grouped kernels, which the
+    # Q8-activation q*k_q8_grouped_swiglu / _down kernels replaced.
+    "experts-float": {"FLYWEIGHT_Q8_EXPERTS": "0"},
+    # Every Q8-activation path off: dense projections, heads and experts.
+    "all-float": {"FLYWEIGHT_IQ2_Q8_DECODE": "0"},
 }
 
 

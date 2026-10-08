@@ -1355,6 +1355,8 @@ extern "C" int flyweight_gpu_compile(
              "iq3s_q8_matvec_transposed_rows",
              "iq3s_q8_matmul_tiled", "iq3s_q8_mmq",
              "quantize_q8_blocks_rows",
+             "q4k_q8_grouped_swiglu", "q5k_q8_grouped_swiglu", "q6k_q8_grouped_swiglu",
+             "q4k_q8_grouped_down", "q5k_q8_grouped_down", "q6k_q8_grouped_down",
              // Row-cap twins of every *_q8_matvec_transposed_rows (MTP verify).
              "q5k_q8_matvec_transposed_rows_r2", "q5k_q8_matvec_transposed_rows_r3", "q5k_q8_matvec_transposed_rows_r4",
              "iq2xxs_q8_matvec_transposed_rows_r2", "iq2xxs_q8_matvec_transposed_rows_r3", "iq2xxs_q8_matvec_transposed_rows_r4",

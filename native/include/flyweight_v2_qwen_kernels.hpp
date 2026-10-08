@@ -8368,6 +8368,204 @@ FLYWEIGHT_Q8_MATMUL_TILED(q6k_q8_matmul_tiled, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MMQ(q6k_q8_mmq, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MMQ_ROUTED(q6k_q8_mmq_routed, q6k_q8_decode, 210, 8, 3)
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// Grouped routed-expert SwiGLU over a Q8-blocked activation, for the K-quant
+// expert stacks. The float kernels (q4k_grouped_swiglu and its _rows twin)
+// reconstruct every weight with q4k_value and ran the 35B-A3B's gate/up at
+// ~160 GB/s; these decode a 32-weight group to int8 once and take dp4a, the
+// path the dense K-quant projections already use.
+//
+// One kernel serves both callers. Decode passes counts == nullptr: blockIdx.y
+// is the expert, every expert reads activation row 0. The rows forward (MTP
+// verify) passes its per-token counts: blockIdx.y is token * top_k + rank, the
+// activation row is the token's, and an empty rank returns. Activation scales
+// sit `scale_stride` halves apart (the rows layout pads them to float stride).
+// Like the float kernels, the gate/up role scales are not applied: they are
+// 1 for every K-quant stack.
+#define FLYWEIGHT_Q8_GROUPED_SWIGLU_BODY(STRIDE, DECODE_GATE, DECODE_UP, DOT)   \
+    const int row = blockIdx.x;                                                 \
+    const int route = blockIdx.y;                                               \
+    int token = 0;                                                              \
+    if (counts) {                                                               \
+        token = route / top_k;                                                  \
+        if (token >= rows || route - token * top_k >= counts[token]) return;   \
+    } else if (route >= experts) return;                                        \
+    if (row >= output_size) return;                                            \
+    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
+    const unsigned char* gate_row =                                             \
+        (const unsigned char*)gate_ptrs[route] + (long long)row * row_bytes;    \
+    const unsigned char* up_row =                                               \
+        (const unsigned char*)up_ptrs[route] + (long long)row * row_bytes;      \
+    const signed char* act = vectors + (long long)token * input_size;           \
+    const __half* act_scales = vector_scales + (long long)token * scale_stride; \
+    const int groups = input_size >> 5;                                         \
+    float gate = 0.0f, up = 0.0f;                                               \
+    for (int g = threadIdx.x; g < groups; g += blockDim.x) {                    \
+        const int4* av = (const int4*)(act + (long long)g * 32);                \
+        const int4 lo = av[0], hi = av[1];                                      \
+        const int acts[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};   \
+        const float a_scale = __half2float(act_scales[g]);                      \
+        int words[8];                                                           \
+        DECODE_GATE                                                             \
+        gate += DOT * a_scale;                                                  \
+        DECODE_UP                                                               \
+        up += DOT * a_scale;                                                    \
+    }                                                                           \
+    const int lane = threadIdx.x & 31;                                          \
+    const int warp = threadIdx.x >> 5;                                          \
+    for (int offset = 16; offset > 0; offset >>= 1) {                           \
+        gate += __shfl_down_sync(0xffffffffu, gate, offset);                    \
+        up += __shfl_down_sync(0xffffffffu, up, offset);                        \
+    }                                                                           \
+    __shared__ float gate_sums[4], up_sums[4];                                  \
+    if (lane == 0) { gate_sums[warp] = gate; up_sums[warp] = up; }              \
+    __syncthreads();                                                            \
+    if (warp != 0) return;                                                      \
+    const int warps = (int)(blockDim.x >> 5);                                   \
+    gate = lane < warps ? gate_sums[lane] : 0.0f;                               \
+    up = lane < warps ? up_sums[lane] : 0.0f;                                   \
+    for (int offset = 16; offset > 0; offset >>= 1) {                           \
+        gate += __shfl_down_sync(0xffffffffu, gate, offset);                    \
+        up += __shfl_down_sync(0xffffffffu, up, offset);                        \
+    }                                                                           \
+    if (lane == 0)                                                              \
+        activated[(long long)route * output_size + row] =                       \
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+
+#define FLYWEIGHT_Q8_GROUPED_SWIGLU_SIGNATURE(name)                             \
+extern "C" __global__ void name(                                                \
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
+    const signed char* vectors, const __half* vector_scales,                    \
+    float* activated, const int input_size, const int output_size,              \
+    const int experts, const int* counts, const int top_k, const int rows,      \
+    const int scale_stride)
+
+// Symmetric formats: decode_fn(row, g, words, &scale_low, &scale_high).
+#define FLYWEIGHT_Q8_GROUPED_SWIGLU(name, decode_fn, stride)                    \
+FLYWEIGHT_Q8_GROUPED_SWIGLU_SIGNATURE(name) {                                   \
+    float s_lo, s_hi;                                                           \
+    FLYWEIGHT_Q8_GROUPED_SWIGLU_BODY(stride,                                    \
+        decode_fn(gate_row, g, words, &s_lo, &s_hi);,                           \
+        decode_fn(up_row, g, words, &s_lo, &s_hi);,                             \
+        q8_group_dot_sym(words, acts, s_lo, s_hi))                              \
+}
+// Asymmetric K-quants (Q2_K/Q4_K/Q5_K): a per-half minimum, folded through the
+// activation sums as in FLYWEIGHT_Q8_MATVEC_ROWS_MIN.
+#define FLYWEIGHT_Q8_GROUPED_SWIGLU_MIN(name, decode_fn, stride)                \
+FLYWEIGHT_Q8_GROUPED_SWIGLU_SIGNATURE(name) {                                   \
+    float s_lo, s_hi, o_lo, o_hi;                                               \
+    FLYWEIGHT_Q8_GROUPED_SWIGLU_BODY(stride,                                    \
+        decode_fn(gate_row, g, words, &s_lo, &s_hi, &o_lo, &o_hi);,             \
+        decode_fn(up_row, g, words, &s_lo, &s_hi, &o_lo, &o_hi);,               \
+        q8_group_dot_min(words, acts, s_lo, s_hi, o_lo, o_hi))                  \
+}
+
+__device__ __forceinline__ float q8_group_dot_sym(
+    const int* words, const int* acts, float scale_low, float scale_high) {
+    int dot_low = 0, dot_high = 0;
+#pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        int dot = __dp4a(words[step * 2], acts[step * 2], 0);
+        dot = __dp4a(words[step * 2 + 1], acts[step * 2 + 1], dot);
+        if (step < 2) dot_low += dot; else dot_high += dot;
+    }
+    return (float)dot_low * scale_low + (float)dot_high * scale_high;
+}
+
+__device__ __forceinline__ float q8_group_dot_min(
+    const int* words, const int* acts, float scale_low, float scale_high,
+    float offset_low, float offset_high) {
+    int dot_low = 0, dot_high = 0, sum_low = 0, sum_high = 0;
+#pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        int dot = __dp4a(words[step * 2], acts[step * 2], 0);
+        dot = __dp4a(words[step * 2 + 1], acts[step * 2 + 1], dot);
+        int sum = __dp4a(0x01010101, acts[step * 2], 0);
+        sum = __dp4a(0x01010101, acts[step * 2 + 1], sum);
+        if (step < 2) { dot_low += dot; sum_low += sum; }
+        else { dot_high += dot; sum_high += sum; }
+    }
+    return (float)dot_low * scale_low - (float)sum_low * offset_low
+         + (float)dot_high * scale_high - (float)sum_high * offset_high;
+}
+
+FLYWEIGHT_Q8_GROUPED_SWIGLU_MIN(q4k_q8_grouped_swiglu, q4k_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_SWIGLU_MIN(q5k_q8_grouped_swiglu, q5k_q8_decode, 176)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(q6k_q8_grouped_swiglu, q6k_q8_decode, 210)
+
+// The down projection over Q8-blocked activated rows: output[row] += sum over
+// the token's experts of weight * down_expert[row] . activated_expert. Decode
+// passes counts == nullptr (one token, `experts` entries); the rows forward
+// passes its per-token counts and grid.y = rows. Activated row r's blocks sit
+// at vectors + r * input_size, its scales `scale_stride` halves apart.
+#define FLYWEIGHT_Q8_GROUPED_DOWN_SIGNATURE(name)                               \
+extern "C" __global__ void name(                                                \
+    const unsigned long long* down_ptrs, const signed char* vectors,           \
+    const __half* vector_scales, float* output, const float* weights,          \
+    const int* counts, const int input_size, const int output_size,            \
+    const int top_k, const int experts, const int scale_stride)
+
+#define FLYWEIGHT_Q8_GROUPED_DOWN_BODY(STRIDE, DECODE, DOT)                     \
+    const int row = blockIdx.x;                                                 \
+    const int token = blockIdx.y;                                               \
+    if (row >= output_size) return;                                            \
+    const int base = counts ? token * top_k : 0;                                \
+    const int count = counts ? counts[token] : experts;                         \
+    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
+    const int groups = input_size >> 5;                                         \
+    float partial = 0.0f;                                                       \
+    for (int g = threadIdx.x; g < groups; g += blockDim.x) {                    \
+        for (int rank = 0; rank < count; ++rank) {                              \
+            const int entry = base + rank;                                      \
+            const unsigned char* down_row = (const unsigned char*)              \
+                down_ptrs[entry] + (long long)row * row_bytes;                  \
+            const int4* av = (const int4*)(vectors                              \
+                + (long long)entry * input_size + (long long)g * 32);           \
+            const int4 lo = av[0], hi = av[1];                                  \
+            const int acts[8] = {lo.x, lo.y, lo.z, lo.w,                        \
+                                 hi.x, hi.y, hi.z, hi.w};                       \
+            int words[8];                                                       \
+            DECODE                                                              \
+            partial += weights[entry] * DOT * __half2float(                     \
+                vector_scales[(long long)entry * scale_stride + g]);            \
+        }                                                                       \
+    }                                                                           \
+    const int lane = threadIdx.x & 31;                                          \
+    const int warp = threadIdx.x >> 5;                                          \
+    for (int offset = 16; offset > 0; offset >>= 1)                             \
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);              \
+    __shared__ float down_sums[4];                                              \
+    if (lane == 0) down_sums[warp] = partial;                                   \
+    __syncthreads();                                                            \
+    if (warp != 0) return;                                                      \
+    partial = lane < (int)(blockDim.x >> 5) ? down_sums[lane] : 0.0f;           \
+    for (int offset = 16; offset > 0; offset >>= 1)                             \
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);              \
+    if (lane == 0)                                                              \
+        output[(long long)(counts ? token : 0) * output_size + row] += partial;
+
+#define FLYWEIGHT_Q8_GROUPED_DOWN(name, decode_fn, stride)                      \
+FLYWEIGHT_Q8_GROUPED_DOWN_SIGNATURE(name) {                                     \
+    float s_lo, s_hi;                                                           \
+    FLYWEIGHT_Q8_GROUPED_DOWN_BODY(stride,                                      \
+        decode_fn(down_row, g, words, &s_lo, &s_hi);,                           \
+        q8_group_dot_sym(words, acts, s_lo, s_hi))                              \
+}
+#define FLYWEIGHT_Q8_GROUPED_DOWN_MIN(name, decode_fn, stride)                  \
+FLYWEIGHT_Q8_GROUPED_DOWN_SIGNATURE(name) {                                     \
+    float s_lo, s_hi, o_lo, o_hi;                                               \
+    FLYWEIGHT_Q8_GROUPED_DOWN_BODY(stride,                                      \
+        decode_fn(down_row, g, words, &s_lo, &s_hi, &o_lo, &o_hi);,             \
+        q8_group_dot_min(words, acts, s_lo, s_hi, o_lo, o_hi))                  \
+}
+
+FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q4k_q8_grouped_down, q4k_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q5k_q8_grouped_down, q5k_q8_decode, 176)
+FLYWEIGHT_Q8_GROUPED_DOWN(q6k_q8_grouped_down, q6k_q8_decode, 210)
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+
 
 // Q8_0 against a Q8-blocked activation. A 34-byte block (fp16 d, 32 int8) is
 // only 2-byte aligned, so the weights are read from the 4-byte grid and
