@@ -25,6 +25,38 @@ inline bool qwen_verify_decode_attention_enabled(){
     return on;
 }
 
+// FLYWEIGHT_MOE_PROFILE=1 also splits the routed-expert stage of MTP
+// verification passes, which the decode-side [moe-profile] never sees: host time
+// in each step of cpu_phase, GPU time of the admission uploads and of the
+// grouped expert kernels (timed events, so the queue serializes -- read the
+// split, not the token rate), and what happened to every route.
+struct QwenVerifyMoeProfile{
+    std::uint64_t passes=0,layers=0,rows=0,routes=0,hits=0,misses=0,
+        admitted=0,refused=0,cpu_routes=0,distinct=0;
+    double route_sync=0,route_loop=0,table_launch=0,cpu_sweep=0,combine=0;
+    double gpu_admit_upload=0,gpu_experts=0;
+    std::vector<std::uint64_t> events;   // three per layer
+    std::vector<char> recorded;          // per layer, this pass
+};
+inline QwenVerifyMoeProfile& qwen_verify_moe_profile(){static QwenVerifyMoeProfile p;return p;}
+struct QwenVerifyMoeProfileAtExit{
+    ~QwenVerifyMoeProfileAtExit(){
+        const auto&p=qwen_verify_moe_profile();
+        if(!p.passes)return;
+        const double n=static_cast<double>(p.passes);
+        std::fprintf(stderr,
+            "\n[verify-moe-profile] %llu verify passes, %.1f rows and %.1f MoE layers per pass\n"
+            "  host  route sync %7.3f  routing loop %7.3f  tables+launch %7.3f  cpu sweep %7.3f  combine %7.3f  ms/pass\n"
+            "  gpu   admission uploads %7.3f  expert kernels (tables+grouped) %7.3f  ms/pass\n"
+            "  routes/pass %.1f (distinct experts %.1f): hit %.1f  miss %.1f (admitted %.1f, refused %.1f)  cpu-fallback %.1f\n",
+            static_cast<unsigned long long>(p.passes),p.rows/n,p.layers/n,
+            p.route_sync/n,p.route_loop/n,p.table_launch/n,p.cpu_sweep/n,p.combine/n,
+            p.gpu_admit_upload/n,p.gpu_experts/n,
+            p.routes/n,p.distinct/n,p.hits/n,p.misses/n,p.admitted/n,p.refused/n,p.cpu_routes/n);
+    }
+};
+static QwenVerifyMoeProfileAtExit qwen_verify_moe_profile_at_exit;
+
 // The FLYWEIGHT_Q8_MATVEC_ROWS twin sized for `rows`, or the full-cap kernel
 // where none is smaller or the module lacks it. Names are interned because the
 // timeline keeps the pointer past the launch.
@@ -247,6 +279,31 @@ void qwen_forward_rows(
     const bool pipelined=pipeline_enabled&&pipeline_half>0&&experts>0&&
         expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
         !expert_policy.is_streamed_gpu();
+    const bool verify_moe_profile=moe_profile_enabled()&&!pipelined&&
+        expert_phase==flyweight::v2::ExpertExecutionPhase::verification;
+    if(verify_moe_profile){
+        auto&vp=qwen_verify_moe_profile();
+        const auto need=runtime.layers.size()*3;
+        while(vp.events.size()<need){
+            std::uint64_t event=0;
+            if(flyweight_gpu_timed_event_create(&event)!=0)
+                throw std::runtime_error("native Qwen verify profile event failed");
+            vp.events.push_back(event);
+        }
+        vp.recorded.assign(runtime.layers.size(),0);
+        ++vp.passes;vp.rows+=static_cast<std::uint64_t>(rows);
+    }
+    auto verify_profile_mark=[&](std::uint32_t layer_number,int which){
+        if(!verify_moe_profile)return;
+        auto&vp=qwen_verify_moe_profile();
+        if(flyweight_gpu_event_record(vp.events[layer_number*3+which],runtime.stream)!=0)
+            throw std::runtime_error("native Qwen verify profile event failed");
+        if(which==0){vp.recorded[layer_number]=1;++vp.layers;}
+    };
+    auto verify_ms_since=[](std::chrono::steady_clock::time_point started){
+        return std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+    };
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
@@ -2104,6 +2161,7 @@ void qwen_forward_rows(
             runtime.prefill_gpu_transfer_nanoseconds+=static_cast<std::uint64_t>(transfer_ms*1.0e6f);
         }
         const auto route_wait_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
+        if(verify_moe_profile)qwen_verify_moe_profile().route_sync+=route_wait_elapsed/1e6;
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
         if(expert_policy.records_prefill_frequency())
             runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
@@ -2177,11 +2235,22 @@ void qwen_forward_rows(
             std::fill(gpu_up_scales,gpu_up_scales+span_entries,1.0f);
             std::fill(gpu_counts,gpu_counts+rows,0);
         }
+        verify_profile_mark(layer_number,0);
+        const auto verify_loop_started=std::chrono::steady_clock::now();
+        if(verify_moe_profile){
+            std::vector<std::int32_t> seen;
+            for(int route=0;route<rows*top_k;++route)
+                if(weights_host[route]!=0.0f)seen.push_back(selected_host[route]);
+            std::sort(seen.begin(),seen.end());
+            qwen_verify_moe_profile().distinct+=static_cast<std::uint64_t>(
+                std::unique(seen.begin(),seen.end())-seen.begin());
+        }
         if(gpu_rows_allowed){
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
                 const int expert=selected_host[route];
+                if(verify_moe_profile)++qwen_verify_moe_profile().routes;
                 if(expert<0||expert>=experts)
                     throw std::runtime_error("native Qwen rows forward selected an invalid expert");
                 if(expert_policy.records_prefill_frequency())
@@ -2192,8 +2261,10 @@ void qwen_forward_rows(
                 if(resident!=runtime.expert_residency.end()){
                     slot_index=resident->second;
                     record_expert_cache_hit(runtime,runtime.expert_slots[slot_index]);
+                    if(verify_moe_profile)++qwen_verify_moe_profile().hits;
                 }else{
                     ++runtime.expert_cache_misses;
+                    if(verify_moe_profile)++qwen_verify_moe_profile().misses;
                     // Under MTP this path *is* the decode path, so declining to
                     // admit here leaves the cache empty forever and runs every
                     // route on the CPU. Page in exactly as decode does. Only the
@@ -2203,7 +2274,11 @@ void qwen_forward_rows(
                     if(rows_may_admit&&layer.expert_dma)
                         slot_index=select_expert_cache_slot(
                             runtime,layer_number,expert,true);
-                    if(slot_index==kNoExpertSlot)continue;
+                    if(slot_index==kNoExpertSlot){
+                        if(verify_moe_profile)++qwen_verify_moe_profile().refused;
+                        continue;
+                    }
+                    if(verify_moe_profile)++qwen_verify_moe_profile().admitted;
                     auto&admitted=runtime.expert_slots[slot_index];
                     admitted.key=cache_key;
                     admitted.valid=true;
@@ -2548,6 +2623,9 @@ void qwen_forward_rows(
                     "native Qwen prefill expert stream index upload failed");
             }
         }
+        if(verify_moe_profile)qwen_verify_moe_profile().route_loop+=verify_ms_since(verify_loop_started);
+        verify_profile_mark(layer_number,1);
+        const auto verify_table_started=std::chrono::steady_clock::now();
         bool any_gpu=false;
         if(gpu_rows_allowed)
             for(int token=0;token<rows;++token)
@@ -2593,9 +2671,17 @@ void qwen_forward_rows(
         // The CPU sweep runs before the GEMM enqueue so the leader's pack
         // worker overlaps it; the GPU meanwhile has the other half's core
         // work queued, so the later enqueue costs it nothing.
+        verify_profile_mark(layer_number,2);
+        if(verify_moe_profile){
+            auto&vp=qwen_verify_moe_profile();
+            vp.table_launch+=verify_ms_since(verify_table_started);
+            for(int route=0;route<rows*top_k;++route)
+                if(weights_host[route]!=0.0f)++vp.cpu_routes;
+        }
         {
             const auto cpu_expert_started=std::chrono::steady_clock::now();
             qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
+            if(verify_moe_profile)qwen_verify_moe_profile().cpu_sweep+=verify_ms_since(cpu_expert_started);
             if(expert_policy.records_prefill_frequency())
                 runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-cpu_expert_started).count();
@@ -3021,6 +3107,11 @@ void qwen_forward_rows(
     // residual, and swap the span's ping-pong buffers for the next layer.
     auto queue_combine=[&](RowsSpan&span){
         install_span(span);
+        const auto verify_combine_started=std::chrono::steady_clock::now();
+        struct CombineClock{bool on;std::chrono::steady_clock::time_point t;
+            ~CombineClock(){if(on)qwen_verify_moe_profile().combine+=
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();}}
+            combine_clock{verify_moe_profile,verify_combine_started};
         // Set by cpu_phase: whether the span queued GPU expert work (table
         // path or streamed) whose accumulator in `fourth` must fold in here.
         const bool gpu_table_path=span.gpu_experts;
@@ -3153,6 +3244,17 @@ void qwen_forward_rows(
         }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
         if(flyweight_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
+        if(verify_moe_profile){
+            auto&vp=qwen_verify_moe_profile();
+            for(std::size_t l=0;l<vp.recorded.size();++l){
+                if(!vp.recorded[l])continue;
+                float upload_ms=0.0f,expert_ms=0.0f;
+                if(flyweight_gpu_event_elapsed(vp.events[l*3],vp.events[l*3+1],&upload_ms)==0)
+                    vp.gpu_admit_upload+=upload_ms;
+                if(flyweight_gpu_event_elapsed(vp.events[l*3+1],vp.events[l*3+2],&expert_ms)==0)
+                    vp.gpu_experts+=expert_ms;
+            }
+        }
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);
     }
     // Every MTP hand-over out of the rows path -- the per-row states the
