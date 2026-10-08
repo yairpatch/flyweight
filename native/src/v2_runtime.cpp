@@ -16218,6 +16218,33 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     runtime->geometries[qwen_slot_geometry_index(*runtime,i)].state_bytes;
         };
         plan_slots(runtime->options.context_limit);
+        // One f16 window of the widest attention layer. Turbo and q8_0 expand
+        // into it for the cuBLAS path; a wrapped 16-bit sliding window is
+        // copied here too. Required once the cache type asks for it, so it is
+        // charged into the budget below rather than taken out of the headroom
+        // the expert cache was sized against.
+        auto plan_kv_stage=[&]{
+            runtime->turbo_kv_stage_bytes=0;
+            runtime->turbo_kv_stage_stride=0;
+            auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
+            const int stage_k=runtime->options.cache_type_k;
+            const int stage_v=runtime->options.cache_type_v;
+            const bool stage_quant=stages_kv(stage_k)||stages_kv(stage_v);
+            const bool stage_swa=(stage_k==1||stage_k==2)&&stage_k==stage_v&&
+                std::any_of(runtime->layers.begin(),runtime->layers.end(),
+                    [](const QwenLayerPlan& layer){return layer.attention_window!=0;});
+            if(!stage_quant&&!stage_swa)return;
+            std::uint64_t widest=0;
+            for(const auto& layer:runtime->layers){
+                if(!layer.attention)continue;
+                if(stage_quant||layer.attention_window)
+                    widest=std::max<std::uint64_t>(widest,
+                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
+            }
+            if(!widest)return;
+            runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
+            runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
+        };
         // QSA scratch geometry: one shape for every selecting layer. Mixed
         // nonzero ratios would need per-layer score buffers; no checkpoint
         // ships them, so refuse instead of sizing for one and overrunning on
@@ -16560,10 +16587,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     // Alignment and the prefill-stream arena are sized after
                     // this point. A small pad keeps a plan that lands on the
                     // budget from failing the check by a rounding error.
+                    // The snapshot pool and the KV stage are charged by that
+                    // check too. Leaving them out, a 27B at 66K turbo4 with
+                    // MTP spilled two blocks and the check then refused the
+                    // plan 727 MiB short (606 of snapshots, 258 of KV stage)
+                    // after the host re-encode had run.
                     constexpr std::uint64_t pad=64ull*1024*1024;
+                    plan_kv_stage();
                     const auto overhead=[&]{
                         return runtime->workspace_bytes+runtime->slots_state_bytes
-                            +runtime->expert_staging_bytes
+                            +runtime->expert_staging_bytes+snapshot_pool
+                            +runtime->turbo_kv_stage_bytes
                             +(runtime->host_ffn_layers?ffn_stage:0)+pad;
                     };
                     const std::uint32_t before=runtime->host_ffn_layers;
@@ -17357,33 +17391,6 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // native Qwen prefill snapshots") instead of the cause. The same
         // arithmetic is known here, one message earlier, with the shortfall in
         // it.
-        // One f16 window of the widest attention layer. Turbo and q8_0 expand
-        // into it for the cuBLAS path; a wrapped 16-bit sliding window is
-        // copied here too. Required once the cache type asks for it, so it is
-        // charged into the budget below rather than taken out of the headroom
-        // the expert cache was sized against.
-        auto plan_kv_stage=[&]{
-            runtime->turbo_kv_stage_bytes=0;
-            runtime->turbo_kv_stage_stride=0;
-            auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
-            const int stage_k=runtime->options.cache_type_k;
-            const int stage_v=runtime->options.cache_type_v;
-            const bool stage_quant=stages_kv(stage_k)||stages_kv(stage_v);
-            const bool stage_swa=(stage_k==1||stage_k==2)&&stage_k==stage_v&&
-                std::any_of(runtime->layers.begin(),runtime->layers.end(),
-                    [](const QwenLayerPlan& layer){return layer.attention_window!=0;});
-            if(!stage_quant&&!stage_swa)return;
-            std::uint64_t widest=0;
-            for(const auto& layer:runtime->layers){
-                if(!layer.attention)continue;
-                if(stage_quant||layer.attention_window)
-                    widest=std::max<std::uint64_t>(widest,
-                        static_cast<std::uint64_t>(layer.kv_heads)*layer.cache_capacity*layer.head_dim);
-            }
-            if(!widest)return;
-            runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
-            runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
-        };
         // Auto-fit shrinks the context to what the card can hold rather than
         // refusing the request. The context is the one term here nobody
         // usually chose -- it defaults to the checkpoint's maximum, which on a
@@ -17467,6 +17474,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         if(!runtime->options.strict_resident&&
            gpu_budget&&base_total_resolved>gpu_budget){
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
+            // Every term base_total_resolved carries, so the sum reads back.
+            const std::uint64_t snapshot_total=slot_count*
+                runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
+            const std::uint64_t stream_total=runtime->prefill_stream_bytes+
+                runtime->prefill_stream_scratch_bytes;
             throw std::runtime_error(
                 "native Qwen base CUDA allocations ("+mib(base_total_resolved)+" MiB = static weights "
                 +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)
@@ -17480,6 +17492,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 +mib(runtime->slots_state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
                 +(runtime->turbo_kv_stage_bytes
                     ?" + kv stage "+mib(runtime->turbo_kv_stage_bytes):"")
+                +(snapshot_total?" + snapshots "+mib(snapshot_total):"")
+                +(runtime->host_ffn_stage_bytes
+                    ?" + host-ffn stage "+mib(runtime->host_ffn_stage_bytes):"")
+                +(stream_total?" + stream "+mib(stream_total):"")
                 +") exceed the "
                 +(auto_fit?"VRAM this device has free (":"--gpu-cache-mib budget (")
                 +mib(gpu_budget)+" MiB), before any expert cache. Short by "
