@@ -335,7 +335,9 @@ void qwen_forward_rows(
             return;
         }
         if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
-            throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
+            throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name+
+                " (grid "+std::to_string(gx)+"x"+std::to_string(gy)+", block "+std::to_string(bx)+
+                ", shared "+std::to_string(shared)+")");
     };
     auto rms_rows=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
         // Invalidate the Q8 activation cache, which is keyed on the source
@@ -1781,7 +1783,13 @@ void qwen_forward_rows(
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
                 int base=static_cast<int>(runtime.position)+span_begin;
-                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
+                // KV_PREFILL's last parameter is the attention window, 0 on
+                // this branch. Omitting it left the driver reading the twelfth
+                // argument pointer from whatever followed this array on the
+                // stack: harmless until an unrelated change moved the frame,
+                // then cuLaunchKernel returned "invalid argument".
+                int no_window=0;
+                void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale,&no_window};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 if(k2horizon){
