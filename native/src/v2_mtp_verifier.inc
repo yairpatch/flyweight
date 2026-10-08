@@ -15,6 +15,16 @@ static constexpr int kQ8RowBatch=8;
 // instead of an almost empty tile (three launches at most).
 static constexpr int kQ8TailRows=32;
 
+// FLYWEIGHT_VERIFY_DECODE_ATTENTION=0 sends small row batches back to the
+// batched prefill attention; see verify_decode_attention in qwen_forward_rows.
+inline bool qwen_verify_decode_attention_enabled(){
+    static const bool on=[]{
+        const char*setting=std::getenv("FLYWEIGHT_VERIFY_DECODE_ATTENTION");
+        return !setting||setting[0]!='0';
+    }();
+    return on;
+}
+
 // The FLYWEIGHT_Q8_MATVEC_ROWS twin sized for `rows`, or the full-cap kernel
 // where none is smaller or the module lacks it. Names are interned because the
 // timeline keeps the pointer past the launch.
@@ -1614,7 +1624,21 @@ void qwen_forward_rows(
             // cannot use them and takes the warp path with its own gate kernel.
             // K2-Horizon runs them ungated (the unpack the rotated turbo path
             // already uses) and applies its softplus gate afterwards.
+            // A handful of rows -- MTP verification, a prompt's last short
+            // chunk -- attends row by row through the decode dispatch instead
+            // of the batched kernels below. Those parallelize over query rows
+            // (one block per head and 32 rows, or a cuBLAS tile of 16-64 rows),
+            // so three rows leave the card idle while each block walks the whole
+            // prefix alone, and a quantized cache is first expanded to f16 over
+            // the full prefix every pass. On the 27B hybrid a 3-row verify pass
+            // grew 43 -> 270 ms between a 300- and a 10k-token context, making
+            // MTP 4x slower than plain decode, whose split-context tiles stay
+            // flat. FLYWEIGHT_VERIFY_DECODE_ATTENTION=0 restores the batched path.
+            const bool verify_decode_attention=
+                rows<=kQ8RowBatch&&!qsa_chunk_selecting&&!laguna&&!k2horizon&&
+                qwen_verify_decode_attention_enabled();
             const bool cublas_prefill_done=
+                !verify_decode_attention&&
                 !qsa_chunk_selecting&&
                 cublas_prefill_requested&&!laguna&&!layer.attention_window&&
                 // f16 and bf16 both: the cache is handed to cuBLAS in
@@ -1709,6 +1733,27 @@ void qwen_forward_rows(
                         launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
                     }
                     auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    int elements=query_elements;
+                    void*token_gate_args[]={&attended,&gate,&gated,&elements};
+                    launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                }
+            }else if(verify_decode_attention){
+                // Each row sees its own causal prefix: the rows' keys and values
+                // are already in the cache (the store loop above), and row t
+                // attends over positions up to its own.
+                for(int token=0;token<rows;++token){
+                    auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    const int position=static_cast<int>(runtime.position)+span_begin+token;
+                    const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
+                    // `first` is free (its roped keys went to the cache) and
+                    // takes the f16 query the cuBLAS route stages.
+                    qwen_decode_attention_full(runtime,launch,query,first,
+                        cache_keys,cache_values,attention_scores,attended,
+                        heads,kv_heads,head_dim,view.tokens,view.capacity,
+                        view.first,scale);
                     int elements=query_elements;
                     void*token_gate_args[]={&attended,&gate,&gated,&elements};
                     launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);

@@ -18900,6 +18900,143 @@ void qwen_decode_attention_128(
         &head_dim,&tokens,&capacity,&first_slot};
     launch_named(kv_values_ring_kernel(runtime),static_cast<std::uint32_t>(heads),1,256,value_args);
 }
+
+// Decode attention at any fused width: the dispatch qwen_decode_step runs for
+// one query row -- the fused tensor-core GQA kernel, cuBLAS (turbo staging or a
+// 16-bit cache in place), the grouped-rows tiles, the fused per-head tiles, then
+// the serial ring pair -- writing `attended`. Shared with the rows forward, whose
+// MTP verify rows each attend over their own prefix through it (see
+// qwen_verify_decode_attention).
+template<typename Launch>
+void qwen_decode_attention_full(
+    FlyweightV2QwenRuntime& runtime, Launch& launch_named,
+    std::uint64_t queries, std::uint64_t first,
+    std::uint64_t cache_keys, std::uint64_t cache_values,
+    std::uint64_t attention_scores, std::uint64_t attended,
+    int heads, int kv_heads, int head_dim, int tokens, int capacity,
+    int first_slot, float scale
+) {
+    const char* fused_tiles=kv_fused_tiles_kernel(runtime);
+    const int fused_tile_tokens=kv_fused_tile_tokens(runtime);
+    // The staging path keeps its priority by measurement, not theory:
+    // rewriting the window to f16 looks like O(context) waste, but the
+    // fused turbo tiles decode every KV row once per *query* head --
+    // an 8x in-loop ALU repeat under GQA -- and measured 25.4 against
+    // cuBLAS' 29.9 tok/s at 12k on the 27B (2/2 interleaved pairs).
+    // The tiles take over where cuBLAS declines (window past the
+    // staging buffer, short windows), which used to fall all the way
+    // to the serial per-head kernels.
+    // The fused tensor-core kernel outranks cuBLAS where it exists, so
+    // it is resolved before anything is staged or launched: cuBLAS
+    // mutates `attended` on the way through and turbo staging rotates
+    // the query in place, neither of which is worth undoing.
+    const int gqa_tile_tokens=runtime.fused_attention
+        ? kv_gqa_rows_tile_tokens(runtime,tokens,head_dim,heads,kv_heads) : 0;
+    const char* mma_tiles=gqa_tile_tokens
+        ? kv_gqa_mma_kernel(
+              runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
+        : nullptr;
+    const bool cublas_done=mma_tiles==nullptr&&
+        (qwen_turbo_cublas_attention(
+            runtime,queries,first,cache_keys,cache_values,
+            attention_scores,attended,heads,kv_heads,head_dim,tokens,
+            capacity,first_slot,scale)||
+        (qwen_cublas_attention_eligible(
+            runtime,tokens,first_slot,capacity)&&
+        flyweight_gpu_attention_16bit_cublas(
+            runtime.options.cache_type_k,
+            queries,first,cache_keys,cache_values,attention_scores,
+            attended,runtime.stream,heads,kv_heads,head_dim,tokens,
+            capacity,first_slot,scale)==0));
+    // Same tile rule and the same one-record-per-(head, tile) layout,
+    // so the two are interchangeable and the merge is unchanged.
+    const char* gqa_tiles=mma_tiles ? mma_tiles
+        : (!cublas_done&&gqa_tile_tokens)
+        ? kv_gqa_tiles_kernel(
+              runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
+        : nullptr;
+    const int gqa_tile_count=gqa_tiles
+        ? (tokens+gqa_tile_tokens-1)/gqa_tile_tokens : 0;
+    // Either the fused tensor-core kernel or, for the shapes it does
+    // not cover, the grouped-rows one. Measured at the runtime's own
+    // shape (17k tokens, 2 KV heads of 8, tiles + merge, interleaved):
+    //
+    //     f16   mma 44.6 us    cuBLAS 72.0 us    rows 141.3 us
+    //     q8    mma 78.6 us    (no cuBLAS)       rows 144.1 us
+    //
+    // End to end that is smaller than it sounds, and worth knowing
+    // before reading a modest A/B as a broken kernel: Ornith runs full
+    // attention on 10 of 40 layers and the rest of the token is MoE, so
+    // 17k q8 decode moves 52.4 -> 58.8 tok/s (+12%) against what this
+    // path used before, and f16 +0.4% against cuBLAS, which was already
+    // most of the way there.
+    const bool gqa_done=gqa_tiles!=nullptr;
+    // Which of the four decode paths ran, announced once. Every one of
+    // them is correct and they differ only in speed, so a silent
+    // fallback looks exactly like a fast path that is not engaged --
+    // which is what an A/B measures instead of what it meant to.
+    if(std::getenv("FLYWEIGHT_ATTENTION_DIAG")){
+        static const char*announced=nullptr;
+        const char*chosen=cublas_done?"cublas"
+            :gqa_done?gqa_tiles
+            :runtime.fused_attention?"fused per-head tiles":"serial ring";
+        if(announced!=chosen){
+            announced=chosen;
+            std::fprintf(stderr,"[attention] decode path: %s\n",chosen);
+        }
+    }
+    if(cublas_done){
+        // Turbo or tensor-core attention already wrote `attended`.
+    }else if(gqa_done){
+        void*gqa_args[]={&queries,&cache_keys,&cache_values,
+            const_cast<std::uint64_t*>(&attention_scores),
+            const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+            const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+        // Always eight warps: the block's warps split the tile's tokens,
+        // and each of them carries the whole group's queries.
+        launch_named(gqa_tiles,kv_heads,gqa_tile_count,256,gqa_args);
+        void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
+            &attended,const_cast<int*>(&heads),
+            const_cast<int*>(&head_dim),
+            const_cast<int*>(&gqa_tile_count)};
+        // Turbo partials are still in the rotated domain, so they take
+        // the merge that undoes it. f16, bf16 and q8 take the plain one.
+        launch_named(kv_fused_merge_kernel_name(runtime,256),
+            heads,1,256,merge_args);
+    }else if(runtime.fused_attention&&kv_fused_width(head_dim)&&
+       (kv_fused_width(head_dim)==128
+            ? fused_tiles
+            : kv_fused_width(head_dim)==256
+                ? kv_fused_tiles_kernel256(runtime)
+                : kv_fused_tiles_kernel512(runtime))&&
+       heads/kv_heads<=8&&
+       (tokens+fused_tile_tokens-1)/fused_tile_tokens<=512&&
+       static_cast<std::uint64_t>((tokens+fused_tile_tokens-1)/fused_tile_tokens)*
+           kv_fused_record_stride(kv_fused_width(head_dim))<=
+           runtime.options.context_limit){
+        const int width=kv_fused_width(head_dim);
+        const char* tiles=width==128
+            ? fused_tiles : width==256
+                ? kv_fused_tiles_kernel256(runtime)
+                : kv_fused_tiles_kernel512(runtime);
+        const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
+        void*fused_args[]={&queries,&cache_keys,&cache_values,
+            const_cast<std::uint64_t*>(&attention_scores),
+            const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+            const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+        launch_named(tiles,kv_fused_grid_heads(runtime,heads,kv_heads),tile_count,256,fused_args);
+        void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
+            &attended,const_cast<int*>(&heads),
+            const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
+        launch_named(kv_fused_merge_kernel_name(runtime,width),
+            heads,1,256,merge_args);
+    }else{
+        void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+        launch_named(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
+        void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+        launch_named(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+    }
+}
 }  // extern "C++"
 
 void qwen_mtp_dense_projection(
@@ -22758,126 +22895,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     const_cast<int*>(&head_dim),&qsa_selected,&capacity};
                 launch_named(kv_values_indexed_kernel(*runtime),heads,1,256,value_args);
             }else{
-            const char* fused_tiles=kv_fused_tiles_kernel(*runtime);
-            const int fused_tile_tokens=kv_fused_tile_tokens(*runtime);
-            // The staging path keeps its priority by measurement, not theory:
-            // rewriting the window to f16 looks like O(context) waste, but the
-            // fused turbo tiles decode every KV row once per *query* head --
-            // an 8x in-loop ALU repeat under GQA -- and measured 25.4 against
-            // cuBLAS' 29.9 tok/s at 12k on the 27B (2/2 interleaved pairs).
-            // The tiles take over where cuBLAS declines (window past the
-            // staging buffer, short windows), which used to fall all the way
-            // to the serial per-head kernels.
-            // The fused tensor-core kernel outranks cuBLAS where it exists, so
-            // it is resolved before anything is staged or launched: cuBLAS
-            // mutates `attended` on the way through and turbo staging rotates
-            // the query in place, neither of which is worth undoing.
-            const int gqa_tile_tokens=runtime->fused_attention
-                ? kv_gqa_rows_tile_tokens(*runtime,tokens,head_dim,heads,kv_heads) : 0;
-            const char* mma_tiles=gqa_tile_tokens
-                ? kv_gqa_mma_kernel(
-                      *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
-                : nullptr;
-            const bool cublas_done=mma_tiles==nullptr&&
-                (qwen_turbo_cublas_attention(
-                    *runtime,queries,first,cache_keys,cache_values,
-                    attention_scores,attended,heads,kv_heads,head_dim,tokens,
-                    capacity,first_slot,scale)||
-                (qwen_cublas_attention_eligible(
-                    *runtime,tokens,first_slot,capacity)&&
-                flyweight_gpu_attention_16bit_cublas(
-                    runtime->options.cache_type_k,
-                    queries,first,cache_keys,cache_values,attention_scores,
-                    attended,runtime->stream,heads,kv_heads,head_dim,tokens,
-                    capacity,first_slot,scale)==0));
-            // Same tile rule and the same one-record-per-(head, tile) layout,
-            // so the two are interchangeable and the merge is unchanged.
-            const char* gqa_tiles=mma_tiles ? mma_tiles
-                : (!cublas_done&&gqa_tile_tokens)
-                ? kv_gqa_tiles_kernel(
-                      *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
-                : nullptr;
-            const int gqa_tile_count=gqa_tiles
-                ? (tokens+gqa_tile_tokens-1)/gqa_tile_tokens : 0;
-            // Either the fused tensor-core kernel or, for the shapes it does
-            // not cover, the grouped-rows one. Measured at the runtime's own
-            // shape (17k tokens, 2 KV heads of 8, tiles + merge, interleaved):
-            //
-            //     f16   mma 44.6 us    cuBLAS 72.0 us    rows 141.3 us
-            //     q8    mma 78.6 us    (no cuBLAS)       rows 144.1 us
-            //
-            // End to end that is smaller than it sounds, and worth knowing
-            // before reading a modest A/B as a broken kernel: Ornith runs full
-            // attention on 10 of 40 layers and the rest of the token is MoE, so
-            // 17k q8 decode moves 52.4 -> 58.8 tok/s (+12%) against what this
-            // path used before, and f16 +0.4% against cuBLAS, which was already
-            // most of the way there.
-            const bool gqa_done=gqa_tiles!=nullptr;
-            // Which of the four decode paths ran, announced once. Every one of
-            // them is correct and they differ only in speed, so a silent
-            // fallback looks exactly like a fast path that is not engaged --
-            // which is what an A/B measures instead of what it meant to.
-            if(std::getenv("FLYWEIGHT_ATTENTION_DIAG")){
-                static const char*announced=nullptr;
-                const char*chosen=cublas_done?"cublas"
-                    :gqa_done?gqa_tiles
-                    :runtime->fused_attention?"fused per-head tiles":"serial ring";
-                if(announced!=chosen){
-                    announced=chosen;
-                    std::fprintf(stderr,"[attention] decode path: %s\n",chosen);
-                }
-            }
-            if(cublas_done){
-                // Turbo or tensor-core attention already wrote `attended`.
-            }else if(gqa_done){
-                void*gqa_args[]={&queries,&cache_keys,&cache_values,
-                    const_cast<std::uint64_t*>(&attention_scores),
-                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
-                    const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-                // Always eight warps: the block's warps split the tile's tokens,
-                // and each of them carries the whole group's queries.
-                launch_named(gqa_tiles,kv_heads,gqa_tile_count,256,gqa_args);
-                void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
-                    &attended,const_cast<int*>(&heads),
-                    const_cast<int*>(&head_dim),
-                    const_cast<int*>(&gqa_tile_count)};
-                // Turbo partials are still in the rotated domain, so they take
-                // the merge that undoes it. f16, bf16 and q8 take the plain one.
-                launch_named(kv_fused_merge_kernel_name(*runtime,256),
-                    heads,1,256,merge_args);
-            }else if(runtime->fused_attention&&kv_fused_width(head_dim)&&
-               (kv_fused_width(head_dim)==128
-                    ? fused_tiles
-                    : kv_fused_width(head_dim)==256
-                        ? kv_fused_tiles_kernel256(*runtime)
-                        : kv_fused_tiles_kernel512(*runtime))&&
-               heads/kv_heads<=8&&
-               (tokens+fused_tile_tokens-1)/fused_tile_tokens<=512&&
-               static_cast<std::uint64_t>((tokens+fused_tile_tokens-1)/fused_tile_tokens)*
-                   kv_fused_record_stride(kv_fused_width(head_dim))<=
-                   runtime->options.context_limit){
-                const int width=kv_fused_width(head_dim);
-                const char* tiles=width==128
-                    ? fused_tiles : width==256
-                        ? kv_fused_tiles_kernel256(*runtime)
-                        : kv_fused_tiles_kernel512(*runtime);
-                const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
-                void*fused_args[]={&queries,&cache_keys,&cache_values,
-                    const_cast<std::uint64_t*>(&attention_scores),
-                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
-                    const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-                launch_named(tiles,kv_fused_grid_heads(*runtime,heads,kv_heads),tile_count,256,fused_args);
-                void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
-                    &attended,const_cast<int*>(&heads),
-                    const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
-                launch_named(kv_fused_merge_kernel_name(*runtime,width),
-                    heads,1,256,merge_args);
-            }else{
-                void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-                launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
-                void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
-                launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
-            }
+            qwen_decode_attention_full(*runtime,launch_named,queries,first,
+                cache_keys,cache_values,attention_scores,attended,
+                heads,kv_heads,head_dim,tokens,capacity,first_slot,scale);
             }
             if(profile)profile_record(profile->recurrent_end);
             std::uint64_t gated=third;int elements=heads*head_dim;
