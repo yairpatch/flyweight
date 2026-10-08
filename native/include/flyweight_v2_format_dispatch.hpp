@@ -296,6 +296,8 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1m_q8_matmul_tiled", .matmul_q8_mmq = "iq1m_q8_mmq",
      .matmul_rows = "iq1m_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
+     .embedding = "qwen_iq1m_embedding",
+     .embedding_rows = "qwen_iq1m_embedding_rows",
      // The grouped octet decoder is iq1m_octet. Prefill can also take
      // `iq1m_q8_mmq_routed`.
      .grouped_expert_prefix = "iq1m", .cpu_expert = true},
