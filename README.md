@@ -104,6 +104,7 @@ knowing. `flyweight serve --help` lists everything, grouped.
 | `--cache-type-k`, `--cache-type-v` | f16 | KV precision: `f32`, `f16`, `bf16`, `q8_0`, `turbo3`, `turbo4` |
 | `--gpu-cache-mib N` | 0 | VRAM for the expert cache; 0 sizes it from what is free at startup |
 | `--expert-mode` | auto | where routed experts run, below |
+| `-ngl N\|auto\|all` | auto | layers kept on the GPU, as llama.cpp's `-ngl`: a dense model's FFN blocks, or a MoE model's whole expert layers (the rest run on the CPU). Attention and KV stay on the GPU |
 | `--cpu-threads N` | 0 | CPU expert workers; 0 picks the physical cores |
 | `--dense-requant auto\|q8\|off` | off | optionally repack BF16 dense weights to Q8_0 on the GPU; `auto` uses VRAM pressure and `q8` forces conversion |
 | `--mtp-drafts N` | 0 | speculative decode with the checkpoint's draft block, up to 8 |
@@ -429,6 +430,7 @@ drafting request answers as a non-drafting one would.
 | `flyweight generate MODEL --prompt TEXT` | print one response and exit (`--max-tokens`, `--temperature`, `--seed`, `--enable-thinking`) |
 | `flyweight benchmark MODEL` | preparation, prefill and steady decode timings as JSON (`--chat`, `--iterations`, `--cold-cache`) |
 | `flyweight inspect MODEL` | metadata, resolved config and tensor list as JSON |
+| `flyweight plan MODEL` | load with serve's placement flags and print where weights, KV and experts went in VRAM and RAM (`--json`); serve prints the same at startup |
 | `flyweight imatrix MODEL --text FILE` | gather an importance matrix |
 | `flyweight probe MODEL` | run a few tokens and dump runtime counters |
 | `flyweight doctor` | check the install |
