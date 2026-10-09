@@ -17686,7 +17686,32 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // the last N MoE layers hold their whole expert set on the GPU and
             // the rest never page, which is what llama.cpp's -ngl does with
             // a MoE model's layers.
-            const bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
+            // Only while the N layers asked for fit whole, though. Past that a
+            // static split spends the VRAM on whole layers whose cold experts
+            // are never routed, and the per-expert cache over every layer wins
+            // by a wide margin: 35B NVFP4 on 12 GB fits 9 of 40 layers, which
+            // measured a 22% GPU hit rate and 46 tok/s against 71% and 57.
+            // So `all`, or any N past the fit, takes the cache, the same "as
+            // much on the GPU as fits" the dense spill gives.
+            bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
+            if(explicit_layers){
+                const auto experts=runtime->model->config.expert_count;
+                std::size_t moe_layers=0;
+                for(const auto&layer:runtime->layers)moe_layers+=layer.dense_ffn?0:1;
+                const std::size_t wanted=std::min<std::size_t>(
+                    moe_layers,runtime->options.gpu_layers);
+                const std::size_t fit=experts
+                    ?std::min<std::size_t>(moe_layers,cache/runtime->expert_slot_bytes/experts)
+                    :0;
+                if(wanted>fit){
+                    std::fprintf(stderr,
+                        "[flyweight] --n-gpu-layers: %zu MoE layers asked for, %zu of "
+                        "%zu fit whole; caching the hottest experts of every layer "
+                        "instead, which keeps more of the routing on the GPU\n",
+                        wanted,fit,moe_layers);
+                    explicit_layers=false;
+                }
+            }
             const bool whole_layer_enabled=explicit_layers||
                 ((runtime->gemma4||
                   (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
@@ -17704,17 +17729,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 char*end=nullptr;
                 const auto requested=whole_layer_setting
                     ?std::strtoul(whole_layer_setting,&end,10):0;
-                if(explicit_layers){
-                    const auto wanted=std::min<std::size_t>(
-                        candidates.size(),runtime->options.gpu_layers);
-                    if(wanted>layer_count)
-                        std::fprintf(stderr,
-                            "[flyweight] --n-gpu-layers: %zu MoE layers asked for, "
-                            "%zu of %zu fit the VRAM budget; the rest run their "
-                            "experts on the CPU\n",wanted,layer_count,
-                            candidates.size());
-                    layer_count=std::min(layer_count,wanted);
-                }else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
+                if(explicit_layers)
+                    layer_count=std::min<std::size_t>(
+                        layer_count,runtime->options.gpu_layers);
+                else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
                     layer_count=std::min<std::size_t>(layer_count,requested);
                 runtime->whole_expert_layer_slots.assign(
                     runtime->layers.size(),-1);
@@ -25418,9 +25436,11 @@ static void qwen_seed_prefill_experts(
     }
     const auto expert_policy=qwen_expert_policy(
         runtime,flyweight::v2::ExpertExecutionPhase::prepare);
-    // Under --n-gpu-layers every GPU layer already holds its whole expert set
-    // pinned and the others may not hold any, so a seed has nothing to place.
-    if(runtime.gemma4||runtime.options.gpu_layers_explicit||
+    // Under a static --n-gpu-layers split every GPU layer already holds its
+    // whole expert set pinned and the others may not hold any, so a seed has
+    // nothing to place. One that fell back to the cache seeds as auto does.
+    if(runtime.gemma4||
+       (runtime.options.gpu_layers_explicit&&!runtime.whole_expert_layer_slots.empty())||
        !expert_policy.is_hybrid()||runtime.expert_slots.empty())return;
     // Auto placement warms the cache whether or not residency is frozen after
     // it: the seed decides the *starting* map, mutability decides whether decode

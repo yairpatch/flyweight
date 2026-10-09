@@ -156,7 +156,8 @@ typedef struct FlyweightV2QwenRuntimeOptions {
     uint32_t gpu_layers; /* layers kept on the GPU; attention and KV stay there either way. Dense
                             models: blocks whose feed-forward stays on the GPU, the rest run it on the
                             CPU. MoE models (hybrid placement only): the last N MoE layers hold their
-                            whole expert set pinned, capped at what fits; the others never page. */
+                            whole expert set pinned and the others never page; an N that does not
+                            fit whole falls back to the per-expert cache over every layer. */
 } FlyweightV2QwenRuntimeOptions;
 
 /* Where a prepared runtime put its weights and arenas, read back after
