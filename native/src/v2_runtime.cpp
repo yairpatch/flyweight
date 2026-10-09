@@ -1440,6 +1440,9 @@ struct FlyweightV2QwenRuntime {
     // Host-backed prompt cache (see QwenHostPrompt). limit=0 disables it.
     std::vector<QwenHostPrompt> host_prompts;
     std::uint64_t host_cache_limit_bytes = 0;
+    // The budget the last prepare planned against, for the placement report.
+    std::uint64_t plan_gpu_budget = 0;
+    bool plan_gpu_budget_auto = false;
     std::uint64_t host_cache_used_bytes = 0;
     std::uint64_t host_cache_clock = 0;
     // Cooperative engine (see flyweight_v2_qwen_engine_step). engine_pending /
@@ -7954,6 +7957,7 @@ extern "C" {
 uint32_t flyweight_v2_version() { return 6; }
 uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
 uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
+uint64_t flyweight_v2_placement_plan_size() { return sizeof(FlyweightV2PlacementPlan); }
 const char* flyweight_v2_last_error() { return error.c_str(); }
 int flyweight_v2_gpu_probe(int32_t device, FlyweightV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
 int flyweight_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,FlyweightV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
@@ -15626,6 +15630,58 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     return 0;
 });}
 void flyweight_v2_qwen_runtime_destroy(FlyweightV2QwenRuntime*runtime){try{if(runtime)release_qwen_device(*runtime);delete runtime;}catch(...){}}
+int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,FlyweightV2PlacementPlan*out){return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid native placement plan arguments");
+    *out=FlyweightV2PlacementPlan{};
+    FlyweightV2GpuInfo gi{};
+    if(!flyweight_backend_is_cpu()&&gpu_probe(gi,runtime->options.device)==0){
+        out->gpu_total_bytes=gi.total_memory;
+        out->gpu_free_bytes=gi.free_memory;
+    }
+    out->gpu_budget_bytes=runtime->plan_gpu_budget;
+    out->gpu_budget_auto=runtime->plan_gpu_budget_auto?1:0;
+    out->expert_mode=static_cast<std::uint32_t>(runtime->options.moe_device);
+    const std::uint64_t slots=std::max<std::size_t>(1,runtime->sequences.size());
+    out->static_weights_bytes=runtime->static_arena_bytes;
+    out->workspace_bytes=runtime->workspace_bytes;
+    out->vision_workspace_bytes=runtime->vision_workspace_bytes;
+    out->kv_state_bytes=runtime->slots_state_bytes;
+    out->snapshot_bytes=slots*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
+    out->expert_cache_bytes=runtime->expert_cache_bytes+runtime->expert_native_cache_bytes;
+    out->expert_staging_bytes=runtime->expert_staging_bytes;
+    out->value_expert_bytes=runtime->mova_cache_bytes+runtime->mova_workspace_bytes;
+    out->prefill_stream_bytes=runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
+    out->host_ffn_stage_bytes=runtime->host_ffn_stage_bytes;
+    out->turbo_kv_bytes=runtime->turbo_kv_stage_bytes+runtime->turbo_prefill_expanded_bytes;
+    out->embedding_stage_bytes=runtime->embedding_stage_bytes;
+    out->host_ffn_bytes=runtime->host_ffn_bytes;
+    out->host_ffn_reencoded_bytes=runtime->host_ffn_q8_bytes;
+    out->host_pinned_bytes=runtime->host_staging_bytes+runtime->dense_host_bytes+
+        runtime->mova_host_bytes+runtime->mova_stage_bytes+runtime->embedding_stage_bytes+
+        (runtime->prefill_stream_mirror
+            ?runtime->prefill_stream_bytes*FlyweightV2QwenRuntime::kStreamMirrorSlots:0);
+    out->expert_weight_bytes=runtime->expert_tensor_bytes;
+    out->prompt_cache_limit_bytes=runtime->host_cache_limit_bytes;
+    out->layers=static_cast<std::uint32_t>(runtime->layers.size());
+    std::uint32_t pinned_layers=0;
+    for(std::size_t index=0;index<runtime->layers.size();++index){
+        if(runtime->layers[index].dense_ffn)++out->dense_ffn_layers;
+        else ++out->moe_layers;
+        if(index<runtime->whole_expert_layer_slots.size()&&
+           runtime->whole_expert_layer_slots[index]>=0)++pinned_layers;
+    }
+    out->host_ffn_layers=runtime->host_ffn_layers;
+    out->gpu_expert_layers=runtime->whole_expert_layer_slots.empty()
+        ?std::numeric_limits<std::uint32_t>::max():pinned_layers;
+    out->parallel_sequences=static_cast<std::uint32_t>(slots);
+    out->expert_cache_slots=runtime->expert_slots.size();
+    out->expert_bundles=static_cast<std::uint64_t>(out->moe_layers)*
+        runtime->model->config.expert_count;
+    out->context_limit=runtime->options.context_limit;
+    out->cache_type_k=runtime->options.cache_type_k;
+    out->cache_type_v=runtime->options.cache_type_v;
+    return 0;
+});}
 int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,FlyweightV2QwenRuntimeInfo*out){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid Qwen runtime info handle");
     std::memset(out,0,sizeof(*out));
@@ -17407,6 +17463,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 if(gi.free_memory>margin)gpu_budget=gi.free_memory-margin;
             }
         }
+        runtime->plan_gpu_budget=gpu_budget;
+        runtime->plan_gpu_budget_auto=auto_fit;
         // The automatic streaming budget yields before it starves anything:
         // if the arena plus scratch push the base allocations past the GPU
         // budget, auto drops to zero where an explicit request would fail
