@@ -25,6 +25,7 @@ from flyweight.cli import (
     _stop_tokens,
     _quant_menu,
     _resolve_quant,
+    _runtime_options,
     _steady_state_counters,
 )
 
@@ -194,6 +195,21 @@ class NativeV2BenchmarkTests(unittest.TestCase):
                     argv.extend(("--prompt", "hello"))
                 args = _parser().parse_args(argv)
                 self.assertEqual(args.dense_requant, "off")
+
+    def test_gpu_layers_takes_llama_cpp_spellings(self) -> None:
+        for command in ("generate", "benchmark-v2", "serve-v2"):
+            for value, expected in (("auto", None), ("all", 1 << 30), ("999", 999), ("0", 0)):
+                with self.subTest(command=command, value=value):
+                    argv = [command, "model.gguf", "-ngl", value]
+                    if command == "generate":
+                        argv.extend(("--prompt", "hello"))
+                    args = _parser().parse_args(argv)
+                    self.assertEqual(args.gpu_layers, expected)
+                    self.assertEqual(_runtime_options(args)["gpu_layers"], expected)
+        args = _parser().parse_args(["serve", "model.gguf"])
+        self.assertIsNone(args.gpu_layers)
+        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            _parser().parse_args(["serve", "model.gguf", "-ngl", "-1"])
 
     def test_public_command_names_and_short_limit_options(self) -> None:
         serve = _parser().parse_args(

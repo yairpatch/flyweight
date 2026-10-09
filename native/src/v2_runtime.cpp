@@ -15409,6 +15409,16 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         runtime->options.moe_device=
             flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
     }
+    // A MoE model's -ngl is a static split of its expert layers between the
+    // card and the host, which only the hybrid placement can run: streamed
+    // GPU pages every route and has no CPU fallback, and cpu has no card.
+    if(runtime->options.gpu_layers_explicit&&m&&m->config.expert_count&&
+       runtime->expert_mode!=flyweight::v2::ExpertExecutionMode::hybrid&&
+       !(runtime->expert_mode==flyweight::v2::ExpertExecutionMode::cpu&&
+         flyweight_backend_is_cpu()))
+        throw std::runtime_error(
+            "--n-gpu-layers splits a MoE model's expert layers between GPU and CPU, "
+            "which needs --expert-mode auto (or hybrid)");
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(const char*lookup=std::getenv("FLYWEIGHT_LOOKUP_DRAFTS")){
         const auto value=std::strtoul(lookup,nullptr,10);
@@ -16422,7 +16432,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // block is MoE so this gate never fired for them, but a Gemma 4 file
         // whose first block were dense would silently run a spilled block on
         // weights that were never uploaded. Excluded explicitly.
-        if(!runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4){
+        const bool dense_spill_model=
+            !runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4;
+        if(runtime->options.gpu_layers_explicit&&!dense_spill_model&&
+           !runtime->model->config.expert_count)
+            throw std::runtime_error(
+                "--n-gpu-layers places feed-forward blocks or expert layers; this model has "
+                "neither to place");
+        if(dense_spill_model){
             std::uint64_t resident=0;
             for(const auto&layer:runtime->layers)for(auto tensor:layer.static_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
             for(auto tensor:{runtime->token_embeddings,runtime->final_norm,runtime->lm_head}){
@@ -16559,13 +16576,21 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // from block 0 with no quantization awareness, which is what that
             // flag does, and exists so the ordering can be A/B'd against the
             // default on the same runtime.
+            // --n-gpu-layers N is the same override counted from the other
+            // side, like llama.cpp's -ngl: every dense block past the first N
+            // runs its feed-forward on the CPU. The env var wins when both are
+            // set, so existing measurement scripts keep meaning what they did.
             const char* forced_env=std::getenv("FLYWEIGHT_HOST_FFN_BLOCKS");
+            std::uint32_t dense_blocks=0;
+            for(const auto&layer:runtime->layers)dense_blocks+=layer.dense_ffn?1u:0u;
+            const bool forced=forced_env||runtime->options.gpu_layers_explicit;
             const std::uint32_t forced_blocks=forced_env
-                ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10)):0;
+                ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10))
+                :dense_blocks-std::min(dense_blocks,runtime->options.gpu_layers);
             const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
             const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
             auto want_more=[&]{
-                return forced_env?runtime->host_ffn_layers<forced_blocks
+                return forced?runtime->host_ffn_layers<forced_blocks
                                  :resident>weight_budget;
             };
             auto spill_pass=[&](bool simd_only){
@@ -16615,7 +16640,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // Spill more only when that check would fail. A model the check
             // already accepts does not move another block, so its tokens stay
             // where the tight margin put them.
-            if(!forced_env&&!runtime->options.gpu_cache_bytes){
+            if(!forced&&!runtime->options.gpu_cache_bytes){
                 FlyweightV2GpuInfo check{};
                 if(gpu_probe(check,runtime->options.device)==0&&check.free_memory>0){
                     const std::uint64_t check_margin=std::max<std::uint64_t>(
@@ -17599,9 +17624,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // measured 85% hits and still no faster than pure-CPU experts.
             // Whole pinned layers page each bundle once and never again,
             // which is the static GPU/CPU layer split llama.cpp runs.
-            const bool whole_layer_enabled=(runtime->gemma4||
-                (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
-                (!whole_layer_setting||whole_layer_setting[0]!='0');
+            // --n-gpu-layers asks for this placement on every architecture:
+            // the last N MoE layers hold their whole expert set on the GPU and
+            // the rest never page, which is what llama.cpp's -ngl does with
+            // a MoE model's layers.
+            const bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
+            const bool whole_layer_enabled=explicit_layers||
+                ((runtime->gemma4||
+                  (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
+                 (!whole_layer_setting||whole_layer_setting[0]!='0'));
             if(whole_layer_enabled&&!runtime->options.strict_resident){
                 const auto experts=runtime->model->config.expert_count;
                 std::vector<std::uint32_t> candidates;
@@ -17615,7 +17646,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 char*end=nullptr;
                 const auto requested=whole_layer_setting
                     ?std::strtoul(whole_layer_setting,&end,10):0;
-                if(whole_layer_setting&&end!=whole_layer_setting&&requested)
+                if(explicit_layers){
+                    const auto wanted=std::min<std::size_t>(
+                        candidates.size(),runtime->options.gpu_layers);
+                    if(wanted>layer_count)
+                        std::fprintf(stderr,
+                            "[flyweight] --n-gpu-layers: %zu MoE layers asked for, "
+                            "%zu of %zu fit the VRAM budget; the rest run their "
+                            "experts on the CPU\n",wanted,layer_count,
+                            candidates.size());
+                    layer_count=std::min(layer_count,wanted);
+                }else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
                     layer_count=std::min<std::size_t>(layer_count,requested);
                 runtime->whole_expert_layer_slots.assign(
                     runtime->layers.size(),-1);
@@ -17970,8 +18011,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 runtime->expert_mode);
             prepare_policy=qwen_expert_policy(
                 *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
-            std::fprintf(stderr,
-                "[flyweight] hybrid expert cache does not fit; falling back to CPU MoE\n");
+            if(runtime->options.gpu_layers_explicit&&!runtime->options.gpu_layers)
+                std::fprintf(stderr,
+                    "[flyweight] --n-gpu-layers 0: routed experts run on the CPU MoE\n");
+            else
+                std::fprintf(stderr,
+                    "[flyweight] hybrid expert cache does not fit; falling back to CPU MoE\n");
         }
         runtime->expert_history.resize(
             qwen_cache_layer_count(*runtime) *
@@ -25295,7 +25340,9 @@ static void qwen_seed_prefill_experts(
     }
     const auto expert_policy=qwen_expert_policy(
         runtime,flyweight::v2::ExpertExecutionPhase::prepare);
-    if(runtime.gemma4||
+    // Under --n-gpu-layers every GPU layer already holds its whole expert set
+    // pinned and the others may not hold any, so a seed has nothing to place.
+    if(runtime.gemma4||runtime.options.gpu_layers_explicit||
        !expert_policy.is_hybrid()||runtime.expert_slots.empty())return;
     // Auto placement warms the cache whether or not residency is frozen after
     // it: the seed decides the *starting* map, mutability decides whether decode
