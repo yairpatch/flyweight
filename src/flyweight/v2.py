@@ -304,6 +304,8 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("scratch_context", ctypes.c_uint64),
         ("context_explicit", ctypes.c_uint32),
         ("vision_max_tokens", ctypes.c_uint32),
+        ("gpu_layers_explicit", ctypes.c_uint32),
+        ("gpu_layers", ctypes.c_uint32),
     ]
 
 
@@ -2428,6 +2430,7 @@ class V2Model:
         scratch_context: int = 0,
         context_explicit: bool = False,
         vision_max_tokens: int = 0,
+        gpu_layers: int | None = None,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2460,6 +2463,7 @@ class V2Model:
             scratch_context=scratch_context,
             context_explicit=context_explicit,
             vision_max_tokens=vision_max_tokens,
+            gpu_layers=gpu_layers,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2870,12 +2874,17 @@ class V2QwenRuntime:
         # to be allocated on first use, which is right for a run with no
         # images and wrong for one with them: by then the cache holds the VRAM.
         vision_max_tokens: int = 0,
+        # llama.cpp's -ngl: a dense model's feed-forward blocks, or a MoE
+        # model's whole expert layers, kept on the GPU. None auto-fits.
+        gpu_layers: int | None = None,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
         # manual budget.
         if device < 0 or context_limit < 0 or gpu_cache_bytes < 0:
             raise ValueError("native Qwen runtime options must be non-negative")
+        if gpu_layers is not None and gpu_layers < 0:
+            raise ValueError("gpu_layers must be non-negative (None = auto-fit)")
         # Context for the slots past the first. Every slot reserves its whole
         # context at prepare whether a conversation fills it or not, so sizing
         # the side slots for side traffic hands the difference to the expert
@@ -3032,6 +3041,8 @@ class V2QwenRuntime:
             scratch_context,
             int(context_explicit),
             max(0, int(vision_max_tokens)),
+            int(gpu_layers is not None),
+            min(int(gpu_layers or 0), 0xFFFFFFFF),
         )
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(

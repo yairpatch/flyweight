@@ -152,6 +152,11 @@ typedef struct FlyweightV2QwenRuntimeOptions {
                                    taking the VRAM the first image then cannot get. 0 = no
                                    reservation: the workspace is allocated on first use, which
                                    is what a caller that never sends images wants. */
+    uint32_t gpu_layers_explicit; /* gpu_layers was chosen by the caller (llama.cpp -ngl); 0 = auto-fit */
+    uint32_t gpu_layers; /* layers kept on the GPU; attention and KV stay there either way. Dense
+                            models: blocks whose feed-forward stays on the GPU, the rest run it on the
+                            CPU. MoE models (hybrid placement only): the last N MoE layers hold their
+                            whole expert set pinned, capped at what fits; the others never page. */
 } FlyweightV2QwenRuntimeOptions;
 
 typedef struct FlyweightV2QwenRuntimeInfo {

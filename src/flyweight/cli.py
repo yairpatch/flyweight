@@ -165,6 +165,28 @@ def _prefill_cache_seed(value: str) -> int | str:
     return count
 
 
+def _gpu_layers(value: str) -> int | None:
+    # None is auto-fit. Any count at or past the model's dense blocks keeps
+    # them all on the GPU, so `all` (and llama.cpp's habitual 999) need no
+    # knowledge of the model here.
+    normalized = value.lower()
+    if normalized == "auto":
+        return None
+    if normalized == "all":
+        return 1 << 30
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected auto, all, or a non-negative integer"
+        ) from error
+    if count < 0:
+        raise argparse.ArgumentTypeError(
+            "expected auto, all, or a non-negative integer"
+        )
+    return count
+
+
 def _prompt_cache_budget(value: str) -> int:
     normalized = value.lower()
     if normalized == "auto":
@@ -457,6 +479,18 @@ def _add_runtime_options(
         placement, "--gpu-cache-mib", type=int, default=0, metavar="MIB",
         help="VRAM budget for the routed-expert cache; 0 fits it to free "
              "memory at load, which is what makes placement vary run to run",
+    )
+    add(
+        placement, "--n-gpu-layers", "-ngl", "--gpu-layers", dest="gpu_layers",
+        type=_gpu_layers, default=None, metavar="N",
+        help="layers kept on the GPU, the rest on the CPU (llama.cpp's -ngl; "
+             "attention and KV stay on the GPU either way). Dense models: "
+             "blocks whose feed-forward stays on the GPU. MoE models: the last "
+             "N layers hold their whole expert set pinned on the GPU and the "
+             "others' experts always run on the CPU, capped at what fits. auto, "
+             "the default, fits dense blocks to free VRAM and gives MoE models "
+             "the hot-expert cache, usually faster than a static split; all "
+             "keeps as many as fit",
     )
     add(
         placement, "--cpu-threads", type=int, default=0, metavar="N",
@@ -1289,7 +1323,7 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
         "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
         "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
         "hybrid_prefill", "expert_residency", "expert_top_k", "expert_top_p",
-        "dense_requant",
+        "dense_requant", "gpu_layers",
     )
     options = {name: getattr(args, name) for name in names if hasattr(args, name)}
     if getattr(args, "kv_dtype", None):
@@ -1455,7 +1489,7 @@ def _benchmark(args: argparse.Namespace) -> int:
 # honoured separately; these are reported rather than accepted and ignored.
 _DEEPSEEK4_UNSUPPORTED = (
     "expert_mode", "hybrid_prefill",
-    "expert_residency", "dense_requant",
+    "expert_residency", "dense_requant", "gpu_layers",
     "prompt_cache_mib", "swa_full",
     "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
     "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
@@ -1704,6 +1738,7 @@ def _serve(args: argparse.Namespace) -> int:
         hybrid_prefill=args.hybrid_prefill,
         expert_residency=args.expert_residency,
         dense_requant=args.dense_requant,
+        gpu_layers=args.gpu_layers,
         api_key=args.api_key,
         cors_origin=args.cors_origin,
         strict_model=args.strict_model,
