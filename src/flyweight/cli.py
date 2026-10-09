@@ -487,10 +487,11 @@ def _add_runtime_options(
              "attention and KV stay on the GPU either way). Dense models: "
              "blocks whose feed-forward stays on the GPU. MoE models: the last "
              "N layers hold their whole expert set pinned on the GPU and the "
-             "others' experts always run on the CPU, capped at what fits. auto, "
-             "the default, fits dense blocks to free VRAM and gives MoE models "
-             "the hot-expert cache, usually faster than a static split; all "
-             "keeps as many as fit",
+             "others' experts always run on the CPU; an N that does not fit "
+             "whole (or all) takes the hot-expert cache over every layer "
+             "instead, which keeps more routing on the GPU. auto, the default, "
+             "fits dense blocks to free VRAM and gives MoE models that cache; "
+             "all keeps as much on the GPU as fits",
     )
     add(
         placement, "--cpu-threads", type=int, default=0, metavar="N",
