@@ -40,6 +40,12 @@ class PlacementReportTests(unittest.TestCase):
         cpu = format_placement(_plan(moe_layers=40, expert_mode=1))
         self.assertIn("all on CPU", cpu)
 
+    def test_expert_preload_is_listed_under_ram(self) -> None:
+        text = format_placement(_plan(moe_layers=40, expert_mode=2,
+                                      preload_expert_bytes=46_800 * _MIB))
+        self.assertRegex(text, r"expert preload \(bg\)\s+46,800 MiB")
+        self.assertNotIn("expert preload", format_placement(_plan()))
+
     def test_dense_spill_and_cpu_backend(self) -> None:
         text = format_placement(_plan(dense_ffn_layers=64, host_ffn_layers=4,
                                       gpu_total_bytes=0))

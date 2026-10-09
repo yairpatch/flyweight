@@ -77,6 +77,8 @@ def format_placement(plan: Mapping[str, int]) -> str:
     for key, label in _HOST_ROWS:
         if plan[key]:
             lines.append(f"  {label:<26}{_mib(plan[key])}")
+    if plan.get("preload_expert_bytes"):
+        lines.append(f"  {'expert preload (bg)':<26}{_mib(plan['preload_expert_bytes'])}")
 
     lines.append("Layers")
     layers = plan["layers"]

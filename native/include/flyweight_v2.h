@@ -158,6 +158,9 @@ typedef struct FlyweightV2QwenRuntimeOptions {
                             CPU. MoE models (hybrid placement only): the last N MoE layers hold their
                             whole expert set pinned and the others never page; an N that does not
                             fit whole falls back to the per-expert cache over every layer. */
+    uint32_t preload_experts; /* 0 = auto (MoE models not registered for direct paging), 1 = on, 2 = off:
+                                 map the routed experts into the process in the background after
+                                 prepare, so the first request does not take a fault storm */
 } FlyweightV2QwenRuntimeOptions;
 
 /* Where a prepared runtime put its weights and arenas, read back after
@@ -189,6 +192,7 @@ typedef struct FlyweightV2PlacementPlan {
     uint64_t host_pinned_bytes;        /* pinned staging and mirrors */
     uint64_t expert_weight_bytes;      /* routed expert tensors in the mapping */
     uint64_t prompt_cache_limit_bytes; /* host prompt cache budget */
+    uint64_t preload_expert_bytes;     /* experts the background preload maps; 0 = no preload */
     /* decisions */
     uint32_t layers;
     uint32_t dense_ffn_layers;

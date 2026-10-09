@@ -2779,6 +2779,7 @@ class NativeV2InferenceService(InferenceService):
         expert_residency: str | None = None,
         dense_requant: str = "off",
         gpu_layers: int | None = None,
+        preload_experts: str = "auto",
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -2877,6 +2878,7 @@ class NativeV2InferenceService(InferenceService):
                 expert_residency=expert_residency,
                 dense_requant=dense_requant,
                 gpu_layers=gpu_layers,
+                preload_experts=preload_experts,
                 # Only with a tower attached: the reservation is real VRAM,
                 # taken for the life of the process, and a text-only run
                 # should not pay for an image it will never be sent.
