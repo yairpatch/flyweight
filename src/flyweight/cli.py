@@ -627,7 +627,10 @@ def _add_runtime_options(
         tuning, "--expert-paging", choices=("auto", "staged", "direct"),
         default="auto",
         help="how experts reach the GPU: staged copies through a pinned "
-             "buffer, direct DMAs from registered host memory",
+             "buffer, direct DMAs from registered (locked) host memory. auto "
+             "picks direct only when RAM holds the whole model with room to "
+             "spare and uploads are on the critical path: streamed GPU "
+             "experts, or MTP/lookup drafting",
     )
     add(
         tuning, "--routed-moe", action="store_true", default=None,
