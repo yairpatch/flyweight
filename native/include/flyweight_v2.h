@@ -156,8 +156,52 @@ typedef struct FlyweightV2QwenRuntimeOptions {
     uint32_t gpu_layers; /* layers kept on the GPU; attention and KV stay there either way. Dense
                             models: blocks whose feed-forward stays on the GPU, the rest run it on the
                             CPU. MoE models (hybrid placement only): the last N MoE layers hold their
-                            whole expert set pinned, capped at what fits; the others never page. */
+                            whole expert set pinned and the others never page; an N that does not
+                            fit whole falls back to the per-expert cache over every layer. */
 } FlyweightV2QwenRuntimeOptions;
+
+/* Where a prepared runtime put its weights and arenas, read back after
+   prepare. Every device figure is an allocation prepare made; what the card
+   lost beyond their sum (CUDA context, a vision tower or image model) is the
+   caller's to measure. Host figures are RAM the runtime holds or maps. */
+typedef struct FlyweightV2PlacementPlan {
+    uint64_t gpu_total_bytes;          /* probed when the plan is read; 0 on the CPU backend */
+    uint64_t gpu_free_bytes;
+    uint64_t gpu_budget_bytes;         /* budget prepare planned against */
+    uint32_t gpu_budget_auto;          /* 1 = auto-fit from free VRAM, 0 = --gpu-cache-mib */
+    uint32_t expert_mode;              /* resolved: 0 streamed GPU, 1 CPU, 2 hybrid */
+    /* device allocations */
+    uint64_t static_weights_bytes;     /* resident non-expert weights */
+    uint64_t workspace_bytes;          /* activations and scratch */
+    uint64_t vision_workspace_bytes;
+    uint64_t kv_state_bytes;           /* KV cache and recurrent state, every slot */
+    uint64_t snapshot_bytes;           /* prefix-reuse checkpoint pool, every slot */
+    uint64_t expert_cache_bytes;       /* routed-expert cache (both copies when persistent) */
+    uint64_t expert_staging_bytes;
+    uint64_t value_expert_bytes;       /* MoVA value-expert cache and workspace */
+    uint64_t prefill_stream_bytes;     /* prefill expert streaming arena and scratch */
+    uint64_t host_ffn_stage_bytes;     /* device staging for a spilled dense block */
+    uint64_t turbo_kv_bytes;           /* turbo KV stage and prefill expansion */
+    uint64_t embedding_stage_bytes;    /* host-resident embedding rows staged per step */
+    /* host */
+    uint64_t host_ffn_bytes;           /* spilled dense feed-forward, read from the mapping */
+    uint64_t host_ffn_reencoded_bytes; /* its SIMD re-encode, heap */
+    uint64_t host_pinned_bytes;        /* pinned staging and mirrors */
+    uint64_t expert_weight_bytes;      /* routed expert tensors in the mapping */
+    uint64_t prompt_cache_limit_bytes; /* host prompt cache budget */
+    /* decisions */
+    uint32_t layers;
+    uint32_t dense_ffn_layers;
+    uint32_t host_ffn_layers;          /* of dense_ffn_layers, run on the CPU */
+    uint32_t moe_layers;
+    uint32_t gpu_expert_layers;        /* whole layers pinned on the GPU; UINT32_MAX = per-expert cache */
+    uint32_t parallel_sequences;
+    uint64_t expert_cache_slots;
+    uint64_t expert_bundles;           /* moe_layers * experts per layer */
+    uint64_t context_limit;
+    int32_t cache_type_k;
+    int32_t cache_type_v;
+} FlyweightV2PlacementPlan;
 
 typedef struct FlyweightV2QwenRuntimeInfo {
     uint32_t layers;
@@ -844,6 +888,7 @@ FLYWEIGHT_V2_API int flyweight_v2_tensor_view(const FlyweightV2Model* model, uin
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_create(FlyweightV2Model* model, const FlyweightV2QwenRuntimeOptions* options, FlyweightV2QwenRuntime** out);
 FLYWEIGHT_V2_API void flyweight_v2_qwen_runtime_destroy(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime* runtime, FlyweightV2QwenRuntimeInfo* out);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime* runtime, FlyweightV2PlacementPlan* out);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime* runtime);
@@ -914,6 +959,7 @@ FLYWEIGHT_V2_API const char* flyweight_v2_last_error(void);
 FLYWEIGHT_V2_API uint32_t flyweight_v2_version(void);
 FLYWEIGHT_V2_API uint64_t flyweight_v2_runtime_options_size(void);
 FLYWEIGHT_V2_API uint64_t flyweight_v2_runtime_info_size(void);
+FLYWEIGHT_V2_API uint64_t flyweight_v2_placement_plan_size(void);
 FLYWEIGHT_V2_API int flyweight_v2_gpu_probe(int32_t device, FlyweightV2GpuInfo* out);
 FLYWEIGHT_V2_API int flyweight_v2_memory_plan(uint64_t budget, uint64_t static_weights, uint64_t kv_state, uint64_t workspace, uint64_t active_experts, uint64_t staging, FlyweightV2MemoryPlan* out);
 FLYWEIGHT_V2_API int flyweight_v2_gpu_available(void);

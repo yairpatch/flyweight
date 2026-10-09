@@ -309,6 +309,33 @@ class _QwenRuntimeOptions(ctypes.Structure):
     ]
 
 
+class _PlacementPlan(ctypes.Structure):
+    _fields_: ClassVar[Sequence[tuple[str, Any]]] = [
+        ("gpu_total_bytes", ctypes.c_uint64),
+        ("gpu_free_bytes", ctypes.c_uint64),
+        ("gpu_budget_bytes", ctypes.c_uint64),
+        ("gpu_budget_auto", ctypes.c_uint32),
+        ("expert_mode", ctypes.c_uint32),
+        *((name, ctypes.c_uint64) for name in (
+            "static_weights_bytes", "workspace_bytes", "vision_workspace_bytes",
+            "kv_state_bytes", "snapshot_bytes", "expert_cache_bytes",
+            "expert_staging_bytes", "value_expert_bytes", "prefill_stream_bytes",
+            "host_ffn_stage_bytes", "turbo_kv_bytes", "embedding_stage_bytes",
+            "host_ffn_bytes", "host_ffn_reencoded_bytes", "host_pinned_bytes",
+            "expert_weight_bytes", "prompt_cache_limit_bytes",
+        )),
+        *((name, ctypes.c_uint32) for name in (
+            "layers", "dense_ffn_layers", "host_ffn_layers", "moe_layers",
+            "gpu_expert_layers", "parallel_sequences",
+        )),
+        ("expert_cache_slots", ctypes.c_uint64),
+        ("expert_bundles", ctypes.c_uint64),
+        ("context_limit", ctypes.c_uint64),
+        ("cache_type_k", ctypes.c_int32),
+        ("cache_type_v", ctypes.c_int32),
+    ]
+
+
 class _QwenRuntimeInfo(ctypes.Structure):
     # Annotated because the mixed field types otherwise join to
     # `tuple[str, object]`, which is not what the Structure base declares.
@@ -589,15 +616,19 @@ def _library() -> ctypes.CDLL:
                 lib.flyweight_v2_runtime_options_size.restype = ctypes.c_uint64
                 lib.flyweight_v2_runtime_info_size.argtypes = []
                 lib.flyweight_v2_runtime_info_size.restype = ctypes.c_uint64
+                lib.flyweight_v2_placement_plan_size.argtypes = []
+                lib.flyweight_v2_placement_plan_size.restype = ctypes.c_uint64
                 version = int(lib.flyweight_v2_version())
                 native_options_size = int(lib.flyweight_v2_runtime_options_size())
                 native_info_size = int(lib.flyweight_v2_runtime_info_size())
                 expected_options_size = ctypes.sizeof(_QwenRuntimeOptions)
                 expected_info_size = ctypes.sizeof(_QwenRuntimeInfo)
+                native_plan_size = int(lib.flyweight_v2_placement_plan_size())
                 if (
                     version != NATIVE_ABI_VERSION
                     or native_options_size != expected_options_size
                     or native_info_size != expected_info_size
+                    or native_plan_size != ctypes.sizeof(_PlacementPlan)
                 ):
                     raise V2Error(
                         "native v2 ABI mismatch: "
@@ -1076,6 +1107,11 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(_QwenRuntimeInfo),
                 ]
                 lib.flyweight_v2_qwen_runtime_info.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_runtime_plan.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_PlacementPlan),
+                ]
+                lib.flyweight_v2_qwen_runtime_plan.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_runtime_reset.argtypes = [ctypes.c_void_p]
                 lib.flyweight_v2_qwen_runtime_reset.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_runtime_cancel.argtypes = [ctypes.c_void_p]
@@ -3005,6 +3041,11 @@ class V2QwenRuntime:
                 "cache_type_k/v must be one of " + ", ".join(sorted(cache_types))
             )
         self.model, self._lib = model, model._lib
+        self.device = device
+        # Free VRAM either side of prepare, so the placement report can show
+        # what the card lost beyond the arenas the runtime itemises.
+        self.gpu_free_before_prepare: int | None = None
+        self.gpu_free_after_prepare: int | None = None
         self.parallel_sequences = parallel_sequences
         self.prompt_cache_mib = prompt_cache_mib
         self.requested_expert_mode = requested_expert_mode
@@ -3204,7 +3245,30 @@ class V2QwenRuntime:
 
     def prepare(self) -> None:
         """Allocate native CUDA arenas and upload persistent model weights."""
+        self.gpu_free_before_prepare = self._gpu_free()
         self.model._check(self._lib.flyweight_v2_qwen_runtime_prepare(self._handle))
+        self.gpu_free_after_prepare = self._gpu_free()
+
+    def _gpu_free(self) -> int | None:
+        if V2Model.active_backend() != "cuda":
+            return None
+        try:
+            return int(V2Model.gpu_info(self.device)["free_memory"])
+        except V2Error:
+            return None
+
+    @property
+    def placement(self) -> dict[str, int]:
+        """Where prepare put weights and arenas; see FlyweightV2PlacementPlan."""
+        value = _PlacementPlan()
+        self.model._check(
+            self._lib.flyweight_v2_qwen_runtime_plan(self._handle, ctypes.byref(value))
+        )
+        plan = {field: int(getattr(value, field)) for field, _ in _PlacementPlan._fields_}
+        if self.gpu_free_before_prepare is not None and self.gpu_free_after_prepare is not None:
+            plan["gpu_used_by_prepare_bytes"] = max(
+                0, self.gpu_free_before_prepare - self.gpu_free_after_prepare)
+        return plan
 
     def synchronize(self) -> None:
         self.model._check(self._lib.flyweight_v2_qwen_runtime_synchronize(self._handle))
