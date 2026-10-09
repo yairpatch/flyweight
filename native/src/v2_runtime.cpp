@@ -18246,8 +18246,22 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             4ull*1024*1024*1024,model_bytes/4);
         // The old all-or-nothing test: the whole mapping plus headroom in RAM.
         // Kept because when it passes there is nothing to budget.
-        const bool auto_direct=runtime->options.expert_paging==0&&
+        // And only where an upload is on the critical path. Hybrid decode
+        // computes a miss on the CPU and uploads it for next time, so cheaper
+        // uploads only shorten the cache's warm-up; measured on a 60 GiB box
+        // (2026-10-09, interleaved pairs, 35B-A3B Q4_K_XL and NVFP4) steady
+        // decode was within noise of staged, the first prompt lost 2-3 s to
+        // the registration running beside its prefill, and ~17 GiB stayed
+        // locked. Streamed GPU decode waits on every miss (+4-6% direct), and
+        // drafted verification admits only through DMA (see the rows
+        // forward), so without it the cache freezes after the seed.
+        const bool upload_bound=
+            runtime->expert_mode==flyweight::v2::ExpertExecutionMode::streamed_gpu||
+            qwen_spec_drafts(*runtime)>0;
+        const bool ram_for_direct=
             runtime->host_available_bytes>=model_bytes+registration_headroom;
+        const bool auto_direct=runtime->options.expert_paging==0&&
+            ram_for_direct&&upload_bound;
         // Partial coverage: register what fits when the whole mapping does not.
         // OPT-IN, not automatic, and the measurement is why. On the reference box
         // (68 GiB checkpoint, 60 GiB RAM) this pins 19.1 GiB over 25 of 48 layers
@@ -18272,6 +18286,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         const bool pages_experts=!runtime->options.strict_resident&&
             std::any_of(runtime->layers.begin(),runtime->layers.end(),
                 [](const QwenLayerPlan& layer){return !layer.dense_ffn;});
+        if(pages_experts&&paging_policy.routed_gpu_execution_allowed()&&
+           runtime->options.expert_paging==0&&ram_for_direct&&!upload_bound)
+            std::fprintf(stderr,
+                "[flyweight] expert paging: staged; hybrid decode runs misses on "
+                "the CPU, so pinning the experts in RAM would buy little "
+                "(--expert-paging direct to pin them anyway)\n");
         if(pages_experts&&paging_policy.routed_gpu_execution_allowed()&&
            (forced_direct||auto_direct||budgeted_direct)){
             const auto registration_started=std::chrono::steady_clock::now();
