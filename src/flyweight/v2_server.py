@@ -2724,6 +2724,16 @@ class BailingGenerator(ChatGenerator):
         return self.engine.cache_stats()
 
 
+def _report_placement(runtime: V2QwenRuntime) -> None:
+    # A report, never a reason to fail a load that already succeeded.
+    from .placement import format_placement
+    try:
+        text = format_placement(runtime.placement)
+    except Exception as error:  # noqa: BLE001
+        text = f"unavailable ({error})"
+    print("[flyweight] placement\n" + text, file=sys.stderr)
+
+
 class NativeV2InferenceService(InferenceService):
     def __init__(
         self,
@@ -2881,6 +2891,7 @@ class NativeV2InferenceService(InferenceService):
             self.v2_model.close()
             raise
         assert self.v2_runtime is not None
+        _report_placement(self.v2_runtime)
         try:
             tokenizer = NativeV2Tokenizer(
             self.v2_model, image_max_tokens=self.image_max_tokens)

@@ -1127,6 +1127,41 @@ inspect of one does the same work as the first serve of it.\
     )
     _add_model_argument(inspect)
 
+    plan = _add_command(
+        commands, "plan",
+        help="show where the model's weights and caches would go",
+        description="Load the model with the given placement options, print "
+                    "where its weights, KV cache and expert cache went on the "
+                    "GPU and in RAM, and exit.",
+        usage="plan MODEL [options]",
+        epilog="""\
+examples:
+  flyweight plan model.gguf
+  flyweight plan model.gguf --context 65536 --kv-dtype q8_0 -ngl 40
+  flyweight plan model.gguf --json
+
+Takes serve's placement options, so the report is what serve with the same
+flags would get. It reads back what prepare allocated rather than predicting
+it, which means it uploads the weights; a model that fails to fit fails here
+the same way. serve and generate print the same report at startup.\
+""",
+    )
+    _add_model_argument(plan)
+    plan.add_argument(
+        "--context", "--context-window", dest="context_window", type=int,
+        default=32768, metavar="N", action=_ExplicitContext,
+        help="context limit, as serve's (default 32768; a value you pass is "
+             "honored as-is rather than shrunk to fit the GPU)",
+    )
+    plan.add_argument(
+        "--json", action="store_true",
+        help="print the plan's raw fields as JSON instead of the table",
+    )
+    _add_backend_option(
+        plan.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(plan, serving=False)
+
     imatrix = _add_command(
         commands, "imatrix",
         help="gather an importance matrix over calibration text",
@@ -1385,6 +1420,28 @@ def _benchmark_bailing_generate(runtime, prompt, tokens, config):
         arrivals.append(time.perf_counter() - started)
         step = [token]
     return generated, arrivals, time.perf_counter() - started
+
+
+def _plan(args: argparse.Namespace) -> int:
+    from .placement import format_placement
+
+    _validate_runtime_args(args)
+    _select_backend(args)
+    mmproj = getattr(args, "mmproj", None)
+    with V2Model(args.model, mtp_model=args.mtp_model, mmproj=mmproj) as model:
+        options = _runtime_options(args)
+        options["context_limit"] = args.context_window
+        options["context_explicit"] = getattr(args, "context_explicit", False)
+        if model.vision:
+            options["vision_max_tokens"] = getattr(args, "image_max_tokens", 1024)
+        with model.native_runtime(**options) as runtime:
+            runtime.prepare()
+            placement = runtime.placement
+    if args.json:
+        print(json.dumps(placement, indent=2))
+    else:
+        print(format_placement(placement))
+    return 0
 
 
 def _benchmark(args: argparse.Namespace) -> int:
@@ -2203,6 +2260,8 @@ def _run(argv: list[str] | None = None) -> int:
             print(json.dumps({"model": model.info, "config": model.config,
                               "tensors": list(model.tensors())}, indent=2))
         return 0
+    if args.command == "plan":
+        return _plan(args)
     if args.command in {"benchmark-v2", "benchmark"}:
         return _benchmark(args)
     if args.command in {"generate", "generate-text-v2"}:
