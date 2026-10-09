@@ -211,6 +211,16 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
             _parser().parse_args(["serve", "model.gguf", "-ngl", "-1"])
 
+    def test_preload_experts_reaches_the_runtime_options(self) -> None:
+        for command in ("generate", "benchmark-v2", "serve-v2", "plan"):
+            with self.subTest(command=command):
+                argv = [command, "model.gguf"]
+                if command == "generate":
+                    argv.extend(("--prompt", "hello"))
+                self.assertEqual(_runtime_options(_parser().parse_args(argv))["preload_experts"], "auto")
+                args = _parser().parse_args([*argv, "--preload-experts", "off"])
+                self.assertEqual(_runtime_options(args)["preload_experts"], "off")
+
     def test_public_command_names_and_short_limit_options(self) -> None:
         serve = _parser().parse_args(
             ["serve", "model.gguf", "--context", "65536", "--max-tokens", "8192",

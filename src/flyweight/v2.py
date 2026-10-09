@@ -306,6 +306,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("vision_max_tokens", ctypes.c_uint32),
         ("gpu_layers_explicit", ctypes.c_uint32),
         ("gpu_layers", ctypes.c_uint32),
+        ("preload_experts", ctypes.c_uint32),
     ]
 
 
@@ -322,7 +323,7 @@ class _PlacementPlan(ctypes.Structure):
             "expert_staging_bytes", "value_expert_bytes", "prefill_stream_bytes",
             "host_ffn_stage_bytes", "turbo_kv_bytes", "embedding_stage_bytes",
             "host_ffn_bytes", "host_ffn_reencoded_bytes", "host_pinned_bytes",
-            "expert_weight_bytes", "prompt_cache_limit_bytes",
+            "expert_weight_bytes", "prompt_cache_limit_bytes", "preload_expert_bytes",
         )),
         *((name, ctypes.c_uint32) for name in (
             "layers", "dense_ffn_layers", "host_ffn_layers", "moe_layers",
@@ -519,6 +520,7 @@ CACHE_TYPE_CODES = {
     "auto": 6,
 }
 CACHE_TYPE_NAMES = {code: name for name, code in CACHE_TYPE_CODES.items()}
+PRELOAD_EXPERTS_CODES = {"auto": 0, "on": 1, "off": 2}
 
 
 _TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
@@ -2467,6 +2469,7 @@ class V2Model:
         context_explicit: bool = False,
         vision_max_tokens: int = 0,
         gpu_layers: int | None = None,
+        preload_experts: str = "auto",
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2500,6 +2503,7 @@ class V2Model:
             context_explicit=context_explicit,
             vision_max_tokens=vision_max_tokens,
             gpu_layers=gpu_layers,
+            preload_experts=preload_experts,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2913,12 +2917,17 @@ class V2QwenRuntime:
         # llama.cpp's -ngl: a dense model's feed-forward blocks, or a MoE
         # model's whole expert layers, kept on the GPU. None auto-fits.
         gpu_layers: int | None = None,
+        # Map the routed experts into the process in the background after
+        # prepare, so a cold first request does not take ~1M page faults.
+        preload_experts: str = "auto",
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
         # manual budget.
         if device < 0 or context_limit < 0 or gpu_cache_bytes < 0:
             raise ValueError("native Qwen runtime options must be non-negative")
+        if preload_experts not in PRELOAD_EXPERTS_CODES:
+            raise ValueError("preload_experts must be 'auto', 'on', or 'off'")
         if gpu_layers is not None and gpu_layers < 0:
             raise ValueError("gpu_layers must be non-negative (None = auto-fit)")
         # Context for the slots past the first. Every slot reserves its whole
@@ -3084,6 +3093,7 @@ class V2QwenRuntime:
             max(0, int(vision_max_tokens)),
             int(gpu_layers is not None),
             min(int(gpu_layers or 0), 0xFFFFFFFF),
+            PRELOAD_EXPERTS_CODES[preload_experts],
         )
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(

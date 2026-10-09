@@ -104,6 +104,7 @@ knowing. `flyweight serve --help` lists everything, grouped.
 | `--cache-type-k`, `--cache-type-v` | f16 | KV precision: `f32`, `f16`, `bf16`, `q8_0`, `turbo3`, `turbo4` |
 | `--gpu-cache-mib N` | 0 | VRAM for the expert cache; 0 sizes it from what is free at startup |
 | `--expert-mode` | auto | where routed experts run, below |
+| `--preload-experts auto\|on\|off` | auto | map a MoE model's experts into RAM in the background after load, so the first request does not stall on page faults; reads stop at what RAM holds |
 | `-ngl N\|auto\|all` | auto | layers kept on the GPU, as llama.cpp's `-ngl`: a dense model's FFN blocks, or a MoE model's whole expert layers (the rest run on the CPU). Attention and KV stay on the GPU |
 | `--cpu-threads N` | 0 | CPU expert workers; 0 picks the physical cores |
 | `--dense-requant auto\|q8\|off` | off | optionally repack BF16 dense weights to Q8_0 on the GPU; `auto` uses VRAM pressure and `q8` forces conversion |

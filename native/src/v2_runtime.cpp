@@ -1509,6 +1509,12 @@ struct FlyweightV2QwenRuntime {
     std::atomic<std::uint32_t> registration_ready{0};
     std::atomic<bool> registration_cancel{false};
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
+    // Background expert populate (FLYWEIGHT_EXPERT_POPULATE): maps the expert
+    // tensors into the process ahead of the first request. Joined before the
+    // mapping can go away.
+    std::thread populate_thread;
+    std::atomic<bool> populate_cancel{false};
+    std::uint64_t preload_expert_bytes = 0; // span the last preload covers; 0 = none
 };
 
 // Speculative row budget: the draft block's drafts when the checkpoint has one,
@@ -2322,6 +2328,11 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
         runtime.registration_cancel.store(true, std::memory_order_release);
         runtime.registration_thread.join();
     }
+    if (runtime.populate_thread.joinable()) {
+        runtime.populate_cancel.store(true, std::memory_order_release);
+        runtime.populate_thread.join();
+    }
+    runtime.preload_expert_bytes = 0;
     if (runtime.stream) flyweight_gpu_stream_sync(runtime.stream);
     // An enqueued expert prefetch DMAs from the model mmap on its own stream,
     // and the main stream only waits for it at the consumption point -- which
@@ -7920,6 +7931,102 @@ static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime& runtime) {
 }
 #else
 static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime&) {}
+#endif
+
+#if defined(__linux__)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+// Whether --preload-experts runs for this prepare. auto preloads every MoE
+// model except one whose experts direct paging is about to register: that
+// registration faults in and pins the same pages, so a second pass would only
+// compete with it for the disk.
+static bool qwen_preload_experts_enabled(const FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.model || !runtime.model->config.expert_count) return false;
+    if (runtime.options.preload_experts == 2) return false;
+    if (runtime.options.preload_experts == 1) return true;
+    return !runtime.model_registered;
+}
+
+// Map every routed-expert page into the process before the first request
+// (--preload-experts). A cold first prefill takes ~1M minor faults from the CPU
+// MoE threads at once -- measured 200-270 s of kernel time on Flash-Next IQ3_S
+// against ~95 s of compute -- and MADV_POPULATE_READ maps a range in one call
+// instead: first-request TTFT 53-60 s -> 19-34 s once it has a 20 s head start.
+// Pages already cached are always mapped; they cost no memory. Reading from
+// disk is capped at what RAM held when it started, less a margin, because
+// reading past that only evicts what was read first. MemFree cannot be the
+// gate: kswapd keeps it up by reclaiming, measured to never bind.
+static void qwen_start_expert_populate(FlyweightV2QwenRuntime& runtime) {
+    if (!qwen_preload_experts_enabled(runtime) || runtime.populate_thread.joinable()) return;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    struct Span { std::uintptr_t begin, end; };
+    std::vector<Span> spans;
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn) continue;
+        for (const auto index : layer.expert_tensors) {
+            if (index >= runtime.model->tensors.size()) continue;
+            const auto& tensor = runtime.model->tensors[index];
+            const auto base = reinterpret_cast<std::uintptr_t>(tensor_data(*runtime.model, tensor));
+            if (!base || !tensor.size) continue;
+            spans.push_back({base & ~(page - 1), (base + tensor.size + page - 1) & ~(page - 1)});
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const Span& a, const Span& b) { return a.begin < b.begin; });
+    std::vector<Span> merged;
+    for (const auto& span : spans) {
+        if (!merged.empty() && span.begin <= merged.back().end)
+            merged.back().end = std::max(merged.back().end, span.end);
+        else merged.push_back(span);
+    }
+    if (merged.empty()) return;
+    std::uint64_t total = 0;
+    for (const auto& span : merged) total += span.end - span.begin;
+    constexpr std::uint64_t kMargin = 4ull << 30;
+    const auto available = available_host_memory();
+    const std::uint64_t read_budget = available > kMargin ? available - kMargin : 0;
+    runtime.preload_expert_bytes = total;
+    std::fprintf(stderr,
+        "[flyweight] preloading %.1f GiB of experts into RAM in the background "
+        "(reads capped at %.1f GiB)\n",
+        total / 1073741824.0, read_budget / 1073741824.0);
+    runtime.populate_cancel.store(false, std::memory_order_release);
+    runtime.populate_thread = std::thread([&runtime, merged = std::move(merged), read_budget, page] {
+        constexpr std::uintptr_t kChunk = 64ull << 20;
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<unsigned char> residency(kChunk / page);
+        std::uint64_t mapped = 0, read = 0, skipped = 0;
+        for (const auto& span : merged) {
+            for (auto at = span.begin; at < span.end; at += kChunk) {
+                if (runtime.populate_cancel.load(std::memory_order_acquire)) goto done;
+                const auto bytes = std::min<std::uintptr_t>(kChunk, span.end - at);
+                const auto pages = bytes / page;
+                std::uint64_t missing = 0;
+                if (mincore(reinterpret_cast<void*>(at), bytes, residency.data()) == 0) {
+                    for (std::size_t i = 0; i < pages; ++i) missing += (residency[i] & 1) ? 0 : 1;
+                } else missing = pages;
+                missing *= page;
+                if (missing && read + missing > read_budget) { skipped += bytes; continue; }
+                // Advisory: a failure costs the head start, never correctness.
+                if (madvise(reinterpret_cast<void*>(at), bytes, MADV_POPULATE_READ) != 0) {
+                    skipped += bytes;
+                    continue;
+                }
+                mapped += bytes - missing;
+                read += missing;
+            }
+        }
+    done:
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr,
+            "[flyweight] expert preload done: %.1f GiB already cached, %.1f GiB read, "
+            "%.1f GiB left for want of RAM, %.1f s\n",
+            mapped / 1073741824.0, read / 1073741824.0, skipped / 1073741824.0, ms / 1000.0);
+    });
+}
+#else
+static void qwen_start_expert_populate(FlyweightV2QwenRuntime&) {}
 #endif
 
 int gpu_probe(FlyweightV2GpuInfo& out, int device) {
@@ -15661,6 +15768,7 @@ int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,Flyweigh
         (runtime->prefill_stream_mirror
             ?runtime->prefill_stream_bytes*FlyweightV2QwenRuntime::kStreamMirrorSlots:0);
     out->expert_weight_bytes=runtime->expert_tensor_bytes;
+    out->preload_expert_bytes=runtime->preload_expert_bytes;
     out->prompt_cache_limit_bytes=runtime->host_cache_limit_bytes;
     out->layers=static_cast<std::uint32_t>(runtime->layers.size());
     std::uint32_t pinned_layers=0;
@@ -18493,6 +18601,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         try{qwen_vision_prepare(*runtime);}
         catch(...){release_qwen_device(*runtime);throw;}
         runtime->decode_ready=true;
+        qwen_start_expert_populate(*runtime);
         // What is left for everything else on this card. On a machine whose GPU
         // also drives the display, the desktop compositor and the browser
         // allocate from the same pool, and when they cannot they do not fail
