@@ -70,6 +70,12 @@ FLYWEIGHT_API int flyweight_q4_moe_grouped(
 // context and the legacy default stream with CuPy.
 FLYWEIGHT_API int flyweight_gpu_available();
 FLYWEIGHT_API int flyweight_gpu_init(std::int32_t device);
+// ROCm backend only: the device's GCN architecture ("gfx1030"), wavefront
+// width and memory, without retaining anything. Nonzero when HIP cannot load
+// or the device does not answer.
+FLYWEIGHT_API int flyweight_gpu_hip_probe(
+    std::int32_t device, char* arch, std::int32_t arch_capacity,
+    std::int32_t* warp_size, std::uint64_t* free_memory, std::uint64_t* total_memory);
 // 1 when the initialized device runs under Windows' WDDM driver model (per-
 // launch OS submission overhead); 0 on Linux, TCC, or the CPU backend.
 FLYWEIGHT_API int flyweight_gpu_wddm();

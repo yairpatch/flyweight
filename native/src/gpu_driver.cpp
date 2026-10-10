@@ -5,10 +5,15 @@
 // uses) and launches on the legacy default stream, so device pointers taken
 // from CuPy arrays are valid here and ordering with CuPy-issued work is
 // automatic.
+//
+// The ROCm backend drives AMD GPUs through the same table: libamdhip64 and
+// libhiprtc fill the CudaApi slots (see load_hip_apis), and hipRTC compiles
+// the CUDA corpus behind flyweight_hip_prelude.hpp.
 #include "flyweight_gpu_driver.h"
 
 #include <flyweight_backend.hpp>
 #include <flyweight_cpu_backend.hpp>
+#include <flyweight_hip_prelude.hpp>
 
 #include <cmath>
 #include <chrono>
@@ -355,10 +360,7 @@ void* win_load_nvrtc() {
 }
 #endif
 
-bool load_apis() {
-    if (g_api.loaded) {
-        return true;
-    }
+bool load_cuda_apis() {
     void* cuda = nullptr;
     void* nvrtc = nullptr;
 #if defined(_WIN32)
@@ -483,9 +485,234 @@ bool load_apis() {
     return ok;
 }
 
+// --- ROCm -------------------------------------------------------------------
+//
+// HIP's module API mirrors the CUDA driver API call for call, so the ROCm
+// backend is the same CudaApi table filled from libamdhip64 and libhiprtc.
+// Entries whose signatures match (streams, events, graphs, modules, launch,
+// pinned memory) are the HIP functions themselves; HIP's error codes, stream,
+// event, capture and host-register flags share CUDA's values for everything
+// this file passes. The rest -- device addresses typed as pointers, the
+// context, device attributes -- go through the adapters below.
+
+struct HipApi {
+    CUresult (*hipSetDevice)(int) = nullptr;
+    CUresult (*hipDeviceGetAttribute)(int*, int, int) = nullptr;
+    // The ABI-versioned properties entry point (ROCm 6+), read only for
+    // gcnArchName; see hip_arch_name.
+    CUresult (*hipGetDevicePropertiesR0600)(void*, int) = nullptr;
+    const char* (*hipGetErrorName)(CUresult) = nullptr;
+    CUresult (*hipMalloc)(void**, size_t) = nullptr;
+    CUresult (*hipFree)(void*) = nullptr;
+    CUresult (*hipMemcpyDtoH)(void*, void*, size_t) = nullptr;
+    CUresult (*hipMemcpyHtoD)(void*, const void*, size_t) = nullptr;
+    CUresult (*hipMemcpyDtoHAsync)(void*, void*, size_t, CUstream) = nullptr;
+    CUresult (*hipMemcpyHtoDAsync)(void*, const void*, size_t, CUstream) = nullptr;
+    CUresult (*hipMemcpyDtoDAsync)(void*, void*, size_t, CUstream) = nullptr;
+    CUresult (*hipMemsetD8Async)(void*, unsigned char, size_t, CUstream) = nullptr;
+    CUresult (*hipMemGetInfo)(size_t*, size_t*) = nullptr;
+};
+HipApi g_hip;
+
+// Which library set g_api holds: kFlyweightBackendCuda or
+// kFlyweightBackendRocm, -1 before the first successful load.
+int g_api_backend = -1;
+
+bool platform_is_hip() { return g_api_backend == kFlyweightBackendRocm; }
+
+void* as_pointer(CUdeviceptr address) {
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+}
+
+// hipDeviceAttribute_t values (ROCm 6/7 hip_runtime_api.h).
+constexpr int kHipAttributeComputeMajor = 23;
+constexpr int kHipAttributeComputeMinor = 61;
+constexpr int kHipAttributeWarpSize = 87;
+// Offset of gcnArchName[256] in hipDeviceProp_tR0600, whose 1472-byte
+// layout is fixed by the versioned symbol name.
+constexpr size_t kHipPropertiesGcnArchName = 1160;
+constexpr size_t kHipPropertiesSize = 1472;
+
+// "gfx1030", or "gfx90a:sramecc+:xnack-" with target features, as hipRTC's
+// --offload-arch wants it. Empty when the runtime cannot say.
+std::string hip_arch_name(int device) {
+    if (g_hip.hipGetDevicePropertiesR0600 == nullptr) return {};
+    // Generous slack beyond the known size, in case a later runtime writes
+    // more than the R0600 layout promises.
+    std::vector<char> properties(kHipPropertiesSize + 4096, '\0');
+    if (g_hip.hipGetDevicePropertiesR0600(properties.data(), device) != 0) return {};
+    const char* name = properties.data() + kHipPropertiesGcnArchName;
+    return std::string(name, strnlen(name, 256));
+}
+
+bool load_hip_apis() {
+#if defined(_WIN32)
+    // The HIP SDK for Windows ships these as amdhip64_N.dll and hiprtcNNNN.dll;
+    // untested, so the backend is Linux-only for now.
+    return false;
+#else
+    void* hip = nullptr;
+    void* hiprtc = nullptr;
+    for (const char* name : {"libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so"}) {
+        hip = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+        if (hip != nullptr) break;
+    }
+    for (const char* name : {"libhiprtc.so.7", "libhiprtc.so.6", "libhiprtc.so"}) {
+        hiprtc = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+        if (hiprtc != nullptr) break;
+    }
+    // A ROCm install outside the loader path: /opt/rocm is where every
+    // distribution and AMD's own packages put it.
+    const char* root = std::getenv("ROCM_PATH");
+    const std::string lib_dir = std::string(root && *root ? root : "/opt/rocm") + "/lib/";
+    if (hip == nullptr) hip = dlopen((lib_dir + "libamdhip64.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (hiprtc == nullptr) hiprtc = dlopen((lib_dir + "libhiprtc.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (hip == nullptr || hiprtc == nullptr) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr, "[flyweight] ROCm disabled: %s not found\n",
+                hip == nullptr ? "the HIP runtime library (libamdhip64)"
+                               : "the hipRTC library (libhiprtc)");
+        }
+        if (hip != nullptr) dlclose(hip);
+        if (hiprtc != nullptr) dlclose(hiprtc);
+        return false;
+    }
+    bool ok = true;
+    ok &= load_symbol(hip, "hipSetDevice", g_hip.hipSetDevice);
+    ok &= load_symbol(hip, "hipDeviceGetAttribute", g_hip.hipDeviceGetAttribute);
+    load_symbol(hip, "hipGetDevicePropertiesR0600", g_hip.hipGetDevicePropertiesR0600);
+    load_symbol(hip, "hipGetErrorName", g_hip.hipGetErrorName);
+    ok &= load_symbol(hip, "hipMalloc", g_hip.hipMalloc);
+    ok &= load_symbol(hip, "hipFree", g_hip.hipFree);
+    ok &= load_symbol(hip, "hipMemcpyDtoH", g_hip.hipMemcpyDtoH);
+    ok &= load_symbol(hip, "hipMemcpyHtoD", g_hip.hipMemcpyHtoD);
+    ok &= load_symbol(hip, "hipMemcpyDtoHAsync", g_hip.hipMemcpyDtoHAsync);
+    ok &= load_symbol(hip, "hipMemcpyHtoDAsync", g_hip.hipMemcpyHtoDAsync);
+    ok &= load_symbol(hip, "hipMemcpyDtoDAsync", g_hip.hipMemcpyDtoDAsync);
+    ok &= load_symbol(hip, "hipMemsetD8Async", g_hip.hipMemsetD8Async);
+    load_symbol(hip, "hipMemGetInfo", g_hip.hipMemGetInfo);
+
+    ok &= load_symbol(hip, "hipInit", g_api.cuInit);
+    load_symbol(hip, "hipGetDeviceCount", g_api.cuDeviceGetCount);
+    load_symbol(hip, "hipDriverGetVersion", g_api.cuDriverGetVersion);
+    ok &= load_symbol(hip, "hipModuleLoadDataEx", g_api.cuModuleLoadDataEx);
+    ok &= load_symbol(hip, "hipModuleGetFunction", g_api.cuModuleGetFunction);
+    ok &= load_symbol(hip, "hipModuleLaunchKernel", g_api.cuLaunchKernel);
+    if (!load_symbol(hip, "hipHostMalloc", g_api.cuMemHostAlloc))
+        ok &= load_symbol(hip, "hipHostAlloc", g_api.cuMemHostAlloc);
+    ok &= load_symbol(hip, "hipHostFree", g_api.cuMemFreeHost);
+    load_symbol(hip, "hipHostRegister", g_api.cuMemHostRegister);
+    load_symbol(hip, "hipHostUnregister", g_api.cuMemHostUnregister);
+    ok &= load_symbol(hip, "hipStreamSynchronize", g_api.cuStreamSynchronize);
+    load_symbol(hip, "hipStreamQuery", g_api.cuStreamQuery);
+    ok &= load_symbol(hip, "hipStreamCreateWithFlags", g_api.cuStreamCreate);
+    ok &= load_symbol(hip, "hipStreamDestroy", g_api.cuStreamDestroy);
+    ok &= load_symbol(hip, "hipEventCreateWithFlags", g_api.cuEventCreate);
+    ok &= load_symbol(hip, "hipEventRecord", g_api.cuEventRecord);
+    ok &= load_symbol(hip, "hipStreamWaitEvent", g_api.cuStreamWaitEvent);
+    ok &= load_symbol(hip, "hipEventSynchronize", g_api.cuEventSynchronize);
+    ok &= load_symbol(hip, "hipEventDestroy", g_api.cuEventDestroy);
+    ok &= load_symbol(hip, "hipEventElapsedTime", g_api.cuEventElapsedTime);
+    ok &= load_symbol(hip, "hipStreamBeginCapture", g_api.cuStreamBeginCapture);
+    ok &= load_symbol(hip, "hipStreamEndCapture", g_api.cuStreamEndCapture);
+    ok &= load_symbol(hip, "hipGraphInstantiateWithFlags", g_api.cuGraphInstantiateWithFlags);
+    ok &= load_symbol(hip, "hipGraphLaunch", g_api.cuGraphLaunch);
+    ok &= load_symbol(hip, "hipGraphDestroy", g_api.cuGraphDestroy);
+    ok &= load_symbol(hip, "hipGraphExecDestroy", g_api.cuGraphExecDestroy);
+
+    ok &= load_symbol(hiprtc, "hiprtcCreateProgram", g_api.nvrtcCreateProgram);
+    ok &= load_symbol(hiprtc, "hiprtcCompileProgram", g_api.nvrtcCompileProgram);
+    ok &= load_symbol(hiprtc, "hiprtcGetCodeSize", g_api.nvrtcGetPTXSize);
+    ok &= load_symbol(hiprtc, "hiprtcGetCode", g_api.nvrtcGetPTX);
+    ok &= load_symbol(hiprtc, "hiprtcGetProgramLogSize", g_api.nvrtcGetProgramLogSize);
+    ok &= load_symbol(hiprtc, "hiprtcGetProgramLog", g_api.nvrtcGetProgramLog);
+    ok &= load_symbol(hiprtc, "hiprtcDestroyProgram", g_api.nvrtcDestroyProgram);
+    load_symbol(hiprtc, "hiprtcGetErrorString", g_api.nvrtcGetErrorString);
+    load_symbol(hiprtc, "hiprtcVersion", g_api.nvrtcVersion);
+
+    // HIP has no primary context to hand out beyond the one its runtime
+    // keeps per device: the device ordinal stands in for the context (+1, so
+    // it is never null) and binding it per thread is hipSetDevice.
+    g_api.cuDevicePrimaryCtxRetain = [](CUcontext* context, CUdevice device) -> CUresult {
+        const CUresult result = g_hip.hipSetDevice(device);
+        if (result == 0)
+            *context = reinterpret_cast<CUcontext>(static_cast<std::intptr_t>(device) + 1);
+        return result;
+    };
+    g_api.cuCtxSetCurrent = [](CUcontext context) -> CUresult {
+        return g_hip.hipSetDevice(
+            static_cast<int>(reinterpret_cast<std::intptr_t>(context) - 1));
+    };
+    g_api.cuDeviceGetAttribute = [](int* value, int attribute, CUdevice device) -> CUresult {
+        const int hip_attribute =
+            attribute == kAttributeComputeMajor ? kHipAttributeComputeMajor
+            : attribute == kAttributeComputeMinor ? kHipAttributeComputeMinor
+            : -1;
+        if (hip_attribute < 0) return 1;  // hipErrorInvalidValue
+        return g_hip.hipDeviceGetAttribute(value, hip_attribute, device);
+    };
+    g_api.cuGetErrorName = [](CUresult result, const char** name) -> CUresult {
+        *name = g_hip.hipGetErrorName ? g_hip.hipGetErrorName(result) : nullptr;
+        return 0;
+    };
+    // RDNA has 64 KB of LDS per workgroup and no opt-in step for the part
+    // above 48 KB; a request beyond the hardware fails at launch instead.
+    g_api.cuFuncSetAttribute = [](CUfunction, int, int) -> CUresult { return 0; };
+    g_api.cuMemAlloc = [](CUdeviceptr* address, size_t bytes) -> CUresult {
+        void* pointer = nullptr;
+        const CUresult result = g_hip.hipMalloc(&pointer, bytes);
+        *address = reinterpret_cast<CUdeviceptr>(pointer);
+        return result;
+    };
+    g_api.cuMemFree = [](CUdeviceptr address) -> CUresult {
+        return g_hip.hipFree(as_pointer(address));
+    };
+    g_api.cuMemcpyDtoH = [](void* host, CUdeviceptr device, size_t bytes) -> CUresult {
+        return g_hip.hipMemcpyDtoH(host, as_pointer(device), bytes);
+    };
+    g_api.cuMemcpyHtoD = [](CUdeviceptr device, const void* host, size_t bytes) -> CUresult {
+        return g_hip.hipMemcpyHtoD(as_pointer(device), host, bytes);
+    };
+    g_api.cuMemcpyDtoHAsync = [](void* host, CUdeviceptr device, size_t bytes, CUstream stream) -> CUresult {
+        return g_hip.hipMemcpyDtoHAsync(host, as_pointer(device), bytes, stream);
+    };
+    g_api.cuMemcpyHtoDAsync = [](CUdeviceptr device, const void* host, size_t bytes, CUstream stream) -> CUresult {
+        return g_hip.hipMemcpyHtoDAsync(as_pointer(device), host, bytes, stream);
+    };
+    g_api.cuMemcpyDtoDAsync = [](CUdeviceptr target, CUdeviceptr source, size_t bytes, CUstream stream) -> CUresult {
+        return g_hip.hipMemcpyDtoDAsync(as_pointer(target), as_pointer(source), bytes, stream);
+    };
+    g_api.cuMemsetD8Async = [](CUdeviceptr device, unsigned char value, size_t bytes, CUstream stream) -> CUresult {
+        return g_hip.hipMemsetD8Async(as_pointer(device), value, bytes, stream);
+    };
+    g_api.loaded = ok;
+    return ok;
+#endif
+}
+
+// Loads the library set for the selected backend. The choice is made once a
+// context exists; before that, a failed probe of one platform (auto mode
+// asks CUDA first) leaves the table free for the other.
+bool load_apis() {
+    const int backend = flyweight_backend_active() == kFlyweightBackendRocm
+        ? kFlyweightBackendRocm : kFlyweightBackendCuda;
+    if (g_api.loaded && g_api_backend == backend) return true;
+    if (g_context != nullptr) return false;
+    g_api = CudaApi{};
+    g_api_backend = -1;
+    const bool ok = backend == kFlyweightBackendRocm ? load_hip_apis() : load_cuda_apis();
+    if (ok) g_api_backend = backend;
+    else g_api.loaded = false;
+    return ok;
+}
+
 bool load_cublas() {
     if (g_cublas_handle != nullptr) return true;
     if (g_cublas.attempted) return false;
+    // NVIDIA-only; every caller has a kernel path to fall back to.
+    if (platform_is_hip()) return false;
     g_cublas.attempted = true;
 #if defined(_WIN32)
     const wchar_t* names[] = {
@@ -526,6 +753,8 @@ bool load_cublas() {
 bool load_cublas_lt() {
     if (g_cublas_lt_handle != nullptr) return true;
     if (g_cublas_lt.attempted) return false;
+    // NVIDIA-only; every caller has a kernel path to fall back to.
+    if (platform_is_hip()) return false;
     g_cublas_lt.attempted = true;
 #if defined(_WIN32)
     const wchar_t* names[] = {
@@ -846,7 +1075,36 @@ extern "C" int flyweight_gpu_available() {
         int count = 0;
         if (g_api.cuDeviceGetCount(&count) != 0 || count <= 0) return 0;
     }
+    // A wave64 part (CDNA) is a GPU the corpus cannot run on; reporting it
+    // unavailable lets auto mode fall back to the CPU instead of failing init.
+    if (platform_is_hip()) {
+        int warp = 0;
+        if (g_hip.hipDeviceGetAttribute(&warp, kHipAttributeWarpSize, 0) != 0 || warp != 32)
+            return 0;
+    }
     return 1;
+}
+
+extern "C" int flyweight_gpu_hip_probe(
+    std::int32_t device, char* arch, std::int32_t arch_capacity,
+    std::int32_t* warp_size, std::uint64_t* free_memory, std::uint64_t* total_memory
+) {
+    if (flyweight_backend_active() != kFlyweightBackendRocm || !load_apis()
+        || g_api.cuInit(0) != 0)
+        return -1;
+    if (g_hip.hipSetDevice(device) != 0) return -2;
+    int warp = 0;
+    if (g_hip.hipDeviceGetAttribute(&warp, kHipAttributeWarpSize, device) != 0) return -3;
+    if (warp_size) *warp_size = warp;
+    if (arch && arch_capacity > 0)
+        std::snprintf(arch, static_cast<size_t>(arch_capacity), "%s",
+                      hip_arch_name(device).c_str());
+    size_t free_bytes = 0, total_bytes = 0;
+    if (g_hip.hipMemGetInfo && g_hip.hipMemGetInfo(&free_bytes, &total_bytes) == 0) {
+        if (free_memory) *free_memory = free_bytes;
+        if (total_memory) *total_memory = total_bytes;
+    }
+    return 0;
 }
 
 extern "C" int flyweight_gpu_init(std::int32_t device) {
@@ -874,6 +1132,18 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
     }
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
+    }
+    if (platform_is_hip()) {
+        // The corpus assumes a 32-lane warp throughout; CDNA (and RDNA forced
+        // into wave64) would run every reduction over half its lanes.
+        int warp = 0;
+        if (g_hip.hipDeviceGetAttribute(&warp, kHipAttributeWarpSize, device) != 0
+            || warp != 32) {
+            std::fprintf(stderr,
+                "[flyweight] ROCm device %d runs %d-lane wavefronts; only "
+                "wave32 GPUs (RDNA) are supported\n", device, warp);
+            return -6;
+        }
     }
 #if defined(_WIN32)
     if (g_api.cuDeviceGetAttribute != nullptr) {
@@ -966,128 +1236,158 @@ extern "C" int flyweight_gpu_compile(
     }
     static std::mutex compile_mutex;
     std::lock_guard<std::mutex> compile_lock(compile_mutex);
-    int major = 0;
-    int minor = 0;
-    if (g_api.cuDeviceGetAttribute(&major, kAttributeComputeMajor, device) != 0
-        || g_api.cuDeviceGetAttribute(&minor, kAttributeComputeMinor, device) != 0
-        || major <= 0) {
-        // An unchecked failure here used to compile for "compute_00".
-        if (log_buffer != nullptr && log_capacity > 0)
-            std::snprintf(log_buffer, log_capacity,
-                          "cannot query the compute capability of device %d",
-                          device);
-        return -1;
-    }
-    // compute_XY yields PTX that the driver's own JIT must accept, which
-    // fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222) whenever the
-    // toolkit's NVRTC is newer than the driver -- a fresh toolkit on a laptop
-    // with a stock driver is the everyday case. sm_XY asks NVRTC for SASS (a
-    // cubin) for this exact device instead, which only needs the same CUDA
-    // major. PTX stays the default wherever the driver can take it: the
-    // driver caches its JIT output on disk, so a model reopens in a couple of
-    // seconds, whereas NVRTC assembles a cubin from scratch on every open
-    // (about 12 s more on a 5070 Ti). FLYWEIGHT_NVRTC_CUBIN=1 forces the
-    // cubin and FLYWEIGHT_NVRTC_PTX=1 forces PTX, for comparison.
-    //
-    // When NVRTC predates the GPU it cannot target the device at all. PTX is
-    // forward compatible, so the newest architecture NVRTC does know is
-    // compiled as PTX and the (newer) driver JITs it for the real device; a
-    // cubin for another architecture would not run there.
-    const int device_arch = major * 10 + minor;
-    int target_arch = device_arch;
+    bool want_cubin = false;
     std::string arch_note;
-    if (g_api.nvrtcGetNumSupportedArchs != nullptr && g_api.nvrtcGetSupportedArchs != nullptr) {
-        int count = 0;
-        if (g_api.nvrtcGetNumSupportedArchs(&count) == 0 && count > 0) {
-            std::vector<int> supported(static_cast<size_t>(count), 0);
-            if (g_api.nvrtcGetSupportedArchs(supported.data()) == 0) {
-                bool exact = false;
-                int best = 0;
-                for (const int candidate : supported) {
-                    if (candidate == device_arch) exact = true;
-                    if (candidate <= device_arch && candidate > best) best = candidate;
-                }
-                if (!exact && best > 0) {
-                    target_arch = best;
-                    int nvrtc_major = 0;
-                    int nvrtc_minor = 0;
-                    if (g_api.nvrtcVersion) g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor);
-                    arch_note = "NVRTC " + std::to_string(nvrtc_major) + "."
-                        + std::to_string(nvrtc_minor) + " does not know sm_"
-                        + std::to_string(device_arch) + "; compiling PTX for compute_"
-                        + std::to_string(best) + " for the driver to JIT";
-                }
-            }
-        }
-    }
-    bool driver_older_than_nvrtc = false;
-    {
-        int driver_version = 0;
-        int nvrtc_major = 0;
-        int nvrtc_minor = 0;
-        if (g_api.cuDriverGetVersion && g_api.nvrtcVersion
-            && g_api.cuDriverGetVersion(&driver_version) == 0
-            && g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor) == 0) {
-            driver_older_than_nvrtc =
-                driver_version < nvrtc_major * 1000 + nvrtc_minor * 10;
-        }
-    }
-    const bool want_cubin = target_arch == device_arch
-        && g_api.nvrtcGetCUBINSize != nullptr
-        && g_api.nvrtcGetCUBIN != nullptr
-        && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr
-        && (driver_older_than_nvrtc
-            || std::getenv("FLYWEIGHT_NVRTC_CUBIN") != nullptr);
-    char arch[64];
-    std::snprintf(
-        arch, sizeof(arch), "--gpu-architecture=%s_%d",
-        want_cubin ? "sm" : "compute", target_arch
-    );
+    char arch[320];
     std::vector<const char*> all_options;
-    all_options.push_back(arch);
-    // FLYWEIGHT_NVRTC_LINEINFO=1 compiles with -lineinfo so Nsight Compute can
-    // attribute stalls to corpus lines; FLYWEIGHT_NVRTC_DUMP=PATH writes the
-    // corpus text those line numbers refer to. Profiling aids, off by default.
-    if (std::getenv("FLYWEIGHT_NVRTC_LINEINFO") != nullptr) all_options.push_back("-lineinfo");
-    if (const char* dump = std::getenv("FLYWEIGHT_NVRTC_DUMP")) {
-        if (FILE* file = std::fopen(dump, "wb")) {
-            std::fwrite(source, 1, std::strlen(source), file);
-            std::fclose(file);
-        }
-    }
-    // nvrtc has no default header search path for the CUDA toolkit headers
-    // (cuda_fp16.h etc.). Point it at CUDA_PATH\include so the kernels compile.
     std::vector<std::string> include_flags;
-#if defined(_WIN32)
-    {
-        wchar_t base[4096];
-        DWORD length = GetEnvironmentVariableW(L"CUDA_PATH", base, 4096);
-        if (length > 0 && length < 4096) {
-            std::wstring winclude = std::wstring(base) + L"\\include";
-            int need = WideCharToMultiByte(
-                CP_UTF8, 0, winclude.c_str(), -1, nullptr, 0, nullptr, nullptr);
-            if (need > 1) {
-                std::string include(static_cast<size_t>(need - 1), '\0');
-                WideCharToMultiByte(
-                    CP_UTF8, 0, winclude.c_str(), -1, include.data(), need,
-                    nullptr, nullptr);
-                include_flags.push_back("-I" + include);
-                include_flags.push_back("-I" + include + "/cccl");
+    // hipRTC compiles the prelude and the corpus as one translation unit.
+    std::string hip_source;
+    if (platform_is_hip()) {
+        const std::string name = hip_arch_name(device);
+        if (name.empty()) {
+            if (log_buffer != nullptr && log_capacity > 0)
+                std::snprintf(log_buffer, log_capacity,
+                              "cannot query the GCN architecture of device %d", device);
+            return -1;
+        }
+        std::snprintf(arch, sizeof(arch), "--offload-arch=%s", name.c_str());
+        all_options.push_back(arch);
+        all_options.push_back("-O3");
+        hip_source = std::string(flyweight::v2::hip_prelude_source) + source;
+        source = hip_source.c_str();
+        // The whole translation unit, so hipRTC's line numbers match the dump.
+        if (const char* dump = std::getenv("FLYWEIGHT_NVRTC_DUMP")) {
+            if (FILE* file = std::fopen(dump, "wb")) {
+                std::fwrite(source, 1, std::strlen(source), file);
+                std::fclose(file);
             }
         }
-    }
-#else
-    if (const char* cuda_path = std::getenv("CUDA_PATH")) {
-        const std::string include = std::string(cuda_path) + "/include";
-        include_flags.push_back("-I" + include);
-        include_flags.push_back("-I" + include + "/cccl");
-    }
-#endif
-    for (const auto& include_flag : include_flags) {
-        all_options.push_back(include_flag.c_str());
-    }
-    for (std::int32_t index = 0; index < option_count; ++index) {
-        all_options.push_back(options[index]);
+        // Callers name the CUDA toolkit's include directories; hipRTC has its
+        // own headers built in, and cuda_fp16.h on the path would shadow them.
+        for (std::int32_t index = 0; index < option_count; ++index)
+            if (std::strncmp(options[index], "-I", 2) != 0)
+                all_options.push_back(options[index]);
+    } else {
+        int major = 0;
+        int minor = 0;
+        if (g_api.cuDeviceGetAttribute(&major, kAttributeComputeMajor, device) != 0
+            || g_api.cuDeviceGetAttribute(&minor, kAttributeComputeMinor, device) != 0
+            || major <= 0) {
+            // An unchecked failure here used to compile for "compute_00".
+            if (log_buffer != nullptr && log_capacity > 0)
+                std::snprintf(log_buffer, log_capacity,
+                              "cannot query the compute capability of device %d",
+                              device);
+            return -1;
+        }
+        // compute_XY yields PTX that the driver's own JIT must accept, which
+        // fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222) whenever the
+        // toolkit's NVRTC is newer than the driver -- a fresh toolkit on a laptop
+        // with a stock driver is the everyday case. sm_XY asks NVRTC for SASS (a
+        // cubin) for this exact device instead, which only needs the same CUDA
+        // major. PTX stays the default wherever the driver can take it: the
+        // driver caches its JIT output on disk, so a model reopens in a couple of
+        // seconds, whereas NVRTC assembles a cubin from scratch on every open
+        // (about 12 s more on a 5070 Ti). FLYWEIGHT_NVRTC_CUBIN=1 forces the
+        // cubin and FLYWEIGHT_NVRTC_PTX=1 forces PTX, for comparison.
+        //
+        // When NVRTC predates the GPU it cannot target the device at all. PTX is
+        // forward compatible, so the newest architecture NVRTC does know is
+        // compiled as PTX and the (newer) driver JITs it for the real device; a
+        // cubin for another architecture would not run there.
+        const int device_arch = major * 10 + minor;
+        int target_arch = device_arch;
+        if (g_api.nvrtcGetNumSupportedArchs != nullptr && g_api.nvrtcGetSupportedArchs != nullptr) {
+            int count = 0;
+            if (g_api.nvrtcGetNumSupportedArchs(&count) == 0 && count > 0) {
+                std::vector<int> supported(static_cast<size_t>(count), 0);
+                if (g_api.nvrtcGetSupportedArchs(supported.data()) == 0) {
+                    bool exact = false;
+                    int best = 0;
+                    for (const int candidate : supported) {
+                        if (candidate == device_arch) exact = true;
+                        if (candidate <= device_arch && candidate > best) best = candidate;
+                    }
+                    if (!exact && best > 0) {
+                        target_arch = best;
+                        int nvrtc_major = 0;
+                        int nvrtc_minor = 0;
+                        if (g_api.nvrtcVersion) g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+                        arch_note = "NVRTC " + std::to_string(nvrtc_major) + "."
+                            + std::to_string(nvrtc_minor) + " does not know sm_"
+                            + std::to_string(device_arch) + "; compiling PTX for compute_"
+                            + std::to_string(best) + " for the driver to JIT";
+                    }
+                }
+            }
+        }
+        bool driver_older_than_nvrtc = false;
+        {
+            int driver_version = 0;
+            int nvrtc_major = 0;
+            int nvrtc_minor = 0;
+            if (g_api.cuDriverGetVersion && g_api.nvrtcVersion
+                && g_api.cuDriverGetVersion(&driver_version) == 0
+                && g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor) == 0) {
+                driver_older_than_nvrtc =
+                    driver_version < nvrtc_major * 1000 + nvrtc_minor * 10;
+            }
+        }
+        want_cubin = target_arch == device_arch
+            && g_api.nvrtcGetCUBINSize != nullptr
+            && g_api.nvrtcGetCUBIN != nullptr
+            && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr
+            && (driver_older_than_nvrtc
+                || std::getenv("FLYWEIGHT_NVRTC_CUBIN") != nullptr);
+        std::snprintf(
+            arch, sizeof(arch), "--gpu-architecture=%s_%d",
+            want_cubin ? "sm" : "compute", target_arch
+        );
+        all_options.push_back(arch);
+        // FLYWEIGHT_NVRTC_LINEINFO=1 compiles with -lineinfo so Nsight Compute can
+        // attribute stalls to corpus lines; FLYWEIGHT_NVRTC_DUMP=PATH writes the
+        // corpus text those line numbers refer to. Profiling aids, off by default.
+        if (std::getenv("FLYWEIGHT_NVRTC_LINEINFO") != nullptr) all_options.push_back("-lineinfo");
+        if (const char* dump = std::getenv("FLYWEIGHT_NVRTC_DUMP")) {
+            if (FILE* file = std::fopen(dump, "wb")) {
+                std::fwrite(source, 1, std::strlen(source), file);
+                std::fclose(file);
+            }
+        }
+        // nvrtc has no default header search path for the CUDA toolkit headers
+        // (cuda_fp16.h etc.). Point it at CUDA_PATH\include so the kernels compile.
+    #if defined(_WIN32)
+        {
+            wchar_t base[4096];
+            DWORD length = GetEnvironmentVariableW(L"CUDA_PATH", base, 4096);
+            if (length > 0 && length < 4096) {
+                std::wstring winclude = std::wstring(base) + L"\\include";
+                int need = WideCharToMultiByte(
+                    CP_UTF8, 0, winclude.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (need > 1) {
+                    std::string include(static_cast<size_t>(need - 1), '\0');
+                    WideCharToMultiByte(
+                        CP_UTF8, 0, winclude.c_str(), -1, include.data(), need,
+                        nullptr, nullptr);
+                    include_flags.push_back("-I" + include);
+                    include_flags.push_back("-I" + include + "/cccl");
+                }
+            }
+        }
+    #else
+        if (const char* cuda_path = std::getenv("CUDA_PATH")) {
+            const std::string include = std::string(cuda_path) + "/include";
+            include_flags.push_back("-I" + include);
+            include_flags.push_back("-I" + include + "/cccl");
+        }
+    #endif
+        for (const auto& include_flag : include_flags) {
+            all_options.push_back(include_flag.c_str());
+        }
+        for (std::int32_t index = 0; index < option_count; ++index) {
+            all_options.push_back(options[index]);
+        }
     }
     // One loaded module per distinct (options, source) pair, kept for the
     // life of the process. Reopening a model used to recompile and overwrite
@@ -1180,7 +1480,8 @@ extern "C" int flyweight_gpu_compile(
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
-        const char* image_kind = want_cubin ? "CUBIN" : "PTX";
+        const char* image_kind =
+            platform_is_hip() ? "code object" : want_cubin ? "CUBIN" : "PTX";
         auto get_size = want_cubin ? g_api.nvrtcGetCUBINSize : g_api.nvrtcGetPTXSize;
         auto get_image = want_cubin ? g_api.nvrtcGetCUBIN : g_api.nvrtcGetPTX;
         size_t image_size = 0;
@@ -1212,7 +1513,10 @@ extern "C" int flyweight_gpu_compile(
                        + ") loading " + image_kind + " for " + std::string(arch)
                        + "; the compile succeeded and the warnings above are not "
                          "the cause. "
-                       + (want_cubin
+                       + (platform_is_hip()
+                          ? "The HIP runtime rejected the code object hipRTC built "
+                            "for this device."
+                          : want_cubin
                           ? "The NVIDIA driver does not accept code from this CUDA "
                             "toolkit's major version: update the driver, or install "
                             "a toolkit the driver supports."

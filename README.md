@@ -2,7 +2,8 @@
 
 Flyweight serves GGUF and safetensors language models from a native C++/CUDA
 runtime, behind OpenAI- and Anthropic-compatible HTTP APIs and a bundled chat
-UI. It is built for one NVIDIA card and a lot of host RAM: mixture-of-experts
+UI. It is built for one NVIDIA card (AMD RDNA cards run too, experimentally,
+through ROCm) and a lot of host RAM: mixture-of-experts
 checkpoints larger than VRAM run with their routed experts on the CPU, or
 split between the two, and the runtime measures what fits rather than asking.
 
@@ -51,6 +52,25 @@ CUDA headers (`cuda_fp16.h`, CCCL) from `CUDA_PATH`, `CUDA_HOME`,
 cuBLAS is optional and used when present. Any compute capability runs; int8
 tensor-core kernels need 7.5 or newer, and the NVFP4 prefill path needs
 Blackwell.
+
+### AMD GPUs (experimental)
+
+`--backend rocm` runs the same kernels on AMD RDNA GPUs (Radeon RX 6000, 7000
+and 9000, and RDNA APUs) through HIP, Linux only. `auto` tries it after CUDA.
+Nothing ROCm is linked into the wheel either: the runtime loads `libamdhip64`
+and `libhiprtc` from the loader path or `ROCM_PATH` (default `/opt/rocm`),
+and hipRTC compiles the kernels at startup (about 30 s, cached on disk by
+ROCm afterwards). You need the HIP runtime -- `hip-runtime-amd` on Arch, or
+AMD's ROCm packages elsewhere -- and your user in the `render` group.
+`flyweight doctor` reports what it finds.
+
+What to expect: output agrees with the CUDA path (greedy tokens can differ at
+near-ties, as between any two GPUs), but none of the tensor-core kernels are
+ported yet, so prompt processing runs on the dot-product kernels and is well
+below what the card can do. CDNA (Instinct) cards are refused: the kernels
+assume a 32-lane warp, and CDNA only runs 64-lane wavefronts. An APU ROCm does
+not list may need `HSA_OVERRIDE_GFX_VERSION` (10.3.0 for RDNA2, 11.0.0 for
+RDNA3).
 
 ### From source
 
@@ -109,7 +129,7 @@ knowing. `flyweight serve --help` lists everything, grouped.
 | `--dense-requant auto\|q8\|off` | off | optionally repack BF16 dense weights to Q8_0 on the GPU; `auto` uses VRAM pressure and `q8` forces conversion |
 | `--mtp-drafts N` | 0 | speculative decode with the checkpoint's draft block, up to 8 |
 | `--mtp-model PATH` | | a standalone draft GGUF (Qwen MTP files, DSpark for DeepSeek-V4) |
-| `--backend auto\|cuda\|cpu` | auto | `cpu` runs every kernel on the host |
+| `--backend auto\|cuda\|rocm\|cpu` | auto | `rocm` runs on an AMD RDNA GPU; `cpu` runs every kernel on the host |
 
 Expert modes:
 
@@ -461,6 +481,7 @@ holding both what the client sent and what the model saw.
 | `FLYWEIGHT_V2_MLOCK=1` | lock the mapped model in RAM |
 | `FLYWEIGHT_TOOL_GRAMMAR=0`, `FLYWEIGHT_RESPONSE_GRAMMAR=0` | disable the tool and JSON sampler constraints |
 | `CUDA_PATH`, `CUDA_HOME` | where NVRTC and the CUDA headers are looked for |
+| `ROCM_PATH` | where the HIP runtime and hipRTC are looked for after the loader path |
 
 The native runtime reads many more `FLYWEIGHT_*` switches (`_PROFILE`,
 `_TRACE`, kernel A/B toggles such as `FLYWEIGHT_CUDA_GRAPHS=0` and
@@ -469,7 +490,9 @@ when serving.
 
 ## Limitations
 
-- CUDA is the only accelerator. `--backend cpu` runs everything on the host.
+- CUDA is the main accelerator. ROCm (`--backend rocm`) is experimental:
+  RDNA only, Linux only, no tensor-core kernels, cuBLAS and NVFP4 paths off.
+  `--backend cpu` runs everything on the host.
 - Two platforms ship wheels; everything else builds from source.
 - No embeddings, audio, fine-tuning or hosted-tool APIs. Response records
   and prompt caches are process-local.
@@ -520,7 +543,9 @@ Where things live:
 - `native/src/v2_runtime.cpp`: GGUF parsing, memory planning, scheduling,
   prefix reuse, sampling and the C ABI; `v2_mtp_verifier.inc` (prefill
   driver and MTP), `v2_vision.inc` (the tower), `v2_diffusion.inc` (the image tower, Z-Image), `v2_qwenimage.inc` (Qwen-Image-2.1)
-- `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS, graphs, transfers
+- `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS, graphs, transfers;
+  the same table filled from HIP and hipRTC for ROCm, whose translation of the
+  kernel corpus lives in `flyweight_hip_prelude.hpp`
 - `native/include/flyweight_v2_qwen_kernels.hpp` and siblings: the CUDA
   kernel source, JIT-compiled by NVRTC and also compiled as host C++ for
   `--backend cpu`; `flyweight_v2_format_dispatch.hpp` maps tensor formats to

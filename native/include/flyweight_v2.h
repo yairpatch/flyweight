@@ -88,11 +88,22 @@ typedef struct FlyweightV2BailingRuntime FlyweightV2BailingRuntime;
 typedef struct FlyweightV2GpuInfo {
     int32_t available;
     int32_t device;
+    /* NVIDIA compute capability. 0.0 on ROCm, which is what keeps every
+       NVIDIA tensor-core path (int8 mma, fp4, flash attention) off there. */
     int32_t compute_major;
     int32_t compute_minor;
     uint64_t total_memory;
     uint64_t free_memory;
+    /* FLYWEIGHT_V2_GPU_PLATFORM_*; NONE when nothing answered. */
+    int32_t platform;
+    int32_t warp_size;
+    /* "sm_120" or "gfx1030". */
+    char arch[32];
 } FlyweightV2GpuInfo;
+
+#define FLYWEIGHT_V2_GPU_PLATFORM_NONE 0
+#define FLYWEIGHT_V2_GPU_PLATFORM_CUDA 1
+#define FLYWEIGHT_V2_GPU_PLATFORM_ROCM 2
 
 typedef struct FlyweightV2MemoryPlan {
     uint64_t budget;

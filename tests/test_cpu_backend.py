@@ -31,7 +31,7 @@ class CpuBackendSelectionTests(unittest.TestCase):
 
     def test_auto_resolves_to_something_concrete(self):
         selected = V2Model.select_backend("auto")
-        self.assertIn(selected, {"cuda", "cpu"})
+        self.assertIn(selected, {"cuda", "rocm", "cpu"})
         self.assertEqual(V2Model.active_backend(), selected)
 
     def test_unknown_backend_is_rejected(self):
