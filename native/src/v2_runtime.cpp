@@ -175,7 +175,9 @@ inline double moe_now() {
         : 0.0;
 }
 void qwen_moe_profile_report();
-extern "C" void flyweight_moe_profile_dump();
+// Same export as the definition: MSVC rejects a declaration whose linkage
+// differs (C2375), which GCC and Clang accept.
+extern "C" FLYWEIGHT_BACKEND_API void flyweight_moe_profile_dump();
 // Prefill can finish without ever reaching the decode-side report (a probe that
 // generates a handful of tokens never hits the every-50 tick), so guarantee the
 // numbers reach stderr. The dump covers every single-token qwen_cpu_moe call,
