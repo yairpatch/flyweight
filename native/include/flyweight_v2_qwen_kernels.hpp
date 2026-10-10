@@ -2362,8 +2362,8 @@ extern "C" __global__ void name(                                               \
     }                                                                          \
 }
 
-// Each format gets the full-cap kernel under its table name plus _r2/_r3/_r4
-// twins sized for MTP verification, which runs one to three drafts plus the
+// Each format gets the full-cap kernel under its table name plus _r2.._r7
+// twins sized for MTP verification, which runs one to seven drafts plus the
 // target row. The cap is the length of partial[] and of the unrolled row
 // loops, so a twin carries a quarter to a half of the accumulators: on the 27B
 // hybrid's IQ2 projections the 4-row cap measured 9-13% faster than the 8-row
@@ -2373,12 +2373,174 @@ extern "C" __global__ void name(                                               \
     FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name, decode_fn, stride, FLYWEIGHT_Q8_ROWS)     \
     FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r2, decode_fn, stride, 2)               \
     FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r3, decode_fn, stride, 3)               \
-    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r4, decode_fn, stride, 4)
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r4, decode_fn, stride, 4)               \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r5, decode_fn, stride, 5)               \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r6, decode_fn, stride, 6)               \
+    FLYWEIGHT_Q8_MATVEC_ROWS_CAP(name##_r7, decode_fn, stride, 7)
 #define FLYWEIGHT_Q8_MATVEC_ROWS_MIN(name, decode_fn, stride)                    \
     FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name, decode_fn, stride, FLYWEIGHT_Q8_ROWS) \
     FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r2, decode_fn, stride, 2)           \
     FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r3, decode_fn, stride, 3)           \
-    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r4, decode_fn, stride, 4)
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r4, decode_fn, stride, 4)           \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r5, decode_fn, stride, 5)           \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r6, decode_fn, stride, 6)           \
+    FLYWEIGHT_Q8_MATVEC_ROWS_MIN_CAP(name##_r7, decode_fn, stride, 7)
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The group-decode LM head (FLYWEIGHT_Q8_LM_HEAD below: a warp per vocab row,
+// eight rows per block, argmax fused) for an MTP verification batch. Each
+// group is decoded once and dotted against every row, the split the matvec
+// rows kernels above make: the ~250k-row table is read once per pass instead
+// of once per row, and the codebook decode -- the single-row head's real cost,
+// it runs well under DRAM bandwidth -- is not repeated per row either.
+// Activation r starts at vectors + r*input_size, its scales at
+// vector_scales + r*scale_stride (halves); winners[r] receives row r's packed
+// (ordered-float << 32 | ~vocab_row) result. cap bounds rows.
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS_PROLOGUE(cap)                                 \
+    __shared__ unsigned long long warp_best[8][cap];                           \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    const int row = blockIdx.x * 8 + warp;                                     \
+    float partial[cap];                                                        \
+    _Pragma("unroll")                                                          \
+    for (int r = 0; r < cap; ++r) partial[r] = 0.0f;
+
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS_EPILOGUE(cap)                                 \
+    _Pragma("unroll")                                                          \
+    for (int r = 0; r < cap; ++r) {                                            \
+        float value = partial[r];                                              \
+        for (int offset = 16; offset > 0; offset >>= 1)                        \
+            value += __shfl_down_sync(0xffffffffu, value, offset);             \
+        if (lane == 0) {                                                       \
+            const unsigned int bits = __float_as_uint(value);                  \
+            const unsigned int ordered =                                       \
+                bits ^ (((int)bits < 0) ? 0xffffffffu : 0x80000000u);          \
+            warp_best[warp][r] = row < output_size                             \
+                ? (((unsigned long long)ordered << 32)                         \
+                   | (unsigned int)(0xffffffffu - (unsigned int)row))          \
+                : 0ull;                                                        \
+        }                                                                      \
+    }                                                                          \
+    __syncthreads();                                                           \
+    if ((int)threadIdx.x < cap && (int)threadIdx.x < rows) {                   \
+        unsigned long long best = warp_best[0][threadIdx.x];                   \
+        for (int i = 1; i < 8; ++i)                                            \
+            best = max(best, warp_best[i][threadIdx.x]);                       \
+        atomicMax(winners + threadIdx.x, best);                                \
+    }
+
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS_CAP(name, decode_fn, stride, cap)             \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, unsigned long long* winners,                  \
+    const int input_size, const int output_size,                               \
+    const int rows, const int scale_stride                                     \
+) {                                                                            \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_PROLOGUE(cap)                                    \
+    if (row < output_size) {                                                   \
+        const int groups_per_row = input_size >> 5;                            \
+        const unsigned char* row_data =                                        \
+            q8_weight_row(packed, row, input_size, stride);                    \
+        for (int g = lane; g < groups_per_row; g += 32) {                      \
+            int words[8];                                                      \
+            float scale_low = 0.0f, scale_high = 0.0f;                         \
+            decode_fn(row_data, g, words, &scale_low, &scale_high);            \
+            _Pragma("unroll")                                                  \
+            for (int r = 0; r < cap; ++r) {                                    \
+                if (r >= rows) continue;                                       \
+                const int4* activation_vectors = (const int4*)(                \
+                    vectors + (long long)r * input_size + (long long)g * 32);  \
+                const int4 activation_low = activation_vectors[0];             \
+                const int4 activation_high = activation_vectors[1];            \
+                int dot_low = 0, dot_high = 0;                                 \
+                dot_low = __dp4a(words[0], activation_low.x, dot_low);         \
+                dot_low = __dp4a(words[1], activation_low.y, dot_low);         \
+                dot_low = __dp4a(words[2], activation_low.z, dot_low);         \
+                dot_low = __dp4a(words[3], activation_low.w, dot_low);         \
+                dot_high = __dp4a(words[4], activation_high.x, dot_high);      \
+                dot_high = __dp4a(words[5], activation_high.y, dot_high);      \
+                dot_high = __dp4a(words[6], activation_high.z, dot_high);      \
+                dot_high = __dp4a(words[7], activation_high.w, dot_high);      \
+                partial[r] +=                                                  \
+                    ((float)dot_low * scale_low + (float)dot_high * scale_high)\
+                    * __half2float(                                            \
+                        vector_scales[(long long)r * scale_stride + g]);       \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_EPILOGUE(cap)                                    \
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The asymmetric K-quants (Q2_K/Q4_K/Q5_K), with the per-sub-block minimum
+// folded into an activation sum as FLYWEIGHT_Q8_MATVEC_ROWS_MIN does.
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN_CAP(name, decode_fn, stride, cap)         \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, unsigned long long* winners,                  \
+    const int input_size, const int output_size,                               \
+    const int rows, const int scale_stride                                     \
+) {                                                                            \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_PROLOGUE(cap)                                    \
+    if (row < output_size) {                                                   \
+        const int blocks_per_row = input_size >> 8;                            \
+        const int groups_per_row = blocks_per_row << 3;                        \
+        const unsigned char* row_data =                                        \
+            packed + (long long)row * blocks_per_row * stride;                 \
+        for (int g = lane; g < groups_per_row; g += 32) {                      \
+            int words[8];                                                      \
+            float scale_low = 0.0f, scale_high = 0.0f;                         \
+            float offset_low = 0.0f, offset_high = 0.0f;                       \
+            decode_fn(row_data, g, words, &scale_low, &scale_high,             \
+                      &offset_low, &offset_high);                              \
+            _Pragma("unroll")                                                  \
+            for (int r = 0; r < cap; ++r) {                                    \
+                if (r >= rows) continue;                                       \
+                const int4* activation_vectors = (const int4*)(                \
+                    vectors + (long long)r * input_size + (long long)g * 32);  \
+                const int4 activation_low = activation_vectors[0];             \
+                const int4 activation_high = activation_vectors[1];            \
+                int dot_low = 0, dot_high = 0, sum_low = 0, sum_high = 0;      \
+                dot_low = __dp4a(words[0], activation_low.x, dot_low);         \
+                dot_low = __dp4a(words[1], activation_low.y, dot_low);         \
+                dot_low = __dp4a(words[2], activation_low.z, dot_low);         \
+                dot_low = __dp4a(words[3], activation_low.w, dot_low);         \
+                dot_high = __dp4a(words[4], activation_high.x, dot_high);      \
+                dot_high = __dp4a(words[5], activation_high.y, dot_high);      \
+                dot_high = __dp4a(words[6], activation_high.z, dot_high);      \
+                dot_high = __dp4a(words[7], activation_high.w, dot_high);      \
+                sum_low = __dp4a(0x01010101, activation_low.x, sum_low);       \
+                sum_low = __dp4a(0x01010101, activation_low.y, sum_low);       \
+                sum_low = __dp4a(0x01010101, activation_low.z, sum_low);       \
+                sum_low = __dp4a(0x01010101, activation_low.w, sum_low);       \
+                sum_high = __dp4a(0x01010101, activation_high.x, sum_high);    \
+                sum_high = __dp4a(0x01010101, activation_high.y, sum_high);    \
+                sum_high = __dp4a(0x01010101, activation_high.z, sum_high);    \
+                sum_high = __dp4a(0x01010101, activation_high.w, sum_high);    \
+                partial[r] +=                                                  \
+                    ((float)dot_low * scale_low - (float)sum_low * offset_low  \
+                     + (float)dot_high * scale_high                            \
+                     - (float)sum_high * offset_high)                          \
+                    * __half2float(                                            \
+                        vector_scales[(long long)r * scale_stride + g]);       \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_EPILOGUE(cap)                                    \
+}
+
+// MTP verification is at most nine rows (eight drafts plus the target row).
+// `name` is the single-row head's table name; the host appends the suffix.
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS(name, decode_fn, stride)                       \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_CAP(name##_rows, decode_fn, stride, 9)           \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_CAP(name##_rows_r2, decode_fn, stride, 2)        \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_CAP(name##_rows_r4, decode_fn, stride, 4)
+#define FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(name, decode_fn, stride)                   \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN_CAP(name##_rows, decode_fn, stride, 9)       \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN_CAP(name##_rows_r2, decode_fn, stride, 2)    \
+    FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN_CAP(name##_rows_r4, decode_fn, stride, 4)
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
@@ -4256,6 +4418,7 @@ __device__ __forceinline__ void q5k_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS_MIN(q5k_q8_matvec_transposed_rows, q5k_q8_decode, 176)
+FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(q5k_q8_lm_head_argmax_warp, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_MMQ_MIN(q5k_q8_mmq, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_MMQ_MIN_ROUTED(q5k_q8_mmq_routed, q5k_q8_decode, 176)
 
@@ -4818,6 +4981,7 @@ __device__ __forceinline__ void iq2xxs_q8_decode(
 
 
 FLYWEIGHT_Q8_MATVEC_ROWS(iq2xxs_q8_matvec_transposed_rows, iq2xxs_q8_decode, 66)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(iq2xxs_q8_lm_head_argmax_warp, iq2xxs_q8_decode, 66)
 FLYWEIGHT_Q8_MATMUL_TILED(iq2xxs_q8_matmul_tiled, iq2xxs_q8_decode, 66)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq2xxs_q8_mmq_routed, iq2xxs_q8_decode, 66, 8, 3)
 
@@ -4918,6 +5082,7 @@ __device__ __forceinline__ void q4k_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS_MIN(q4k_q8_matvec_transposed_rows, q4k_q8_decode, 144)
+FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(q4k_q8_lm_head_argmax_warp, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_MMQ_MIN(q4k_q8_mmq, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_MMQ_MIN_ROUTED(q4k_q8_mmq_routed, q4k_q8_decode, 144)
 
@@ -5051,6 +5216,7 @@ __device__ __forceinline__ void iq3xxs_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS(iq3xxs_q8_matvec_transposed_rows, iq3xxs_q8_decode, 98)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(iq3xxs_q8_lm_head_argmax_warp, iq3xxs_q8_decode, 98)
 FLYWEIGHT_Q8_MATMUL_TILED(iq3xxs_q8_matmul_tiled, iq3xxs_q8_decode, 98)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq3xxs_q8_mmq_routed, iq3xxs_q8_decode, 98, 8, 3)
 
@@ -5717,6 +5883,7 @@ __device__ __forceinline__ void iq3s_q8_decode(
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 FLYWEIGHT_Q8_MATVEC_ROWS(iq3s_q8_matvec_transposed_rows, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(iq3s_q8_lm_head_argmax_warp, iq3s_q8_decode, 110)
 FLYWEIGHT_Q8_MATMUL_TILED(iq3s_q8_matmul_tiled, iq3s_q8_decode, 110)
 FLYWEIGHT_Q8_MMQ_ONE(iq3s_q8_mmq, iq3s_q8_decode, 110)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq3s_q8_mmq_routed, iq3s_q8_decode, 110, 8, 3)
@@ -6077,6 +6244,7 @@ __device__ __forceinline__ float iq4nl_q8_group(
 // multiple of 32, which is the row width IQ4_NL exists for.
 FLYWEIGHT_Q8_MATVEC(iq4nl_q8_matvec_transposed_warp, iq4nl_q8_group, 144)
 FLYWEIGHT_Q8_MATVEC_ROWS(iq4nl_q8_matvec_transposed_rows, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(iq4nl_q8_lm_head_argmax_warp, iq4nl_q8_decode, 144)
 FLYWEIGHT_Q8_MATMUL_TILED(iq4nl_q8_matmul_tiled, iq4nl_q8_decode, 144)
 FLYWEIGHT_Q8_MMQ_ONE(iq4nl_q8_mmq, iq4nl_q8_decode, 144)
 FLYWEIGHT_Q8_LM_HEAD(iq4nl_q8_lm_head_argmax_warp, iq4nl_q8_group, 144)
@@ -6852,6 +7020,7 @@ __device__ __forceinline__ void iq1s_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS(iq1s_q8_matvec_transposed_rows, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(iq1s_q8_lm_head_argmax_warp, iq1s_q8_decode, 50)
 FLYWEIGHT_Q8_MATMUL_TILED(iq1s_q8_matmul_tiled, iq1s_q8_decode, 50)
 
 // MMQ-side twins of the decoders below: the same bits from 16-bit loads (a
@@ -7950,6 +8119,7 @@ __device__ __forceinline__ void q2k_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS_MIN(q2k_q8_matvec_transposed_rows, q2k_q8_decode, 84)
+FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(q2k_q8_lm_head_argmax_warp, q2k_q8_decode, 84)
 FLYWEIGHT_Q8_MMQ_MIN(q2k_q8_mmq, q2k_q8_decode, 84)
 FLYWEIGHT_Q8_MMQ_MIN_ROUTED(q2k_q8_mmq_routed, q2k_q8_decode, 84)
 
@@ -8057,6 +8227,7 @@ __device__ __forceinline__ void q3k_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS(q3k_q8_matvec_transposed_rows, q3k_q8_decode, 110)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(q3k_q8_lm_head_argmax_warp, q3k_q8_decode, 110)
 FLYWEIGHT_Q8_MATMUL_TILED(q3k_q8_matmul_tiled, q3k_q8_decode, 110)
 FLYWEIGHT_Q8_MMQ(q3k_q8_mmq, q3k_q8_decode, 110)
 FLYWEIGHT_Q8_MMQ_ROUTED(q3k_q8_mmq_routed, q3k_q8_decode, 110, 8, 3)
@@ -8364,6 +8535,7 @@ __device__ __forceinline__ void q6k_q8_decode(
 }
 
 FLYWEIGHT_Q8_MATVEC_ROWS(q6k_q8_matvec_transposed_rows, q6k_q8_decode, 210)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(q6k_q8_lm_head_argmax_warp, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MATMUL_TILED(q6k_q8_matmul_tiled, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MMQ(q6k_q8_mmq, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MMQ_ROUTED(q6k_q8_mmq_routed, q6k_q8_decode, 210, 8, 3)
@@ -8643,6 +8815,7 @@ __device__ __forceinline__ float q80_q8_group(
 FLYWEIGHT_Q8_MATVEC(q80_q8_matvec_transposed_warp, q80_q8_group, 272)
 FLYWEIGHT_Q8_LM_HEAD(q80_q8_lm_head_argmax_warp, q80_q8_group, 272)
 FLYWEIGHT_Q8_MATVEC_ROWS(q80_q8_matvec_transposed_rows, q80_q8_decode, 272)
+FLYWEIGHT_Q8_LM_HEAD_ROWS(q80_q8_lm_head_argmax_warp, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MATMUL_TILED(q80_q8_matmul_tiled, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MMQ_ONE(q80_q8_mmq, q80_q8_decode, 272)
 // Flat 32-element blocks, same (5, 0) shape as IQ4_NL. Stride 34 is not a
