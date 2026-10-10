@@ -1243,21 +1243,17 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t mtp_draft_nanoseconds = 0;
     std::uint64_t mtp_verify_nanoseconds = 0;
     std::uint64_t mtp_rollback_nanoseconds = 0;
-    std::uint64_t mtp_calibration_decode_nanoseconds = 0;
-    std::uint64_t mtp_calibration_round_nanoseconds = 0;
-    std::uint64_t mtp_calibration_round_tokens = 0;
-    std::uint32_t mtp_calibration_decode_tokens = 0;
-    std::uint32_t mtp_calibration_rounds = 0;
-    std::uint32_t mtp_calibration_warmup_tokens = 0;
-    bool mtp_calibration_draft_turn = false;
-    bool mtp_calibration_done = false;
-    bool mtp_adaptive_disabled = false;
-    bool mtp_adaptive_reported = false;
-    // Tokens decoded since the verdict, and what it was: a verdict taken in
-    // a load spike (or a quiet moment) expires after enough tokens so the
-    // next request re-measures rather than living with it for the process.
-    std::uint64_t mtp_verdict_tokens = 0;
-    bool mtp_adaptive_last_keep = false;
+    // Adaptive drafting; see qwen_mtp_should_draft.
+    struct MtpGate {
+        bool prefer_mtp = false;      // the mode the long windows run
+        bool exploring = false;       // in the short window of the other mode
+        bool reported = false;        // a verdict has been logged
+        std::uint32_t skip_tokens = 0;  // untimed tokens left after a boundary
+        std::uint32_t units = 0;      // tokens or rounds run in this window
+        std::uint64_t window_nanoseconds = 0, window_tokens = 0;
+        std::uint64_t long_nanoseconds = 0, long_tokens = 0;
+        std::uint32_t decode_window = 0;  // backed-off long decode window
+    } mtp_gate;
     std::uint64_t mtp_target_hidden_offset = 0;
     std::uint64_t mtp_draft_hidden_offset = 0;
     std::uint64_t mtp_verified_hidden_offset = 0;
@@ -16502,12 +16498,18 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 if(tensor==runtime->token_embeddings&&runtime->embeddings_host_resident)continue;
                 resident+=device_align(runtime->model->tensors[tensor].size);
             }
-            if(runtime->mtp_available){
-                for(auto tensor:runtime->mtp_layer_plan.static_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
+            // The draft block is uploaded only when drafting is on (see the
+            // persistent set below), so only then does it compete for the
+            // budget; counting it for a checkpoint that merely carries one
+            // spilled feed-forward to make room for weights that never load.
+            std::uint64_t mtp_weight_bytes=0;
+            if(runtime->mtp_available&&runtime->options.mtp_drafts){
+                for(auto tensor:runtime->mtp_layer_plan.static_tensors)mtp_weight_bytes+=device_align(runtime->model->tensors[tensor].size);
                 for(auto tensor:runtime->mtp_special_tensors)
                     if(tensor!=runtime->final_norm)
-                        resident+=device_align(runtime->model->tensors[tensor].size);
+                        mtp_weight_bytes+=device_align(runtime->model->tensors[tensor].size);
             }
+            resident+=mtp_weight_bytes;
             std::uint64_t budget=runtime->options.gpu_cache_bytes;
             if(!budget){
                 FlyweightV2GpuInfo gi{};
@@ -16561,8 +16563,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // the host is different arithmetic, so it moves that run's tokens.
             // Measured: it re-spills the dense contract fixture entirely and
             // the host and resident paths stop agreeing.
-            const std::size_t snapshot_slots=qwen_spec_drafts(*runtime)?1:
-                std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+            // A lambda because MTP placement below may drop drafting, which
+            // gives the slots back to --parallel.
+            const auto snapshot_slots=[&]()->std::size_t{
+                return qwen_spec_drafts(*runtime)?1:
+                    std::max<std::uint32_t>(1u,runtime->parallel_sequences);};
             // Estimated here rather than read from prefill_snapshot_bytes,
             // which is not sized until after this point. Moving that sizing
             // earlier was tried and reverted: it changes what prefix donation
@@ -16593,9 +16598,109 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // has always refused with this arithmetic spelled out, and widening
             // the reservation there re-spills the dense contract fixture, whose
             // host and resident paths then stop agreeing.
-            const std::uint64_t snapshot_pool=runtime->options.gpu_cache_bytes?0:
-                snapshot_slots*runtime->prefill_snapshots.size()*
-                    device_align(snapshot_estimate*sizeof(float));
+            const auto snapshot_pool_bytes=[&]()->std::uint64_t{
+                return runtime->options.gpu_cache_bytes?0:
+                    snapshot_slots()*runtime->prefill_snapshots.size()*
+                        device_align(snapshot_estimate*sizeof(float));};
+            std::uint64_t snapshot_pool=snapshot_pool_bytes();
+            // MTP has to earn its VRAM. The draft block's weights and state
+            // (its KV, the DeltaNet snapshot arena, the fold retention) are a
+            // few hundred MiB, and charged against a model that only just fits
+            // they push dense feed-forward to the host: a 27B IQ2_XXS at the
+            // default 32K f16 KV spilled 7 of 64 blocks under --mtp-drafts 2
+            // and decoded at 24 tok/s against 42.8 without MTP, which no
+            // acceptance rate wins back (verify gains ~1.3x at best). So when
+            // MTP's own bytes are what would spill, they come out of the
+            // context instead -- the term the auto-fit clamp below already
+            // treats as nobody's choice -- or, when --context-window was
+            // chosen, drafting is dropped. Spill a model needs regardless of
+            // MTP is left to the passes below; only MTP's share is placed here.
+            // Auto-fit only, and not under a forced spill (FLYWEIGHT_HOST_FFN_BLOCKS,
+            // --n-gpu-layers), whose block count is the caller's statement.
+            if(runtime->options.mtp_drafts&&!runtime->options.gpu_cache_bytes&&budget&&
+               !std::getenv("FLYWEIGHT_HOST_FFN_BLOCKS")&&
+               !runtime->options.gpu_layers_explicit){
+                FlyweightV2GpuInfo check{};
+                std::uint64_t check_budget=0;
+                if(gpu_probe(check,runtime->options.device)==0&&check.free_memory>0){
+                    // The allocation-check margin, as the pass below takes it.
+                    const std::uint64_t check_margin=std::max<std::uint64_t>(
+                        2048ull*1024*1024,check.total_memory/8);
+                    check_budget=check.free_memory>check_margin
+                        ?check.free_memory-check_margin:0;
+                }
+                // How far the current plan is over the tighter of the two
+                // budgets the passes below spill against, with nothing spilled.
+                const auto shortfall=[&]()->std::uint64_t{
+                    plan_kv_stage();
+                    const std::uint64_t common=runtime->workspace_bytes
+                        +runtime->slots_state_bytes+runtime->expert_staging_bytes
+                        +snapshot_pool;
+                    const std::uint64_t tight=resident+common
+                        +std::max<std::uint64_t>(1024ull*1024,budget/64);
+                    const std::uint64_t checked=resident+common
+                        +runtime->turbo_kv_stage_bytes+64ull*1024*1024;
+                    std::uint64_t over=tight>budget?tight-budget:0;
+                    if(check_budget&&checked>check_budget)
+                        over=std::max(over,checked-check_budget);
+                    return over;
+                };
+                const std::uint64_t requested=runtime->options.context_limit;
+                const std::uint64_t over=shortfall();
+                if(over){
+                    // MTP's share at the requested context: its weights plus
+                    // what its state adds to one slot (drafting runs one).
+                    const std::uint64_t with_state=runtime->state_bytes;
+                    const auto drafts=runtime->options.mtp_drafts;
+                    runtime->options.mtp_drafts=0;
+                    plan_slots(requested);
+                    const std::uint64_t without_state=runtime->state_bytes;
+                    runtime->options.mtp_drafts=drafts;
+                    plan_slots(requested);
+                    const std::uint64_t share=mtp_weight_bytes+
+                        (with_state>without_state?with_state-without_state:0);
+                    // The spill the model would take with no draft block.
+                    const std::uint64_t target=over>share?over-share:0;
+                    // Shrinking the context past half of what was asked costs
+                    // more than drafting is worth; drop MTP there instead.
+                    std::uint64_t best=0;
+                    if(!runtime->options.context_explicit&&
+                       !runtime->options.strict_resident){
+                        std::uint64_t low=std::max<std::uint64_t>(2048,requested/2);
+                        std::uint64_t high=requested-1;
+                        while(low<=high){
+                            const auto middle=low+(high-low)/2;
+                            plan_slots(middle);
+                            if(shortfall()<=target){best=middle;low=middle+1;}
+                            else high=middle-1;
+                        }
+                    }
+                    if(best){
+                        plan_slots(best);
+                        std::fprintf(stderr,
+                            "[flyweight] MTP: context %llu -> %llu tokens so the draft "
+                            "block (%llu MiB) fits without moving feed-forward to the "
+                            "CPU. Pass --context-window to choose the trade yourself; "
+                            "--cache-type-k/v q8_0 keeps more of the context.\n",
+                            static_cast<unsigned long long>(requested),
+                            static_cast<unsigned long long>(best),
+                            static_cast<unsigned long long>(share/(1024ull*1024)));
+                    }else{
+                        runtime->options.mtp_drafts=0;
+                        resident-=mtp_weight_bytes;
+                        plan_slots(requested);
+                        snapshot_pool=snapshot_pool_bytes();
+                        std::fprintf(stderr,
+                            "[flyweight] MTP disabled: the draft block (%llu MiB) would "
+                            "move dense feed-forward to the CPU at %llu tokens of "
+                            "context, which costs more than drafting gains. "
+                            "--cache-type-k/v q8_0 or a smaller --context-window "
+                            "makes room for it.\n",
+                            static_cast<unsigned long long>(share/(1024ull*1024)),
+                            static_cast<unsigned long long>(requested));
+                    }
+                }
+            }
             const std::uint64_t reserved_base=runtime->workspace_bytes
                 +runtime->slots_state_bytes
                 +runtime->expert_staging_bytes
@@ -25761,7 +25866,7 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
 
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
-static void qwen_mtp_expire_calibration(FlyweightV2QwenRuntime&runtime);
+static void qwen_mtp_note_request_boundary(FlyweightV2QwenRuntime&runtime);
 // `tail_slot` is the plan's -- see QwenPromptPlan::tail_slot. It travels as an
 // argument rather than on the runtime because the cooperative engine interleaves
 // tasks: each carries its own plan, and a second task admitted between this
@@ -25770,7 +25875,7 @@ static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token,
         uint64_t requested_generation_tokens, std::size_t tail_slot) {
     runtime->cache_admission_enabled=true;
-    if(runtime->options.mtp_drafts)qwen_mtp_expire_calibration(*runtime);
+    if(runtime->options.mtp_drafts)qwen_mtp_note_request_boundary(*runtime);
     qwen_prefetch_cpu_experts(*runtime);
     qwen_schedule_hugepage_collapse(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
@@ -26214,145 +26319,147 @@ static bool qwen_mtp_adaptive_enabled(){
     return !setting||setting[0]!='0';
 }
 
-// How many decoded tokens a calibration verdict lives before the next request
-// boundary re-runs the trial. FLYWEIGHT_MTP_RECALIBRATE_TOKENS overrides; 0
-// makes the first verdict permanent, which is what it always was.
-static std::uint64_t qwen_mtp_recalibrate_tokens(){
-    static const std::uint64_t tokens=[]{
-        const char*setting=std::getenv("FLYWEIGHT_MTP_RECALIBRATE_TOKENS");
-        return setting?std::strtoull(setting,nullptr,10):std::uint64_t{2048};
-    }();
-    return tokens;
+// Adaptive drafting is a running A/B rather than a one-off trial. The
+// preferred mode runs in long windows; after each one the other mode runs a
+// short window, and the pair -- measured back to back, so in the same thermal
+// state, on the same stretch of content -- decides the next preference.
+//
+// What it replaced: a trial of 8 ordinary tokens against 4 rounds at the start
+// of the first request, kept for 2048 tokens behind a 1.25x bar. Served, that
+// was wrong in both directions. On the 27B (steady state 19.2 ms/token
+// speculative vs 24.5 ordinary) it measured 25.1 vs 24.3 and switched drafting
+// off; on the 35B-A3B it read an ordinary baseline of 18-20 ms/token against a
+// 12.5 steady state and kept drafting that ran 13% slower. Sixteen rounds were
+// no better: acceptance alone varies ~8% over that few, and a wrong verdict
+// then stood for two thousand tokens. The bar threw away the 1.09-1.18x
+// drafting gains at temperature 0.8.
+//
+// Both modes are timed the same way, sampling included (the engine stops the
+// ordinary decode timer after the sampler, as the round's timer does).
+// Window sizes are in rounds for drafting and tokens for ordinary decode; the
+// first units after a switch are not timed, because each mode inherits the
+// other's expert-cache state, and a request boundary drops the partial
+// window and skips the tokens right after the prefill (kQwenMtpBoundarySkip).
+// A short drafting window flatters an MoE: it runs on the expert cache
+// ordinary decode shaped, and only a long one lets the verify rows churn it
+// to drafting's real steady state (served on the 35B-A3B: 10-11.5 ms/token
+// over 16 rounds after ordinary decode, 14-16.7 over 128). So drafting is
+// taken up on a short win but has to hold through a long window to stay, and
+// every time it fails that -- or ordinary decode wins a probe outright --
+// ordinary decode's window doubles. A model drafting cannot help pays a
+// shrinking share of trial windows; one it helps resets the backoff by
+// surviving a long window.
+static constexpr std::uint32_t kQwenMtpLongRounds=128;
+static constexpr std::uint32_t kQwenMtpShortRounds=16;
+static constexpr std::uint32_t kQwenMtpLongDecodeMin=32;
+static constexpr std::uint32_t kQwenMtpLongDecodeMax=4096;
+static constexpr std::uint32_t kQwenMtpShortDecode=16;
+static constexpr std::uint32_t kQwenMtpUntimedRounds=1;
+static constexpr std::uint32_t kQwenMtpUntimedDecode=4;
+// The first tokens after a prefill run far slower than steady state (cold
+// expert residency for the new prompt, clocks); neither mode is timed there.
+static constexpr std::uint32_t kQwenMtpBoundarySkip=8;
+// Hysteresis: drafting has to win by this to be taken up, and is dropped only
+// once it is slower outright, so a verdict at the edge does not flap.
+static constexpr std::uint64_t kQwenMtpAdoptPercent=95;
+
+static bool qwen_mtp_gate_drafting(const FlyweightV2QwenRuntime&runtime){
+    const auto&gate=runtime.mtp_gate;
+    return gate.exploring?!gate.prefer_mtp:gate.prefer_mtp;
 }
 
-// At a request boundary: forget an expired verdict so the trial runs again.
-// Only between requests -- a trial mid-request would interleave its arms
-// with a conversation's own decode, which is exactly the noise it measures.
-static void qwen_mtp_expire_calibration(FlyweightV2QwenRuntime&runtime){
-    const auto lifetime=qwen_mtp_recalibrate_tokens();
-    if(!runtime.mtp_calibration_done||!lifetime||runtime.mtp_verdict_tokens<lifetime)return;
-    runtime.mtp_calibration_done=false;
-    runtime.mtp_adaptive_disabled=false;
-    runtime.mtp_calibration_decode_nanoseconds=0;
-    runtime.mtp_calibration_round_nanoseconds=0;
-    runtime.mtp_calibration_round_tokens=0;
-    runtime.mtp_calibration_decode_tokens=0;
-    runtime.mtp_calibration_rounds=0;
-    runtime.mtp_calibration_warmup_tokens=0;
-    runtime.mtp_calibration_draft_turn=false;
-    runtime.mtp_verdict_tokens=0;
+static void qwen_mtp_note_request_boundary(FlyweightV2QwenRuntime&runtime){
+    auto&gate=runtime.mtp_gate;
+    gate.skip_tokens=kQwenMtpBoundarySkip;
+    gate.units=0;
+    gate.window_nanoseconds=0;
+    gate.window_tokens=0;
 }
-
-static constexpr std::uint32_t kQwenMtpBaselineTokens=8;
-static constexpr std::uint32_t kQwenMtpTrialRounds=4;
-// Tokens discarded before calibration starts. The first tokens after prefill
-// are far slower than steady state -- cold expert residency, GPU clocks still
-// ramping -- and the old gate spent its entire sequential baseline there before
-// timing MTP afterwards. That inflated the baseline enough that MTP measured as
-// a win and was kept while actually running ~30% slower.
-static constexpr std::uint32_t kQwenMtpWarmupTokens=8;
-static constexpr std::uint64_t kQwenMtpKeepPercent=80;
 
 static bool qwen_mtp_should_draft(const FlyweightV2QwenRuntime&runtime){
     // Lookup drafting gates itself on whether the history offers a match
-    // (qwen_lookup_draft returns 0 otherwise); the timing calibration below
-    // is the draft block's, and its arms would only measure rounds that the
-    // match test had already admitted.
+    // (qwen_lookup_draft returns 0 otherwise); the timing gate below is the
+    // draft block's, and its windows would only measure rounds that the match
+    // test had already admitted.
     if(!runtime.options.mtp_drafts)return runtime.lookup_drafts!=0;
-    if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
-    if(runtime.options.mtp_drafts<2||runtime.mtp_adaptive_disabled)return false;
-    if(runtime.mtp_calibration_done)return true;
-    if(runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens)return false;
-    // Alternate the two arms so both are sampled in the same thermal and cache
-    // state. Whichever arm fills first stops, and the other runs to its target.
-    const bool need_decode=
-        runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens;
-    const bool need_rounds=
-        runtime.mtp_calibration_rounds<kQwenMtpTrialRounds;
-    if(need_decode&&need_rounds)return runtime.mtp_calibration_draft_turn;
-    // One arm is full, so run the other. Both full is unreachable: whichever
-    // record_* call filled the last slot ran qwen_mtp_finish_calibration, and
-    // mtp_calibration_done returned above.
-    return need_rounds;
+    if(!qwen_mtp_adaptive_enabled())return true;
+    if(runtime.options.mtp_drafts<2)return false;
+    // The skip runs whichever mode is current, so a preferred mode is not
+    // interrupted at every request; only its timing waits.
+    return qwen_mtp_gate_drafting(runtime);
 }
 
-static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime);
+static void qwen_mtp_gate_record(
+    FlyweightV2QwenRuntime&runtime,bool drafted,std::uint64_t nanoseconds,
+    std::uint64_t tokens
+){
+    if(!qwen_mtp_adaptive_enabled()||runtime.options.mtp_drafts<2)return;
+    auto&gate=runtime.mtp_gate;
+    if(!gate.decode_window)gate.decode_window=kQwenMtpLongDecodeMin;
+    // A unit of the other mode -- an ordinary token at the tail of a request
+    // with no room for a round -- belongs to neither window.
+    if(drafted!=qwen_mtp_gate_drafting(runtime))return;
+    if(gate.skip_tokens){
+        gate.skip_tokens-=static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(gate.skip_tokens,tokens));
+        return;
+    }
+    const std::uint32_t untimed=drafted?kQwenMtpUntimedRounds:kQwenMtpUntimedDecode;
+    if(gate.units++>=untimed){
+        gate.window_nanoseconds+=nanoseconds;
+        gate.window_tokens+=tokens;
+    }
+    const std::uint32_t length=drafted
+        ?(gate.exploring?kQwenMtpShortRounds:kQwenMtpLongRounds)
+        :(gate.exploring?kQwenMtpShortDecode:gate.decode_window);
+    if(gate.units<untimed+length)return;
+    const auto window_ns=gate.window_nanoseconds,window_tokens=gate.window_tokens;
+    gate.units=0;
+    gate.window_nanoseconds=0;
+    gate.window_tokens=0;
+    if(!gate.exploring){
+        gate.long_nanoseconds=window_ns;
+        gate.long_tokens=window_tokens;
+        gate.exploring=true;
+        return;
+    }
+    gate.exploring=false;
+    if(!window_tokens||!gate.long_tokens)return;
+    const auto preferred=gate.long_nanoseconds/gate.long_tokens;
+    const auto other=window_ns/window_tokens;
+    const auto drafting=gate.prefer_mtp?preferred:other;
+    const auto ordinary=gate.prefer_mtp?other:preferred;
+    const bool want=gate.prefer_mtp
+        ?drafting<=ordinary
+        :drafting*100<ordinary*kQwenMtpAdoptPercent;
+    const bool changed=want!=gate.prefer_mtp;
+    if(want&&!changed)gate.decode_window=kQwenMtpLongDecodeMin;
+    else if(!want)gate.decode_window=std::min(gate.decode_window*2,kQwenMtpLongDecodeMax);
+    gate.prefer_mtp=want;
+    // Every change is logged, and the first verdict either way, so a server
+    // that never takes drafting up still says why.
+    if(changed||!gate.reported){
+        std::fprintf(stderr,
+            "[flyweight] MTP: %llu us/token speculative vs %llu us/token ordinary "
+            "decode -- %s\n",
+            static_cast<unsigned long long>(drafting/1000),
+            static_cast<unsigned long long>(ordinary/1000),
+            want?"drafting":"ordinary decode");
+        gate.reported=true;
+    }
+}
 
 static void qwen_mtp_record_decode(
     FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds
 ){
-    if(!qwen_mtp_adaptive_enabled())return;
-    if(runtime.mtp_adaptive_disabled||runtime.mtp_calibration_done){
-        ++runtime.mtp_verdict_tokens;
-        return;
-    }
-    if(runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens){
-        ++runtime.mtp_calibration_warmup_tokens;
-        return;
-    }
-    runtime.mtp_calibration_draft_turn=true;
-    if(runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens){
-        runtime.mtp_calibration_decode_nanoseconds+=nanoseconds;
-        ++runtime.mtp_calibration_decode_tokens;
-    }
-    qwen_mtp_finish_calibration(runtime);
-}
-
-// Both arms full -> decide. This must be reachable from whichever record_*
-// call completes the pair: the sequential arm can be the last to fill, and
-// deciding only inside record_round left should_draft returning false forever
-// with the verdict never reached -- MTP off by accident rather than by verdict.
-static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime){
-    if(runtime.mtp_calibration_done||
-       runtime.mtp_calibration_rounds<kQwenMtpTrialRounds||
-       runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens||
-       !runtime.mtp_calibration_round_tokens)return;
-    runtime.mtp_calibration_done=true;
-    const auto baseline_per_token=
-        runtime.mtp_calibration_decode_nanoseconds/
-        runtime.mtp_calibration_decode_tokens;
-    const auto mtp_per_token=
-        runtime.mtp_calibration_round_nanoseconds/
-        runtime.mtp_calibration_round_tokens;
-    // The verifier is intentionally layer-major, so it is not bit-identical to
-    // token-major decode.  Keep it only for a decisive win: besides absorbing
-    // timing and rejection variance, the short trial then ends well before
-    // harmless rounding differences can accumulate into a greedy-token change.
-    const bool keep=
-        mtp_per_token*100<baseline_per_token*kQwenMtpKeepPercent;
-    if(!keep)runtime.mtp_adaptive_disabled=true;
-    runtime.mtp_verdict_tokens=0;
-    // Report both verdicts. Only the fallback used to be logged, so a gate that
-    // wrongly kept MTP -- the case that costs the user throughput -- was
-    // completely silent. A re-calibration reports only when the verdict
-    // changed, so a stable server does not narrate every few thousand tokens.
-    const bool changed=runtime.mtp_adaptive_reported&&keep!=runtime.mtp_adaptive_last_keep;
-    runtime.mtp_adaptive_last_keep=keep;
-    if(!runtime.mtp_adaptive_reported||changed){
-        std::fprintf(stderr,
-            "[flyweight] MTP calibration: %llu us/token speculative vs "
-            "%llu us/token ordinary decode -- %s\n",
-            static_cast<unsigned long long>(mtp_per_token/1000),
-            static_cast<unsigned long long>(baseline_per_token/1000),
-            keep?"keeping MTP":"falling back to ordinary decode");
-        runtime.mtp_adaptive_reported=true;
-    }
+    qwen_mtp_gate_record(runtime,false,nanoseconds,1);
 }
 
 static void qwen_mtp_record_round(
     FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds,
     std::uint32_t committed
 ){
-    if(!qwen_mtp_adaptive_enabled())return;
-    if(runtime.mtp_adaptive_disabled||runtime.mtp_calibration_done){
-        runtime.mtp_verdict_tokens+=committed;
-        return;
-    }
-    runtime.mtp_calibration_draft_turn=false;
-    runtime.mtp_calibration_round_nanoseconds+=nanoseconds;
-    runtime.mtp_calibration_round_tokens+=committed;
-    ++runtime.mtp_calibration_rounds;
-    qwen_mtp_finish_calibration(runtime);
+    qwen_mtp_gate_record(runtime,true,nanoseconds,committed);
 }
 
 int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,FlyweightV2TokenCallback callback,void*user){return guarded([&]{
@@ -27832,13 +27939,17 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                     const auto decode_started=std::chrono::steady_clock::now();
                     const int status=flyweight_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
                     if(status)throw std::runtime_error("native Qwen decode failed");
+                    if(task->sampling.active())
+                        task->next_token=qwen_sample_last_logits(*runtime,task->sampling,task->next_token);
+                    // Timed through the sampler: qwen_mtp_round samples every
+                    // verified row inside its own timer, so stopping this one
+                    // at the argmax charged a temperature request's second
+                    // LM-head projection to the speculative arm only.
                     if(runtime->options.mtp_drafts)
                         qwen_mtp_record_decode(
                             *runtime,
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now()-decode_started).count());
-                    if(task->sampling.active())
-                        task->next_token=qwen_sample_last_logits(*runtime,task->sampling,task->next_token);
                 }
             }catch(const std::exception&error){
                 std::fprintf(stderr,"[flyweight] engine task %llu decode failed: %s\n",
