@@ -52,7 +52,7 @@ def _version() -> str:
 
 
 def _select_backend(args: argparse.Namespace) -> str:
-    """Settle CUDA against CPU before anything allocates.
+    """Settle the GPU backends against CPU before anything allocates.
 
     Every command that builds a runtime calls this: allocations belong to
     whichever backend was active when they were made, so it has to happen
@@ -270,13 +270,14 @@ def _add_model_argument(parser: argparse.ArgumentParser) -> argparse._ArgumentGr
 def _add_backend_option(group: argparse._ArgumentGroup) -> None:
     """Whether a GPU is used at all -- separate from --device, which picks one."""
     group.add_argument(
-        "--backend", choices=("auto", "cuda", "cpu"), default="auto",
-        help="where the runtime executes; auto uses CUDA when a driver is "
-             "present and falls back to the CPU backend otherwise",
+        "--backend", choices=("auto", "cuda", "rocm", "cpu"), default="auto",
+        help="where the runtime executes; auto uses CUDA, then ROCm (AMD "
+             "RDNA GPUs), when a driver is present and falls back to the CPU "
+             "backend otherwise",
     )
     group.add_argument(
         "--device", type=int, default=0, metavar="N",
-        help="CUDA device index to run on",
+        help="GPU device index to run on",
     )
 
 
@@ -1638,13 +1639,15 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
     if backend != "cpu":
         from .v2 import V2Model as _V2Model
         try:
-            available = bool(_V2Model.gpu_info()["available"])
+            # The probe answers for the active backend, so settle it first.
+            available = (_V2Model.select_backend(backend) != "cpu"
+                         and bool(_V2Model.gpu_info()["available"]))
         except Exception:
             available = False
         if available:
             device = int(getattr(args, "device", 0) or 0)
-        elif backend == "cuda":
-            raise SystemExit("no CUDA device is available")
+        elif backend in ("cuda", "rocm"):
+            raise SystemExit(f"no {'CUDA' if backend == 'cuda' else 'ROCm'} device is available")
     cache_type_k = args.cache_type_k
     cache_type_v = args.cache_type_v
     if getattr(args, "kv_dtype", None):
@@ -2005,6 +2008,38 @@ def _cuda_libraries_present() -> tuple[bool, bool]:
     return driver, nvrtc
 
 
+def _hip_libraries_present() -> tuple[bool, bool]:
+    """Whether the HIP runtime and hipRTC each load, by gpu_driver.cpp's rules."""
+    import ctypes
+
+    def loads(name: str) -> bool:
+        try:
+            ctypes.CDLL(name)
+            return True
+        except OSError:
+            return False
+
+    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm") / "lib"
+    hip = any(loads(name) for name in (
+        "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so",
+        str(root / "libamdhip64.so")))
+    hiprtc = any(loads(name) for name in (
+        "libhiprtc.so.7", "libhiprtc.so.6", "libhiprtc.so",
+        str(root / "libhiprtc.so")))
+    return hip, hiprtc
+
+
+def _amd_gpu_present() -> bool:
+    """Whether the kernel sees an AMD GPU (PCI vendor 0x1002)."""
+    for vendor in Path("/sys/class/drm").glob("card*/device/vendor"):
+        try:
+            if vendor.read_text().strip() == "0x1002":
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _cuda_headers_dir() -> Path | None:
     """The include directory NVRTC will be handed, or None when there is none.
 
@@ -2232,6 +2267,46 @@ def _doctor() -> int:
         except Exception as error:  # noqa: BLE001 - no driver is not a failure
             report("nvidia gpu", None, f"unavailable ({error})",
                    "serve with --backend cpu, or install an NVIDIA driver")
+
+    # AMD only where there is a reason to look -- ROCm installed or a Radeon
+    # the kernel can see -- so an NVIDIA box does not grow a line of noise.
+    if library_ok and sys.platform.startswith("linux"):
+        hip, hiprtc = _hip_libraries_present()
+        if hip or _amd_gpu_present():
+            try:
+                from .v2 import V2Model
+
+                previous = V2Model.active_backend()
+                V2Model.select_backend("rocm")
+                try:
+                    gpu = V2Model.gpu_info(0)
+                finally:
+                    V2Model.select_backend(previous)
+                if gpu.get("available"):
+                    free = int(gpu.get("free_memory", 0)) / (1024 ** 3)
+                    total = int(gpu.get("total_memory", 0)) / (1024 ** 3)
+                    report("amd gpu", True,
+                           f"device 0, {gpu.get('arch')}, {free:.1f}/{total:.1f} "
+                           "GiB free (--backend rocm)")
+                elif gpu.get("platform") == "rocm":
+                    report("amd gpu", None,
+                           f"{gpu.get('arch')} runs {gpu.get('warp_size')}-lane "
+                           "wavefronts; only RDNA (wave32) GPUs are supported")
+                elif not hip:
+                    report("amd gpu", None, "no HIP runtime (libamdhip64)",
+                           "install ROCm's HIP runtime (Arch: pacman -S "
+                           "hip-runtime-amd), or serve with another backend")
+                elif not hiprtc:
+                    report("amd gpu", None,
+                           "HIP runtime found, but the hipRTC library is missing",
+                           "install ROCm's hipRTC (it ships with the HIP runtime)")
+                else:
+                    report("amd gpu", None, "no usable device",
+                           "add your user to the render group; an APU ROCm does "
+                           "not list may need HSA_OVERRIDE_GFX_VERSION "
+                           "(10.3.0 for RDNA2, 11.0.0 for RDNA3)")
+            except Exception as error:  # noqa: BLE001 - no driver is not a failure
+                report("amd gpu", None, f"unavailable ({error})")
 
     print()
     print("this install can serve" if not failures

@@ -3,10 +3,13 @@
 namespace flyweight::v2 {
 inline constexpr char qwen_cuda_source[] = R"FLYWEIGHT_CUDA(
 
+// hipRTC gets the equivalents from flyweight_hip_prelude.hpp instead.
+#if !defined(FLYWEIGHT_HIP)
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_radix_sort.cuh>
+#endif
 
 // FP4 E2M1 encoding, round to nearest even with saturation: what the
 // fp4x2 e2m1 float2 constructor in the toolkit's fp4 header computes. Written

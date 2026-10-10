@@ -254,7 +254,14 @@ class _GpuInfo(ctypes.Structure):
         ("compute_minor", ctypes.c_int32),
         ("total_memory", ctypes.c_uint64),
         ("free_memory", ctypes.c_uint64),
+        ("platform", ctypes.c_int32),
+        ("warp_size", ctypes.c_int32),
+        ("arch", ctypes.c_char * 32),
     ]
+
+
+# Mirrors FLYWEIGHT_V2_GPU_PLATFORM_* in native/include/flyweight_v2.h.
+_GPU_PLATFORMS = {0: "none", 1: "cuda", 2: "rocm"}
 
 
 class _MemoryPlan(ctypes.Structure):
@@ -577,7 +584,7 @@ TASK_EVENT_TOKEN = 0
 TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
 TASK_EVENT_PREFILL = 3
-NATIVE_ABI_VERSION = 6
+NATIVE_ABI_VERSION = 7
 # "Let the runtime pick the size" for the host prompt cache, carried through the
 # option struct as a size. Lives here rather than in the CLI so a caller that is
 # not the CLI -- and the runtimes that read it -- can say the same thing.
@@ -587,7 +594,9 @@ _cached_library: ctypes.CDLL | None = None
 
 
 # Mirrors FlyweightBackend in native/include/flyweight_backend.hpp.
-_BACKENDS = {"auto": -1, "cuda": 0, "cpu": 1}
+_BACKENDS = {"auto": -1, "cuda": 0, "cpu": 1, "rocm": 2}
+# The backends that run on a GPU; they share every code path past the driver.
+GPU_BACKENDS = ("cuda", "rocm")
 
 
 def _library() -> ctypes.CDLL:
@@ -2517,10 +2526,10 @@ class V2Model:
         Must be called before a runtime is prepared: allocations belong to
         whichever backend was active when they were made.
 
-        "auto" prefers CUDA and falls back to the CPU backend when no driver
-        is present, which is the behaviour a caller almost always wants -- the
-        alternative is a hard failure on a machine that could have run the
-        model slowly.
+        "auto" prefers CUDA, then ROCm, and falls back to the CPU backend when
+        neither driver is present, which is the behaviour a caller almost
+        always wants -- the alternative is a hard failure on a machine that
+        could have run the model slowly.
         """
         lib = _library()
         if backend not in _BACKENDS:
@@ -2529,9 +2538,13 @@ class V2Model:
                 + ", ".join(sorted(_BACKENDS))
             )
         if backend == "auto":
-            # Ask the CUDA backend whether a driver is present before settling.
-            lib.flyweight_backend_select(_BACKENDS["cuda"])
-            backend = "cuda" if lib.flyweight_v2_gpu_available() == 1 else "cpu"
+            # Ask each GPU backend whether a driver is present before settling.
+            backend = "cpu"
+            for candidate in GPU_BACKENDS:
+                lib.flyweight_backend_select(_BACKENDS[candidate])
+                if lib.flyweight_v2_gpu_available() == 1:
+                    backend = candidate
+                    break
         if lib.flyweight_backend_select(_BACKENDS[backend]) != 0:
             raise V2Error(f"native backend {backend!r} is unavailable")
         return backend
@@ -2546,14 +2559,26 @@ class V2Model:
         return "unknown"
 
     @staticmethod
-    def gpu_info(device: int = 0) -> dict[str, int]:
+    def gpu_info(device: int = 0) -> dict[str, int | str]:
+        """The active GPU backend's view of `device`.
+
+        `platform` is "cuda", "rocm" or "none"; `arch` is "sm_120" or
+        "gfx1030". The compute capability is NVIDIA's and reads 0.0 on ROCm.
+        """
         lib = _library()
         value = _GpuInfo()
         status = lib.flyweight_v2_gpu_probe(device, ctypes.byref(value))
         if status:
             message = lib.flyweight_v2_last_error() or b"native v2 GPU probe failed"
             raise V2Error(message.decode(errors="replace"))
-        return {field: int(getattr(value, field)) for field, _ in _GpuInfo._fields_}
+        info: dict[str, int | str] = {
+            field: int(getattr(value, field))
+            for field, _ in _GpuInfo._fields_
+            if field not in ("platform", "arch")
+        }
+        info["platform"] = _GPU_PLATFORMS.get(int(value.platform), "none")
+        info["arch"] = value.arch.decode(errors="replace")
+        return info
 
     @staticmethod
     def memory_plan(
@@ -2603,10 +2628,10 @@ class V2Model:
     ) -> str:
         lib = _library()
         if lib.flyweight_v2_gpu_available() != 1:
-            raise V2Error("CUDA driver or NVRTC is unavailable")
+            raise V2Error("no GPU driver and runtime compiler (CUDA+NVRTC or HIP+hipRTC)")
         status = lib.flyweight_v2_gpu_init(device)
         if status:
-            raise V2Error(f"native v2 CUDA initialization failed with status {status}")
+            raise V2Error(f"native v2 GPU initialization failed with status {status}")
         if options is None:
             include_dirs: list[Path] = []
             for variable in ("CUDA_PATH", "CUDA_HOME"):
@@ -3250,7 +3275,7 @@ class V2QwenRuntime:
         self.gpu_free_after_prepare = self._gpu_free()
 
     def _gpu_free(self) -> int | None:
-        if V2Model.active_backend() != "cuda":
+        if V2Model.active_backend() not in GPU_BACKENDS:
             return None
         try:
             return int(V2Model.gpu_info(self.device)["free_memory"])

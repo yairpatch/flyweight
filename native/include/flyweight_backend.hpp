@@ -18,7 +18,8 @@
 //     registry.
 //
 // Only the memory, stream, and event primitives need explicit branches, because
-// those bottom out in the CUDA driver rather than in launch().
+// those bottom out in the CUDA driver rather than in launch(). The ROCm backend
+// needs none: it is the CUDA path with HIP behind the driver table.
 
 #include <cstdint>
 
@@ -44,6 +45,9 @@ extern "C" {
 enum FlyweightBackend {
     kFlyweightBackendCuda = 0,
     kFlyweightBackendCpu = 1,
+    // AMD GPUs through HIP/hipRTC. Shares every GPU code path with CUDA; only
+    // the library set gpu_driver.cpp loads differs.
+    kFlyweightBackendRocm = 2,
 };
 
 // Selects the backend for the process. Must be called before runtime prepare;

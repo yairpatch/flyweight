@@ -493,8 +493,8 @@ FLYWEIGHT_BACKEND_API int flyweight_backend_select(int backend) {
         g_backend.store(kFlyweightBackendCpu, std::memory_order_relaxed);
         return 0;
     }
-    if (backend == kFlyweightBackendCuda) {
-        g_backend.store(kFlyweightBackendCuda, std::memory_order_relaxed);
+    if (backend == kFlyweightBackendCuda || backend == kFlyweightBackendRocm) {
+        g_backend.store(backend, std::memory_order_relaxed);
         return 0;
     }
     return -1;

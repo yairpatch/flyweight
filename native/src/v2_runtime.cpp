@@ -7918,8 +7918,24 @@ static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime& runtime) {
 static void qwen_schedule_hugepage_collapse(FlyweightV2QwenRuntime&) {}
 #endif
 
+// The CUDA half fills in the NVIDIA fields after a successful probe.
+static void gpu_probe_cuda_identity(FlyweightV2GpuInfo& out) {
+    out.platform = FLYWEIGHT_V2_GPU_PLATFORM_CUDA; out.warp_size = 32;
+    std::snprintf(out.arch, sizeof(out.arch), "sm_%d%d", out.compute_major, out.compute_minor);
+}
+
 int gpu_probe(FlyweightV2GpuInfo& out, int device) {
     std::memset(&out, 0, sizeof(out)); out.device = device;
+    if (flyweight_backend_active() == kFlyweightBackendRocm) {
+        std::uint64_t free_bytes = 0, total_bytes = 0;
+        std::int32_t warp = 0;
+        if (flyweight_gpu_hip_probe(device, out.arch, sizeof(out.arch), &warp, &free_bytes, &total_bytes) != 0)
+            return 0;
+        // Same verdict flyweight_gpu_init reaches: the corpus is wave32 only.
+        out.available = warp == 32; out.platform = FLYWEIGHT_V2_GPU_PLATFORM_ROCM; out.warp_size = warp;
+        out.free_memory = free_bytes; out.total_memory = total_bytes;
+        return 0;
+    }
 #if defined(_WIN32)
     HMODULE lib = LoadLibraryW(L"nvcuda.dll");
     if (!lib) return 0;
@@ -7930,7 +7946,7 @@ int gpu_probe(FlyweightV2GpuInfo& out, int device) {
     // Balance the retain on every exit: an unreleased probe kept the primary
     // context alive (and its VRAM) for the life of the process.
     if(set(context)!=0) { if(release) release(device); FreeLibrary(lib); return 0; }
-    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); FreeLibrary(lib); return 0;
+    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; gpu_probe_cuda_identity(out); if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); FreeLibrary(lib); return 0;
 #else
     void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL); if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL); if (!lib) return 0;
     using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Release = int (*)(int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
@@ -7940,7 +7956,7 @@ int gpu_probe(FlyweightV2GpuInfo& out, int device) {
     // Balance the retain on every exit: an unreleased probe kept the primary
     // context alive (and its VRAM) for the life of the process.
     if(set(context)!=0) { if(release) release(device); dlclose(lib); return 0; }
-    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); dlclose(lib); return 0;
+    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; gpu_probe_cuda_identity(out); if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); dlclose(lib); return 0;
 #endif
 }
 
@@ -7950,7 +7966,7 @@ int plan_memory(FlyweightV2MemoryPlan& out, uint64_t budget, uint64_t static_wei
 }
 
 extern "C" {
-uint32_t flyweight_v2_version() { return 6; }
+uint32_t flyweight_v2_version() { return 7; }
 uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
 uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
 uint64_t flyweight_v2_placement_plan_size() { return sizeof(FlyweightV2PlacementPlan); }
