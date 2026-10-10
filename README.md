@@ -72,6 +72,14 @@ assume a 32-lane warp, and CDNA only runs 64-lane wavefronts. An APU ROCm does
 not list may need `HSA_OVERRIDE_GFX_VERSION` (10.3.0 for RDNA2, 11.0.0 for
 RDNA3).
 
+Unsupported APUs can be unreliable. On a Radeon 610M (gfx1036) with ROCm 7.2,
+the driver occasionally drops a kernel launch or runs a kernel ahead of the
+copy queued before it. A plain HIP loop shows this with Flyweight not
+involved. Mixture-of-experts models, whose CPU expert path churns host memory,
+then decode garbage in a fraction of runs. Treat output from a GPU ROCm does
+not list as untrusted. A discrete RDNA2/3/4 card, or an APU on ROCm's support
+list, is what this backend targets.
+
 ### From source
 
 Needed on macOS, on ARM, and for developing Flyweight. Python 3.11+, CMake
