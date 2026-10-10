@@ -1694,7 +1694,7 @@ class NativeV2ServerTests(unittest.TestCase):
         # silently did nothing.
         self.assertIsNone(args.hybrid_prefill)
         self.assertIsNone(args.expert_residency)
-        self.assertEqual(args.dense_requant, "auto")
+        self.assertEqual(args.dense_requant, "off")
         self.assertEqual(args.prompt_cache_mib, (1 << 32) - 1)
 
     def test_a_typed_context_window_is_marked_explicit(self) -> None:

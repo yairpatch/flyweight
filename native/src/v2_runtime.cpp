@@ -175,7 +175,9 @@ inline double moe_now() {
         : 0.0;
 }
 void qwen_moe_profile_report();
-extern "C" void flyweight_moe_profile_dump();
+// Same export as the definition: MSVC rejects a declaration whose linkage
+// differs (C2375), which GCC and Clang accept.
+extern "C" FLYWEIGHT_BACKEND_API void flyweight_moe_profile_dump();
 // Prefill can finish without ever reaching the decode-side report (a probe that
 // generates a handful of tokens never hits the every-50 tick), so guarantee the
 // numbers reach stderr. The dump covers every single-token qwen_cpu_moe call,
@@ -25995,10 +25997,21 @@ static void qwen_mtp_fold_check(
         auto compare=[&](const std::vector<float>&fold,const std::vector<float>&replay,const char*what){
             if(std::memcmp(fold.data(),replay.data(),fold.size()*sizeof(float))==0)return;
             float maximum=0.0f;
-            for(std::size_t element=0;element<fold.size();++element)
+            std::size_t first=fold.size(),differing=0;
+            for(std::size_t element=0;element<fold.size();++element){
+                if(fold[element]==replay[element])continue;
+                if(first==fold.size())first=element;
+                ++differing;
                 maximum=std::max(maximum,std::fabs(fold[element]-replay[element]));
-            std::fprintf(stderr,"mtp fold check failed: delta layer %zu %s state max_diff=%g rows=%u\n",
-                index,what,maximum,valid);
+            }
+            // Where and on what machine: this has fired intermittently on CI
+            // runners and never on a development box, so the message has to
+            // carry what a rerun cannot reproduce.
+            std::fprintf(stderr,"mtp fold check failed: delta layer %zu %s state max_diff=%g rows=%u "
+                "differing=%zu/%zu first=%zu fold=%.9g replay=%.9g cpu_features=0x%x\n",
+                index,what,maximum,valid,differing,fold.size(),first,
+                first<fold.size()?fold[first]:0.0f,first<fold.size()?replay[first]:0.0f,
+                flyweight_cpu_features());
             throw std::runtime_error("native MTP fold state diverged from replay");
         };
         compare(folded[index].conv,replayed[index].conv,"conv");

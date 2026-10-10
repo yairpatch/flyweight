@@ -315,50 +315,46 @@ class V2RuntimeTests(unittest.TestCase):
             runtime,
         )
 
-    def test_mtp_adaptive_trial_uses_warm_baseline_and_decisive_margin(self):
-        """The gate must compare like with like, and reach a verdict.
+    def test_mtp_gate_compares_like_with_like_and_reaches_a_verdict(self):
+        """The running MTP gate must time both modes fairly and decide.
 
-        This test used to assert only the constants, so it passed while the
-        gate was measuring its sequential baseline on the first 16 tokens after
-        prefill -- the slowest tokens there are -- and MTP afterwards. That
-        inflated the baseline enough to keep MTP while it ran ~30% slower.
+        It replaced a one-off trial that timed its ordinary baseline on the
+        slowest tokens there are (right after prefill) and kept a wrong verdict
+        for 2048 tokens. These pin the properties that made the replacement
+        right rather than its exact window sizes.
         """
         root = Path(__file__).resolve().parents[1]
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
-        self.assertIn("kQwenMtpKeepPercent=80", runtime)
-        self.assertIn(
-            "mtp_per_token*100<baseline_per_token*kQwenMtpKeepPercent",
-            runtime,
-        )
+        # The post-prefill ramp is skipped before either mode is timed.
+        self.assertIn("kQwenMtpBoundarySkip=8", runtime)
+        boundary = runtime.split(
+            "static void qwen_mtp_note_request_boundary(FlyweightV2QwenRuntime&runtime){")[1]
+        self.assertIn("gate.skip_tokens=kQwenMtpBoundarySkip;", boundary.split("\n}")[0])
 
-        # The post-prefill ramp is discarded before either arm is timed.
-        self.assertIn("kQwenMtpWarmupTokens=8", runtime)
-        self.assertIn(
-            "runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens",
-            runtime,
-        )
+        # The first units after a switch inherit the other mode's expert-cache
+        # state and are not timed.
+        self.assertIn("kQwenMtpUntimedRounds=1", runtime)
+        self.assertIn("kQwenMtpUntimedDecode=4", runtime)
 
-        # Both arms are then sampled alternately, in the same thermal state.
-        self.assertIn(
-            "if(need_decode&&need_rounds)return runtime.mtp_calibration_draft_turn;",
-            runtime,
-        )
+        # Hysteresis: drafting has to win clearly to be taken up, and is only
+        # dropped once it is slower outright.
+        self.assertIn("kQwenMtpAdoptPercent=95", runtime)
+        self.assertIn("drafting*100<ordinary*kQwenMtpAdoptPercent", runtime)
+        self.assertIn("?drafting<=ordinary", runtime)
 
-        # The verdict must be reachable from whichever recorder fills the last
-        # slot; deciding only inside record_round wedged should_draft at false
-        # with the verdict never reached.
-        self.assertIn("qwen_mtp_finish_calibration", runtime)
+        # Both recorders feed the one gate, so the verdict is reachable from
+        # whichever mode fills the window.
         record_decode = runtime.split("static void qwen_mtp_record_decode")[1]
-        record_decode = record_decode.split("\n}")[0]
-        self.assertIn("qwen_mtp_finish_calibration(runtime);", record_decode)
+        self.assertIn("qwen_mtp_gate_record(runtime,false,", record_decode.split("\n}")[0])
         record_round = runtime.split("static void qwen_mtp_record_round")[1]
-        record_round = record_round.split("\n}")[0]
-        self.assertIn("qwen_mtp_finish_calibration(runtime);", record_round)
+        self.assertIn("qwen_mtp_gate_record(runtime,true,", record_round.split("\n}")[0])
 
-        # Both verdicts are logged: a gate that wrongly keeps MTP used to be
-        # completely silent, which is the case that costs throughput.
-        self.assertIn('keep?"keeping MTP":"falling back', runtime)
+        # Every change is logged, and the first verdict either way: a gate that
+        # wrongly keeps MTP used to be silent, which is the case that costs
+        # throughput.
+        self.assertIn('want?"drafting":"ordinary decode"', runtime)
+        self.assertIn("if(changed||!gate.reported)", runtime)
 
     def test_mtp_small_q8_batches_use_decode_matvecs(self):
         root = Path(__file__).resolve().parents[1]
@@ -480,8 +476,9 @@ class V2RuntimeTests(unittest.TestCase):
         # is absent and cuBLAS did not run.
         self.assertIn(": (!cublas_done&&gqa_tile_tokens)", runtime)
         # The tile is chosen by what fits, not by preference.
-        self.assertIn("kv_gqa_rows_tile_tokens(*runtime,tokens)", runtime)
-        self.assertIn("records*kv_fused_record_stride(256)", runtime)
+        self.assertIn("kv_gqa_rows_tile_tokens(runtime,tokens,head_dim,heads,kv_heads)", runtime)
+        self.assertIn("const int stride=kv_fused_record_stride(group16?128:256);", runtime)
+        self.assertIn("records*static_cast<std::uint64_t>(stride)>", runtime)
         # The superseded staged variant is gone rather than left unreachable.
         self.assertNotIn("kv_attention_gqa_f16_256_s8", kernels)
         self.assertNotIn("kv_attention_gqa_f16_256_s8", driver)
