@@ -59,7 +59,7 @@ ROWS = 96
 # in native/include/flyweight_v2_qwen_kernels.hpp.
 Q8_ROW_BATCH = 8
 # Row-cap twins FLYWEIGHT_Q8_MATVEC_ROWS emits next to the full-cap kernel.
-ROW_CAP_TWINS = (2, 3, 4)
+ROW_CAP_TWINS = (2, 3, 4, 5, 6, 7)
 
 # Formats with a batched multi-row matvec. Prefill dispatches on these; see the
 # rows_kernel switch in native/src/v2_mtp_verifier.inc.
@@ -344,9 +344,9 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
             packed_ptr = self._upload_weights(label, seed=41 + index)
             # 1 and the full batch are the edges; 3 leaves the tail of the
             # unrolled row loop predicated off, which is where an unpredicated
-            # accumulator would read another row's activations. 2, 3 and 4
-            # also fill each row-cap twin exactly.
-            for batch in (1, 2, 3, 4, Q8_ROW_BATCH):
+            # accumulator would read another row's activations. 2..7 also
+            # fill each row-cap twin exactly.
+            for batch in (1, 2, 3, 4, 5, 6, 7, Q8_ROW_BATCH):
                 with self.subTest(quantization=label, batch=batch):
                     activations = np.stack([
                         self._exact_q8_activation(41 + row)
@@ -425,6 +425,95 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
                     self.assertGreater(
                         float(np.abs(expected[row] - expected[0]).max()), 1e-3,
                         "reference rows are too similar to detect a mix-up")
+
+
+# The rows LM head variants FLYWEIGHT_Q8_LM_HEAD_ROWS emits, by row cap.
+LM_HEAD_ROWS_VARIANTS = (("_rows_r2", 2), ("_rows_r4", 4), ("_rows", 9))
+
+
+def _unpack_winner(packed: int) -> tuple[int, float]:
+    """(vocab row, logit) from the LM heads' ordered-float << 32 | ~row word."""
+    row = 0xFFFFFFFF - (packed & 0xFFFFFFFF)
+    ordered = packed >> 32
+    bits = ordered ^ 0x80000000 if ordered & 0x80000000 else (~ordered) & 0xFFFFFFFF
+    return row, float(np.array([bits], dtype=np.uint32).view(np.float32)[0])
+
+
+class BatchedLmHeadTests(Q8KernelHarness, unittest.TestCase):
+    """MTP verification's LM head: one pass over the table for every row.
+
+    ``<prefix>_q8_lm_head_argmax_warp_rows*`` decodes each weight group once and
+    dots it against up to nine activation rows, writing row r's packed argmax
+    to winners[r]. Each row must name the vocab row the single-row matvec's
+    maximum names, with the same logit up to summation order. Covers both the
+    symmetric decode and the asymmetric K-quants' activation-sum path, and
+    ROWS=96 spreads the vocab over twelve blocks, so the cross-block atomicMax
+    is exercised too.
+    """
+
+    # Borrowed rather than inherited, so BatchedRowsTests' own cases do not
+    # run a second time under this class.
+    _single_row_reference = BatchedRowsTests._single_row_reference
+    _upload_weights = BatchedRowsTests._upload_weights
+
+    def test_batched_lm_head_matches_single_row_matvec(self):
+        for index, label in enumerate(FORMATS):
+            if label in NO_Q8_LM_HEAD:
+                continue
+            prefix = FORMATS[label][2]
+            packed_ptr = self._upload_weights(label, seed=61 + index)
+            for batch in (1, 2, 3, 4, 5, 9):
+                with self.subTest(quantization=label, batch=batch):
+                    activations = np.stack([
+                        self._exact_q8_activation(61 + row)
+                        for row in range(batch)])
+                    expected = self._single_row_reference(
+                        label, packed_ptr, activations, batch)
+                    scale_stride = (COLUMNS // 32) * 2
+                    vectors_f32 = self._alloc(batch * COLUMNS * 4)
+                    flat = np.ascontiguousarray(activations.reshape(-1))
+                    self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+                        vectors_f32, flat.ctypes.data_as(ctypes.c_void_p),
+                        batch * COLUMNS * 4), 0)
+                    quantized = self._alloc(batch * COLUMNS)
+                    scales = self._alloc(batch * scale_stride * 2)
+                    winners = self._alloc(9 * 8)
+                    stride = ctypes.c_int32(scale_stride)
+                    q8_ptr = ctypes.c_uint64(quantized)
+                    scale_ptr = ctypes.c_uint64(scales)
+                    self._launch(
+                        "quantize_q8_blocks_rows", (COLUMNS + 255) // 256, 256,
+                        [ctypes.c_uint64(vectors_f32), q8_ptr, scale_ptr,
+                         ctypes.c_int32(COLUMNS), stride], grid_y=batch)
+                    for suffix, cap in LM_HEAD_ROWS_VARIANTS:
+                        if batch > cap:
+                            continue
+                        kernel = f"{prefix}_q8_lm_head_argmax_warp{suffix}"
+                        self.assertEqual(self._lib.flyweight_gpu_memset(
+                            winners, 0, 9 * 8, 0), 0)
+                        self._launch(
+                            kernel, (ROWS + 7) // 8, 256,
+                            [packed_ptr, q8_ptr, scale_ptr,
+                             ctypes.c_uint64(winners), ctypes.c_int32(COLUMNS),
+                             ctypes.c_int32(ROWS), ctypes.c_int32(batch), stride])
+                        self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
+                        packed = (ctypes.c_uint64 * 9)()
+                        self.assertEqual(self._lib.flyweight_gpu_download(
+                            packed, winners, 9 * 8, 0), 0)
+                        self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
+                        for row in range(batch):
+                            chosen, logit = _unpack_winner(packed[row])
+                            self.assertEqual(
+                                chosen, int(np.argmax(expected[row])),
+                                f"{kernel} row {row} chose another vocab row")
+                            best = float(expected[row].max())
+                            self.assertAlmostEqual(
+                                logit, best, delta=2e-4 * max(1.0, abs(best)),
+                                msg=f"{kernel} row {row} logit")
+                        # Rows past the batch stay untouched.
+                        for row in range(batch, 9):
+                            self.assertEqual(packed[row], 0,
+                                             f"{kernel} wrote past the batch")
 
 
 if __name__ == "__main__":

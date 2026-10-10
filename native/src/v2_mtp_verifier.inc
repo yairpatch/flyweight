@@ -61,9 +61,9 @@ static QwenVerifyMoeProfileAtExit qwen_verify_moe_profile_at_exit;
 // where none is smaller or the module lacks it. Names are interned because the
 // timeline keeps the pointer past the launch.
 inline const char* qwen_q8_rows_kernel(const char* kernel,int rows){
-    static const char* const suffixes[]={nullptr,nullptr,"_r2","_r3","_r4"};
-    if(rows<2||rows>4)return kernel;
-    static std::map<std::string,std::string> interned[5];
+    static const char* const suffixes[]={nullptr,nullptr,"_r2","_r3","_r4","_r5","_r6","_r7"};
+    if(rows<2||rows>7)return kernel;
+    static std::map<std::string,std::string> interned[8];
     auto it=interned[rows].find(kernel);
     if(it==interned[rows].end())
         it=interned[rows].emplace(kernel,std::string(kernel)+suffixes[rows]).first;
@@ -670,7 +670,7 @@ void qwen_forward_rows(
                 return;
             }
             if(rows>1&&rows_kernel){
-                // The _r2/_r3/_r4 twins carry partial[] sized to the batch
+                // The _r2.._r7 twins carry partial[] sized to the batch
                 // rather than to kQ8RowBatch; see FLYWEIGHT_Q8_MATVEC_ROWS.
                 // The width is the single-row kernel's: the rows kernel walks
                 // a row's groups in the same blockDim strides.
@@ -3226,54 +3226,59 @@ void qwen_forward_rows(
         else rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
         if(flyweight_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
         int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
-        if(runtime.lm_head_type==8||runtime.lm_head_type==30){
+        // The Q8-activation head decode uses, but one pass over the table for
+        // every row (rows <= 9; see FLYWEIGHT_Q8_LM_HEAD_ROWS): the per-row
+        // launches re-read and re-decoded the whole vocab table per row, ~1.65
+        // ms each on the 27B's Q3_K head. Q8_0 joins it too -- it took the
+        // float rows head here while decode quantized the activation, so verify
+        // and decode disagreed on the head's input. The per-row launches
+        // remain for a module without the rows kernels, the float heads for
+        // types without a Q8 head at all.
+        const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
+        const bool lm_q8=lm_q8_kernel&&qwen_q8_head_enabled()&&
+            qwen_q8_row_fits(runtime.lm_head_type, hidden_size);
+        const char*lm_q8_rows=nullptr;
+        if(lm_q8){
+            static std::map<std::string,std::string> interned[3];
+            const int variant=rows<=2?0:(rows<=4?1:2);
+            static const char* const suffixes[]={"_rows_r2","_rows_r4","_rows"};
+            auto it=interned[variant].find(lm_q8_kernel);
+            if(it==interned[variant].end())
+                it=interned[variant].emplace(lm_q8_kernel,
+                    std::string(lm_q8_kernel)+suffixes[variant]).first;
+            if(flyweight_gpu_kernel_available(it->second.c_str()))
+                lm_q8_rows=it->second.c_str();
+        }
+        if(lm_q8){
+            int scale_stride=(hidden_size/32)*2;
+            void*quant_args[]={const_cast<std::uint64_t*>(&normalized),&small_q8,
+                &small_q8_scales,const_cast<int*>(&hidden_size),&scale_stride};
+            launch("quantize_q8_blocks_rows",(hidden_size+255)/256,
+                   static_cast<std::uint32_t>(rows),256,quant_args);
+            q8_cached_input=0;q8_cached_width=0;
+            if(lm_q8_rows){
+                void*rows_args[]={&lm_head,&small_q8,&small_q8_scales,
+                    const_cast<std::uint64_t*>(&winners),const_cast<int*>(&hidden_size),
+                    &vocabulary,&rows,&scale_stride};
+                launch(lm_q8_rows,(vocabulary+7)/8,1,256,rows_args);
+            }else for(int row=0;row<rows;++row){
+                auto row_q8=small_q8+static_cast<std::uint64_t>(row)*hidden_size;
+                auto row_scales=small_q8_scales+
+                    static_cast<std::uint64_t>(row)*(hidden_size/32)*sizeof(float);
+                auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
+                void*row_args[]={&lm_head,&row_q8,&row_scales,&winner,const_cast<int*>(&hidden_size),&vocabulary};
+                launch(lm_q8_kernel,(vocabulary+7)/8,1,256,row_args);
+            }
+        }else if(runtime.lm_head_type==8||runtime.lm_head_type==30){
             void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&winners),const_cast<int*>(&hidden_size),&vocabulary,&rows};
             launch(runtime.lm_head_type==30?"qwen_bf16_lm_head_argmax_rows":"qwen_q8_lm_head_argmax_rows",(vocabulary+7)/8,rows,256,argmax_args);
         }else{
-            // Quantized heads (K-quants, IQ, F32) have no fused rows kernel, so
-            // stand in with the per-row kernels the single-token decode uses,
-            // one launch per row. They write the same packed winner with an
-            // atomicMax on winners[0] of whatever pointer they are handed, so
-            // the row's own slot is just an offset. `rows` is the MTP verify
-            // batch (<= 9), and each launch does exactly the work the fused
-            // kernel would do for that row, so this only costs the extra
-            // launches. Without it an IQ/K-quant checkpoint served with
-            // --mtp-draft failed on the first decoded token.
-            const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
-            const char*lm_setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
-            const bool lm_q8_enabled=!lm_setting||lm_setting[0]!='0';
-            if(lm_q8_kernel&&lm_q8_enabled&&
-               qwen_q8_row_fits(runtime.lm_head_type, hidden_size)){
-                // Same trade the decode path makes: quantize the activation to
-                // Q8 blocks and run the group-decode head instead of
-                // reconstructing every weight in float. The head is the largest
-                // tensor read per row and verification reads it once per row,
-                // so the float fallback alone made speculation slower than
-                // ordinary decode on a Q3_K head.
-                for(int row=0;row<rows;++row){
-                    auto row_input=normalized+static_cast<std::uint64_t>(row)*hidden_size*sizeof(float);
-                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*hidden_size;
-                    auto row_scales=small_q8_scales+
-                        static_cast<std::uint64_t>(row)*(hidden_size/32)*sizeof(float);
-                    void*quant_args[]={&row_input,&row_q8,&row_scales,const_cast<int*>(&hidden_size)};
-                    launch("quantize_q8_blocks",(hidden_size+31)/32,1,32,quant_args);
-                }
-                for(int row=0;row<rows;++row){
-                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*hidden_size;
-                    auto row_scales=small_q8_scales+
-                        static_cast<std::uint64_t>(row)*(hidden_size/32)*sizeof(float);
-                    auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
-                    void*row_args[]={&lm_head,&row_q8,&row_scales,&winner,const_cast<int*>(&hidden_size),&vocabulary};
-                    launch(lm_q8_kernel,(vocabulary+7)/8,1,256,row_args);
-                }
-            }else{
-                const char*kernel=qwen_lm_head_argmax_kernel(runtime.lm_head_type);
-                for(int row=0;row<rows;++row){
-                    auto vector=normalized+static_cast<std::uint64_t>(row)*hidden_size*sizeof(float);
-                    auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
-                    void*row_args[]={&lm_head,&vector,&winner,const_cast<int*>(&hidden_size),&vocabulary};
-                    launch(kernel,(vocabulary+7)/8,1,256,row_args);
-                }
+            const char*kernel=qwen_lm_head_argmax_kernel(runtime.lm_head_type);
+            for(int row=0;row<rows;++row){
+                auto vector=normalized+static_cast<std::uint64_t>(row)*hidden_size*sizeof(float);
+                auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
+                void*row_args[]={&lm_head,&vector,&winner,const_cast<int*>(&hidden_size),&vocabulary};
+                launch(kernel,(vocabulary+7)/8,1,256,row_args);
             }
         }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
