@@ -54,11 +54,19 @@ class CMakeBuildPy(build_py):
             candidate = output_dir / f"{native_build.LIBRARY_STEM}{suffix}"
             if candidate.exists():
                 candidate.unlink()
-        native_build.build_native(
-            output=output_dir,
-            build_dir=root / "build" / "native",
-            development_targets=False,
-        )
+        try:
+            native_build.build_native(
+                output=output_dir,
+                build_dir=root / "build" / "native",
+                development_targets=False,
+            )
+        except Exception as error:
+            # An editable install runs build_py under setuptools' _safely_run,
+            # which turns any Exception into a deprecation warning and installs
+            # anyway: a native build that failed to compile "succeeded" with no
+            # library, on every platform. SystemExit is not an Exception, so it
+            # fails the install as a failed build should.
+            raise SystemExit(f"flyweight: the native runtime failed to build: {error}") from error
 
 
 class PlatformWheel(bdist_wheel):

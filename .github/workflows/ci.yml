@@ -51,8 +51,11 @@ jobs:
       # nothing else to obtain the runtime. It used to build via native_build
       # with PYTHONPATH=src, which is why `pip install -e .` was free to stop
       # producing a library without any job noticing.
+      # -v shows the native build's own output. Without it a Windows install
+      # that produced no library still reported success in 39 seconds, and
+      # the first sign was the doctor step below, with nothing to go on.
       - name: Install (builds the native runtime)
-        run: pip install -e .
+        run: pip install -v -e .
       - name: Check the install reports itself healthy
         run: flyweight doctor
       # Adds the contract tests and benchmarks to the same build tree. The

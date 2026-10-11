@@ -5544,7 +5544,7 @@ def _repaired_edit_arguments(
 def _parse_tool_calls(
     text: str,
     *,
-    tools: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+    tools: Sequence[Mapping[str, Any]] = (),
     keep_incomplete: bool = False,
     transcript: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -6052,7 +6052,7 @@ def _generation_result(step: GenerationStep) -> GenerationResult:
 
 
 def _tool_argument_schema(
-    tools: tuple[dict[str, Any], ...] | list[dict[str, Any]], name: str
+    tools: Sequence[Mapping[str, Any]], name: str
 ) -> dict[str, Any] | None:
     for tool in tools:
         function = tool.get("function")
@@ -6879,7 +6879,7 @@ def _validate_response_input(
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise APIError(400, "input must be a non-empty array", parameter="input")
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise APIError(400, f"input[{index}] must be an object", parameter="input")
