@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -489,6 +492,64 @@ class DenseNativeTests(unittest.TestCase):
         finally:
             runtime.close()
             model.close()
+
+
+
+class DecodeAttentionPathTests(unittest.TestCase):
+    """The tensor-core decode kernels against the serial ring pair, one
+    grouped-query shape and cache type at a time. Each decode runs in its own
+    interpreter, because the path switches latch once per process."""
+
+    SERIAL = {
+        "FLYWEIGHT_MMA_ATTENTION": "0",
+        "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+        "FLYWEIGHT_TURBO_CUBLAS": "0",
+        "FLYWEIGHT_FUSED_ATTENTION": "0",
+    }
+
+    def _decode(self, shape: tuple[int, int, int], cache: str,
+                env: dict[str, str]) -> tuple[list[int], str]:
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        run = subprocess.run(
+            [sys.executable, "-m", "tests.dense_decode_probe",
+             *(str(value) for value in shape)],
+            env={**os.environ, **env, "FLYWEIGHT_ATTENTION_DIAG": "1",
+                 "FLYWEIGHT_PROBE_KV": cache},
+            capture_output=True, text=True, timeout=900,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        tokens = json.loads(run.stdout.strip().splitlines()[-1])
+        if tokens is None:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        paths = [line for line in run.stderr.splitlines()
+                 if "[attention] decode path" in line]
+        return tokens, paths[-1] if paths else ""
+
+    def test_tensor_core_decode_matches_the_serial_pair(self):
+        # (heads, kv_heads, head_dim): 8-way at 256 (Qwen3.6-35B), 6-way at
+        # 256 (Qwen3.8-27B), 12-way at 256 (Flash-Next), 4-way at 128. Turbo
+        # had a tensor-core kernel only at 12; every other turbo shape used to
+        # take the staging path, and 6-way had no kernel of any type.
+        cases = (
+            ((16, 2, 256), "turbo4", "gqa_mma_turbo4_256_s8"),
+            ((16, 2, 256), "turbo3", "gqa_mma_turbo3_256_s8"),
+            ((12, 2, 256), "turbo4", "gqa_mma_turbo4_256_s6"),
+            ((12, 2, 256), "q8_0", "gqa_mma_q8_256_s6"),
+            ((24, 2, 256), "turbo4", "gqa_mma_turbo4_256_s12"),
+            ((8, 2, 128), "turbo4", "gqa_mma_turbo4_128_s4"),
+            # Not new, but wrong until now on this dispatcher: the 128-dim
+            # kernels' 130-float records were merged as 258-float ones.
+            ((8, 2, 128), "f16", "gqa_mma_f16_128_s4"),
+        )
+        for shape, cache, kernel in cases:
+            with self.subTest(shape=shape, cache=cache):
+                tensor_core, path = self._decode(shape, cache, {})
+                serial, serial_path = self._decode(shape, cache, self.SERIAL)
+                self.assertIn(kernel, path)
+                self.assertIn("serial ring", serial_path)
+                self.assertEqual(tensor_core, serial)
 
 
 if __name__ == "__main__":

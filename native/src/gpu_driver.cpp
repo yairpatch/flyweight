@@ -1849,6 +1849,17 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_gqa_mma_q8_128_s16_t128", "kv_attention_gqa_mma_q8_128_s16_t256",
              "kv_attention_gqa_mma_bf16_128_s4_t256", "kv_attention_gqa_mma_bf16_128_s4_t512",
              "kv_attention_gqa_mma_q8_128_s4_t256", "kv_attention_gqa_mma_q8_128_s4_t512",
+             // Qwen3.8-27B: 256-dim heads in groups of 6.
+             "kv_attention_gqa_mma_f16_256_s6_t256", "kv_attention_gqa_mma_f16_256_s6_t512",
+             "kv_attention_gqa_mma_bf16_256_s6_t256", "kv_attention_gqa_mma_bf16_256_s6_t512",
+             "kv_attention_gqa_mma_q8_256_s6_t256", "kv_attention_gqa_mma_q8_256_s6_t512",
+             // A turbo cache on the 8-, 6- and 4-way shapes.
+             "kv_attention_gqa_mma_turbo3_256_s8_t256", "kv_attention_gqa_mma_turbo3_256_s8_t512",
+             "kv_attention_gqa_mma_turbo4_256_s8_t256", "kv_attention_gqa_mma_turbo4_256_s8_t512",
+             "kv_attention_gqa_mma_turbo3_256_s6_t256", "kv_attention_gqa_mma_turbo3_256_s6_t512",
+             "kv_attention_gqa_mma_turbo4_256_s6_t256", "kv_attention_gqa_mma_turbo4_256_s6_t512",
+             "kv_attention_gqa_mma_turbo3_128_s4_t256", "kv_attention_gqa_mma_turbo3_128_s4_t512",
+             "kv_attention_gqa_mma_turbo4_128_s4_t256", "kv_attention_gqa_mma_turbo4_128_s4_t512",
              // Flash-Next: 256-dim heads, 12 query heads per KV head. One full
              // mma tile of 8 plus a partial tile of 4, sharing one cache load.
              // Turbo variants decode the codebook in that load.

@@ -18785,18 +18785,22 @@ inline const char* kv_gqa_mma_kernel(
     if(!enabled||kv_heads<=0)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
-    // Four instantiated shapes: 256-dim heads in groups of 8, which fill the
-    // mma's 8-wide query tile exactly; 128-dim heads in groups of 4, which
-    // leave half of it idle; 128-dim heads in groups of 16 (Muse), which are
-    // two full tiles of 8 sharing one load of the cache row; and 256-dim heads
-    // in groups of 12 (Flash-Next), one full tile plus a partial tile of 4,
-    // also sharing one load. Anything else falls through to the grouped-rows
-    // kernel.
+    // Five instantiated shapes: 256-dim heads in groups of 8, which fill the
+    // mma's 8-wide query tile exactly; 256-dim heads in groups of 6 and
+    // 128-dim heads in groups of 4, which leave part of it idle; 128-dim heads
+    // in groups of 16 (Muse), which are two full tiles of 8 sharing one load
+    // of the cache row; and 256-dim heads in groups of 12 (Flash-Next), one
+    // full tile plus a partial tile of 4, also sharing one load. Turbo caches
+    // have all but the 16-way group. Anything else falls through to the
+    // grouped-rows kernel.
     const bool wide=head_dim==256&&heads==kv_heads*8;
     const bool narrow_heads=head_dim==128&&heads==kv_heads*4;
     const bool group16=head_dim==128&&heads==kv_heads*16;
     const bool group12=head_dim==256&&heads==kv_heads*12;
-    if(!wide&&!narrow_heads&&!group16&&!group12)return nullptr;
+    // And 256-dim heads in groups of 6 (Qwen3.8-27B), two columns of the mma
+    // tile idle, the way 4-way leaves four.
+    const bool group6=head_dim==256&&heads==kv_heads*6;
+    if(!wide&&!narrow_heads&&!group16&&!group12&&!group6)return nullptr;
     if(group12){
         if(tile!=128&&tile!=256&&tile!=512)return nullptr;
         const char* name=
@@ -18832,12 +18836,30 @@ inline const char* kv_gqa_mma_kernel(
     if(tile!=256&&tile!=512)return nullptr;
     const bool narrow=tile==256;
     const char* name=wide?(
+        t==5?(narrow?"kv_attention_gqa_mma_turbo4_256_s8_t256"
+                    :"kv_attention_gqa_mma_turbo4_256_s8_t512"):
+        t==4?(narrow?"kv_attention_gqa_mma_turbo3_256_s8_t256"
+                    :"kv_attention_gqa_mma_turbo3_256_s8_t512"):
         t==3?(narrow?"kv_attention_gqa_mma_q8_256_s8_t256"
                     :"kv_attention_gqa_mma_q8_256_s8_t512"):
         t==2?(narrow?"kv_attention_gqa_mma_bf16_256_s8_t256"
                     :"kv_attention_gqa_mma_bf16_256_s8_t512"):
         t==1?(narrow?"kv_attention_gqa_mma_f16_256_s8_t256"
-                    :"kv_attention_gqa_mma_f16_256_s8_t512"):nullptr):(
+                    :"kv_attention_gqa_mma_f16_256_s8_t512"):nullptr):group6?(
+        t==5?(narrow?"kv_attention_gqa_mma_turbo4_256_s6_t256"
+                    :"kv_attention_gqa_mma_turbo4_256_s6_t512"):
+        t==4?(narrow?"kv_attention_gqa_mma_turbo3_256_s6_t256"
+                    :"kv_attention_gqa_mma_turbo3_256_s6_t512"):
+        t==3?(narrow?"kv_attention_gqa_mma_q8_256_s6_t256"
+                    :"kv_attention_gqa_mma_q8_256_s6_t512"):
+        t==2?(narrow?"kv_attention_gqa_mma_bf16_256_s6_t256"
+                    :"kv_attention_gqa_mma_bf16_256_s6_t512"):
+        t==1?(narrow?"kv_attention_gqa_mma_f16_256_s6_t256"
+                    :"kv_attention_gqa_mma_f16_256_s6_t512"):nullptr):(
+        t==5?(narrow?"kv_attention_gqa_mma_turbo4_128_s4_t256"
+                    :"kv_attention_gqa_mma_turbo4_128_s4_t512"):
+        t==4?(narrow?"kv_attention_gqa_mma_turbo3_128_s4_t256"
+                    :"kv_attention_gqa_mma_turbo3_128_s4_t512"):
         t==3?(narrow?"kv_attention_gqa_mma_q8_128_s4_t256"
                     :"kv_attention_gqa_mma_q8_128_s4_t512"):
         t==2?(narrow?"kv_attention_gqa_mma_bf16_128_s4_t256"
@@ -18870,7 +18892,7 @@ inline int kv_gqa_rows_tile_tokens(
     // a 256-token tile is only a few blocks, so the 128-token tile is offered
     // first and the wider ones exist for when the partial records no longer fit.
     const bool group12=head_dim==256&&share==12;
-    const int stride=kv_fused_record_stride(group16?128:256);
+    const int stride=kv_fused_record_stride(head_dim==128?128:256);
     const int candidates[3]={(group16||group12)?128:256,(group16||group12)?256:512,512};
     int previous=-1;
     for(const int tile:candidates){
@@ -19364,7 +19386,13 @@ void qwen_decode_attention_full(
             const_cast<int*>(&gqa_tile_count)};
         // Turbo partials are still in the rotated domain, so they take
         // the merge that undoes it. f16, bf16 and q8 take the plain one.
-        launch_named(kv_fused_merge_kernel_name(runtime,256),
+        // At the kernel's own width: a record is head_dim + 2 floats, and
+        // the 128-dim kernels (4- and 16-way) write 130 of them. Merging
+        // those as 258-float records read every head but the first out of
+        // alignment -- garbage attention for any Qwen-family model with
+        // 128-dim heads in those groups, which only the 128-dim dispatcher
+        // (K2-Horizon, Muse) had been getting right.
+        launch_named(kv_fused_merge_kernel_name(runtime,kv_fused_width(head_dim)),
             heads,1,256,merge_args);
     }else if(runtime.fused_attention&&kv_fused_width(head_dim)&&
        (kv_fused_width(head_dim)==128

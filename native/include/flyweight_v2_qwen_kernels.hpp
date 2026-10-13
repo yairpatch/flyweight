@@ -12996,8 +12996,12 @@ __device__ __forceinline__ void kv_mma_stage_turbo(
     }
 }
 
+// turbo_bits != 0 reads a turbo cache, the same way the 12-way kernel below
+// does: each query head is rotated once into the store's basis (the dot is
+// invariant under the shared rotation), K and V decode through the turbo
+// staging, and the partial stays rotated for the turbo merge to undo.
 template<typename KT, typename VT, typename Operand, int maximum_head_dim,
-         int share, int tokens_per_tile>
+         int share, int tokens_per_tile, int turbo_bits = 0>
 __device__ void kv_attention_gqa_mma_impl(
     const float* query,
     const KT* keys,
@@ -13047,7 +13051,35 @@ __device__ void kv_attention_gqa_mma_impl(
     // Q as the second operand, once, scaled on the way in: lane `l` carries
     // query head `group` at dims 2*quad, +1, +8, +9 of every 16-dim step.
     unsigned int query_operand[fragments][2];
-    {
+    if constexpr (turbo_bits > 0) {
+        // Columns past `share` stay zero, as on the plain path below.
+        __shared__ float rotated_query[maximum_head_dim];
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            query_operand[fragment][0] = 0u;
+            query_operand[fragment][1] = 0u;
+        }
+        for (int local = 0; local < share; ++local) {
+            const float* src = query + (long long)(head_base + local) * head_dim;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+                rotated_query[d] = src[d] * turbo_sign_d(d, 0u);
+            __syncthreads();
+            turbo_fwht_shared(rotated_query, head_dim);
+            if (group == local) {
+                #pragma unroll
+                for (int fragment = 0; fragment < fragments; ++fragment) {
+                    const int start = fragment * 16 + 2 * quad;
+                    query_operand[fragment][0] = kv_mma_pack<Operand>(
+                        rotated_query[start] * scale,
+                        rotated_query[start + 1] * scale);
+                    query_operand[fragment][1] = kv_mma_pack<Operand>(
+                        rotated_query[start + 8] * scale,
+                        rotated_query[start + 9] * scale);
+                }
+            }
+            __syncthreads();
+        }
+    } else {
         // The mma's query dimension is eight columns wide. A group narrower
         // than that (4-way GQA) fills the first `share` and zeroes the rest,
         // so the spare columns cost their share of the tensor-core issue and
@@ -13082,9 +13114,15 @@ R"FLYWEIGHT_CUDA(
         float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         #pragma unroll
         for (int chunk = 0; chunk < chunks; ++chunk) {
-            kv_mma_stage<KT, Operand, chunk_dims, stride>(
-                keys, stage, kv_head, capacity, first, base, live,
-                chunk * chunk_dims, head_dim, lane);
+            if constexpr (turbo_bits > 0)
+                kv_mma_stage_turbo<turbo_bits, chunk_dims, stride>(
+                    reinterpret_cast<const unsigned char*>(keys), stage,
+                    kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            else
+                kv_mma_stage<KT, Operand, chunk_dims, stride>(
+                    keys, stage, kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
             __syncwarp();
             #pragma unroll
             for (int step = 0; step < chunk_dims / 16; ++step) {
@@ -13154,9 +13192,15 @@ R"FLYWEIGHT_CUDA(
 
         #pragma unroll
         for (int chunk = 0; chunk < chunks; ++chunk) {
-            kv_mma_stage<VT, Operand, chunk_dims, stride>(
-                values, stage, kv_head, capacity, first, base, live,
-                chunk * chunk_dims, head_dim, lane);
+            if constexpr (turbo_bits > 0)
+                kv_mma_stage_turbo<turbo_bits, chunk_dims, stride>(
+                    reinterpret_cast<const unsigned char*>(values), stage,
+                    kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
+            else
+                kv_mma_stage<VT, Operand, chunk_dims, stride>(
+                    values, stage, kv_head, capacity, first, base, live,
+                    chunk * chunk_dims, head_dim, lane);
             __syncwarp();
             #pragma unroll
             for (int step = 0; step < chunk_dims / 16; ++step) {
@@ -13956,7 +14000,51 @@ KV_ATTENTION_GQA_MMA(
 KV_ATTENTION_GQA_MMA(
     kv_attention_gqa_mma_q8_128_s4_t256, unsigned char, unsigned char, __half,
     128, 4, 256)
+// 256-dim heads in 6-way groups (Qwen3.8-27B: 24/4). Nothing in the kernel
+// assumes a power of two -- it only compares `group < share` -- so the group
+// needed instantiations, not code; without them this model fell to the
+// per-head fused tiles, which re-read every cached row once per query head.
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_256_s6_t512, __half, __half, __half, 256, 6, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_256_s6_t256, __half, __half, __half, 256, 6, 256)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_256_s6_t512, unsigned char, unsigned char, __half,
+    256, 6, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_256_s6_t256, unsigned char, unsigned char, __half,
+    256, 6, 256)
 #endif
+// A turbo cache on the same shapes. It had no tensor-core kernel outside the
+// 12-way group, so these models took the staging path: the whole window
+// re-expanded to f16 every decoded token, then cuBLAS read it again.
+#define KV_ATTENTION_GQA_MMA_TURBO(name, DIM, SHARE, TILE, BITS) \
+extern "C" __global__ __launch_bounds__(256, 1) void name( \
+    const float* query, const unsigned char* keys, const unsigned char* values, \
+    float* partial, const int heads, const int kv_heads, const int head_dim, \
+    const int tokens, const int capacity, const int first, const float scale \
+) { \
+    kv_attention_gqa_mma_impl<unsigned char, unsigned char, __half, DIM, SHARE, \
+                              TILE, BITS>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_256_s8_t512, 256, 8, 512, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_256_s8_t256, 256, 8, 256, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_256_s8_t512, 256, 8, 512, 4)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_256_s8_t256, 256, 8, 256, 4)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_256_s6_t512, 256, 6, 512, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_256_s6_t256, 256, 6, 256, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_256_s6_t512, 256, 6, 512, 4)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_256_s6_t256, 256, 6, 256, 4)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_128_s4_t512, 128, 4, 512, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo3_128_s4_t256, 128, 4, 256, 3)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_128_s4_t512, 128, 4, 512, 4)
+KV_ATTENTION_GQA_MMA_TURBO(kv_attention_gqa_mma_turbo4_128_s4_t256, 128, 4, 256, 4)
+#endif
+#undef KV_ATTENTION_GQA_MMA_TURBO
 // bf16 operands are one step later than f16 ones.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 KV_ATTENTION_GQA_MMA(
@@ -13971,6 +14059,12 @@ KV_ATTENTION_GQA_MMA(
 KV_ATTENTION_GQA_MMA(
     kv_attention_gqa_mma_bf16_128_s4_t256, __nv_bfloat16, __nv_bfloat16,
     __nv_bfloat16, 128, 4, 256)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_256_s6_t512, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 256, 6, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_256_s6_t256, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 256, 6, 256)
 #endif
 #undef KV_ATTENTION_GQA_MMA
 )FLYWEIGHT_CUDA"
