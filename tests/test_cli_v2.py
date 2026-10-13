@@ -401,6 +401,28 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertEqual(captured_kwargs.get("cache_type_v"), "q8_0")
         mock_serve_http.assert_called_once_with(args, service)
 
+    def test_cache_dir_reaches_the_server_and_only_the_server(self) -> None:
+        args = _parser().parse_args(
+            ["serve", "model.gguf", "--cache-dir", "/tmp/prompts"])
+        captured_kwargs: dict[str, object] = {}
+
+        def build(*args_, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        with patch("flyweight.cli._architecture", return_value="qwen3"), \
+                patch("flyweight.cli.V2Model"), \
+                patch("flyweight.v2_server.NativeV2InferenceService", build), \
+                patch("flyweight.cli._serve_http", return_value=0):
+            self.assertEqual(_serve(args), 0)
+        self.assertEqual(captured_kwargs.get("prompt_cache_dir"), "/tmp/prompts")
+        self.assertIsNone(
+            _parser().parse_args(["serve", "model.gguf"]).prompt_cache_dir)
+        # generate keeps no prompt cache and has no shutdown to save at.
+        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            _parser().parse_args(
+                ["generate", "model.gguf", "--prompt", "hi", "--cache-dir", "x"])
+
     def test_deepseek_serve_honours_cache_type_and_gpu_budget(self) -> None:
         args = _parser().parse_args([
             "serve", "model.gguf", "--backend", "cpu",

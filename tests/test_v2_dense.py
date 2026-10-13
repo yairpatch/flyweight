@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -138,6 +139,212 @@ class DenseNativeTests(unittest.TestCase):
         finally:
             runtime.close()
             model.close()
+            V2Model.select_backend("auto")
+
+    def test_restored_checkpoints_keep_their_recency(self):
+        # A conversation displaced into the host cache, re-sent, then
+        # continued must find the same checkpoint it would have without the
+        # round trip. The restore used to stamp the checkpoints newest first,
+        # inverting their recency, so the re-send's end-of-prompt snapshot
+        # overwrote the freshest mid checkpoint (200 here) instead of the
+        # oldest, and the continuation fell back to 100.
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        main = [5] * 300
+        diverged = [*main[:250], *([9] * 20)]
+
+        def reuse(displace: bool) -> int:
+            runtime = model.native_runtime(
+                context_limit=1024, mtp_drafts=0, parallel_sequences=1,
+                prompt_cache_mib=64, prefill_checkpoint_interval=64)
+            runtime.prepare()
+            try:
+                # More than one token, so the re-send cannot take the live
+                # state whole and has to restore the tail checkpoint.
+                _collect_task(runtime, runtime.task_submit(main, 4))
+                if displace:
+                    _run_task(runtime, [11] * 300)
+                _run_task(runtime, main)
+                _run_task(runtime, diverged)
+                return runtime.info["prefix_cache_last_reused_tokens"]
+            finally:
+                runtime.close()
+
+        try:
+            self.assertEqual(reuse(displace=False), 200)
+            self.assertEqual(reuse(displace=True), 200)
+        finally:
+            V2Model.select_backend("auto")
+
+    def _cached_runtime(self, model: V2Model, **options):
+        runtime = model.native_runtime(
+            context_limit=512,
+            mtp_drafts=0,
+            parallel_sequences=1,
+            prompt_cache_mib=64,
+            **options,
+        )
+        runtime.prepare()
+        return runtime
+
+    def _cache_directory(self) -> Path:
+        holder = tempfile.TemporaryDirectory(prefix="flyweight-prompts-")
+        _WORKSPACES.append(holder)
+        return Path(holder.name) / "cache"
+
+    def test_prompt_cache_survives_a_restart(self):
+        # The conversation still on the slot is the one worth keeping, and
+        # nothing displaced it into the host cache: saving has to spill it.
+        # Restored, it must continue exactly as the live runtime did.
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        directory = self._cache_directory()
+        main = [5] * 300
+        try:
+            first = self._cached_runtime(model)
+            try:
+                _run_task(first, main)
+                fingerprint = first.prompt_cache_fingerprint()
+                self.assertEqual(first.save_prompt_cache(directory, fingerprint), 1)
+                # Unchanged entries are not written again.
+                self.assertEqual(first.save_prompt_cache(directory, fingerprint), 0)
+                live = _collect_task(first, first.task_submit([*main, 7], 4))
+            finally:
+                first.close()
+            self.assertEqual(len(list(directory.glob("*.fwpc"))), 1)
+
+            second = self._cached_runtime(model)
+            try:
+                self.assertEqual(second.prompt_cache_fingerprint(), fingerprint)
+                entries, size = second.load_prompt_cache(directory, fingerprint)
+                self.assertEqual(entries, 1)
+                self.assertGreater(size, 0)
+                restored = _collect_task(second, second.task_submit([*main, 7], 4))
+                self.assertEqual(
+                    second.info["prefix_cache_last_reused_tokens"], len(main))
+                self.assertEqual(restored, live)
+            finally:
+                second.close()
+        finally:
+            V2Model.select_backend("auto")
+
+    def test_server_restores_at_startup_and_saves_at_close(self):
+        from flyweight.v2_server import NativeV2InferenceService
+
+        V2Model.select_backend("cpu")
+        model, _, path = _model()
+        root = self._cache_directory()
+
+        def service(runtime):
+            # The prompt cache plumbing alone, without the HTTP layer.
+            instance = NativeV2InferenceService.__new__(NativeV2InferenceService)
+            instance.v2_runtime = runtime
+            instance._prompt_cache_dir = instance._load_prompt_cache(root, path)
+            return instance
+
+        try:
+            first = self._cached_runtime(model)
+            try:
+                saver = service(first)
+                directory = saver._prompt_cache_dir
+                self.assertEqual(directory.parent, root)
+                # Older configurations of the same model, oldest first.
+                stale = [root / f"{path.stem}-{index:016x}" for index in range(3)]
+                for age, old in enumerate(reversed(stale), start=1):
+                    old.mkdir(parents=True)
+                    os.utime(old, (age * 1000, age * 1000))
+                _run_task(first, [5] * 300)
+                saver._save_prompt_cache()
+            finally:
+                first.close()
+            self.assertEqual(len(list(directory.glob("*.fwpc"))), 1)
+            # Three configurations are kept: this one and the two newest.
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                sorted([directory.name, stale[0].name, stale[1].name]))
+
+            second = self._cached_runtime(model)
+            try:
+                service(second)
+                self.assertEqual(second.info["prompt_cache_entries"], 1)
+            finally:
+                second.close()
+        finally:
+            V2Model.select_backend("auto")
+
+    def test_prompt_cache_skips_what_it_cannot_use(self):
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        directory = self._cache_directory()
+        main = [5] * 300
+
+        def damage() -> None:
+            entry = next(directory.glob("*.fwpc"))
+            entry.write_bytes(entry.read_bytes()[: entry.stat().st_size // 2])
+
+        try:
+            first = self._cached_runtime(model)
+            try:
+                _run_task(first, main)
+                fingerprint = first.prompt_cache_fingerprint()
+                first.save_prompt_cache(directory, fingerprint)
+            finally:
+                first.close()
+            second = self._cached_runtime(model)
+            try:
+                # Another configuration's entry is left alone...
+                self.assertEqual(
+                    second.load_prompt_cache(directory, fingerprint + "x"), (0, 0))
+                # ...and a damaged one is skipped, then replaced when the same
+                # conversation is saved over it.
+                damage()
+                self.assertEqual(
+                    second.load_prompt_cache(directory, fingerprint), (0, 0))
+                self.assertEqual(second.info["prompt_cache_entries"], 0)
+                _run_task(second, main)
+                self.assertEqual(second.save_prompt_cache(directory, fingerprint), 1)
+            finally:
+                second.close()
+            third = self._cached_runtime(model)
+            try:
+                self.assertEqual(
+                    third.load_prompt_cache(directory, fingerprint)[0], 1)
+            finally:
+                third.close()
+            # Damaged with nothing to replace it, the next save drops it.
+            damage()
+            fourth = self._cached_runtime(model)
+            try:
+                self.assertEqual(
+                    fourth.load_prompt_cache(directory, fingerprint), (0, 0))
+                self.assertEqual(fourth.save_prompt_cache(directory, fingerprint), 0)
+                self.assertEqual(list(directory.glob("*.fwpc")), [])
+            finally:
+                fourth.close()
+        finally:
+            V2Model.select_backend("auto")
+
+    def test_prompt_cache_fingerprint_tracks_meaning_not_placement(self):
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        try:
+            base = self._cached_runtime(model)
+            placed = model.native_runtime(
+                context_limit=256, mtp_drafts=0, parallel_sequences=2,
+                prompt_cache_mib=128, cpu_threads=2)
+            placed.prepare()
+            quantized = self._cached_runtime(model, cache_type_k="q8_0",
+                                             cache_type_v="q8_0")
+            try:
+                self.assertEqual(base.prompt_cache_fingerprint(),
+                                 placed.prompt_cache_fingerprint())
+                self.assertNotEqual(base.prompt_cache_fingerprint(),
+                                    quantized.prompt_cache_fingerprint())
+            finally:
+                base.close()
+                placed.close()
+                quantized.close()
+        finally:
             V2Model.select_backend("auto")
 
     def test_tail_checkpoint_survives_a_last_token_divergence(self):

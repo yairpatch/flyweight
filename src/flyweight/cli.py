@@ -523,6 +523,17 @@ def _add_runtime_options(
              # would otherwise print as its sentinel.
              + (" (default: auto)" if cache_default else " (default: off)"),
     )
+    # Only the server keeps a prompt cache by default, and only it has a
+    # shutdown to save at.
+    if cache_default:
+        add(
+            placement, "--cache-dir", dest="prompt_cache_dir", default=None,
+            metavar="DIR",
+            help="keep the prompt cache on disk here across restarts: written "
+                 "at shutdown, read back at startup within the --cache budget. "
+                 "Each model and configuration gets its own subdirectory, and "
+                 "entries saved under different settings are never restored",
+        )
     add(
         placement, "--kv-dtype", "--kv-cache-type", dest="kv_dtype",
         choices=KV_TYPES, default=None,
@@ -1552,7 +1563,7 @@ def _benchmark(args: argparse.Namespace) -> int:
 _DEEPSEEK4_UNSUPPORTED = (
     "expert_mode", "hybrid_prefill",
     "expert_residency", "dense_requant", "gpu_layers",
-    "prompt_cache_mib", "swa_full",
+    "prompt_cache_mib", "prompt_cache_dir", "swa_full",
     "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
     "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
     "prefill_checkpoint_interval", "prefill_checkpoint_slots",
@@ -1791,6 +1802,7 @@ def _serve(args: argparse.Namespace) -> int:
         parallel_sequences=args.parallel_sequences,
         scratch_context=args.scratch_context,
         prompt_cache_mib=args.prompt_cache_mib,
+        prompt_cache_dir=getattr(args, "prompt_cache_dir", None),
         swa_full=args.swa_full,
         prefill_cache_seed=args.prefill_cache_seed,
         routed_moe=args.routed_moe,

@@ -915,6 +915,17 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime* 
 /* Writes one attention layer's live KV window as f32 for the TurboQuant
    quality harness: int32 count, int32 head_dim, then the keys and the values. */
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_dump_kv(FlyweightV2QwenRuntime* runtime, uint32_t layer_index, const char* path);
+/* The host prompt cache on disk, so a session survives a restart. `save`
+   first spills every slot's conversation into the host cache, then writes
+   each entry as one file under `directory` (unchanged ones only have their
+   recency refreshed) and deletes the files the cache no longer holds.
+   `load` reads entries back into the host cache, newest first within its
+   budget. `fingerprint` describes the configuration: it is stored in every
+   file and a file whose fingerprint differs is skipped, as is one whose state
+   layout does not match this runtime. Both are no-ops without a prepared
+   runtime and a host cache budget; neither may run beside a generation. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_prompt_cache_save(FlyweightV2QwenRuntime* runtime, const char* directory, const char* fingerprint, uint64_t* written);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_prompt_cache_load(FlyweightV2QwenRuntime* runtime, const char* directory, const char* fingerprint, uint64_t* loaded, uint64_t* bytes);
 /* Importance-matrix capture, armed by FLYWEIGHT_IMATRIX=1 at prepare. `count`
    is how many weight tensors have seen activations. `entry` reads one of
    them: the tensor name, its channel width (input channels, times experts

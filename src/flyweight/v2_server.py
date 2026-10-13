@@ -3,9 +3,14 @@ from __future__ import annotations
 import codecs
 import dataclasses
 import datetime
+import hashlib
 import json
+import os
+import re
+import shutil
 import sys
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -2734,6 +2739,32 @@ def _report_placement(runtime: V2QwenRuntime) -> None:
     print("[flyweight] placement\n" + text, file=sys.stderr)
 
 
+# How many configurations of one model keep a saved prompt cache. Each is a
+# directory of up to the --cache budget, and the fingerprint changes with every
+# rebuild of the native library, so without a bound a development checkout
+# leaves a few GiB behind per build.
+_PROMPT_CACHE_CONFIGURATIONS = 3
+
+
+def _prune_prompt_caches(directory: Path) -> None:
+    """Keep the most recently saved configurations of this model, drop the rest."""
+    try:
+        os.utime(directory)
+    except OSError:
+        return
+    stem, _, _ = directory.name.rpartition("-")
+    pattern = re.compile(re.escape(stem) + r"-[0-9a-f]{16}")
+    siblings = sorted(
+        (path for path in directory.parent.iterdir()
+         if path.is_dir() and pattern.fullmatch(path.name)),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in siblings[_PROMPT_CACHE_CONFIGURATIONS:]:
+        if stale != directory:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
 class NativeV2InferenceService(InferenceService):
     def __init__(
         self,
@@ -2767,6 +2798,7 @@ class NativeV2InferenceService(InferenceService):
         parallel_sequences: int = 1,
         scratch_context: int = 0,
         prompt_cache_mib: int = 0,
+        prompt_cache_dir: str | Path | None = None,
         swa_full: bool = False,
         prefill_cache_seed: int | str | None = None,
         routed_moe: bool = False,
@@ -2892,6 +2924,8 @@ class NativeV2InferenceService(InferenceService):
             raise
         assert self.v2_runtime is not None
         _report_placement(self.v2_runtime)
+        self._prompt_cache_dir = self._load_prompt_cache(
+            prompt_cache_dir, model_path)
         try:
             tokenizer = NativeV2Tokenizer(
             self.v2_model, image_max_tokens=self.image_max_tokens)
@@ -2985,10 +3019,67 @@ class NativeV2InferenceService(InferenceService):
         # One sequence of caches, so requests must not overlap.
         self._serialize_generation = True
 
+    def _load_prompt_cache(
+        self, root: str | Path | None, model_path: str | Path
+    ) -> Path | None:
+        """Restore the prompt cache an earlier run saved; return where it lives.
+
+        One directory per configuration, named by the model and a hash of the
+        runtime's fingerprint, so runs that cannot share state never overwrite
+        each other's files. A failure here costs the restored conversations,
+        not the server, so it is reported and startup carries on.
+        """
+        runtime = self.v2_runtime
+        if root is None or runtime is None:
+            return None
+        try:
+            if not runtime.placement["prompt_cache_limit_bytes"]:
+                log_notice("--cache-dir needs the prompt cache, which --cache off disabled")
+                return None
+            fingerprint = runtime.prompt_cache_fingerprint()
+            digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+            directory = Path(root).expanduser() / f"{Path(model_path).stem}-{digest}"
+            started = time.perf_counter()
+            entries, size = runtime.load_prompt_cache(directory, fingerprint)
+        except (OSError, V2Error) as error:
+            log_notice(f"prompt cache not restored: {error}")
+            return None
+        self._prompt_cache_fingerprint = fingerprint
+        if entries:
+            print(
+                f"[flyweight] prompt cache: restored {entries} conversation(s), "
+                f"{size / 1024**2:,.0f} MiB from {directory} "
+                f"in {time.perf_counter() - started:.1f} s",
+                file=sys.stderr,
+            )
+        return directory
+
+    def _save_prompt_cache(self) -> None:
+        directory = getattr(self, "_prompt_cache_dir", None)
+        if directory is None or self.v2_runtime is None:
+            return
+        started = time.perf_counter()
+        try:
+            written = self.v2_runtime.save_prompt_cache(
+                directory, self._prompt_cache_fingerprint)
+        except (OSError, V2Error) as error:
+            print(f"[flyweight] prompt cache not saved: {error}", file=sys.stderr)
+            return
+        if written:
+            print(
+                f"[flyweight] prompt cache: saved {written} conversation(s) to "
+                f"{directory} in {time.perf_counter() - started:.1f} s",
+                file=sys.stderr,
+            )
+        _prune_prompt_caches(directory)
+
     def close(self) -> None:
         generator_close = getattr(self.generator, "close", None)
         if callable(generator_close):
             generator_close()
+        # After the engine has stopped touching the runtime, before the
+        # runtime goes: saving reads every slot's arena.
+        self._save_prompt_cache()
         images = getattr(self, "images", None)
         if images is not None:
             images.close()
