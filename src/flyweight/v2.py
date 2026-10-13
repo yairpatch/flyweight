@@ -1129,6 +1129,16 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
                 ]
                 lib.flyweight_v2_qwen_runtime_dump_kv.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_prompt_cache_save.argtypes = [
+                    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.flyweight_v2_qwen_prompt_cache_save.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_prompt_cache_load.argtypes = [
+                    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.flyweight_v2_qwen_prompt_cache_load.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_imatrix_count.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
                 ]
@@ -3118,6 +3128,7 @@ class V2QwenRuntime:
             int(gpu_layers is not None),
             min(int(gpu_layers or 0), 0xFFFFFFFF),
         )
+        self._options = options
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(
                 model._handle, ctypes.byref(options), ctypes.byref(self._handle)
@@ -3234,6 +3245,93 @@ class V2QwenRuntime:
                 self._handle, ctypes.c_uint32(layer), str(path).encode("utf-8")
             )
         )
+
+    # Runtime options that only decide where things run or how much is held,
+    # never what a cached state means: a saved conversation stays valid across
+    # them. Everything else is in the fingerprint, so an option added later
+    # invalidates saved caches until someone decides it belongs here -- the
+    # safe direction to be wrong in. The cache types are replaced by the
+    # resolved ones, which is what "auto" actually picked.
+    _PROMPT_CACHE_PLACEMENT_OPTIONS = frozenset({
+        "device", "moe_device", "context_limit", "gpu_cache_bytes",
+        "cache_type_k", "cache_type_v",
+        "prefill_checkpoint_interval", "prefill_checkpoint_slots",
+        "parallel_sequences", "prompt_cache_mib", "prefill_cache_seed",
+        "expert_paging", "cpu_prefetch_mib", "cpu_prefetch_auto",
+        "next_layer_prefetch", "cpu_threads", "hybrid_prefill_cpu",
+        "immutable_residency", "prefill_cache_seed_auto", "strict_resident",
+        "prefill_expert_stream_mib", "scratch_context", "context_explicit",
+        "vision_max_tokens", "gpu_layers_explicit",
+    })
+
+    def prompt_cache_fingerprint(self) -> str:
+        """What a saved prompt cache depends on, as one stable string.
+
+        The weights (each file by path, size and modification time), the
+        native library build, the resolved KV cache types, and every runtime
+        option that can change what a cached state means. The native side
+        stores it in each file and skips any whose string differs; it also
+        checks the state layout itself, which catches a mismatch this misses
+        but not one that keeps the layout and changes the meaning. Needs a
+        prepared runtime, because "auto" cache types resolve at prepare.
+        """
+        def identity(path: Path | None) -> list[object] | None:
+            if path is None:
+                return None
+            stat = path.stat()
+            return [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+
+        info = self.info
+        options = {
+            name: getattr(self._options, name)
+            for name, _ in _QwenRuntimeOptions._fields_
+            if name not in self._PROMPT_CACHE_PLACEMENT_OPTIONS
+        }
+        return json.dumps({
+            "format": 1,
+            "model": identity(self.model.path),
+            "mtp_model": identity(self.model.mtp_model_path),
+            "mmproj": identity(self.model.mmproj_path),
+            "native": identity(Path(self._lib._name)),
+            "cache_type_k": info["cache_type_k"],
+            "cache_type_v": info["cache_type_v"],
+            "options": options,
+        }, sort_keys=True)
+
+    def save_prompt_cache(self, directory: str | Path, fingerprint: str) -> int:
+        """Spill every slot into the host prompt cache and write it to disk.
+
+        Returns how many entries were written; one already on disk unchanged
+        is not rewritten. Must not run beside a generation.
+        """
+        written = ctypes.c_uint64()
+        self.model._check(
+            self._lib.flyweight_v2_qwen_prompt_cache_save(
+                self._handle, str(directory).encode("utf-8"),
+                fingerprint.encode("utf-8"), ctypes.byref(written),
+            )
+        )
+        return int(written.value)
+
+    def load_prompt_cache(
+        self, directory: str | Path, fingerprint: str
+    ) -> tuple[int, int]:
+        """Read saved entries back into the host prompt cache, newest first.
+
+        Returns (entries, bytes) loaded. Entries whose fingerprint or state
+        layout does not match this runtime are skipped, as are any past the
+        cache's budget.
+        """
+        loaded = ctypes.c_uint64()
+        size = ctypes.c_uint64()
+        self.model._check(
+            self._lib.flyweight_v2_qwen_prompt_cache_load(
+                self._handle, str(directory).encode("utf-8"),
+                fingerprint.encode("utf-8"), ctypes.byref(loaded),
+                ctypes.byref(size),
+            )
+        )
+        return int(loaded.value), int(size.value)
 
     def imatrix_entries(self) -> list[tuple[str, list[float], int]]:
         """The importance matrix the run accumulated: (name, sums, rows) each.

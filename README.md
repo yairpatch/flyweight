@@ -129,6 +129,7 @@ knowing. `flyweight serve --help` lists everything, grouped.
 | `--parallel N` | 1 | independent sequence slots, each with its own KV cache |
 | `--scratch-context N` | 0 | smaller context for the slots past the first |
 | `--cache auto\|off\|MIB` | auto | host-RAM cache for displaced conversations, restored by longest prefix. `auto` is one eighth of free RAM, capped at 8 GiB |
+| `--cache-dir DIR` | off | keep that cache on disk across restarts: saved at shutdown (Ctrl-C or SIGTERM), restored at startup within the `--cache` budget. Each model and configuration gets its own subdirectory, and the three most recent are kept |
 | `--cache-type-k`, `--cache-type-v` | f16 | KV precision: `f32`, `f16`, `bf16`, `q8_0`, `turbo3`, `turbo4` |
 | `--gpu-cache-mib N` | 0 | VRAM for the expert cache; 0 sizes it from what is free at startup |
 | `--expert-mode` | auto | where routed experts run, below |
@@ -503,7 +504,7 @@ when serving.
   `--backend cpu` runs everything on the host.
 - Two platforms ship wheels; everything else builds from source.
 - No embeddings, audio, fine-tuning or hosted-tool APIs. Response records
-  and prompt caches are process-local.
+  are process-local, and so are prompt caches unless `--cache-dir` is set.
 - Qwen3.8-Flash-Next runs its sparse-attention layers as dense attention by
   default, exact within the trained 2048-token selection budget and an
   approximation beyond it. MTP needs a release with a draft block (the

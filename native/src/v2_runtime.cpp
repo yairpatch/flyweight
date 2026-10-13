@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #if defined(_WIN32)
@@ -789,6 +790,10 @@ struct QwenHostPrompt {
     // laid out differently has to re-derive both range lists and check they
     // still describe the same regions.
     std::size_t geometry = 0;
+    // Already on disk as written: read from there at startup, or saved
+    // earlier in this run. Only such an entry may skip its write -- a file of
+    // the same name could otherwise be a damaged one load skipped.
+    bool persisted = false;
 };
 
 // Resumable prompt-processing state shared by the blocking generate path and
@@ -24723,8 +24728,19 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         seq.last_output_greedy = e.last_output_greedy;
     }
     std::size_t slot_i = 0;
+    // The spill stored the checkpoints newest first, so stamping them in that
+    // order inverted their recency: the freshest mid checkpoint came back as
+    // the least recently used, and the next turn's tail rotation
+    // (qwen_prompt_begin) overwrote exactly it. Measured on the 35B: a
+    // conversation restored, re-sent, then continued reused 8448 of 23911
+    // tokens against 15616 without the round trip. Count down instead.
+    const std::uint64_t restored =
+        std::min<std::uint64_t>(e.snapshots.size(), snapshots.size());
+    const std::uint64_t clock_base = snapshot_clock;
+    snapshot_clock += restored;
     for (auto& hs : e.snapshots) {
         if (slot_i >= snapshots.size()) break;
+        const std::uint64_t clock = clock_base + restored - slot_i;
         auto& dst = snapshots[slot_i++];
         if (flyweight_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
             || flyweight_gpu_stream_sync(runtime.stream) != 0) {
@@ -24739,7 +24755,7 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         dst.last_output = hs.last_output;
         dst.last_output_greedy = hs.last_output_greedy;
         dst.valid = true;
-        dst.clock = ++snapshot_clock;
+        dst.clock = clock;
     }
     for (std::size_t i = slot_i; i < snapshots.size(); ++i)
         snapshots[i].valid = false;
@@ -24763,6 +24779,335 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
     qwen_free_host_prompt(runtime, entry_idx);
     return true;
 }
+
+// The host prompt cache on disk, so a long session survives a server restart
+// instead of reprefilling from zero (llama.cpp's --slot-save-path, but written
+// at shutdown and read at startup rather than driven by an endpoint).
+//
+// One file per QwenHostPrompt, named by a hash of its tokens and image spans,
+// so an entry that comes back unchanged is not rewritten. The caller keeps one
+// directory per configuration and passes a fingerprint string that every file
+// stores and must match on load; the state layout is then checked again
+// against this runtime's own ranges, so a file from another model, cache type
+// or build is skipped rather than restored into the wrong arena.
+//
+// Layout, host byte order: "FWPC", u32 version, u64 recency, u64 fingerprint
+// length + bytes, u64 position, u32 last output, u8 greedy, tokens (u64 count
+// + u32s), image spans (u64 count + fields), u64 range count + u64 sizes,
+// u64 state bytes, u64 snapshot bytes, u64 snapshot count, the packed state,
+// each snapshot (tokens, spans, u32 last output, u8 greedy, bytes), "FWPC".
+// Recency sits at a fixed offset so a save can refresh an unchanged entry's
+// place in the LRU order without rewriting its state.
+extern "C++" {
+namespace {
+constexpr char kPromptFileMagic[4]={'F','W','P','C'};
+constexpr std::uint32_t kPromptFileVersion=1;
+constexpr const char* kPromptFileSuffix=".fwpc";
+constexpr long kPromptFileRecencyOffset=8;
+
+struct PromptFileWriter {
+    std::FILE* file;
+    bool ok=true;
+    void bytes(const void* data,std::size_t size){
+        if(ok&&size&&std::fwrite(data,1,size,file)!=size)ok=false;
+    }
+    template<typename T> void value(T v){bytes(&v,sizeof v);}
+    void tokens(const std::vector<std::uint32_t>& t){
+        value<std::uint64_t>(t.size());
+        bytes(t.data(),t.size()*sizeof(std::uint32_t));
+    }
+    void spans(const std::vector<QwenImageSpan>& spans){
+        value<std::uint64_t>(spans.size());
+        for(const auto& s:spans){
+            value(s.start);value(s.count);value(s.grid_h);value(s.grid_w);value(s.hash);
+        }
+    }
+};
+
+struct PromptFileReader {
+    std::FILE* file;
+    bool ok=true;
+    void bytes(void* data,std::size_t size){
+        if(ok&&size&&std::fread(data,1,size,file)!=size)ok=false;
+    }
+    template<typename T> T value(){T v{};bytes(&v,sizeof v);return v;}
+    // Every count is bounded before anything is sized from it: a damaged
+    // length has to fail the entry, not ask for terabytes.
+    std::uint64_t count(std::uint64_t limit){
+        const auto n=value<std::uint64_t>();
+        if(n>limit)ok=false;
+        return ok?n:0;
+    }
+    std::vector<std::uint32_t> tokens(std::uint64_t limit){
+        std::vector<std::uint32_t> t(count(limit));
+        bytes(t.data(),t.size()*sizeof(std::uint32_t));
+        return t;
+    }
+    std::vector<QwenImageSpan> spans(std::uint64_t limit){
+        std::vector<QwenImageSpan> spans(count(limit));
+        for(auto& s:spans){
+            s.start=value<std::uint64_t>();s.count=value<std::uint32_t>();
+            s.grid_h=value<std::uint32_t>();s.grid_w=value<std::uint32_t>();
+            s.hash=value<std::uint64_t>();
+        }
+        return spans;
+    }
+};
+
+std::string prompt_file_name(const QwenHostPrompt& e){
+    std::uint64_t h=1469598103934665603ull;
+    auto mix=[&](const void* data,std::size_t size){
+        const auto* p=static_cast<const unsigned char*>(data);
+        for(std::size_t i=0;i<size;++i){h^=p[i];h*=1099511628211ull;}
+    };
+    mix(e.tokens.data(),e.tokens.size()*sizeof(std::uint32_t));
+    for(const auto& s:e.image_spans){
+        mix(&s.start,sizeof s.start);mix(&s.count,sizeof s.count);
+        mix(&s.grid_h,sizeof s.grid_h);mix(&s.grid_w,sizeof s.grid_w);
+        mix(&s.hash,sizeof s.hash);
+    }
+    char name[17];
+    std::snprintf(name,sizeof name,"%016llx",static_cast<unsigned long long>(h));
+    return std::string(name)+kPromptFileSuffix;
+}
+
+bool write_prompt_file(const std::filesystem::path& path,const QwenHostPrompt& e,
+        const std::string& fingerprint,std::uint64_t recency,
+        std::uint64_t snapshot_bytes,
+        const std::vector<std::pair<std::uint64_t,std::uint64_t>>& ranges){
+    std::FILE* file=std::fopen(path.string().c_str(),"wb");
+    if(!file)return false;
+    PromptFileWriter w{file};
+    w.bytes(kPromptFileMagic,sizeof kPromptFileMagic);
+    w.value(kPromptFileVersion);
+    w.value(recency);
+    w.value<std::uint64_t>(fingerprint.size());
+    w.bytes(fingerprint.data(),fingerprint.size());
+    w.value(e.position);
+    w.value(e.last_output_token);
+    w.value<std::uint8_t>(e.last_output_greedy);
+    w.tokens(e.tokens);
+    w.spans(e.image_spans);
+    w.value<std::uint64_t>(ranges.size());
+    std::uint64_t state_bytes=0;
+    for(const auto& r:ranges){w.value(r.second);state_bytes+=r.second;}
+    w.value(state_bytes);
+    w.value(snapshot_bytes);
+    w.value<std::uint64_t>(e.snapshots.size());
+    w.bytes(e.state,state_bytes);
+    for(const auto& s:e.snapshots){
+        w.tokens(s.tokens);
+        w.spans(s.image_spans);
+        w.value(s.last_output);
+        w.value<std::uint8_t>(s.last_output_greedy);
+        w.bytes(s.state,snapshot_bytes);
+    }
+    w.bytes(kPromptFileMagic,sizeof kPromptFileMagic);
+    const bool closed=std::fclose(file)==0;
+    return w.ok&&closed;
+}
+
+// Read one entry. With `payload` false only the header is read and checked,
+// which is what choosing the newest entries within the budget needs; `e.bytes`
+// then says what the entry would cost. Returns false for any file this runtime
+// cannot use: wrong magic, version or fingerprint, a layout that does not match
+// its ranges, a truncated or damaged body.
+bool read_prompt_file(FlyweightV2QwenRuntime& runtime,const std::filesystem::path& path,
+        const std::string& fingerprint,bool payload,QwenHostPrompt& e,
+        std::uint64_t& recency){
+    std::FILE* file=std::fopen(path.string().c_str(),"rb");
+    if(!file)return false;
+    PromptFileReader r{file};
+    std::vector<void*> buffers;
+    const auto fail=[&]{
+        for(void* b:buffers)std::free(b);
+        std::fclose(file);
+        e=QwenHostPrompt{};
+        return false;
+    };
+    char magic[4]{};
+    r.bytes(magic,sizeof magic);
+    if(!r.ok||std::memcmp(magic,kPromptFileMagic,sizeof magic)!=0)return fail();
+    if(r.value<std::uint32_t>()!=kPromptFileVersion)return fail();
+    recency=r.value<std::uint64_t>();
+    std::string stored(r.count(1u<<20),'\0');
+    r.bytes(stored.data(),stored.size());
+    if(!r.ok||stored!=fingerprint)return fail();
+    const std::uint64_t context=qwen_slot_context(runtime,0);
+    e.position=r.value<std::uint64_t>();
+    e.last_output_token=r.value<std::uint32_t>();
+    e.last_output_greedy=r.value<std::uint8_t>()!=0;
+    e.tokens=r.tokens(context);
+    e.image_spans=r.spans(context);
+    if(!r.ok||e.position>context)return fail();
+    // The packed state is the slot's live ranges at this position, so it is
+    // only meaningful against the same list, region for region.
+    const auto ranges=qwen_slot_state_ranges(runtime,0,e.position);
+    const std::uint64_t range_count=r.count(1u<<20);
+    if(!r.ok||range_count!=ranges.size())return fail();
+    std::uint64_t state_bytes=0;
+    for(const auto& range:ranges){
+        if(r.value<std::uint64_t>()!=range.second)return fail();
+        state_bytes+=range.second;
+    }
+    if(r.value<std::uint64_t>()!=state_bytes)return fail();
+    const std::uint64_t snapshot_bytes=r.value<std::uint64_t>();
+    const std::uint64_t snapshot_count=r.count(64);
+    if(!r.ok||(snapshot_count&&snapshot_bytes!=runtime.prefill_snapshot_bytes))return fail();
+    e.geometry=0;
+    e.bytes=state_bytes+snapshot_count*snapshot_bytes;
+    if(!payload){std::fclose(file);return true;}
+    e.state=std::malloc(state_bytes?state_bytes:1);
+    if(!e.state)return fail();
+    buffers.push_back(e.state);
+    r.bytes(e.state,state_bytes);
+    for(std::uint64_t i=0;i<snapshot_count&&r.ok;++i){
+        QwenHostSnapshot s;
+        s.tokens=r.tokens(context);
+        s.image_spans=r.spans(context);
+        s.last_output=r.value<std::uint32_t>();
+        s.last_output_greedy=r.value<std::uint8_t>()!=0;
+        s.state=std::malloc(snapshot_bytes);
+        if(!s.state)return fail();
+        buffers.push_back(s.state);
+        r.bytes(s.state,snapshot_bytes);
+        e.snapshots.push_back(std::move(s));
+    }
+    r.bytes(magic,sizeof magic);
+    if(!r.ok||std::memcmp(magic,kPromptFileMagic,sizeof magic)!=0)return fail();
+    std::fclose(file);
+    return true;
+}
+}  // namespace
+}  // extern "C++"
+
+int flyweight_v2_qwen_prompt_cache_save(
+    FlyweightV2QwenRuntime* runtime, const char* directory,
+    const char* fingerprint, uint64_t* written
+){return guarded([&]{
+    if(!runtime||!directory||!fingerprint)
+        throw std::runtime_error("invalid prompt cache save arguments");
+    if(written)*written=0;
+    if(!runtime->state||!runtime->host_cache_limit_bytes||runtime->sequences.empty())
+        return 0;
+    // The conversations still on the GPU slots are the ones most worth
+    // keeping -- the active one above all -- and nothing has spilled them,
+    // because nothing displaced them. Spilling applies the cache's own rules:
+    // tiny prompts skipped, a dominated prefix replaced, the budget kept.
+    for(std::size_t slot=0;slot<runtime->sequences.size();++slot)
+        qwen_spill_slot_to_host(*runtime,slot);
+    namespace fs=std::filesystem;
+    const fs::path root(directory);
+    fs::create_directories(root);
+    const std::string stamp(fingerprint);
+    // Recency runs on across restarts: this save's entries follow every
+    // earlier save's, in the order the in-memory LRU had them.
+    const std::uint64_t base=static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count())*1000;
+    std::set<std::string> keep;
+    std::uint64_t count=0;
+    for(auto& e:runtime->host_prompts){
+        const std::string name=prompt_file_name(e);
+        keep.insert(name);
+        const fs::path target=root/name;
+        const std::uint64_t recency=base+e.clock;
+        if(e.persisted&&fs::exists(target)){
+            // Written as it stands: refresh its place in the LRU order only.
+            if(std::FILE* file=std::fopen(target.string().c_str(),"r+b")){
+                if(std::fseek(file,kPromptFileRecencyOffset,SEEK_SET)==0)
+                    std::fwrite(&recency,sizeof recency,1,file);
+                std::fclose(file);
+            }
+            continue;
+        }
+        const fs::path temp=root/(name+".tmp");
+        const auto ranges=qwen_slot_state_ranges(*runtime,e.geometry,e.position);
+        if(!write_prompt_file(temp,e,stamp,recency,runtime->prefill_snapshot_bytes,ranges)){
+            std::error_code ignored;
+            fs::remove(temp,ignored);
+            throw std::runtime_error("failed to write prompt cache entry "+temp.string());
+        }
+        fs::rename(temp,target);
+        e.persisted=true;
+        ++count;
+    }
+    // What the cache no longer holds -- evicted, superseded by a longer turn
+    // of the same conversation, or left out of the budget at load -- goes, as
+    // does a temporary file an interrupted save left behind.
+    const std::string suffix(kPromptFileSuffix);
+    for(const auto& item:fs::directory_iterator(root)){
+        const std::string name=item.path().filename().string();
+        const bool entry=name.size()>suffix.size()&&
+            name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0;
+        const bool temp=name.size()>4&&name.compare(name.size()-4,4,".tmp")==0&&
+            name.find(suffix)!=std::string::npos;
+        if((entry&&!keep.count(name))||temp){
+            std::error_code ignored;
+            fs::remove(item.path(),ignored);
+        }
+    }
+    if(written)*written=count;
+    return 0;
+});}
+
+int flyweight_v2_qwen_prompt_cache_load(
+    FlyweightV2QwenRuntime* runtime, const char* directory,
+    const char* fingerprint, uint64_t* loaded, uint64_t* bytes
+){return guarded([&]{
+    if(!runtime||!directory||!fingerprint)
+        throw std::runtime_error("invalid prompt cache load arguments");
+    if(loaded)*loaded=0;
+    if(bytes)*bytes=0;
+    if(!runtime->state||!runtime->host_cache_limit_bytes||runtime->sequences.empty())
+        return 0;
+    namespace fs=std::filesystem;
+    const fs::path root(directory);
+    std::error_code missing;
+    if(!fs::is_directory(root,missing))return 0;
+    const std::string stamp(fingerprint);
+    const std::string suffix(kPromptFileSuffix);
+    struct Candidate{fs::path path;std::uint64_t recency;std::uint64_t bytes;};
+    std::vector<Candidate> candidates;
+    for(const auto& item:fs::directory_iterator(root)){
+        const std::string name=item.path().filename().string();
+        if(name.size()<=suffix.size()||
+           name.compare(name.size()-suffix.size(),suffix.size(),suffix)!=0)continue;
+        QwenHostPrompt header;
+        std::uint64_t recency=0;
+        if(read_prompt_file(*runtime,item.path(),stamp,false,header,recency))
+            candidates.push_back({item.path(),recency,header.bytes});
+    }
+    // Newest first into the budget; whatever does not fit is left on disk for
+    // the next save to drop, exactly as the in-memory cache would have.
+    std::sort(candidates.begin(),candidates.end(),
+        [](const Candidate& a,const Candidate& b){return a.recency>b.recency;});
+    std::vector<Candidate> chosen;
+    std::uint64_t used=runtime->host_cache_used_bytes;
+    for(const auto& c:candidates){
+        if(c.bytes>runtime->host_cache_limit_bytes-std::min(used,runtime->host_cache_limit_bytes))
+            continue;
+        used+=c.bytes;
+        chosen.push_back(c);
+    }
+    // Oldest first, so the fresh clocks keep the order the LRU had.
+    std::reverse(chosen.begin(),chosen.end());
+    std::uint64_t count=0,total=0;
+    for(const auto& c:chosen){
+        QwenHostPrompt e;
+        std::uint64_t recency=0;
+        if(!read_prompt_file(*runtime,c.path,stamp,true,e,recency))continue;
+        e.persisted=true;
+        e.clock=++runtime->host_cache_clock;
+        runtime->host_cache_used_bytes+=e.bytes;
+        total+=e.bytes;
+        runtime->host_prompts.push_back(std::move(e));
+        ++count;
+    }
+    if(loaded)*loaded=count;
+    if(bytes)*bytes=total;
+    return 0;
+});}
 
 // Copy a cached prefix from one slot into another, so a prompt that merely
 // SHARES a conversation's opening does not have to take over the slot holding
