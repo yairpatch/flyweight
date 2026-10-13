@@ -477,7 +477,11 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn(": (!cublas_done&&gqa_tile_tokens)", runtime)
         # The tile is chosen by what fits, not by preference.
         self.assertIn("kv_gqa_rows_tile_tokens(runtime,tokens,head_dim,heads,kv_heads)", runtime)
-        self.assertIn("const int stride=kv_fused_record_stride(group16?128:256);", runtime)
+        # Sized by the kernel's own head width: a 128-dim record is 130 floats.
+        self.assertIn("const int stride=kv_fused_record_stride(head_dim==128?128:256);", runtime)
+        # And merged at that width -- the 128-dim kernels' records were once
+        # merged as 258-float ones on this dispatcher.
+        self.assertIn("kv_fused_merge_kernel_name(runtime,kv_fused_width(head_dim))", runtime)
         self.assertIn("records*static_cast<std::uint64_t>(stride)>", runtime)
         # The superseded staged variant is gone rather than left unreachable.
         self.assertNotIn("kv_attention_gqa_f16_256_s8", kernels)
@@ -512,12 +516,16 @@ class V2RuntimeTests(unittest.TestCase):
         # A bf16 cache keeps its own element type into the tensor cores rather
         # than passing through f16, which has a quarter of its exponent range.
         self.assertIn("__CUDA_ARCH__ >= 800", kernels)
-        for precision in ("f16", "bf16", "q8"):
-            for tile in (256, 512):
-                symbol = f"kv_attention_gqa_mma_{precision}_256_s8_t{tile}"
-                self.assertIn(symbol, kernels)
-                self.assertIn(symbol, driver)
-                self.assertIn(symbol, runtime)
+        # Every cache type, turbo included, at 8-way and 6-way 256-dim and
+        # 4-way 128-dim. 6-way is Qwen3.8-27B, which without its own
+        # instantiations fell out of every group-sharing kernel.
+        for precision in ("f16", "bf16", "q8", "turbo3", "turbo4"):
+            for shape in ("256_s8", "256_s6", "128_s4"):
+                for tile in (256, 512):
+                    symbol = f"kv_attention_gqa_mma_{precision}_{shape}_t{tile}"
+                    self.assertIn(symbol, kernels)
+                    self.assertIn(symbol, driver)
+                    self.assertIn(symbol, runtime)
         # Muse Glimmer is 16 query heads per KV head at dim 128. m16n8k16's N
         # is 8, so that group is two bands sharing one cache load, with the
         # softmax still in f32 registers. Tiles start at 128 because two KV
