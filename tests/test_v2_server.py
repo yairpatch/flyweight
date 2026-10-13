@@ -1473,6 +1473,40 @@ class NativeV2ServerTests(unittest.TestCase):
             generator.engine.submit([1, 2], 8, ())
         generator.close()  # idempotent
 
+    def test_opening_anchor_ends_after_the_system_turn(self) -> None:
+        # The stub encodes every text, the turn separator included, as [1, 2].
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            StubV2Model(), StubV2Runtime([]), NativeV2Tokenizer(StubV2Model())  # type: ignore[arg-type]
+        )
+        system = [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]
+        user_first = [{"role": "user", "content": "y"}]
+        anchor = generator._opening_anchor
+        # The first terminator closes the system turn; a lone first id that
+        # does not start one is skipped.
+        self.assertEqual(anchor(system, [7, 1, 8, 1, 2, 9, 1, 2, 9]), 5)
+        self.assertEqual(anchor(user_first, [7, 1, 2, 9]), 0)
+        self.assertEqual(anchor(system, [7, 8, 9]), 0)
+        # Nothing follows the opening, so there is nothing to pin past.
+        self.assertEqual(anchor(system, [7, 1, 2]), 0)
+        generator.close()
+
+    def test_native_engine_forwards_the_anchor_only_when_known(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class Recorder(StubV2Runtime):
+            def task_submit(self, prompt, max_tokens, stop_tokens=(), **options):
+                calls.append(options)
+                return super().task_submit(prompt, max_tokens, stop_tokens)
+
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            StubV2Model(), Recorder([10, 99]), NativeV2Tokenizer(StubV2Model())  # type: ignore[arg-type]
+        )
+        generator.engine.submit([1, 2, 3], 2, (99,), anchor=2)
+        generator.engine.submit([1, 2, 3], 2, (99,))
+        generator.close()
+        self.assertEqual(calls[0].get("anchor"), 2)
+        self.assertNotIn("anchor", calls[1])
+
     def test_native_engine_rejects_work_past_active_task_limit(self) -> None:
         runtime = BlockingV2Runtime()
         generator = NativeV2Generator(  # type: ignore[arg-type]

@@ -965,6 +965,12 @@ typedef struct FlyweightV2QwenImage {
     uint64_t hash;
 } FlyweightV2QwenImage;
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t* task_id);
+/* The vision entry point plus `anchor`: where the prompt's shared opening
+   (system prompt and tool declarations) ends, or 0 when unknown. Prefix reuse
+   on a recurrent model can only restart from a checkpoint, so the first one
+   goes there and a later prompt repeating that opening reuses all of it.
+   `images` may be null with `image_count` 0. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_anchored(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t anchor, uint64_t* task_id);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime* runtime, FlyweightV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 /* Work the engine can do while it has nothing to run: spill unowned slots to
    the host prompt cache, which admission would otherwise do in front of the

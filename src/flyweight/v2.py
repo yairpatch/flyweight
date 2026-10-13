@@ -1258,6 +1258,14 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint64),
                 ]
                 lib.flyweight_v2_qwen_task_submit_vision.restype = ctypes.c_int
+                # The vision entry point plus the shared-opening anchor; the
+                # one task_submit uses, with or without images.
+                lib.flyweight_v2_qwen_task_submit_anchored.argtypes = [
+                    *lib.flyweight_v2_qwen_task_submit_vision.argtypes[:-1],
+                    ctypes.c_uint64,  # anchor
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.flyweight_v2_qwen_task_submit_anchored.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_engine_step.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_QwenTaskEvent),
@@ -3466,8 +3474,15 @@ class V2QwenRuntime:
         response_format: Mapping[str, Any] | None = None,
         forbid_tool_calls: bool = False,
         images: Sequence["PromptImage"] | None = None,
+        anchor: int = 0,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id.
+
+        `anchor` is where the prompt's shared opening ends -- the system prompt
+        and tool declarations -- or 0 when unknown. The first prefill
+        checkpoint goes there, so a later prompt repeating that opening (a new
+        session, a subagent) reuses all of it rather than the nearest spread
+        checkpoint below it.
 
         `images` are the prompt's pictures for a model with a vision tower:
         each a PromptImage whose pixels are already resized and normalized
@@ -3498,11 +3513,12 @@ class V2QwenRuntime:
         specification = _constraint_specification(
             tools, response_format, forbid_tool_calls
         )
+        holders: list[Any] = []
+        entries: Any = None
         if images:
             # Pixel buffers must outlive the call: the native side copies
             # them during submit, so keeping the ctypes views in a list here
             # is enough.
-            holders = []
             entries = (_QwenImage * len(images))()
             for index, image in enumerate(images):
                 view = memoryview(image.pixels).cast("B")
@@ -3518,34 +3534,8 @@ class V2QwenRuntime:
                 entries[index].height = image.height
                 entries[index].token_offset = image.token_offset
                 entries[index].hash = image.hash & ((1 << 64) - 1)
-            self.model._check(
-                self._lib.flyweight_v2_qwen_task_submit_vision(
-                    self._handle,
-                    values,
-                    len(prompt_tokens),
-                    max_tokens,
-                    stops,
-                    len(stop_tokens),
-                    temperature,
-                    top_k,
-                    top_p,
-                    min_p,
-                    repetition_penalty,
-                    presence_penalty,
-                    frequency_penalty,
-                    penalty_window,
-                    0 if seed is None else seed & ((1 << 64) - 1),
-                    int(seed is not None),
-                    specification,
-                    entries,
-                    len(images),
-                    ctypes.byref(task_id),
-                )
-            )
-            del holders
-            return int(task_id.value)
         self.model._check(
-            self._lib.flyweight_v2_qwen_task_submit_grammar(
+            self._lib.flyweight_v2_qwen_task_submit_anchored(
                 self._handle,
                 values,
                 len(prompt_tokens),
@@ -3563,9 +3553,13 @@ class V2QwenRuntime:
                 0 if seed is None else seed & ((1 << 64) - 1),
                 int(seed is not None),
                 specification,
+                entries,
+                len(images) if images else 0,
+                max(0, int(anchor)),
                 ctypes.byref(task_id),
             )
         )
+        del holders
         return int(task_id.value)
 
     def engine_step(self, capacity: int = 256) -> list[tuple[int, int, int]]:

@@ -175,11 +175,19 @@ class _NativeEngine:
         response_format: dict[str, object] | None = None,
         forbid_tool_calls: bool = False,
         images: Sequence[PromptImage] | None = None,
+        anchor: int = 0,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
         )
         sampling_config = sampling or _GREEDY
+        # Only a prompt with pictures, or one with a known opening, names the
+        # argument, so a runtime without those entry points keeps working.
+        optional: dict[str, Any] = {}
+        if images:
+            optional["images"] = list(images)
+        if anchor:
+            optional["anchor"] = anchor
         with self._lock:
             if self._closing:
                 raise RuntimeError("native v2 engine is shutting down")
@@ -201,9 +209,7 @@ class _NativeEngine:
                 tools=tools,
                 response_format=response_format,
                 forbid_tool_calls=forbid_tool_calls,
-                # Only a prompt with pictures names the argument, so a
-                # runtime without the vision entry point keeps working.
-                **({"images": list(images)} if images else {}),
+                **optional,
             )
             self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
@@ -1553,6 +1559,7 @@ class ChatGenerator:
         self._chat_continuations: OrderedDict[ChatKey, ChatRecord] = OrderedDict()
         self._chat_continuation_capacity = 32
         self._forced_close_ids: dict[str, list[int]] | None = None
+        self._turn_separator_ids: tuple[int, ...] | None = None
 
     # How long a request may hear nothing before its scheduling is checked on.
     # Generous: it costs one wakeup per request per interval and only ever
@@ -1610,6 +1617,44 @@ class ChatGenerator:
             final.stopped_on_eos,
             final.state_tokens,
         )
+
+    def _opening_anchor(
+        self, messages: Sequence[Mapping[str, object]], prompt_ids: Sequence[int]
+    ) -> int:
+        """Where the conversation's shared opening ends in `prompt_ids`, or 0.
+
+        The opening is a leading system or developer message, with the tool
+        declarations a template renders into it: what a new session or a
+        subagent under the same agent sends again verbatim. The runtime pins
+        its first prefill checkpoint there, because on a recurrent model a
+        later prompt can only reuse up to a checkpoint -- the 256-token pin
+        otherwise, or the nearest spread one. It ends at the first turn
+        terminator, matched in token space rather than by rendering the
+        template a second time; a miss costs only where that checkpoint sits.
+        """
+        first = messages[0] if messages else None
+        if not isinstance(first, Mapping) or first.get("role") not in (
+            "system", "developer"
+        ):
+            return 0
+        separator = self._turn_separator_ids
+        if separator is None:
+            text = getattr(self.tokenizer, "turn_separator", "")
+            separator = tuple(self.tokenizer.encode(text)) if text else ()
+            self._turn_separator_ids = separator
+        if not separator:
+            return 0
+        ids = list(prompt_ids)
+        start = 0
+        while True:
+            try:
+                index = ids.index(separator[0], start)
+            except ValueError:
+                return 0
+            end = index + len(separator)
+            if tuple(ids[index:end]) == separator:
+                return end if end < len(ids) else 0
+            start = index + 1
 
     def prepare_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
@@ -1672,6 +1717,7 @@ class ChatGenerator:
         prompt_images = getattr(self.tokenizer, "prompt_images", None)
         if callable(prompt_images) and _message_images(messages):
             options["images"] = prompt_images(messages, prompt_ids)
+        options["anchor"] = self._opening_anchor(messages, prompt_ids)
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
             if step.finished:
@@ -1923,6 +1969,8 @@ class ChatGenerator:
         )
         progress = options.get("progress")
         progress_callback = progress if callable(progress) else None
+        anchor_option = options.get("anchor")
+        anchor = anchor_option if isinstance(anchor_option, int) else 0
         if not prompt_ids:
             raise ValueError("formatted prompt produced no token IDs")
         generated: list[int] = []
@@ -1990,6 +2038,7 @@ class ChatGenerator:
             # opencode compaction stored exactly that as its summary).
             forbid_tool_calls=not tool_grammar,
             **({"images": options["images"]} if options.get("images") else {}),
+            **({"anchor": anchor} if anchor else {}),
         )
         try:
             prefill_complete = False
@@ -2128,6 +2177,7 @@ class ChatGenerator:
                             else None
                         ),
                         forbid_tool_calls=not tool_grammar,
+                        **({"anchor": anchor} if anchor else {}),
                     )
             # Flush any dangling partial UTF-8 sequence (a truncated character
             # at the very end of generation becomes a single visible U+FFFD).
