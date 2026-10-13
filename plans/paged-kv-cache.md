@@ -1,6 +1,6 @@
 # Paged KV cache (vLLM-style)
 
-> **STATUS 2026-09-18**: PHASE 0 ONLY: `kv_peak_live_bytes` telemetry in `/health` shipped and measured 9.5% reservation occupancy, which makes the case. Phases 1-5 (block tables, shared pool, retiring the per-slot reservation) not started.
+> **STATUS 2026-10-13**: phases 0, 1 and 1b SHIPPED (telemetry, cross-slot prefix donation, scratch slots); 2-5 (block tables, shared pool, retiring the per-slot reservation) not started, and **deprioritized**. On the hybrid models this runtime serves, block-level prefix sharing does not raise reuse: the recurrent state still restarts only from a checkpoint, so reuse is bounded by checkpoint placement, not by KV layout. The prefill lever for new sessions and subagents was placement itself -- the first checkpoint now pins at the end of the system prompt when the server knows it (8742 of 8746 shared tokens reused on the 35B, against 6400 before). What 2-5 still buy is VRAM, which phase 1b measured as memory rather than throughput.
 
 ## Where the runtime is today
 

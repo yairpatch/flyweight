@@ -140,6 +140,34 @@ class DenseNativeTests(unittest.TestCase):
             model.close()
             V2Model.select_backend("auto")
 
+    def test_anchor_lets_a_new_session_reuse_the_whole_opening(self):
+        # A second conversation sharing only the opening (system prompt and
+        # tools) can reuse only up to a checkpoint on a recurrent model.
+        # Without an anchor the nearest one below a 200-token opening is the
+        # spread target at 146; with it, the checkpoint is the opening's end.
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        opening = [5] * 200
+
+        def reuse(anchor: int) -> int:
+            runtime = model.native_runtime(
+                context_limit=1024, mtp_drafts=0, parallel_sequences=1,
+                prefill_checkpoint_interval=32)
+            runtime.prepare()
+            try:
+                for turn in (7, 8):
+                    _collect_task(runtime, runtime.task_submit(
+                        [*opening, *([turn] * 20)], 4, anchor=anchor))
+                return runtime.info["prefix_cache_last_reused_tokens"]
+            finally:
+                runtime.close()
+
+        try:
+            self.assertEqual(reuse(0), 146)
+            self.assertEqual(reuse(len(opening)), len(opening))
+        finally:
+            V2Model.select_backend("auto")
+
     def test_tail_checkpoint_survives_a_last_token_divergence(self):
         # A stripped-reasoning replay re-tokenizes the newline after the
         # forced "<think>" opener, so the next turn agrees with the previous

@@ -921,6 +921,9 @@ struct QwenEngineTask {
     // visit so a drafting task still interleaves with the others.
     std::deque<std::uint32_t> drafted;
     QwenSamplingState sampling;
+    // Where the caller's shared opening ends -- the system prompt and tool
+    // declarations -- or 0. See qwen_prompt_begin.
+    std::uint64_t anchor = 0;
     std::size_t slot = 0;
     int phase = 0;
     bool cancelled = false;
@@ -25147,7 +25150,7 @@ static bool qwen_kv_rewindable(const FlyweightV2QwenRuntime& runtime) {
 
 static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, QwenPromptPlan& plan,
-        bool require_last_logits=false) {
+        bool require_last_logits=false, std::uint64_t anchor=0) {
     // Prefix-reuse diagnostics (computed before any state mutation below). The
     // longest common prefix against the live processed_tokens and against the
     // best snapshot shows where this prompt diverges from what is cached: a
@@ -25350,11 +25353,25 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         // prompt) reused nothing on a recurrent arch and reprefilled from
         // zero. The pin is that traffic's reuse floor; the remaining slots
         // still spread over the whole prompt for mid-history rewrites.
-        if(interval<prompt_count)plan.targets.push_back(interval);
+        //
+        // When the caller knows where the shared opening ends -- the system
+        // prompt and tool declarations, which a new session or a subagent
+        // under the same agent repeats verbatim -- the pin goes THERE instead.
+        // At the interval it reused 256 tokens of that opening; spread
+        // targets did better only by luck of spacing (6400 of an 8815-token
+        // system prompt on the 35B). The anchor is the whole of it, and slot
+        // 0 keeps it for the conversation's life, since every later turn has
+        // already reused past it. The spread then covers what follows it:
+        // the opening itself is never rewritten mid-way.
+        const bool anchored=anchor&&anchor<prompt_count;
+        const std::uint64_t pin=anchored?anchor:interval;
+        const std::uint64_t spread_from=anchored?anchor:0;
+        if(pin<prompt_count)plan.targets.push_back(pin);
         const std::uint64_t spacing=std::max<std::uint64_t>(
-            interval,prompt_count/std::max<std::size_t>(mid_slots,std::size_t{1}));
+            interval,(prompt_count-spread_from)/
+                std::max<std::size_t>(mid_slots,std::size_t{1}));
         // The spread targets snap to the chunk boundaries the pin implies
-        // (interval + k * prefill_rows) rather than splitting chunks: a
+        // (pin + k * prefill_rows) rather than splitting chunks: a
         // target inside a chunk shortens it, and on the MoE sweep every
         // routed expert is decoded once per pipeline half, so 682-token
         // chunks cost ~11% of a 2048-token prefill against 1024-token ones.
@@ -25364,13 +25381,13 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             runtime->prefill_rows>1&&prompt_count>=2ull*runtime->prefill_rows
                 ?runtime->prefill_rows:1;
         auto snap=[&](std::uint64_t pos){
-            if(pos<=interval||grid==1)return pos;
-            const std::uint64_t beyond=pos-interval;
+            if(pos<=pin||grid==1)return pos;
+            const std::uint64_t beyond=pos-pin;
             const std::uint64_t down=beyond/grid*grid;
             const std::uint64_t up=down+grid;
-            return interval+(beyond-down<up-beyond?down:up);
+            return pin+(beyond-down<up-beyond?down:up);
         };
-        for(std::uint64_t pos=spacing;
+        for(std::uint64_t pos=spread_from+spacing;
             pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing){
             const std::uint64_t snapped=snap(pos);
             if(snapped<prompt_count&&
@@ -26610,7 +26627,8 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         float presence_penalty,float frequency_penalty,uint32_t penalty_window,
         uint64_t seed,bool has_seed,uint64_t*task_id,
         const char*tool_specification=nullptr,
-        std::vector<QwenTaskImage>*images=nullptr,float min_p=0.0f) {
+        std::vector<QwenTaskImage>*images=nullptr,float min_p=0.0f,
+        std::uint64_t anchor=0) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -26638,6 +26656,7 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         throw std::runtime_error("native Qwen frequency_penalty must be in [-2, 2]");
     QwenEngineTask task;
     task.prompt.assign(prompt,prompt+prompt_count);
+    task.anchor=anchor;
     if(images)task.images=std::move(*images);
     if(stop_tokens&&stop_count)task.stop_tokens.assign(stop_tokens,stop_tokens+stop_count);
     task.max_tokens=max_tokens;
@@ -26724,12 +26743,12 @@ int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime*runtime,const u
     return 0;
 });}
 
-int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
+static int qwen_task_submit_images(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
         uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count,
         float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty,
         float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed,
         uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images,
-        uint64_t image_count, uint64_t* task_id) { return guarded([&]{
+        uint64_t image_count, uint64_t anchor, uint64_t* task_id) { return guarded([&]{
     if (image_count && !images) throw std::runtime_error("image array is null");
     std::vector<QwenTaskImage> copied;
     if (image_count) {
@@ -26757,9 +26776,34 @@ int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const 
     }
     qwen_task_submit_impl(runtime, prompt, prompt_count, max_tokens, stop_tokens, stop_count,
         temperature, top_k, top_p, repetition_penalty, presence_penalty, frequency_penalty,
-        penalty_window, seed, has_seed != 0, task_id, tool_specification, &copied, min_p);
+        penalty_window, seed, has_seed != 0, task_id, tool_specification, &copied, min_p,
+        anchor);
     return 0;
 }); }
+
+int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
+        uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count,
+        float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty,
+        float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed,
+        uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images,
+        uint64_t image_count, uint64_t* task_id) {
+    return qwen_task_submit_images(runtime, prompt, prompt_count, max_tokens, stop_tokens,
+        stop_count, temperature, top_k, top_p, min_p, repetition_penalty, presence_penalty,
+        frequency_penalty, penalty_window, seed, has_seed, tool_specification, images,
+        image_count, 0, task_id);
+}
+
+int flyweight_v2_qwen_task_submit_anchored(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
+        uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count,
+        float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty,
+        float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed,
+        uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images,
+        uint64_t image_count, uint64_t anchor, uint64_t* task_id) {
+    return qwen_task_submit_images(runtime, prompt, prompt_count, max_tokens, stop_tokens,
+        stop_count, temperature, top_k, top_p, min_p, repetition_penalty, presence_penalty,
+        frequency_penalty, penalty_window, seed, has_seed, tool_specification, images,
+        image_count, anchor, task_id);
+}
 
 int flyweight_v2_qwen_task_submit_sampling(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
@@ -27753,7 +27797,7 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     // so it needs the prompt's last logits kept for the same reason a sampled
     // one does.
     if (qwen_prompt_begin(&runtime, prompt, prompt_count, task.plan,
-                          task.sampling.active()) != 0)
+                          task.sampling.active(), task.anchor) != 0)
         throw std::runtime_error("native Qwen prompt admission failed");
     qwen_admit_mark("prompt_begin",admit_t0);
     task.index = task.plan.prompt_start;
