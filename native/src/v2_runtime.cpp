@@ -18882,6 +18882,43 @@ inline int kv_gqa_rows_tile_tokens(
     }
     return 0;
 }
+// A K/V pair of different types that the staging paths can still widen to f16
+// one side at a time: each side f16, q8_0 or turbo. Every other batched kernel
+// is instantiated for one cache type, so before this a mismatched pair (say
+// turbo3 keys over turbo4 values) fell through to the per-row serial pair in
+// both prefill and decode -- 159 against 1100 tok/s of prefill at 7.7k on the
+// 35B. bf16 is left out because the staged window carries one element type,
+// and the other side would have to be converted to match it.
+inline bool kv_mixed_stageable(int key_type,int value_type){
+    auto side=[](int t){return t==1||t==3||kv_type_is_turbo(t);};
+    return key_type!=value_type&&side(key_type)&&side(value_type);
+}
+// Widen `tokens` ring slots of one side of the cache, starting at `first`,
+// into the staging layout [kv_head][tokens][head_dim]. The quantized codecs
+// decode to f16 and a 16-bit cache is copied unchanged. A turbo side stays
+// rotated, so whether the query or the output owes a transform depends only on
+// that side's own type: the rotation streams are per role (keys 0, values 1),
+// not per bit width.
+inline void qwen_kv_stage_side(
+    FlyweightV2QwenRuntime& runtime, int type, std::uint64_t cache,
+    std::uint64_t stage, int kv_heads, int head_dim, int tokens,
+    int capacity, int first
+){
+    void*args[]={&cache,&stage,&kv_heads,&head_dim,&tokens,&capacity,&first};
+    const bool sixteen=type==1||type==2;
+    const char*name=sixteen?"kv_ring_unwrap_16":
+                    type==5?"kv_dequant_turbo4_f16":
+                    type==4?"kv_dequant_turbo3_f16":
+                    type==3?"kv_dequant_q8_f16":nullptr;
+    if(!name)throw std::runtime_error("native Qwen KV staging: unsupported cache type");
+    const int status=sixteen
+        ?flyweight_gpu_launch_named(name,static_cast<std::uint32_t>(tokens),
+            static_cast<std::uint32_t>(kv_heads),128,0,runtime.stream,args)
+        :flyweight_gpu_launch_named(name,static_cast<std::uint32_t>(kv_heads),
+            (static_cast<std::uint32_t>(tokens)+7)/8,256,0,runtime.stream,args);
+    if(status!=0)
+        throw std::runtime_error(std::string("native Qwen KV staging kernel failed: ")+name);
+}
 // Prefill counterpart of qwen_turbo_cublas_attention: stage the whole causal
 // window as f16 once for the chunk, then run the fused f16 prefill kernel over
 // it instead of walking the cache once per row.
@@ -18898,11 +18935,14 @@ inline int kv_gqa_rows_tile_tokens(
 // Widen one layer's live KV window into f16 so the tensor-core path can read
 // it. Turbo has always come through here; q8_0 now does too, and only when the
 // caller says the cuBLAS path will actually be taken -- for a short prefix the
-// warp kernel wins and staging the window would be work for nothing. `rotated`
-// Returns 0 when it declines, 1 when it staged, and 2 when it staged AND
-// rotated the queries -- only turbo's are, and the caller has to undo exactly
-// what was done. A code rather than an out-parameter because the call sits in
-// an if-init, which holds one declaration statement.
+// warp kernel wins and staging the window would be work for nothing. A mixed
+// pair (kv_mixed_stageable) always stages: no batched kernel reads one, so the
+// alternative is the per-row serial pair.
+// Returns 0 when it declines, 1 when it staged, and 2 when it staged AND the
+// values are rotated, so the output comes back rotated and the caller owes the
+// inverse before the gate. Turbo keys rotate the queries here, which needs no
+// undoing. A code rather than an out-parameter because the call sits in an
+// if-init, which holds one declaration statement.
 inline int qwen_kv_prefill_stage(
     FlyweightV2QwenRuntime& runtime, QwenLayerPlan& layer,
     std::uint64_t queries, std::uint64_t cache_keys, std::uint64_t cache_values,
@@ -18911,11 +18951,12 @@ inline int qwen_kv_prefill_stage(
     std::uint64_t& stage_keys, std::uint64_t& stage_values
 ){
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
-    if(ck!=cv)return 0;
+    const bool mixed=kv_mixed_stageable(ck,cv);
+    if(ck!=cv&&!mixed)return 0;
     const bool turbo=kv_type_is_turbo(ck);
     const bool swa=layer.attention_window!=0;
     const bool sixteen=ck==1||ck==2;
-    if(!turbo&&!(ck==3&&cublas_available)&&!(swa&&sixteen&&cublas_available))return 0;
+    if(!mixed&&!turbo&&!(ck==3&&cublas_available)&&!(swa&&sixteen&&cublas_available))return 0;
     if(!runtime.turbo_kv_stage||rows<=0||heads<=0||kv_heads<=0)return 0;
     if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0||head_dim>256)return 0;
     const char*env=std::getenv("FLYWEIGHT_TURBO_CUBLAS");
@@ -18965,38 +19006,23 @@ inline int qwen_kv_prefill_stage(
     stage_keys=runtime.turbo_kv_stage;
     stage_values=runtime.turbo_kv_stage+runtime.turbo_kv_stage_stride;
     int origin=static_cast<int>(static_cast<std::uint64_t>(first_absolute)%layer.cache_capacity);
-    if(sixteen){
-        auto copy=[&](std::uint64_t source,std::uint64_t destination){
-            void*args[]={&source,&destination,&kv_heads,&head_dim,
-                const_cast<int*>(&window),const_cast<int*>(&slot_capacity),const_cast<int*>(&origin)};
-            return flyweight_gpu_launch_named("kv_ring_unwrap_16",
-                static_cast<std::uint32_t>(window),static_cast<std::uint32_t>(kv_heads),
-                128,0,runtime.stream,args)==0;
-        };
-        if(!copy(cache_keys,stage_keys)||!copy(cache_values,stage_values))return 0;
-    }else{
-    const char*dequant=ck==5?"kv_dequant_turbo4_f16":
-                       ck==4?"kv_dequant_turbo3_f16":"kv_dequant_q8_f16";
-    const std::uint32_t token_blocks=(static_cast<std::uint32_t>(window)+7)/8;
-    int tokens=window;
-    void*key_args[]={&cache_keys,&stage_keys,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
-    launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,key_args);
-    void*value_args[]={&cache_values,&stage_values,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
-    launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,value_args);
-    }
+    qwen_kv_stage_side(runtime,ck,cache_keys,stage_keys,kv_heads,head_dim,
+                       window,slot_capacity,origin);
+    qwen_kv_stage_side(runtime,cv,cache_values,stage_values,kv_heads,head_dim,
+                       window,slot_capacity,origin);
 
     // Only turbo stores rotated: q8_0 is a plain codec, so its staged window
     // is already in the query's basis and the gate can be left to the
-    // attention kernel rather than undone afterwards.
-    if(turbo){
+    // attention kernel rather than undone afterwards. Each side answers for
+    // itself: turbo keys need a rotated query, turbo values a rotated output.
+    if(kv_type_is_turbo(ck)){
         // Queries and attended rows are both [row][head][head_dim] contiguous,
         // so the rotation runs over rows*heads vectors in one launch.
         int vectors=rows*heads,key_stream=0;
         void*rotate_args[]={&queries,&vectors,&head_dim,&key_stream};
         launch("turbo_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
-        return 2;
     }
-    return 1;
+    return kv_type_is_turbo(cv)?2:1;
 }
 
 inline int kv_fused_tile_tokens(const FlyweightV2QwenRuntime&){return 1024;}
@@ -19035,6 +19061,10 @@ inline bool qwen_cublas_attention_eligible(
 // heads*head_dim elements, negligible beside the window itself, and it avoids a
 // Walsh-Hadamard per cached token.
 //
+// A mixed pair (kv_mixed_stageable) comes through here too, each side expanded
+// by its own codec: only turbo keys rotate the query and only turbo values owe
+// the inverse. Without it a mixed cache had no path but the serial pair.
+//
 // Eligibility is decided before anything is mutated, so a false return leaves
 // the caller's normal dispatch free to run on an untouched query. Failures
 // after that point throw rather than fall back, because the query has already
@@ -19054,7 +19084,8 @@ inline bool qwen_turbo_cublas_attention(
         }
         return false;
     };
-    if(ck!=cv||!kv_type_is_turbo(ck))return decline("cache type not a matched turbo pair");
+    if(!(ck==cv&&kv_type_is_turbo(ck))&&!kv_mixed_stageable(ck,cv))
+        return decline("cache types neither a matched turbo pair nor a stageable mix");
     if(!runtime.turbo_kv_stage)return decline("no staging buffer");
     if(tokens<=0||heads<=0||kv_heads<=0)return decline("degenerate shape");
     if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0)return decline("head geometry");
@@ -19076,23 +19107,25 @@ inline bool qwen_turbo_cublas_attention(
     };
     std::uint64_t stage_keys=runtime.turbo_kv_stage;
     std::uint64_t stage_values=runtime.turbo_kv_stage+runtime.turbo_kv_stage_stride;
-    const char*dequant=ck==5?"kv_dequant_turbo4_f16":"kv_dequant_turbo3_f16";
-    const std::uint32_t token_blocks=(static_cast<std::uint32_t>(tokens)+7)/8;
-    void*key_args[]={&cache_keys,&stage_keys,&kv_heads,&head_dim,&tokens,&capacity,&first_slot};
-    launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,key_args);
-    void*value_args[]={&cache_values,&stage_values,&kv_heads,&head_dim,&tokens,&capacity,&first_slot};
-    launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,value_args);
+    qwen_kv_stage_side(runtime,ck,cache_keys,stage_keys,kv_heads,head_dim,
+                       tokens,capacity,first_slot);
+    qwen_kv_stage_side(runtime,cv,cache_values,stage_values,kv_heads,head_dim,
+                       tokens,capacity,first_slot);
 
     int key_stream=0,value_stream=1,unwrapped=0;
-    void*rotate_args[]={&queries,&heads,&head_dim,&key_stream};
-    launch("turbo_rotate_rows",static_cast<std::uint32_t>(heads),1,rotate_args);
+    if(kv_type_is_turbo(ck)){
+        void*rotate_args[]={&queries,&heads,&head_dim,&key_stream};
+        launch("turbo_rotate_rows",static_cast<std::uint32_t>(heads),1,rotate_args);
+    }
     // The staging copy is already unwrapped, so cuBLAS sees a linear window.
     if(flyweight_gpu_attention_f16_cublas(queries,query_f16,stage_keys,stage_values,
             scores_f16,attended,runtime.stream,heads,kv_heads,head_dim,tokens,
             tokens,unwrapped,scale)!=0)
         throw std::runtime_error("native Qwen turbo cuBLAS attention failed");
-    void*unrotate_args[]={&attended,&heads,&head_dim,&value_stream};
-    launch("turbo_unrotate_rows",static_cast<std::uint32_t>(heads),1,unrotate_args);
+    if(kv_type_is_turbo(cv)){
+        void*unrotate_args[]={&attended,&heads,&head_dim,&value_stream};
+        launch("turbo_unrotate_rows",static_cast<std::uint32_t>(heads),1,unrotate_args);
+    }
     return true;
 }
 

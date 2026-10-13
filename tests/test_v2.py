@@ -806,6 +806,33 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("head_dim&(head_dim-1)", runtime)
         self.assertIn("kv_type_is_turbo", runtime)
 
+    def test_mismatched_kv_types_take_the_staged_paths(self):
+        # Turbo3 keys over turbo4 values used to fail every batched path's
+        # K == V check and fall to the per-row serial pair: 159 against 1100
+        # tok/s of prefill at 7.7k on the 35B. Both staging paths have to admit
+        # the mix, expand each side by its own codec, and rotate per side --
+        # turbo keys the query, turbo values the output.
+        root = Path(__file__).resolve().parents[1]
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+
+        def body(signature: str) -> str:
+            start = runtime.index(signature)
+            return runtime[start:runtime.index("\n}\n", start)]
+
+        # bf16 stays out: the staged window carries one element type.
+        self.assertIn("t==1||t==3||kv_type_is_turbo(t)",
+                      body("inline bool kv_mixed_stageable("))
+        for signature in ("inline int qwen_kv_prefill_stage(",
+                          "inline bool qwen_turbo_cublas_attention("):
+            with self.subTest(function=signature):
+                code = body(signature)
+                self.assertIn("kv_mixed_stageable(ck,cv)", code)
+                self.assertNotIn("if(ck!=cv)return 0;", code)
+                self.assertIn("qwen_kv_stage_side(runtime,ck,cache_keys", code)
+                self.assertIn("qwen_kv_stage_side(runtime,cv,cache_values", code)
+                self.assertIn("if(kv_type_is_turbo(ck)){", code)
+                self.assertIn("kv_type_is_turbo(cv)", code)
+
     def test_turbo_block_sizes_match_the_cpu_reference(self):
         root = Path(__file__).resolve().parents[1]
         reference = (root / "native/src/turboquant.h").read_text(encoding="utf-8")
