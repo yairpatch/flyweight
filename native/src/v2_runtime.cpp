@@ -1012,6 +1012,11 @@ struct FlyweightV2QwenRuntime {
     // (the instruction is guarded) but fall back to a shuffle emulation that is
     // far slower than the dp4a tile kernel, so the host must not pick them.
     bool int8_tensor_cores=false;
+    // RDNA3 (gfx11) int8 WMMA, which the dense prefill projections use through
+    // the <mmq>_wmma twins. Separate from int8_tensor_cores: that flag also
+    // admits the routed, narrow and diffusion MMQ kernels, which issue the PTX
+    // MMA and have no WMMA form. FLYWEIGHT_WMMA=0 turns it off.
+    bool int8_wmma=false;
     // Blackwell block-scaled FP4 MMA (compute 10.0+), which is what the
     // cuBLASLt NVFP4 prefill GEMMs need. Decides the prefill tensor-core
     // default; FLYWEIGHT_NVFP4_PREFILL_TC overrides either way.
@@ -17042,6 +17047,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 runtime->int8_tensor_cores=
                     probe.compute_major*10+probe.compute_minor>=80;
                 runtime->fp4_tensor_cores=probe.compute_major>=10;
+                static const bool wmma_enabled=[]{
+                    const char* setting=std::getenv("FLYWEIGHT_WMMA");
+                    return !setting||setting[0]!='0';
+                }();
+                runtime->int8_wmma=wmma_enabled&&
+                    probe.platform==FLYWEIGHT_V2_GPU_PLATFORM_ROCM&&
+                    std::strncmp(probe.arch,"gfx11",5)==0;
             }
         }
         runtime->device_tensor_types.resize(runtime->model->tensors.size());

@@ -106,6 +106,11 @@ static constexpr int kQ8MmqWideThreads=
     (kQ8MmqRows/16/2)*(kQ8MmqTokens/8/4)*32;
 // The _MIN variant still runs one fragment per warp.
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
+// The RDNA3 WMMA twins (<mmq>_wmma): 128 rows by 64 tokens on 8 waves, for
+// every family alike. Must match FLYWEIGHT_WMMA_ROWS / _TOKENS / _THREADS.
+static constexpr int kQ8WmmaRows=128;
+static constexpr int kQ8WmmaTokens=64;
+static constexpr int kQ8WmmaThreads=256;
 
 // FLYWEIGHT_PREFILL_TIMELINE=1: every launch gets a start and stop event
 // (=2 additionally lists every kernel in the per-chunk report, not the top 8)
@@ -480,6 +485,17 @@ void qwen_forward_rows(
         const bool mmq_min=format&&format->mmq_min;
         const char* tiled_kernel=format?format->matmul_q8_tiled:nullptr;
         const char* q8_kernel=nullptr;
+        // The RDNA3 twin of the MMQ kernel, when this device runs it and the
+        // family has one (the table-driven IQ formats do not yet).
+        const char* wmma_kernel=nullptr;
+        if(mmq_kernel&&runtime.int8_wmma){
+            static std::map<std::string,std::string> interned_wmma;
+            auto it=interned_wmma.find(mmq_kernel);
+            if(it==interned_wmma.end())
+                it=interned_wmma.emplace(mmq_kernel,std::string(mmq_kernel)+"_wmma").first;
+            if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
+                wmma_kernel=it->second.c_str();
+        }
         // On MoE the *per-row* path below re-reads the whole weight matrix per
         // row, which only pays off against the reconstruct-in-float matmul when
         // there are few rows. A dense model has no *_matmul_rows kernel that
@@ -494,7 +510,7 @@ void qwen_forward_rows(
         // Q6_K dense measured 39% slower at pp2048 than an otherwise identical
         // Q8_0-dense checkpoint, whose type-8 path is already a 32x32 tile.
         const bool batched_kernel=rows>kQ8RowBatch&&
-            ((mmq_kernel&&runtime.int8_tensor_cores)||tiled_kernel);
+            ((mmq_kernel&&runtime.int8_tensor_cores)||wmma_kernel||tiled_kernel);
         // rows_q8_gate, not matvec_q8_warp alone: the table records which
         // formats this block has been measured on (see its drift note).
         // FLYWEIGHT_IQ2_Q8_DECODE=0 keeps this block off as well, so the kill
@@ -574,6 +590,20 @@ void qwen_forward_rows(
                     it=interned_small.emplace(mmq_kernel,std::string(mmq_kernel)+"_n").first;
                 if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                     small_narrow=it->second.c_str();
+            }
+            // RDNA3: the WMMA twin, one launch per projection with the token
+            // tiles on grid.y like MMQ. Same super-block K tiling, so the
+            // same width test.
+            if((input_size&255)==0&&rows>kQ8RowBatch&&wmma_kernel){
+                const std::uint32_t token_tiles=
+                    static_cast<std::uint32_t>((rows+kQ8WmmaTokens-1)/kQ8WmmaTokens);
+                int batch=rows;
+                void*wmma_args[]={&matrix,&small_q8,&small_q8_scales,&output,
+                    &input_size,&output_size,&batch,&scale_stride};
+                launch(wmma_kernel,(output_size+kQ8WmmaRows-1)/kQ8WmmaRows,token_tiles,
+                       kQ8WmmaThreads,wmma_args);
+                dense_trace(wmma_kernel);
+                return;
             }
             // MMQ tiles K in super-blocks, so a row that is only a multiple of
             // 32 stays on the tiled or rows kernel below.
