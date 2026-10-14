@@ -170,6 +170,14 @@ struct CublasApi {
         const void*, void*, cudaDataType_t, int, long long, int,
         cublasComputeType_t, cublasGemmAlgo_t
     ) = nullptr;
+    // The enum values the GEMM is called with. hipBLAS takes the call in the
+    // same shape and the same data type codes (hipDataType mirrors
+    // cudaDataType), but spells the operations, the compute type and the
+    // algorithm with numbers of its own; load_hipblas sets these.
+    cublasOperation_t op_n = 0;
+    cublasOperation_t op_t = 1;
+    cublasComputeType_t compute_32f = 68;
+    cublasGemmAlgo_t algo = 99;  // CUBLAS_GEMM_DEFAULT_TENSOR_OP
     void* library = nullptr;
     bool attempted = false;
 };
@@ -708,11 +716,61 @@ bool load_apis() {
     return ok;
 }
 
+// The ROCm stand-in for cuBLAS: hipBLAS (over rocBLAS, which carries the
+// matrix-core kernels for the card). Optional like cuBLAS -- the runtime only
+// needs libamdhip64 and libhiprtc, and every caller falls back to its kernel
+// path when this does not load. Only the hipBLAS 2+ interface (ROCm 6+), where
+// the GEMM takes hipDataType and hipblasComputeType_t in cuBLAS's shape;
+// ROCm 5's took enums of its own and is not loaded. FLYWEIGHT_HIPBLAS=0 keeps
+// it unloaded.
+bool load_hipblas() {
+#if defined(_WIN32)
+    return false;
+#else
+    const char* setting = std::getenv("FLYWEIGHT_HIPBLAS");
+    if (setting && setting[0] == '0') return false;
+    int major = 0;
+    for (const auto& [name, version] :
+         {std::pair<const char*, int>{"libhipblas.so.3", 3}, {"libhipblas.so.2", 2}}) {
+        g_cublas.library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (g_cublas.library == nullptr) {
+            const char* root = std::getenv("ROCM_PATH");
+            const std::string path =
+                std::string(root && *root ? root : "/opt/rocm") + "/lib/" + name;
+            g_cublas.library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        }
+        if (g_cublas.library != nullptr) { major = version; break; }
+    }
+    if (g_cublas.library == nullptr) return false;
+    bool ok = true;
+    ok &= load_symbol(g_cublas.library, "hipblasCreate", g_cublas.create);
+    ok &= load_symbol(g_cublas.library, "hipblasDestroy", g_cublas.destroy);
+    ok &= load_symbol(g_cublas.library, "hipblasSetStream", g_cublas.set_stream);
+    ok &= load_symbol(
+        g_cublas.library, "hipblasGemmStridedBatchedEx",
+        g_cublas.gemm_strided_batched_ex
+    );
+    g_cublas.op_n = 111;          // HIPBLAS_OP_N
+    g_cublas.op_t = 112;          // HIPBLAS_OP_T
+    g_cublas.compute_32f = 2;     // HIPBLAS_COMPUTE_32F
+    // HIPBLAS_GEMM_DEFAULT: renumbered in hipBLAS 3 to rocBLAS's value.
+    g_cublas.algo = major >= 3 ? 160 : 100;
+    if (!ok || g_cublas.create(&g_cublas_handle) != 0) {
+        g_cublas_handle = nullptr;
+        return false;
+    }
+    return true;
+#endif
+}
+
 bool load_cublas() {
     if (g_cublas_handle != nullptr) return true;
     if (g_cublas.attempted) return false;
-    // NVIDIA-only; every caller has a kernel path to fall back to.
-    if (platform_is_hip()) return false;
+    // Every caller has a kernel path to fall back to.
+    if (platform_is_hip()) {
+        g_cublas.attempted = true;
+        return load_hipblas();
+    }
     g_cublas.attempted = true;
 #if defined(_WIN32)
     const wchar_t* names[] = {
@@ -4049,10 +4107,11 @@ extern "C" int flyweight_gpu_attention_16bit_cublas(
         return -4;
 
     constexpr int kCudaR32F = 0;
-    constexpr int kCublasOpN = 0;
-    constexpr int kCublasOpT = 1;
-    constexpr int kCompute32F = 68;
-    constexpr int kTensorOp = 99;
+    // cuBLAS's numbering, or hipBLAS's on ROCm (see CublasApi).
+    const int kCublasOpN = g_cublas.op_n;
+    const int kCublasOpT = g_cublas.op_t;
+    const int kCompute32F = g_cublas.compute_32f;
+    const int kTensorOp = g_cublas.algo;
     const float zero = 0.0f;
     const auto key_base = reinterpret_cast<const void*>(
         keys + static_cast<std::uint64_t>(first) * head_dim * sizeof(std::uint16_t)
@@ -4168,10 +4227,11 @@ extern "C" int flyweight_gpu_attention_prefill_cublas(
 
     constexpr int kCudaR16F = 2;
     constexpr int kCudaR32F = 0;
-    constexpr int kCublasOpN = 0;
-    constexpr int kCublasOpT = 1;
-    constexpr int kCompute32F = 68;
-    constexpr int kTensorOp = 99;
+    // cuBLAS's numbering, or hipBLAS's on ROCm (see CublasApi).
+    const int kCublasOpN = g_cublas.op_n;
+    const int kCublasOpT = g_cublas.op_t;
+    const int kCompute32F = g_cublas.compute_32f;
+    const int kTensorOp = g_cublas.algo;
     const int group = heads / kv_heads;
     const long long cache_stride =
         static_cast<long long>(capacity) * head_dim;

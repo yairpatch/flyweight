@@ -135,6 +135,52 @@ class RocmDeviceTests(unittest.TestCase):
         self.assertEqual(len(rocm), 12)
         self.assertEqual(rocm, cpu)
 
+    def test_hipblas_prefill_attention_decodes_like_the_kernel_path(self) -> None:
+        # Prompt attention through hipBLAS against the same runtime's kernel
+        # attention (FLYWEIGHT_HIPBLAS=0), forced on for a prompt shorter than
+        # the 512-token default so the small fixture reaches it. Everything
+        # else is the same code on the same card, so the tokens agree unless
+        # the GEMMs are wrong -- and hipBLAS takes its own enum numbers, where
+        # a wrong one either fails the call (the kernel fallback would hide
+        # it, hence the check that the library loaded) or transposes the
+        # product. A failed call falls back to the kernels silently, so the
+        # prefill trace has to show the GEMM path completing (cublas=1) on the
+        # first, 256-row chunk. The CPU backend is no referee here: this random
+        # 64-token model sits at near-ties often enough over 300 tokens that
+        # any change of accumulation order flips some.
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "dense.gguf"
+            build_dense_qwen35_gguf(path, quantize="q8_0")
+            script = """
+                import json, os, sys
+                os.environ["FLYWEIGHT_CUBLAS_PREFILL_ATTENTION"] = "1"
+                os.environ["FLYWEIGHT_HIPBLAS"] = sys.argv[2]
+                os.environ["FLYWEIGHT_ATTN_PREFILL_TRACE"] = "1"
+                import tempfile
+                trace = tempfile.TemporaryFile(mode="w+")
+                os.dup2(trace.fileno(), 2)
+                from flyweight.v2 import V2Model
+                V2Model.select_backend("rocm")
+                with V2Model(sys.argv[1]) as model:
+                    with model.native_qwen_runtime(context_limit=512) as runtime:
+                        runtime.prepare()
+                        prompt = [(index * 11 + 5) % 64 for index in range(300)]
+                        produced = []
+                        runtime.generate(prompt, 12, produced.append)
+                loaded = "libhipblas" in open("/proc/self/maps").read()
+                trace.seek(0)
+                gemm = "cublas=1" in trace.read()
+                print(json.dumps({"tokens": produced, "hipblas": loaded, "gemm": gemm}))
+            """
+            gemm = _in_subprocess(script, str(path), "1")
+            kernel = _in_subprocess(script, str(path), "0")
+        if not gemm["hipblas"]:
+            self.skipTest("hipBLAS is not installed")
+        self.assertTrue(gemm["gemm"], "hipBLAS loaded but the GEMM attention failed")
+        self.assertFalse(kernel["hipblas"])
+        self.assertFalse(kernel["gemm"])
+        self.assertEqual(len(gemm["tokens"]), 12)
+        self.assertEqual(gemm["tokens"], kernel["tokens"])
 
 if __name__ == "__main__":
     unittest.main()
