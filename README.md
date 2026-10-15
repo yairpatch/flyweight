@@ -17,6 +17,7 @@ split between the two, and the runtime measures what fits rather than asking.
 | Gemma 4 | GGUF | Routed experts must be Q4_0 (the QAT release); no MTP |
 | Laguna 2.1 | GGUF | Per-head attention gate; no MTP |
 | Muse Glimmer | GGUF | Channel-tagged reasoning; native ATEM tool calls; no speculative decoding |
+| LFM2 / LFM2-MoE (LFM2.5) | GGUF | Gated short-conv + GQA hybrid; native pythonic tool calls; no speculative decoding |
 
 Image generation with [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
 or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (RGBA out)
@@ -314,7 +315,9 @@ required parameters present, array and object values well-formed JSON.
 incrementally where the format supports it. DeepSeek-V4, BailingMoE3 and
 K2-Horizon render tools through their own templates and are parsed but not
 grammar-enforced; Muse Glimmer uses its native ATEM format and supports one
-tool call per turn. Other families get the Hermes-style tool prompt and
+tool call per turn. LFM2 writes its calls as a Python-style list between
+`<|tool_call_start|>` and `<|tool_call_end|>`; they are parsed, not
+grammar-enforced. Other families get the Hermes-style tool prompt and
 grammar.
 `parallel_tool_calls: false` caps a turn at one call, and
 `--max-tool-call-tokens` bounds a runaway one.
@@ -450,7 +453,7 @@ which, listing sizes and marking cached ones; `--quant` or
 | DeepSeek-V4-Flash | `--mtp-model` pointing at the DSpark draft GGUF |
 | BailingMoE3 | draft block loads; the server does not drive it yet |
 | Qwen without a draft block | `FLYWEIGHT_LOOKUP_DRAFTS=N` (up to 7): prompt-lookup self-speculation, worth 10-15% on code, neutral on prose |
-| Gemma 4, Laguna, Muse Glimmer, K2-Horizon | none |
+| Gemma 4, Laguna, Muse Glimmer, K2-Horizon, LFM2 | none |
 
 Every verified token passes through the request's own sampler, so a
 drafting request answers as a non-drafting one would.
@@ -521,6 +524,8 @@ when serving.
   no expert paging: a model that does not fit runs on the host entirely.
 - Laguna supports only the per-head attention gate; larger Laguna
   checkpoints with the per-element gate are rejected at load.
+- LFM2 decodes its `--parallel` slots one after another rather than in one
+  batched step, and LFM2-VL's vision tower is not wired.
 - Text is not NFC-normalized before tokenizing, so a decomposed accent can
   tokenize differently from the reference tokenizer.
 - Special-token spellings inside message content (`<|im_start|>`,

@@ -1931,6 +1931,8 @@ extern "C" int flyweight_gpu_compile(
              "qwen4_hc_mix_rows", "qwen4_hc_inject_rows",
              "qwen4_ple_gate_rows", "qwen4_ple_gv_rows",
              "qwen4_ple_conv_sequence",
+             // LFM2 gated short convolution
+             "lfm2_conv_step", "lfm2_conv_rows",
              // qwen4exp QSA indexer (phase 3)
              "qsa_key_store", "qsa_block_scores",
              "kv_attention_scores_indexed", "kv_attention_scores_f16_indexed",
