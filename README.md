@@ -69,8 +69,12 @@ near-ties, as between any two GPUs). On RDNA3 (Radeon RX 7000) the prompt's
 quantized projections run on the WMMA matrix cores, about twice the prompt
 throughput of the dot-product kernels on a Qwen3.5-4B Q4_K_M (RX 7600);
 `FLYWEIGHT_WMMA=0` turns them off. RDNA2 has no matrix cores and RDNA4's are
-not used yet, and prompt attention runs on scalar kernels everywhere, so
-prompt processing is still below what the card can do. CDNA (Instinct) cards are refused: the kernels
+not used yet. With hipBLAS installed (`hipblas` on Arch, part of AMD's ROCm
+packages elsewhere; ROCm 6 or later), prompt attention runs on its GEMMs as it
+does on cuBLAS under CUDA: an 8K-token prompt goes from 23 s to 11 s on the
+same card. Without it, or with `FLYWEIGHT_HIPBLAS=0`, attention stays on the
+scalar kernels. Decode attention keeps its own kernel either way; hipBLAS was
+slower there past about 2K tokens of context. CDNA (Instinct) cards are refused: the kernels
 assume a 32-lane warp, and CDNA only runs 64-lane wavefronts. An APU ROCm does
 not list may need `HSA_OVERRIDE_GFX_VERSION` (10.3.0 for RDNA2, 11.0.0 for
 RDNA3).

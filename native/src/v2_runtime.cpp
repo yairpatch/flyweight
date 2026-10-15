@@ -1017,6 +1017,8 @@ struct FlyweightV2QwenRuntime {
     // admits the routed, narrow and diffusion MMQ kernels, which issue the PTX
     // MMA and have no WMMA form. FLYWEIGHT_WMMA=0 turns it off.
     bool int8_wmma=false;
+    // The GPU is AMD's. Decides defaults that were measured per platform.
+    bool rocm=false;
     // Blackwell block-scaled FP4 MMA (compute 10.0+), which is what the
     // cuBLASLt NVFP4 prefill GEMMs need. Decides the prefill tensor-core
     // default; FLYWEIGHT_NVFP4_PREFILL_TC overrides either way.
@@ -17051,6 +17053,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     const char* setting=std::getenv("FLYWEIGHT_WMMA");
                     return !setting||setting[0]!='0';
                 }();
+                runtime->rocm=probe.platform==FLYWEIGHT_V2_GPU_PLATFORM_ROCM;
                 runtime->int8_wmma=wmma_enabled&&
                     probe.platform==FLYWEIGHT_V2_GPU_PLATFORM_ROCM&&
                     std::strncmp(probe.arch,"gfx11",5)==0;
@@ -19081,8 +19084,12 @@ inline int qwen_cublas_attention_min_tokens(){
 inline bool qwen_cublas_attention_eligible(
     const FlyweightV2QwenRuntime&runtime,int tokens,int first_slot,int capacity
 ){
+    // Off by default on ROCm, where hipBLAS stands in for cuBLAS: the
+    // grouped-rows kernel decodes faster from about 2K tokens of context (RX
+    // 7600, Qwen3.5-4B: 59.5 against 53.5 tok/s at 8K) and the GEMMs win only
+    // a few percent below that. FLYWEIGHT_CUBLAS_ATTENTION=1 turns it on.
     const char*env=std::getenv("FLYWEIGHT_CUBLAS_ATTENTION");
-    const bool enabled=!env||env[0]!='0';
+    const bool enabled=env&&env[0]?env[0]!='0':!runtime.rocm;
     return flyweight::v2::attention::cublas_eligible(
         runtime.options.cache_type_k,runtime.options.cache_type_v,
         tokens,first_slot,capacity,enabled,
