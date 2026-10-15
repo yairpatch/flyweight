@@ -1947,7 +1947,8 @@ extern "C" int flyweight_gpu_compile(
     // MTP verification twins, named after their base kernel: the matvec rows
     // kernels' _r5.._r7 caps and the Q8 LM heads' rows variants. Generated so
     // the list cannot drift from the FLYWEIGHT_Q8_MATVEC_ROWS / FLYWEIGHT_Q8_LM_HEAD
-    // macros that emit them.
+    // macros that emit them. Also the RDNA3 MMQ twins (FLYWEIGHT_Q8_WMMA), which
+    // only a gfx11 compile defines; elsewhere the lookup just misses.
     for (const char* format : {"q5k", "iq2xxs", "q4k", "iq3xxs", "iq2s", "iq3s",
                                "iq4xs", "iq4nl", "iq1s", "iq1m", "iq2xs", "q2k",
                                "q3k", "q6k", "q80"}) {
@@ -1956,6 +1957,7 @@ extern "C" int flyweight_gpu_compile(
             names.push_back(std::string(format) + "_q8_matvec_transposed_rows" + cap);
         for (const char* variant : {"_rows", "_rows_r2", "_rows_r4"})
             names.push_back(std::string(format) + "_q8_lm_head_argmax_warp" + variant);
+        names.push_back(std::string(format) + "_q8_mmq_wmma");
         for (const auto& name : names) {
             CUfunction function = nullptr;
             if (g_api.cuModuleGetFunction(&function, g_module, name.c_str()) == 0)

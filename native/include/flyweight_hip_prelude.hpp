@@ -16,7 +16,9 @@
 // The inline-PTX tensor-core primitives stay behind their __CUDA_ARCH__
 // guards, which HIP never defines: their emulation paths compile, and the
 // host keeps them off the hot path because a ROCm device reports compute
-// capability 0.0 (see gpu_probe in v2_runtime.cpp).
+// capability 0.0 (see gpu_probe in v2_runtime.cpp). RDNA3's matrix cores are
+// reached through kernels of their own instead, the <mmq>_wmma twins
+// (FLYWEIGHT_Q8_WMMA), which only a gfx11 compile defines.
 
 namespace flyweight::v2 {
 inline constexpr char hip_prelude_source[] = R"FLYWEIGHT_HIP(

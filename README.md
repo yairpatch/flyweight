@@ -65,9 +65,12 @@ AMD's ROCm packages elsewhere -- and your user in the `render` group.
 `flyweight doctor` reports what it finds.
 
 What to expect: output agrees with the CUDA path (greedy tokens can differ at
-near-ties, as between any two GPUs), but none of the tensor-core kernels are
-ported yet, so prompt processing runs on the dot-product kernels and is well
-below what the card can do. CDNA (Instinct) cards are refused: the kernels
+near-ties, as between any two GPUs). On RDNA3 (Radeon RX 7000) the prompt's
+quantized projections run on the WMMA matrix cores, about twice the prompt
+throughput of the dot-product kernels on a Qwen3.5-4B Q4_K_M (RX 7600);
+`FLYWEIGHT_WMMA=0` turns them off. RDNA2 has no matrix cores and RDNA4's are
+not used yet, and prompt attention runs on scalar kernels everywhere, so
+prompt processing is still below what the card can do. CDNA (Instinct) cards are refused: the kernels
 assume a 32-lane warp, and CDNA only runs 64-lane wavefronts. An APU ROCm does
 not list may need `HSA_OVERRIDE_GFX_VERSION` (10.3.0 for RDNA2, 11.0.0 for
 RDNA3).
