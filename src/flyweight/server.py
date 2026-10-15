@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import hmac
@@ -197,6 +198,16 @@ K2_ARG_PAIR_PATTERN = re.compile(
     r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
     re.DOTALL,
 )
+# LFM2 writes a turn's calls as one Python-style list between two special
+# tokens: <|tool_call_start|>[get_weather(city='Paris'), now()]<|tool_call_end|>.
+# String arguments are single-quoted Python literals; mappings and lists are
+# JSON, so `true` / `false` / `null` appear where Python would spell them
+# otherwise.
+LFM2_TOOL_CALL_MARKER = "<|tool_call_start|>"
+LFM2_TOOL_CALL_END_MARKER = "<|tool_call_end|>"
+LFM2_TOOL_CALL_BLOCK_PATTERN = re.compile(
+    r"<\|tool_call_start\|>\s*(.*?)\s*<\|tool_call_end\|>", re.DOTALL
+)
 DSML_TOOL_CALL_MARKER = "<｜DSML｜tool_calls>"
 DSML_TOOL_CALL_END_MARKER = "</｜DSML｜tool_calls>"
 DSML_TOOL_CALL_BLOCK_PATTERN = re.compile(
@@ -234,6 +245,8 @@ def _tool_markers(architecture: str | None) -> tuple[str, str]:
         return K2_TOOL_CALLS_MARKER, K2_TOOL_CALLS_END_MARKER
     if architecture == "muse-glimmer":
         return ATEM_TOOL_CALL_MARKER, ATEM_TOOL_CALL_END_MARKER
+    if architecture in ("lfm2", "lfm2moe"):
+        return LFM2_TOOL_CALL_MARKER, LFM2_TOOL_CALL_END_MARKER
     return TOOL_CALL_MARKER, TOOL_CALL_END_MARKER
 
 
@@ -4647,7 +4660,7 @@ def serve(
 # markup and the result blocks. Anything else gets the generic Hermes prompt and
 # our own rendering, which is what a checkpoint without tool support needs.
 NATIVE_TOOL_ARCHITECTURES = (
-    "deepseek4", "bailingmoe3", "k2-horizon", "muse-glimmer"
+    "deepseek4", "bailingmoe3", "k2-horizon", "muse-glimmer", "lfm2", "lfm2moe"
 )
 
 
@@ -5567,6 +5580,9 @@ def _parse_tool_calls(
     for block in K2_TOOL_CALL_BLOCK_PATTERN.finditer(text):
         name, arguments = _decode_k2_tool_call_body(block.group(1))
         decoded.append((name, arguments, ""))
+    for block in LFM2_TOOL_CALL_BLOCK_PATTERN.finditer(text):
+        for name, arguments in _decode_lfm2_tool_calls(block.group(1)):
+            decoded.append((name, arguments, ""))
     for block in DSML_TOOL_CALL_BLOCK_PATTERN.finditer(text):
         for invoke in DSML_INVOKE_PATTERN.finditer(block.group(1)):
             arguments = {}
@@ -5658,6 +5674,7 @@ def _parse_tool_calls(
             text.find(TOOL_CALL_MARKER), text.find(DSML_TOOL_CALL_MARKER),
             text.find(K2_TOOL_CALLS_MARKER),
             text.find(ATEM_TOOL_CALL_MARKER),
+            text.find(LFM2_TOOL_CALL_MARKER),
         ) if position != -1
     ]
     marker = min(markers) if markers else -1
@@ -6026,6 +6043,7 @@ def _turn_is_silent(
         TOOL_CALL_MARKER in text
         or DSML_TOOL_CALL_MARKER in text
         or K2_TOOL_CALLS_MARKER in text
+        or LFM2_TOOL_CALL_MARKER in text
     )
 
 
@@ -6035,6 +6053,7 @@ def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bo
         TOOL_CALL_END_MARKER not in text
         and DSML_TOOL_CALL_END_MARKER not in text
         and K2_TOOL_CALLS_END_MARKER not in text
+        and LFM2_TOOL_CALL_END_MARKER not in text
     ):
         return False
     _, calls = _parse_tool_calls(text, tools=list(tools))
@@ -6686,6 +6705,88 @@ def _decode_k2_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
                 pass
         arguments[key.strip()] = text
     return (name or None), arguments
+
+
+_LFM2_JSON_NAMES = {"true": True, "false": False, "null": None,
+                    "True": True, "False": False, "None": None}
+
+
+def _lfm2_literal(node: ast.AST) -> Any:
+    """One argument value of an LFM2 call, as the template wrote it.
+
+    Python literals and JSON both appear (a string argument is a quoted
+    Python string, a mapping is `tojson` output), so the JSON keywords are
+    accepted as names. Anything that is not a literal at all -- an expression
+    the model improvised -- is kept as its source text rather than dropped.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in _LFM2_JSON_NAMES:
+        return _LFM2_JSON_NAMES[node.id]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return [_lfm2_literal(item) for item in node.elts]
+    if isinstance(node, ast.Dict):
+        return {
+            _lfm2_literal(key) if key is not None else None: _lfm2_literal(value)
+            for key, value in zip(node.keys, node.values)
+        }
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.USub, ast.UAdd))
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+    ):
+        value = node.operand.value
+        return -value if isinstance(node.op, ast.USub) else value
+    return ast.unparse(node)
+
+
+def _lfm2_call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _lfm2_call_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def _decode_lfm2_tool_calls(body: str) -> list[tuple[str | None, dict[str, Any]]]:
+    """Decode an LFM2 <|tool_call_start|> body into (name, arguments) pairs.
+
+    The template's own form is a Python list of keyword calls. A JSON body --
+    `{"name": ..., "arguments": ...}` or a list of them -- is accepted too,
+    since the model card documents that as the alternative it was trained on.
+    Positional arguments carry no name to bind and are skipped.
+    """
+    body = body.strip()
+    if body.startswith("{") or body.startswith("[{"):
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            value = None
+        if value is not None:
+            pairs: list[tuple[str | None, dict[str, Any]]] = []
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, Mapping):
+                    pairs.append(_decode_tool_call_body(json.dumps(item)))
+            return pairs
+    try:
+        tree = ast.parse(body, mode="eval")
+    except (SyntaxError, ValueError):
+        return []
+    node = tree.body
+    calls = node.elts if isinstance(node, (ast.List, ast.Tuple)) else [node]
+    decoded: list[tuple[str | None, dict[str, Any]]] = []
+    for call in calls:
+        if not isinstance(call, ast.Call):
+            continue
+        arguments = {
+            keyword.arg: _lfm2_literal(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        decoded.append((_lfm2_call_name(call.func), arguments))
+    return decoded
 
 
 def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:

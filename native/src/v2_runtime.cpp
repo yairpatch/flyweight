@@ -940,6 +940,9 @@ struct FlyweightV2QwenRuntime {
     bool laguna = false;
     bool muse = false;
     bool k2horizon = false;
+    // LFM2 / LFM2-MoE (Liquid): the non-attention blocks are a gated short
+    // convolution rather than DeltaNet, and the MoE has no shared expert.
+    bool lfm2 = false;
     // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
     // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
     // bookends in the forward paths and, at bring-up, disables CUDA graphs
@@ -2602,10 +2605,15 @@ void build_tokenizer_tables(FlyweightV2Model& m) {
     m.control_tokens.clear();
     for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
+    // LFM2 spells <think> and </think> as user-defined (type 4) tokens that
+    // its template emits as text; llama.cpp splits those out exactly like the
+    // control tokens, and BPE would otherwise shred them into "<", "think", ">".
+    const bool user_defined_specials=m.tokenizer_pre=="lfm2";
     // Longest first, so a control token that prefixes another still matches the
     // longer one when scanning input left to right.
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++){
-        if(id>=m.token_types.size()||m.token_types[id]!=3)continue;
+        if(id>=m.token_types.size())continue;
+        if(m.token_types[id]!=3&&!(user_defined_specials&&m.token_types[id]==4))continue;
         if(m.vocabulary[id].empty())continue;
         m.control_tokens.emplace_back(m.vocabulary[id],id);
     }
@@ -2706,6 +2714,9 @@ int parse(FlyweightV2Model& m) {
         else if(suffix(".attention.value_length_mla"))target=&m.config.value_length_mla;
         else if(suffix(".kda.head_dim"))target=&m.config.attention_head_dim;
         else if(suffix(".ssm.conv_kernel"))target=&m.config.conv_kernel;
+        // LFM2's gated short convolution names its width after the rolling
+        // cache it keeps (l_cache = kernel taps, the state is one fewer).
+        else if(suffix(".shortconv.l_cache"))target=&m.config.conv_kernel;
         else if(suffix(".expert_group_used_count"))target=&m.config.expert_group_used;
         else if(suffix(".expert_group_count"))target=&m.config.expert_group_count;
         else if(suffix(".attention.output_lora_rank"))target=&m.config.output_lora_rank;
@@ -2978,6 +2989,21 @@ int parse(FlyweightV2Model& m) {
             throw std::runtime_error(
                 "qwen4exp compress-ratio array is shorter than the model layer count");
     }
+    // LFM2 (Liquid): gated short-conv blocks interleaved with GQA blocks. The
+    // cadence is the per-layer KV-head array, zero on the conv blocks, so the
+    // scalar the attention geometry reads stays unset unless it is lifted out
+    // of the array here. lfm2moe ships no expert_weights_norm key: llama.cpp
+    // and transformers both hardcode the top-k renormalization.
+    if(m.architecture=="lfm2"||m.architecture=="lfm2moe"){
+        if(!m.config.attention_kv_heads&&!m.config.attention_kv_heads_by_layer.empty())
+            m.config.attention_kv_heads=*std::max_element(
+                m.config.attention_kv_heads_by_layer.begin(),
+                m.config.attention_kv_heads_by_layer.end());
+        if(m.config.conv_kernel<2)
+            throw std::runtime_error(
+                m.architecture+" GGUF is missing shortconv.l_cache");
+        if(m.architecture=="lfm2moe")m.config.expert_weights_norm=true;
+    }
     if(m.architecture=="qwen_image"||m.architecture=="qwenimage21-dit"){
         m.architecture="qwenimage21-dit";
         m.config.architecture="qwenimage21-dit";
@@ -3134,21 +3160,49 @@ std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayer
     if(runtime.laguna)return 8;
     if(runtime.muse)return 9;
     if(runtime.k2horizon)return 5;
+    if(runtime.lfm2)return layer.attention?7:4;
     return layer.attention?7:10;
 }
 
 // DeepSeek-shaped routing: sigmoid probabilities ranked by a score-correction
-// bias, the picked weights L1-normalized and scaled. Laguna and K2-Horizon both
-// route this way; Qwen and Gemma 4 take the plain softmax top-k.
+// bias, the picked weights L1-normalized and scaled. Laguna, K2-Horizon and
+// LFM2-MoE route this way; Qwen and Gemma 4 take the plain softmax top-k.
 bool qwen_sigmoid_bias_router(const FlyweightV2QwenRuntime& runtime) {
-    return runtime.laguna||runtime.k2horizon;
+    return runtime.laguna||runtime.k2horizon||runtime.lfm2;
 }
 
 // Qwen gates its shared expert on a learned projection parked at moe_base+5.
 // The DeepSeek-shaped families have no such tensor and their shared branch is
 // always on, so reading that slot would pick up whatever the layout put there.
 bool qwen_shared_expert_gated(const FlyweightV2QwenRuntime& runtime) {
-    return !runtime.laguna&&!runtime.k2horizon;
+    return !runtime.laguna&&!runtime.k2horizon&&!runtime.lfm2;
+}
+
+// LFM2-MoE routes every token through its experts alone: there is no shared
+// branch, so the slots past the router hold nothing to run and the routed
+// accumulation starts from zero instead of from a shared-expert output.
+bool qwen_has_shared_expert(const FlyweightV2QwenRuntime& runtime) {
+    return !runtime.lfm2;
+}
+
+// The per-sequence state of a non-attention block, in floats: its causal-conv
+// ring and, for DeltaNet, the recurrent matrix behind it. LFM2's short conv
+// keeps only the last l_cache-1 columns of b*x and has no recurrence. Every
+// sizing, snapshot and spill site reads this one definition.
+struct QwenRecurrentState { std::uint64_t conv = 0, recurrent = 0; };
+QwenRecurrentState qwen_recurrent_state(
+    const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer
+) {
+    const auto& tensors = runtime.model->tensors;
+    if (runtime.lfm2)
+        return {tensor_elements(tensors[layer.static_tensors.at(3)]) /
+                    runtime.model->config.conv_kernel *
+                    (runtime.model->config.conv_kernel - 1),
+                0};
+    const auto& a = tensors[layer.static_tensors.at(8)];
+    const auto& norm = tensors[layer.static_tensors.at(9)];
+    return {tensor_elements(tensors[layer.static_tensors.at(6)]),
+            a.shape[0] * norm.shape[0] * norm.shape[0]};
 }
 
 // Width of a dense block's SwiGLU. On a model that is dense throughout this is
@@ -3159,7 +3213,7 @@ int qwen_dense_intermediate(
     const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     std::size_t moe_base
 ) {
-    if(runtime.laguna||runtime.k2horizon)
+    if(runtime.laguna||runtime.k2horizon||runtime.lfm2)
         return static_cast<int>(
             runtime.model->tensors[layer.static_tensors.at(moe_base+1)].shape[1]);
     return static_cast<int>(runtime.moe_intermediate);
@@ -3779,6 +3833,126 @@ void build_muse_glimmer_plan(FlyweightV2QwenRuntime& runtime) {
     runtime.moe_intermediate=model.config.dense_intermediate_size;
     runtime.scratch_elements=std::max(
         runtime.scratch_elements,2u*model.config.dense_intermediate_size);
+}
+
+// LFM2 / LFM2-MoE (Liquid). Every block opens with one RMS norm and then runs
+// either GQA attention (per-head QK RMS norm, NEOX RoPE, no output gate) or a
+// gated short convolution, the blocks the KV-head array marks with zero:
+//
+//   b, c, x = split3(in_proj(h));  y = out_proj(c * conv_causal(b * x))
+//
+// with a depthwise kernel of l_cache taps and no activation. The feed-forward
+// is a dense SwiGLU on the first `leading_dense_block_count` blocks (all of
+// them on dense LFM2) and sigmoid-routed MoE with a selection-only bias and no
+// shared expert after that. The final norm is `token_embd_norm` and the head
+// is tied to the embedding table. Semantics follow llama.cpp's
+// src/models/lfm2.cpp and transformers' modeling_lfm2_moe.py.
+//
+// Slot layout, so qwen_ffn_base (7 / 4) addresses the feed-forward block:
+//
+//   attention  0 attn_norm  1 attn_q  2 attn_k  3 attn_v  4 attn_output
+//              5 attn_q_norm  6 attn_k_norm
+//   conv       0 attn_norm  1 shortconv.in_proj  2 shortconv.out_proj
+//              3 shortconv.conv
+//   then       +0 ffn_norm, dense +1/+2/+3 gate/up/down,
+//              MoE +1 ffn_gate_inp, +2 exp_probs_b (router_bias)
+void build_lfm2_plan(FlyweightV2QwenRuntime& runtime) {
+    auto& model=*runtime.model;
+    runtime.lfm2=true;
+    runtime.token_embeddings=tensor_index(model,"token_embd.weight");
+    runtime.final_norm=tensor_index(model,"token_embd_norm.weight");
+    runtime.lm_head=has_tensor(model,"output.weight")
+        ?tensor_index(model,"output.weight"):runtime.token_embeddings;
+    runtime.lm_head_type=model.tensors[runtime.lm_head].type;
+    runtime.static_tensor_bytes+=model.tensors[runtime.token_embeddings].size;
+    runtime.static_tensor_bytes+=model.tensors[runtime.final_norm].size;
+    if(runtime.lm_head!=runtime.token_embeddings)
+        runtime.static_tensor_bytes+=model.tensors[runtime.lm_head].size;
+    const auto& kv_by_layer=model.config.attention_kv_heads_by_layer;
+    const auto hidden=model.config.hidden_size;
+    runtime.layers.reserve(model.config.layer_count);
+    for(std::uint32_t layer_index=0;layer_index<model.config.layer_count;++layer_index){
+        const std::string prefix="blk."+std::to_string(layer_index)+".";
+        QwenLayerPlan layer;
+        layer.attention=has_tensor(model,prefix+"attn_q.weight");
+        // The KV-head array is the declared cadence; the tensors are what
+        // runs. A disagreement is a conversion this code has not seen.
+        if(layer_index<kv_by_layer.size()&&(kv_by_layer[layer_index]!=0)!=layer.attention)
+            throw std::runtime_error(
+                "LFM2 attention.head_count_kv disagrees with the tensors at layer "+
+                std::to_string(layer_index));
+        add_static_tensor(runtime,layer,prefix+"attn_norm.weight");
+        if(layer.attention){
+            for(const char* suffix:{
+                "attn_q.weight","attn_k.weight","attn_v.weight","attn_output.weight",
+                "attn_q_norm.weight","attn_k_norm.weight"
+            })add_static_tensor(runtime,layer,prefix+suffix);
+            layer.attention_window=attention_window(model,layer_index);
+            layer.attention_heads=model.config.attention_heads;
+            layer.kv_heads=layer_index<kv_by_layer.size()
+                ?kv_by_layer[layer_index]:model.config.attention_kv_heads;
+            if(!layer.kv_heads||!layer.attention_heads)
+                throw std::runtime_error("LFM2 attention geometry is incomplete");
+            layer.head_dim=hidden/layer.attention_heads;
+            if(model.tensors[layer.static_tensors[2]].shape.size()<2||
+               model.tensors[layer.static_tensors[2]].shape[1]!=
+                   static_cast<std::uint64_t>(layer.kv_heads)*layer.head_dim||
+               model.tensors[layer.static_tensors[5]].shape[0]!=layer.head_dim)
+                throw std::runtime_error(
+                    "LFM2 attention projections disagree with hidden_size / head_count");
+            if(layer.kv_heads!=model.config.attention_kv_heads)
+                throw std::runtime_error(
+                    "native LFM2 expects one KV-head count on every attention layer");
+            layer.rotary_dim=std::min<std::uint32_t>(
+                model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim,
+                layer.head_dim);
+            layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f;
+        }else{
+            for(const char* suffix:{
+                "shortconv.in_proj.weight","shortconv.out_proj.weight",
+                "shortconv.conv.weight"
+            })add_static_tensor(runtime,layer,prefix+suffix);
+            const auto& in_proj=model.tensors[layer.static_tensors[1]];
+            const auto& conv=model.tensors[layer.static_tensors[3]];
+            // The conv state and the decode kernels are f32 and read the taps
+            // channel-major ([channel][tap]), which is ggml's {l_cache, hidden}.
+            if(conv.type!=0||conv.shape.size()<2||conv.shape[0]!=model.config.conv_kernel||
+               conv.shape[1]!=hidden)
+                throw std::runtime_error("LFM2 shortconv.conv must be an f32 {l_cache, hidden} tensor");
+            if(in_proj.shape.size()<2||in_proj.shape[1]!=3ull*hidden)
+                throw std::runtime_error("LFM2 shortconv.in_proj must project to 3 x hidden_size");
+        }
+        add_static_tensor(runtime,layer,prefix+"ffn_norm.weight");
+        layer.dense_ffn=has_tensor(model,prefix+"ffn_gate.weight");
+        if(layer.dense_ffn){
+            for(const char* suffix:{"ffn_gate.weight","ffn_up.weight","ffn_down.weight"})
+                add_static_tensor(runtime,layer,prefix+suffix);
+        }else{
+            add_static_tensor(runtime,layer,prefix+"ffn_gate_inp.weight");
+            add_static_tensor(runtime,layer,prefix+"exp_probs_b.bias");
+            layer.router_bias=layer.static_tensors.back();
+            const std::array<std::string,3> experts={
+                prefix+"ffn_gate_exps.weight",
+                prefix+"ffn_up_exps.weight",
+                prefix+"ffn_down_exps.weight",
+            };
+            for(std::size_t role=0;role<experts.size();++role){
+                layer.expert_tensors[role]=tensor_index(model,experts[role]);
+                runtime.expert_tensor_bytes+=model.tensors[layer.expert_tensors[role]].size;
+            }
+        }
+        for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+        runtime.layers.push_back(std::move(layer));
+    }
+    if(model.config.expert_count&&model.config.expert_gating_func==1)
+        throw std::runtime_error("native LFM2-MoE expects sigmoid expert gating");
+    runtime.moe_intermediate=model.config.expert_intermediate_size
+        ?model.config.expert_intermediate_size:model.config.dense_intermediate_size;
+    // Both SwiGLU stages write gate and up contiguously before silu_mul reads
+    // the pair, so the scratch has to hold the wider of the two pairs.
+    runtime.scratch_elements=std::max(
+        runtime.scratch_elements,
+        2u*std::max(runtime.moe_intermediate,model.config.dense_intermediate_size));
 }
 
 void build_gemma4_plan(FlyweightV2QwenRuntime& runtime) {
@@ -15117,6 +15291,21 @@ std::vector<std::string> qwen35_pretokenize(const std::string& text) {
     return apostrophe_bpe_pretokenize(text,true,1,false);
 }
 
+// LFM2 (`lfm2` in GGUF), which llama.cpp gives the llama3 pre-tokenizer: the
+// regex in LiquidAI's tokenizer.json is the original llama3 pattern, digits in
+// groups of up to three and no mark or joiner handling.
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?\p{L}+
+// | \p{N}{1,3}
+// |  ?[^\s\p{L}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+std::vector<std::string> lfm2_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,false,3,false);
+}
+
 std::vector<std::string> gpt4o_pretokenize(const std::string& text,
                                           std::size_t max_digit_run) {
     const auto decoded=gguf_utf8_decode(text);
@@ -15281,6 +15470,7 @@ std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
     if(m.tokenizer_pre=="laguna")return laguna_pretokenize(text);
     if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    if(m.tokenizer_pre=="lfm2")return lfm2_pretokenize(text);
     // Three names, one regex: Ling's tokenizer.json carries the llama3 pattern
     // verbatim (single digits, no case split), and Qwen2's is the same
     // pattern spelled with apostrophes.
@@ -15315,18 +15505,28 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
        m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
        m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
        m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
-       m->tokenizer_pre=="bailingmoe3"){
+       m->tokenizer_pre=="bailingmoe3"||m->tokenizer_pre=="lfm2"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
         std::vector<uint32_t> result;
         const std::string input(text);
         size_t at=0,plain=0;
+        // llama.cpp's `ignore_merges`, which its llama3 family sets: a
+        // pre-token that is itself a vocabulary entry is emitted whole, before
+        // BPE gets the chance to assemble it some other way, which the merge
+        // table alone does not guarantee.
+        const bool ignore_merges=m->tokenizer_pre=="lfm2";
         auto flush=[&](size_t end){
             if(end<=plain)return;
             const auto segment=input.substr(plain,end-plain);
-            for(const auto& piece:gguf_pretokenize(*m,segment))
+            for(const auto& piece:gguf_pretokenize(*m,segment)){
+                if(ignore_merges){
+                    const auto whole=m->vocabulary_ids.find(gguf_byte_encode(piece.c_str()));
+                    if(whole!=m->vocabulary_ids.end()){result.push_back(whole->second);continue;}
+                }
                 gguf_bpe_piece(*m,piece,result);
+            }
         };
         while(at<input.size()){
             const auto* match=static_cast<const std::pair<std::string,std::uint32_t>*>(nullptr);
@@ -15401,6 +15601,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     const bool muse=m->config.architecture=="muse-glimmer";
     const bool qwen4exp=m->config.architecture=="qwen4exp";
     const bool k2horizon=m->config.architecture=="k2-horizon";
+    const bool lfm2=m->config.architecture=="lfm2"||m->config.architecture=="lfm2moe";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
     if((m->config.architecture=="qwen3"||m->config.architecture=="qwen3vl")&&
@@ -15410,7 +15611,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
-    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer and K2-Horizon models");
+    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon&&!lfm2)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer, K2-Horizon and LFM2 models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
@@ -15480,6 +15681,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // than in-model MTP heads, so there is nothing here to draft with.
     if(muse&&runtime->options.mtp_drafts)throw std::runtime_error("native Muse Glimmer MTP is not implemented");
     if(k2horizon&&runtime->options.mtp_drafts)throw std::runtime_error("native K2-Horizon MTP is not implemented");
+    if(lfm2&&runtime->options.mtp_drafts)throw std::runtime_error("LFM2 checkpoints carry no MTP draft block");
+    // Speculative verification rewinds recurrent state through the DeltaNet
+    // snapshot and fold machinery, which knows nothing of the short-conv ring.
+    if(lfm2&&runtime->lookup_drafts){
+        std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: LFM2 has no draft verification path\n");
+        runtime->lookup_drafts=0;
+    }
     // MoVA declares its geometry in two keys that have to agree with each
     // other. The reference asserts the same pair, and a used count above the
     // expert count would run the top-k selection off the end of the router.
@@ -15530,6 +15738,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     else if(muse)build_muse_glimmer_plan(*runtime);
     else if(qwen4exp)build_qwen4exp_plan(*runtime);
     else if(k2horizon)build_k2horizon_plan(*runtime);
+    else if(lfm2)build_lfm2_plan(*runtime);
     else build_qwen_plan(*runtime);
     qwen_load_nvfp4_weight_scales(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
@@ -16186,15 +16395,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
                 layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             }else{
-                const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
-                const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
-                const auto&norm=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
-                // The whole tensor, not its first two extents: a checkpoint may
-                // describe the same bytes with a singleton dimension in the
+                // The whole conv tensor, not its first two extents: a checkpoint
+                // may describe the same bytes with a singleton dimension in the
                 // middle, and reserving less than the convolution writes puts
                 // the conv state on top of the recurrent state.
-                layer.state_first=reserve(tensor_elements(conv)*sizeof(float));
-                layer.state_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
+                const auto recurrent=qwen_recurrent_state(*runtime,layer);
+                layer.state_first=reserve(recurrent.conv*sizeof(float));
+                layer.state_second=reserve(recurrent.recurrent*sizeof(float));
             }
             if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
                 // Dilated causal conv: (kernel-1)*dilation past columns, where
@@ -16412,7 +16619,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // Anything else leaves these regions empty and keeps the sequential path.
         std::uint64_t delta_value_heads=0;
         for(const auto&layer:runtime->layers){
-            if(layer.attention)continue;
+            if(layer.attention||runtime->lfm2)continue;
             const auto heads=runtime->model->tensors[layer.static_tensors[8]].shape[0];
             const auto dim=runtime->model->tensors[layer.static_tensors[9]].shape[0];
             if(dim==flyweight::v2::workspace::kDeltaDim)delta_value_heads=heads;
@@ -16619,11 +16826,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                             *runtime->model->config.indexer_key_length;
                     continue;
                 }
-                const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
-                const auto&a=runtime->model->tensors[layer.static_tensors[8]];
-                const auto&norm=runtime->model->tensors[layer.static_tensors[9]];
-                snapshot_estimate+=conv.shape[0]*conv.shape[1]
-                    +a.shape[0]*norm.shape[0]*norm.shape[0];
+                const auto recurrent=qwen_recurrent_state(*runtime,layer);
+                snapshot_estimate+=recurrent.conv+recurrent.recurrent;
             }
             // Auto-fit only: under an explicit --gpu-cache-mib the later check
             // has always refused with this arithmetic spelled out, and widening
@@ -17335,10 +17539,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // Gemma 4 supports independent sequence slots, but its hybrid expert
         // path currently schedules those slots sequentially. The Qwen
         // layer-overlapped multi-decode driver assumes separate gate/up/down
-        // expert tensors and must not consume Gemma's fused Q4_0 bundles.
+        // expert tensors and must not consume Gemma's fused Q4_0 bundles. Its
+        // layer loop also knows only DeltaNet and attention blocks, so LFM2's
+        // short-conv slots decode one after another as well.
         if(decode_slots>1&&runtime->model->config.expert_count&&
            prepare_policy.routed_cpu_execution_allowed()&&
-           !runtime->gemma4&&!runtime->laguna){
+           !runtime->gemma4&&!runtime->laguna&&!runtime->lfm2){
             const std::uint64_t by_workspace=runtime->workspace_bytes/runtime->decode_slice_bytes;
             runtime->multi_decode_capacity=static_cast<std::uint32_t>(
                 std::min(std::min(decode_slots,by_workspace),std::uint64_t{4}));
@@ -17377,10 +17583,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                         *runtime->model->config.indexer_key_length;
                 continue;
             }
-            const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
-            const auto&a=runtime->model->tensors[layer.static_tensors[8]];
-            const auto&norm=runtime->model->tensors[layer.static_tensors[9]];
-            snapshot_floats+=conv.shape[0]*conv.shape[1]+a.shape[0]*norm.shape[0]*norm.shape[0];
+            const auto recurrent=qwen_recurrent_state(*runtime,layer);
+            snapshot_floats+=recurrent.conv+recurrent.recurrent;
         }
         runtime->prefill_snapshot_bytes=snapshot_floats?device_align(snapshot_floats*sizeof(float)):0;
         // One KV+DeltaNet state arena per parallel decode slot. MTP manages its
@@ -20532,15 +20736,14 @@ void qwen_prefill_snapshot_copy(
             }
             continue;
         }
-        const auto&conv=runtime.model->tensors[layer.static_tensors[6]];
-        const auto&a=runtime.model->tensors[layer.static_tensors[8]];
-        const auto&norm=runtime.model->tensors[layer.static_tensors[9]];
-        const auto conv_bytes=conv.shape[0]*conv.shape[1]*sizeof(float);
-        const auto recurrent_bytes=a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float);
+        const auto recurrent=qwen_recurrent_state(runtime,layer);
+        const auto conv_bytes=recurrent.conv*sizeof(float);
+        const auto recurrent_bytes=recurrent.recurrent*sizeof(float);
         const auto live_conv=runtime.state+layer.state_first;
         const auto live_recurrent=runtime.state+layer.state_second;
         launch_copy(restore?cursor:live_conv,restore?live_conv:cursor,conv_bytes);
         cursor+=conv_bytes;
+        if(!recurrent_bytes)continue;
         launch_copy(restore?cursor:live_recurrent,restore?live_recurrent:cursor,recurrent_bytes);
         cursor+=recurrent_bytes;
     }
@@ -22925,7 +23128,22 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                        layer.hc_attn_inject);
         }else rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
-        if(!layer.attention){
+        if(runtime->lfm2&&!layer.attention){
+            // LFM2 gated short conv: in_proj to [b | c | x], c * conv(b * x)
+            // against this slot's l_cache-1 column ring, out_proj, residual.
+            const int channels=hidden_size;
+            int kernel_size=static_cast<int>(runtime->model->config.conv_kernel);
+            dense(1,normalized,first,hidden_size,3*channels);
+            std::uint64_t conv_state=runtime->state+layer.state_first;
+            auto conv_weights=tensor(3);
+            void*conv_args[]={const_cast<std::uint64_t*>(&first),&conv_weights,&conv_state,
+                              const_cast<std::uint64_t*>(&second),const_cast<int*>(&channels),
+                              &kernel_size};
+            launch_named("lfm2_conv_step",(static_cast<std::uint32_t>(channels)+255)/256,1,256,conv_args);
+            dense(2,second,residual,hidden_size,hidden_size);
+            add(residual,hidden);
+            moe_base=4;
+        }else if(!layer.attention){
             int channels=static_cast<int>(runtime->model->tensors[layer.static_tensors[1]].shape[1]);
             int gate_elements=static_cast<int>(runtime->model->tensors[layer.static_tensors[2]].shape[1]);
             int value_heads=static_cast<int>(runtime->model->tensors[layer.static_tensors[8]].shape[0]);
@@ -23070,6 +23288,56 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 q8_cached_input=0;
             }else if(runtime->qwen4exp)hc_post(residual);
             moe_base=10;
+        }else if(runtime->lfm2){
+            // LFM2 attention: plain Q/K/V projections, per-head QK RMS norm and
+            // half-split RoPE (Laguna's kernel with its YaRN terms at rest),
+            // no output gate.
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            dense(1,normalized,first,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            const std::uint64_t queries=fourth;
+            const int rotary=static_cast<int>(layer.rotary_dim);
+            const int position=static_cast<int>(runtime->position);
+            const float theta=layer.rope_theta;
+            float freq_scale=1.0f,ext_factor=0.0f,mscale=1.0f,corr_low=0.0f,corr_high=0.0f;
+            auto qnorm=tensor(5),knorm=tensor(6);
+            void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,
+                           const_cast<std::uint64_t*>(&queries),const_cast<int*>(&heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon),&freq_scale,&ext_factor,&mscale,
+                           &corr_low,&corr_high};
+            launch_named("laguna_head_norm_rope",heads,1,256,q_args);
+            const std::uint64_t keys=first;
+            void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,
+                           const_cast<std::uint64_t*>(&keys),const_cast<int*>(&kv_heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon),&freq_scale,&ext_factor,&mscale,
+                           &corr_low,&corr_high};
+            launch_named("laguna_head_norm_rope",kv_heads,1,256,k_args);
+            std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={const_cast<std::uint64_t*>(&keys),&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            // `first` is free again: its roped key went to the cache above.
+            if(profile)profile_record(profile->recurrent_start);
+            qwen_decode_attention_full(*runtime,launch_named,queries,first,
+                cache_keys,cache_values,attention_scores,attended,
+                heads,kv_heads,head_dim,tokens,capacity,first_slot,scale);
+            if(profile)profile_record(profile->recurrent_end);
+            dense(4,attended,residual,q_size,hidden_size);
+            add(residual,hidden);
+            moe_base=7;
         }else if(runtime->muse){
             // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
             // norm with interleaved RoPE on the sliding-window layers only, and
@@ -23452,6 +23720,13 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);}
         const int intermediate=static_cast<int>(runtime->moe_intermediate);
         auto enqueue_shared=[&]{
+            if(!qwen_has_shared_expert(*runtime)){
+                // The routed experts accumulate into `third`, which a shared
+                // expert would otherwise have written first.
+                if(flyweight_gpu_memset(third,0,static_cast<std::uint64_t>(hidden_size)*sizeof(float),launch_stream)!=0)
+                    throw std::runtime_error("native Qwen MoE accumulator clear failed");
+                return;
+            }
             auto shared_gate_matrix=tensor(moe_base+2),shared_up_matrix=tensor(moe_base+3);
             // The device type, not the stored one: bf16 shared experts are
             // requantized to Q8_0 on upload and must still take the fused path.
@@ -24469,11 +24744,10 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
                         static_cast<std::uint64_t>(layer.qsa_ratio) * key_len * sizeof(float));
             }
         } else if (!position_indexed_only) {
-            const auto& conv = runtime.model->tensors[layer.static_tensors[6]];
-            const auto& a = runtime.model->tensors[layer.static_tensors[8]];
-            const auto& norm = runtime.model->tensors[layer.static_tensors[9]];
-            ranges.emplace_back(layer.state_first, tensor_elements(conv) * sizeof(float));
-            ranges.emplace_back(layer.state_second, a.shape[0] * norm.shape[0] * norm.shape[0] * sizeof(float));
+            const auto recurrent = qwen_recurrent_state(runtime, layer);
+            ranges.emplace_back(layer.state_first, recurrent.conv * sizeof(float));
+            if (recurrent.recurrent)
+                ranges.emplace_back(layer.state_second, recurrent.recurrent * sizeof(float));
         }
         if (!position_indexed_only &&
             layer.ple_conv != std::numeric_limits<std::uint64_t>::max()) {

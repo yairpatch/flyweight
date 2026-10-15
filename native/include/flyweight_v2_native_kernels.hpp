@@ -1109,6 +1109,58 @@ void route_topk_sigmoid_bias_rows(
     }
 }
 
+// LFM2 gated short convolution, one token. `projected` is in_proj's output,
+// [b | c | x] each `channels` wide; the block computes c * conv(b * x) with a
+// depthwise causal kernel and no activation. The state holds the previous
+// kernel_size-1 values of b * x per channel, oldest first, and the taps are
+// [channel][kernel] with the oldest tap first -- ggml's {l_cache, hidden}
+// layout, which is also the order ggml_ssm_conv and torch's Conv1d apply.
+extern "C" __global__
+void lfm2_conv_step(
+    const float* projected, const float* weights, float* state,
+    float* output, const int channels, const int kernel_size
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int history = kernel_size - 1;
+    float* channel_state = state + (long long)channel * history;
+    const float* taps = weights + (long long)channel * kernel_size;
+    const float bx = projected[channel] * projected[2 * channels + channel];
+    float value = taps[history] * bx;
+    for (int index = 0; index < history; ++index)
+        value += taps[index] * channel_state[index];
+    for (int index = 0; index + 1 < history; ++index)
+        channel_state[index] = channel_state[index + 1];
+    if (history > 0) channel_state[history - 1] = bx;
+    output[channel] = projected[channels + channel] * value;
+}
+
+// Row-batched lfm2_conv_step: one thread per channel walks the chunk's rows in
+// order, so the state each row reads is the one the row before it left, and
+// the chunk ends with exactly the state token-by-token decode would.
+extern "C" __global__
+void lfm2_conv_rows(
+    const float* projected, const float* weights, float* state,
+    float* output, const int rows, const int channels, const int kernel_size
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int history = kernel_size - 1;
+    float* channel_state = state + (long long)channel * history;
+    const float* taps = weights + (long long)channel * kernel_size;
+    for (int row = 0; row < rows; ++row) {
+        const float* source = projected + (long long)row * 3 * channels;
+        const float bx = source[channel] * source[2 * channels + channel];
+        float value = taps[history] * bx;
+        for (int index = 0; index < history; ++index)
+            value += taps[index] * channel_state[index];
+        for (int index = 0; index + 1 < history; ++index)
+            channel_state[index] = channel_state[index + 1];
+        if (history > 0) channel_state[history - 1] = bx;
+        output[(long long)row * channels + channel] = source[channels + channel] * value;
+    }
+}
+
 extern "C" __global__
 void qwen_shared_scale(
     const float* input, const float* gate,

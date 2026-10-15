@@ -1175,7 +1175,23 @@ void qwen_forward_rows(
                         layer.hc_attn_inject);
         }else rms_rows(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
-        if(!layer.attention){
+        if(runtime.lfm2&&!layer.attention){
+            // LFM2 gated short conv over the chunk; see lfm2_conv_rows.
+            const int channels=hidden_size;
+            int kernel_size=static_cast<int>(runtime.model->config.conv_kernel);
+            dense(1,normalized,first,hidden_size,3*channels);
+            auto conv_state=runtime.state+layer.state_first;auto conv_weights=tensor(3);
+            void*conv_args[]={const_cast<std::uint64_t*>(&first),&conv_weights,&conv_state,
+                              const_cast<std::uint64_t*>(&second),&rows,
+                              const_cast<int*>(&channels),&kernel_size};
+            phase(layer_number,"proj");
+            launch("lfm2_conv_rows",(static_cast<std::uint32_t>(channels)+255)/256,1,256,conv_args);
+            phase(layer_number,"conv");
+            dense(2,second,residual,hidden_size,hidden_size);
+            add_rows(residual,hidden);
+            moe_base=qwen_ffn_base(runtime,layer);
+            phase(layer_number,"outproj");
+        }else if(!layer.attention){
             int channels=static_cast<int>(runtime.model->tensors[layer.static_tensors[1]].shape[1]);
             int gate_elements=static_cast<int>(runtime.model->tensors[layer.static_tensors[2]].shape[1]);
             int value_heads=static_cast<int>(runtime.model->tensors[layer.static_tensors[8]].shape[0]);
@@ -1409,13 +1425,18 @@ void qwen_forward_rows(
             // and Qwen's gate kernels.
             const bool muse=runtime.muse;
             const bool k2horizon=runtime.k2horizon;
-            const int heads=(laguna||k2horizon)
+            // LFM2 projects plainly, norms and ropes per head with Laguna's
+            // kernel, and has no gate at all: its attention output takes the
+            // same ungated route K2-Horizon's does when that has no gate.
+            const bool lfm2=runtime.lfm2;
+            const bool ungated=k2horizon||lfm2;
+            const int heads=(laguna||k2horizon||lfm2)
                 ?static_cast<int>(layer.attention_heads)
                 :static_cast<int>(runtime.model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime.model->config.attention_kv_heads);
             const int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[2]].shape[1]/kv_heads);
             const int query_elements=heads*head_dim;
-            const int q_size=(laguna||muse||k2horizon)?query_elements:query_elements*2;
+            const int q_size=(laguna||muse||k2horizon||lfm2)?query_elements:query_elements*2;
             const int kv_size=kv_heads*head_dim;
             // K2-Horizon's MoVA blocks have no attn_v to project: the value
             // rows come from a 64-expert mixture that lives in the GGUF
@@ -1443,10 +1464,10 @@ void qwen_forward_rows(
             // Both per-layer architectures carry their own rotary span and
             // theta. For Muse Glimmer the span is zero on full-attention
             // layers, which is how those run NoPE.
-            const int rotary=(laguna||muse||k2horizon)
+            const int rotary=(laguna||muse||k2horizon||lfm2)
                 ?static_cast<int>(layer.rotary_dim)
                 :static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
-            const float theta=(laguna||muse||k2horizon)
+            const float theta=(laguna||muse||k2horizon||lfm2)
                 ?layer.rope_theta
                 :(runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f);
             // Laguna's full-attention layers extend with YaRN; its sliding-window
@@ -1494,7 +1515,7 @@ void qwen_forward_rows(
             static const bool rope_rows_enabled=[]{
                 const char*s=std::getenv("FLYWEIGHT_ROPE_ROWS");
                 return !s||s[0]!='0';}();
-            const bool rope_rows=rope_rows_enabled&&!laguna&&!muse&&!k2horizon&&
+            const bool rope_rows=rope_rows_enabled&&!laguna&&!muse&&!k2horizon&&!lfm2&&
                 (runtime.image_spans.empty()||!runtime.model->config.has_rope_sections());
             if(rope_rows){
                 auto rope=qwen_rope_args(runtime,runtime.image_spans,
@@ -1518,7 +1539,7 @@ void qwen_forward_rows(
                 int position=static_cast<int>(runtime.position)+span_begin+token;
                 auto projected_key=second+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 auto key=first+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
-                if(laguna){
+                if(laguna||lfm2){
                     void*q_args[]={&projected,&qnorm,&query,const_cast<int*>(&heads),
                                    const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
                                    &position,const_cast<float*>(&theta),const_cast<float*>(&epsilon),
@@ -1724,7 +1745,7 @@ void qwen_forward_rows(
             // MTP 4x slower than plain decode, whose split-context tiles stay
             // flat. FLYWEIGHT_VERIFY_DECODE_ATTENTION=0 restores the batched path.
             const bool verify_decode_attention=
-                rows<=kQ8RowBatch&&!qsa_chunk_selecting&&!laguna&&!k2horizon&&
+                rows<=kQ8RowBatch&&!qsa_chunk_selecting&&!laguna&&!ungated&&
                 qwen_verify_decode_attention_enabled();
             const bool cublas_prefill_done=
                 !verify_decode_attention&&
@@ -1748,7 +1769,7 @@ void qwen_forward_rows(
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position)+span_begin,
                     0,
-                    cublas_tile_rows,cublas_block_tokens,scale,k2horizon?0:1)==0;
+                    cublas_tile_rows,cublas_block_tokens,scale,ungated?0:1)==0;
             // FLYWEIGHT_ATTN_PREFILL_TRACE=1: which attention path actually ran,
             // printed for the first few layers. The cuBLAS attempt fails
             // silently by design (missing library, kernel, workspace), so a
@@ -1879,7 +1900,7 @@ void qwen_forward_rows(
                 void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale,&no_window};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
-                if(k2horizon){
+                if(ungated){
                     if(k2_gate){
                         void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
                         launch("k2_attention_gate",(elements+255)/256,1,256,gate_args);
@@ -1932,7 +1953,7 @@ void qwen_forward_rows(
                         runtime.stream,heads,kv_heads,head_dim,rows,staged_capacity,
                         base,staged_attention_window,
                         cublas_tile_rows,cublas_block_tokens,scale,
-                        (rotated||k2horizon)?0:1)==0;
+                        (rotated||ungated)?0:1)==0;
                 if(!staged_cublas){
                     void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&base),const_cast<int*>(&rows),&staged_capacity,&scale,&staged_attention_window};
                     launch(staged_kv_type==2?"kv_attention_prefill_bf16":"kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
@@ -1945,7 +1966,7 @@ void qwen_forward_rows(
                     void*unrotate_args[]={const_cast<std::uint64_t*>(&third),&vectors,const_cast<int*>(&head_dim),&value_stream};
                     launch("turbo_unrotate_rows",static_cast<std::uint32_t>(vectors),1,256,unrotate_args);
                 }
-                if(k2horizon){
+                if(ungated){
                     k2_attended=third;
                     if(k2_gate){
                         void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
@@ -1967,7 +1988,7 @@ void qwen_forward_rows(
                 auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
-                if(k2horizon){
+                if(ungated){
                     if(k2_gate){
                         auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                         auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
@@ -1986,7 +2007,7 @@ void qwen_forward_rows(
                     }
                 }
             }
-            dense(4,k2horizon?(k2_gate?third:k2_attended):third,residual,query_elements,hidden_size);
+            dense(4,ungated?(k2_gate?third:k2_attended):third,residual,query_elements,hidden_size);
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
@@ -2120,6 +2141,12 @@ void qwen_forward_rows(
         // `first` scratch (silu_mul expects gate at [0, n) and up at [n, 2n)
         // of one buffer), then the elementwise swiglu combine.
         const auto swiglu_elements=static_cast<std::uint64_t>(rows)*intermediate;
+        if(!qwen_has_shared_expert(runtime)){
+            // No shared branch: the routed experts accumulate from zero.
+            if(flyweight_gpu_memset(third,0,input_bytes,runtime.stream)!=0)
+                throw std::runtime_error("native Qwen rows MoE accumulator clear failed");
+            return true;
+        }
         // The device type, not the stored one: requant may have flipped an
         // all-NVFP4 draft block's shexp to Q8_0, and the packed-NVFP4 branch
         // must not run on converted bytes.
