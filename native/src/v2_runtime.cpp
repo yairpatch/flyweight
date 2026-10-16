@@ -3156,6 +3156,28 @@ void add_static_tensor(
     runtime.static_tensor_bytes += runtime.model->tensors[index].size;
 }
 
+// FLYWEIGHT_GPU_MISS. By default a hybrid cache miss is staged into a slot for
+// the next token and computed on the CPU for this one. That CPU matvec is the
+// decode lead.
+//   1 — a miss that received a slot is uploaded first and included in this
+//       token's grouped kernels. A rejected miss stays on the CPU.
+//   2 — a rejected miss is also computed on the GPU, from the expert staging
+//       buffer, and is not admitted. The cache policy is unchanged.
+// Either way the upload is then on the token's critical path, which is what
+// the expert-paging choice at prepare reads this for.
+int qwen_hybrid_gpu_miss_mode() {
+    static const int mode = [] {
+        const char* setting = std::getenv("FLYWEIGHT_GPU_MISS");
+        if (!setting || !setting[0] || setting[0] == '0') return 0;
+        const int value = setting[0] == '2' ? 2 : 1;
+        std::fprintf(stderr,
+            "[flyweight] hybrid cache misses compute on the GPU (%s)\n",
+            value == 2 ? "admitted and rejected" : "admitted only");
+        return value;
+    }();
+    return mode;
+}
+
 std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
     if(runtime.laguna)return 8;
     if(runtime.muse)return 9;
@@ -18620,9 +18642,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // locked. Streamed GPU decode waits on every miss (+4-6% direct), and
         // drafted verification admits only through DMA (see the rows
         // forward), so without it the cache freezes after the seed.
+        // FLYWEIGHT_GPU_MISS puts the upload back on the path: an admitted miss
+        // waits for it before the grouped kernels run, and staged it costs a
+        // host memcpy first (0.9 ms of a 12 ms token on LFM2.5-24B Q6_K, where
+        // direct measured 88.4 against 83.9 tok/s in interleaved pairs).
         const bool upload_bound=
             runtime->expert_mode==flyweight::v2::ExpertExecutionMode::streamed_gpu||
-            qwen_spec_drafts(*runtime)>0;
+            qwen_spec_drafts(*runtime)>0||
+            (runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid&&
+             qwen_hybrid_gpu_miss_mode()>0);
         const bool ram_for_direct=
             runtime->host_available_bytes>=model_bytes+registration_headroom;
         const bool auto_direct=runtime->options.expert_paging==0&&
@@ -22130,21 +22158,7 @@ static void qwen_run_hybrid_experts(
         const char* setting = std::getenv("FLYWEIGHT_NVFP4_TILED");
         return setting && setting[0] == '1';
     }();
-    // A cache miss is staged into a slot for the next token and computed on
-    // the CPU for this one. That CPU matvec is the decode lead.
-    //   1 — a miss that received a slot is uploaded first and included in
-    //       this token's grouped kernels. A rejected miss stays on the CPU.
-    //   2 — a rejected miss is also computed on the GPU, from the expert
-    //       staging buffer, and is not admitted. The cache policy is unchanged.
-    static const int gpu_miss_mode = [] {
-        const char* setting = std::getenv("FLYWEIGHT_GPU_MISS");
-        if (!setting || !setting[0] || setting[0] == '0') return 0;
-        const int mode = setting[0] == '2' ? 2 : 1;
-        std::fprintf(stderr,
-            "[flyweight] hybrid cache misses compute on the GPU (%s)\n",
-            mode == 2 ? "admitted and rejected" : "admitted only");
-        return mode;
-    }();
+    const int gpu_miss_mode = qwen_hybrid_gpu_miss_mode();
     const bool gpu_miss = gpu_miss_mode >= 1;
     const bool gpu_miss_scratch = gpu_miss_mode >= 2;
     if (runtime.expert_slots.empty())
