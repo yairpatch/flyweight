@@ -1933,6 +1933,11 @@ extern "C" int flyweight_gpu_compile(
              "qwen4_ple_conv_sequence",
              // LFM2 gated short convolution
              "lfm2_conv_step", "lfm2_conv_rows",
+             // Nemotron H Mamba-2 / latent MoE
+             "nemotron_ssm_conv_step", "nemotron_ssm_conv_rows",
+             "nemotron_ssm_step", "nemotron_ssm_scan_rows",
+             "nemotron_ssm_norm", "nemotron_ssm_norm_rows",
+             "nemotron_relu2_mul", "nemotron_relu2_rows",
              // qwen4exp QSA indexer (phase 3)
              "qsa_key_store", "qsa_block_scores",
              "kv_attention_scores_indexed", "kv_attention_scores_f16_indexed",

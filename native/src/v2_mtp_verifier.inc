@@ -1042,6 +1042,10 @@ void qwen_forward_rows(
         // queue_combine must fold into the residual.
         bool gpu_experts;
         std::chrono::steady_clock::time_point pager_started;
+        // Set by cpu_phase when the routed sum it left in output_host is
+        // latent-width rows (Nemotron H) that queue_combine must project
+        // back up through this layer's ffn_latent_up.
+        const QwenLayerPlan* latent_layer=nullptr;
     };
     // Prefill expert streaming stages one expert set per layer, chosen by
     // whichever half reaches the layer first, into the arena slice of the
@@ -1175,7 +1179,200 @@ void qwen_forward_rows(
                         layer.hc_attn_inject);
         }else rms_rows(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
-        if(runtime.lfm2&&!layer.attention){
+        if(runtime.nemotron&&layer.mamba){
+            // Mamba-2 chunk, the row twins of the decode branch: ssm_in per
+            // row to z|x|B|C|dt, the depthwise causal conv walking the rows in
+            // sequence order so the taps ring ends where decode's step would
+            // leave it (the conv covers x|B|C alone, dt is the raw projection
+            // tail and the ssm_dt bias joins before softplus inside the scan),
+            // the selective scan over the same rows, the grouped RMS with the
+            // weight indexed by global channel, and the ssm_out projection
+            // back into the residual stream.
+            const auto&config=runtime.model->config;
+            const int inner=static_cast<int>(config.ssm_inner_size);
+            const int d_state=static_cast<int>(config.ssm_state_size);
+            const int groups=static_cast<int>(config.ssm_group_count);
+            const int heads=static_cast<int>(config.ssm_time_step_rank);
+            const int conv_channels=inner+2*groups*d_state;
+            const int d_in_proj=2*inner+2*groups*d_state+heads;
+            const int head_dim=inner/heads;
+            int conv_kernel=static_cast<int>(config.conv_kernel);
+            dense(layer.ssm_in_role,normalized,first,hidden_size,d_in_proj);
+            auto conv_weights=tensor(layer.ssm_conv_role);
+            std::uint64_t conv_state=runtime.state+layer.state_first;
+            std::uint64_t conv_bias=
+                layer.ssm_conv_bias_role!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime.device_tensors[layer.static_tensors.at(layer.ssm_conv_bias_role)]:0;
+            // The conv input is the xBC segment: `first` skips the z half per
+            // row, and the rows stride the full d_in_proj projection.
+            std::uint64_t conv_source=first+static_cast<std::uint64_t>(inner)*sizeof(float);
+            // dt is read raw off the projection tail, z off its head.
+            std::uint64_t dt_row=first+
+                static_cast<std::uint64_t>(inner+conv_channels)*sizeof(float);
+            auto dt_bias=tensor(layer.ssm_dt_role),a=tensor(layer.ssm_a_role);
+            auto d=tensor(layer.ssm_d_role);
+            std::uint64_t scan_state=runtime.state+layer.state_second;
+            auto norm_weights=tensor(layer.ssm_norm_role);
+            long long conv_stride=conv_channels,proj_stride=d_in_proj,
+                inner_stride=inner;
+            phase(layer_number,"proj");
+            // Input rows are whole projections (d_in_proj apart); the conv
+            // writes its x|B|C rows compactly.
+            void*conv_args[]={const_cast<std::uint64_t*>(&conv_source),&conv_weights,
+                              &conv_bias,&conv_state,const_cast<std::uint64_t*>(&second),
+                              &rows,const_cast<int*>(&conv_channels),
+                              &conv_kernel,&proj_stride};
+            launch("nemotron_ssm_conv_rows",
+                (static_cast<std::uint32_t>(conv_channels)+255)/256,1,256,conv_args);
+            phase(layer_number,"ssm");
+            void*scan_args[]={const_cast<std::uint64_t*>(&second),&conv_stride,
+                              const_cast<std::uint64_t*>(&dt_row),&proj_stride,
+                              const_cast<std::uint64_t*>(&first),&proj_stride,
+                              &dt_bias,&a,&d,&scan_state,
+                              const_cast<std::uint64_t*>(&third),&inner_stride,
+                              &rows,const_cast<int*>(&heads),const_cast<int*>(&head_dim),
+                              const_cast<int*>(&d_state),const_cast<int*>(&groups)};
+            launch("nemotron_ssm_scan_rows",
+                (static_cast<std::uint32_t>(inner)+255)/256,1,256,scan_args);
+            void*norm_args[]={const_cast<std::uint64_t*>(&third),&inner_stride,
+                              &norm_weights,const_cast<std::uint64_t*>(&second),
+                              &inner_stride,&rows,const_cast<int*>(&inner),
+                              const_cast<int*>(&groups),const_cast<float*>(&epsilon)};
+            launch("nemotron_ssm_norm_rows",static_cast<std::uint32_t>(groups),
+                static_cast<std::uint32_t>(rows),256,norm_args);
+            phase(layer_number,"ssmnorm");
+            dense(layer.ssm_out_role,second,residual,inner,hidden_size);
+            add_rows(residual,hidden);
+            std::swap(span.hidden,span.residual);
+            if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
+                throw std::runtime_error("native Qwen prefill core profiling event failed");
+            return false;
+        }
+        if(runtime.nemotron&&layer.attention){
+            // Plain GQA chunk: Q/K/V straight into the cache with no RoPE and
+            // no per-head norm, 1/sqrt(head_dim) scaling. A long chunk takes
+            // the one-launch warp prefill kernel the other families use; a
+            // handful of rows, or a cache it cannot read, attends row by row
+            // through the decode dispatch. Queries sit in `fourth` so `first`
+            // is free for the decode dispatch's f16 staging.
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            dense(1,normalized,fourth,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            std::uint64_t cache_keys=runtime.state+layer.state_first,
+                cache_values=runtime.state+layer.state_second;
+            int capacity=static_cast<int>(layer.cache_capacity);
+            int position=static_cast<int>(runtime.position)+span_begin;
+            long long kv_stride=kv_size;
+            phase(layer_number,"qkvproj");
+            void*k_store_args[]={const_cast<std::uint64_t*>(&second),
+                const_cast<std::uint64_t*>(&cache_keys),const_cast<int*>(&kv_heads),
+                const_cast<int*>(&head_dim),&position,&capacity,&kv_stride};
+            launch((std::string(kv_store_kernel(runtime.options.cache_type_k,true))+"_rows").c_str(),
+                kv_heads,static_cast<std::uint32_t>(rows),256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),
+                const_cast<std::uint64_t*>(&cache_values),const_cast<int*>(&kv_heads),
+                const_cast<int*>(&head_dim),&position,&capacity,&kv_stride};
+            launch((std::string(kv_store_kernel(runtime.options.cache_type_v,false))+"_rows").c_str(),
+                kv_heads,static_cast<std::uint32_t>(rows),256,v_store_args);
+            phase(layer_number,"attend");
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            std::uint64_t attended=second;
+            if(rows>kQ8RowBatch&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
+                int no_window=0;
+                void*attention_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
+                    &cache_values,&attended,const_cast<int*>(&heads),
+                    const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,
+                    &rows,&capacity,&scale,&no_window};
+                launch(kv_prefill_kernel(runtime),heads,
+                    (static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
+            }else for(int token=0;token<rows;++token){
+                const auto view=attention_cache_view(
+                    layer,static_cast<std::uint64_t>(position+token));
+                qwen_decode_attention_full(runtime,launch,
+                    fourth+static_cast<std::uint64_t>(token)*q_size*sizeof(float),first,
+                    cache_keys,cache_values,attention_scores,
+                    attended+static_cast<std::uint64_t>(token)*q_size*sizeof(float),
+                    heads,kv_heads,head_dim,view.tokens,view.capacity,view.first,scale);
+            }
+            dense(4,attended,residual,q_size,hidden_size);
+            add_rows(residual,hidden);
+            std::swap(span.hidden,span.residual);
+            if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
+                throw std::runtime_error("native Qwen prefill core profiling event failed");
+            return false;
+        }
+        if(runtime.nemotron&&!layer.attention&&!layer.mamba){
+            // MoE-only block: the pre-block rms above is the block norm (there
+            // is no mixer). The router reads the unprojected normed rows and
+            // writes this layer's routes compactly, layer.expert_used per row;
+            // the routed experts read the latent reduction when the block
+            // carries one, else the normed rows. Routes and inputs go down
+            // asynchronously behind the route event for cpu_phase, the relu2
+            // shared expert stays on device in `third`, and queue_combine
+            // projects the latent sum back up and folds it in.
+            const int layer_experts=static_cast<int>(layer.expert_count);
+            const int layer_top_k=static_cast<int>(layer.expert_used);
+            const int expert_in=static_cast<int>(
+                layer.moe_latent?layer.moe_latent:hidden_size);
+            dense(1,normalized,router_logits,hidden_size,layer_experts);
+            std::uint64_t router_bias=
+                layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime.device_tensors[layer.router_bias]:0;
+            int normalize=runtime.model->config.expert_weights_norm?1:0;
+            float weight_scale=runtime.model->config.expert_weights_scale;
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&router_bias,
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&route_weights),&rows,
+                               const_cast<int*>(&layer_experts),
+                               const_cast<int*>(&layer_top_k),
+                               &normalize,&weight_scale};
+            phase(layer_number,"router");
+            launch("route_topk_sigmoid_bias_rows",rows,1,256,route_args,
+                   static_cast<std::uint32_t>(2*layer_experts*sizeof(float)));
+            std::uint64_t expert_input=normalized;
+            if(layer.moe_latent){
+                dense(layer.latent_down,normalized,second,hidden_size,expert_in);
+                expert_input=second;
+            }
+            const auto routes=static_cast<std::uint64_t>(rows)*layer_top_k;
+            if(flyweight_gpu_download(selected_host,selected_device,
+                   routes*sizeof(std::int32_t),runtime.stream)!=0||
+               flyweight_gpu_download(weights_host,route_weights,
+                   routes*sizeof(float),runtime.stream)!=0||
+               flyweight_gpu_download(input_host,expert_input,
+                   static_cast<std::uint64_t>(rows)*expert_in*sizeof(float),
+                   runtime.stream)!=0)
+                throw std::runtime_error("native Nemotron H rows route transfer failed");
+            if(flyweight_gpu_event_record(span.route_event,runtime.stream)!=0)
+                throw std::runtime_error("native Nemotron H rows route event failed");
+            phase(layer_number,"routesel");
+            // Shared expert: two projections around the relu2 rows kernel.
+            // Stream order lets the relu2 output reuse `second` once the
+            // latent download above has read it.
+            const int shared_ff=static_cast<int>(
+                runtime.model->tensors[layer.static_tensors.at(layer.shexp_up)].shape[1]);
+            dense(layer.shexp_up,normalized,first,hidden_size,shared_ff);
+            long long ff_stride=shared_ff;
+            void*relu_args[]={const_cast<std::uint64_t*>(&first),&ff_stride,
+                              const_cast<std::uint64_t*>(&second),&ff_stride,&rows,
+                              const_cast<int*>(&shared_ff)};
+            launch("nemotron_relu2_rows",
+                (static_cast<std::uint32_t>(rows)*static_cast<std::uint32_t>(shared_ff)+255)/256,
+                1,256,relu_args);
+            dense(layer.shexp_down,second,third,shared_ff,hidden_size);
+            phase(layer_number,"shexp");
+            if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
+                throw std::runtime_error("native Qwen prefill core profiling event failed");
+            // A front-less block never wrote a sublayer output into
+            // `residual`, so swap now: span.residual becomes the live stream
+            // queue_combine adds onto, and its own swap restores the order.
+            std::swap(span.hidden,span.residual);
+            return true;
+        }else if(runtime.lfm2&&!layer.attention){
             // LFM2 gated short conv over the chunk; see lfm2_conv_rows.
             const int channels=hidden_size;
             int kernel_size=static_cast<int>(runtime.model->config.conv_kernel);
@@ -2204,6 +2401,27 @@ void qwen_forward_rows(
     auto cpu_phase=[&](RowsSpan&span,std::uint32_t layer_number){
         install_span(span);
         auto&layer=runtime.layers[layer_number];
+        if(runtime.nemotron&&!layer.attention&&!layer.mamba){
+            // Nemotron H routed experts: relu2 on the CPU (the runtime
+            // requires --moe-device cpu for this arch), over the compact
+            // routes and inputs queue_core sent down.
+            const auto route_wait_started=std::chrono::steady_clock::now();
+            if(flyweight_gpu_event_sync(span.route_event)!=0)
+                throw std::runtime_error("native Nemotron H rows route synchronization failed");
+            runtime.route_wait_nanoseconds+=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-route_wait_started).count();
+            const auto cpu_expert_started=std::chrono::steady_clock::now();
+            nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,
+                input_host,activated_host,down_host,output_host);
+            runtime.prefill_expert_nanoseconds+=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-cpu_expert_started).count();
+            span.pager_started=route_wait_started;
+            span.gpu_experts=false;
+            span.latent_layer=layer.moe_latent?&layer:nullptr;
+            return;
+        }
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(flyweight_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         if(profile_prefill){
@@ -3206,12 +3424,28 @@ void qwen_forward_rows(
         // Set by cpu_phase: whether the span queued GPU expert work (table
         // path or streamed) whose accumulator in `fourth` must fold in here.
         const bool gpu_table_path=span.gpu_experts;
+        if(const auto*latent_layer=span.latent_layer){
+            const int latent=static_cast<int>(latent_layer->moe_latent);
+            if(flyweight_gpu_upload(first,output_host,
+                   static_cast<std::uint64_t>(rows)*latent*sizeof(float),
+                   runtime.stream)!=0)
+                throw std::runtime_error("native Nemotron H rows expert upload failed");
+            runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-span.pager_started).count();
+            // `first` was just overwritten: drop any Q8 activations cached
+            // against its address before projecting it.
+            q8_cached_input=0;q8_cached_width=0;
+            dense_rows(latent_layer->static_tensors.at(latent_layer->latent_up),
+                       first,fourth,latent,hidden_size);
+            add_rows(third,fourth);
+            span.latent_layer=nullptr;
+        }else{
         const auto output_bytes=
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
         if(flyweight_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
         runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-span.pager_started).count();
         if(gpu_table_path){add_rows(fourth,first);add_rows(third,fourth);}
         else add_rows(third,first);
+        }
         if(runtime.qwen4exp)hc_post_rows(third);
         else add_rows(residual,third);
         std::swap(span.hidden,span.residual);
