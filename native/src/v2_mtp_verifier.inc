@@ -1859,7 +1859,7 @@ void qwen_forward_rows(
             const bool cublas_prefill_disabled=
                 cublas_prefill_env&&cublas_prefill_env[0]=='0';
             const bool cublas_prefill_requested=
-                !cublas_prefill_disabled&&
+                !cublas_prefill_disabled&&flyweight_gpu_cublas_available()&&
                 (cublas_prefill_forced||max_tokens>=512);
             // Flash-blocked: the score tile is bounded by a KV position block
             // rather than the whole visible prefix, so the 16-row query tile

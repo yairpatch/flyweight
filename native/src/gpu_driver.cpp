@@ -713,6 +713,7 @@ bool load_cublas() {
     if (g_cublas.attempted) return false;
     // NVIDIA-only; every caller has a kernel path to fall back to.
     if (platform_is_hip()) return false;
+    if (!driver_ready()) return false;
     g_cublas.attempted = true;
 #if defined(_WIN32)
     const wchar_t* names[] = {
@@ -1133,6 +1134,10 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
     }
+    if (!platform_is_hip()) {
+        load_cublas();
+        load_cublas_lt();
+    }
     if (platform_is_hip()) {
         // The corpus assumes a 32-lane warp throughout; CDNA (and RDNA forced
         // into wave64) would run every reduction over half its lanes.
@@ -1158,6 +1163,11 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
 extern "C" int flyweight_gpu_wddm() {
     if (flyweight_backend_is_cpu()) return 0;
     return g_wddm;
+}
+
+extern "C" int flyweight_gpu_cublas_available() {
+    if (flyweight_backend_is_cpu() || platform_is_hip()) return 0;
+    return load_cublas() ? 1 : 0;
 }
 
 struct Entry {

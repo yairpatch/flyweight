@@ -135,6 +135,8 @@ FLYWEIGHT_API int flyweight_gpu_attention_cache(
 );
 // 1 when the compiled kernel module defines `name`, 0 otherwise.
 FLYWEIGHT_API int flyweight_gpu_kernel_available(const char* name);
+// 1 when cuBLAS is loaded and available, 0 otherwise.
+FLYWEIGHT_API int flyweight_gpu_cublas_available();
 // Tensor-core decode attention over a 16-bit float cache, read in place.
 // kv_type is the cache precision code: 1 = f16, 2 = bf16.
 FLYWEIGHT_API int flyweight_gpu_attention_16bit_cublas(

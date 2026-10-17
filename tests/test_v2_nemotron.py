@@ -302,6 +302,19 @@ class NemotronNativeTests(unittest.TestCase):
                 finally:
                     runtime.close()
 
+        # Long sequence crossing the 128-token cuBLAS threshold
+        long_prompt = [(index * 13) % 96 for index in range(120)]
+        for precision in ("f16", "turbo4", "q8_0"):
+            with self.subTest(long_context_precision=precision):
+                runtime = _native(model, context_limit=256, cache_type_k=precision, cache_type_v=precision)
+                try:
+                    produced = []
+                    runtime.generate(long_prompt, 15, produced.append)
+                    self.assertEqual(len(produced), 15)
+                finally:
+                    runtime.close()
+
+
 
 class NemotronToolCallTests(unittest.TestCase):
     def test_template_renders_tools_with_the_generic_markers(self):

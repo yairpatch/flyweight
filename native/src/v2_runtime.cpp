@@ -19991,6 +19991,7 @@ inline int qwen_cublas_attention_min_tokens(){
 inline bool qwen_cublas_attention_eligible(
     const FlyweightV2QwenRuntime&runtime,int tokens,int first_slot,int capacity
 ){
+    if(!flyweight_gpu_cublas_available())return false;
     const char*env=std::getenv("FLYWEIGHT_CUBLAS_ATTENTION");
     const bool enabled=!env||env[0]!='0';
     return flyweight::v2::attention::cublas_eligible(
@@ -20031,6 +20032,8 @@ inline bool qwen_turbo_cublas_attention(
         }
         return false;
     };
+    if(!flyweight_gpu_cublas_available())
+        return decline("cuBLAS unavailable");
     if(!(ck==cv&&kv_type_is_turbo(ck))&&!kv_mixed_stageable(ck,cv))
         return decline("cache types neither a matched turbo pair nor a stageable mix");
     if(!runtime.turbo_kv_stage)return decline("no staging buffer");
@@ -20088,6 +20091,7 @@ inline bool qwen_unwrap_cublas_attention(
     std::uint64_t attended, int heads, int kv_heads, int head_dim,
     int tokens, int capacity, int first_slot, float scale
 ){
+    if(!flyweight_gpu_cublas_available())return false;
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
     if(ck!=cv||(ck!=1&&ck!=2))return false;
     if(tokens<qwen_cublas_attention_min_tokens())return false;
