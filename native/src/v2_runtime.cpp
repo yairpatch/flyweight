@@ -5374,6 +5374,95 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
 void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,
                         int elements,float*out);
 
+// The expert stacks whose integer codes fold exactly into the int16 rows GEMM,
+// or null. FLYWEIGHT_ROWS_I16=0 holds the fold off for A/B, as it does in
+// qwen_cpu_moe_rows.
+using NemotronFold=void(*)(const std::uint8_t*,int,std::uint64_t,int,std::int16_t*,float*);
+NemotronFold nemotron_direct_fold(std::uint32_t type){
+    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
+    if((flyweight_cpu_features()&8u)==0)return nullptr;
+    if(rows_i16_setting&&rows_i16_setting[0]=='0')return nullptr;
+    switch(type){
+        case 16:return qwen_iq2xxs_fold_rows_vnni512;
+        case 17:return qwen_iq2xs_fold_rows_vnni512;
+        case 18:return qwen_iq3xxs_fold_rows_vnni512;
+        case 21:return qwen_iq3s_fold_rows_vnni512;
+        case 22:return qwen_iq2s_fold_rows_vnni512;
+        case 23:return qwen_iq4xs_fold_rows_vnni512;
+        default:return nullptr;
+    }
+}
+
+// One grouped projection of nemotron_cpu_moe_rows: for every routed expert,
+// `outputs_per_route` weight rows of width `width` against the vectors of the
+// routes that picked it (`slots[offsets[e]..]`). `vector_of(route)` is a
+// route's float input and `i16_row(route)` its row in `acts_i16`, which is
+// null when the stage runs f32; `store(route, row, value)` takes each result.
+// A free function rather than a lambda: MSVC does not capture locals that
+// only an OpenMP clause names.
+template<typename VectorOf,typename I16Row,typename Store>
+void nemotron_grouped_projection(
+    const std::uint8_t* base, std::uint64_t expert_bytes, std::uint32_t type,
+    int width, int outputs_per_route,
+    const std::vector<int>& groups, const std::vector<int>& offsets,
+    const std::vector<int>& counts, const std::vector<int>& slots,
+    NemotronFold fold, const std::int16_t* acts_i16, const float* acts_scales,
+    int threads, VectorOf vector_of, I16Row i16_row, Store store
+) {
+    constexpr int kTaskRows=16;
+    const bool use_i16=fold&&acts_i16;
+    const int blocks=(outputs_per_route+kTaskRows-1)/kTaskRows;
+    const int scale_blocks=width/256;
+    const int group_count=static_cast<int>(groups.size());
+    #pragma omp parallel for schedule(dynamic,4) num_threads(threads)
+    for(int task=0;task<group_count*blocks;++task){
+        const int expert=groups[task/blocks];
+        const int row0=(task%blocks)*kTaskRows;
+        const int mr=std::min(kTaskRows,outputs_per_route-row0);
+        const int begin=offsets[expert],count=counts[expert];
+        const auto*data=base+static_cast<std::uint64_t>(expert)*expert_bytes;
+        thread_local std::vector<float> values;
+        values.resize(static_cast<std::size_t>(kTaskRows)*count);
+        if(count<=2){
+            // One or two tokens: a direct dot beats decoding the rows.
+            for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence)
+                values[static_cast<std::size_t>(i)*count+occurrence]=qwen_quant_dot(
+                    data,type,vector_of(slots[begin+occurrence]),width,row0+i);
+        }else if(use_i16){
+            thread_local std::vector<std::int16_t> folded;
+            thread_local std::vector<float> folded_scales;
+            thread_local std::vector<const std::int16_t*> act_ptrs;
+            thread_local std::vector<const float*> act_scale_ptrs;
+            folded.resize(static_cast<std::size_t>(kTaskRows)*width);
+            folded_scales.resize(static_cast<std::size_t>(kTaskRows)*scale_blocks);
+            act_ptrs.resize(count);act_scale_ptrs.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence){
+                const auto index=static_cast<std::size_t>(i16_row(slots[begin+occurrence]));
+                act_ptrs[occurrence]=acts_i16+index*width;
+                act_scale_ptrs[occurrence]=acts_scales+index*scale_blocks;
+            }
+            fold(data,width,row0,mr,folded.data(),folded_scales.data());
+            qwen_i16_gemm_k256_vnni512(folded.data(),folded_scales.data(),mr,
+                act_ptrs.data(),act_scale_ptrs.data(),count,width,values.data());
+        }else{
+            thread_local std::vector<float> decoded;
+            thread_local std::vector<const float*> vector_ptrs;
+            decoded.resize(static_cast<std::size_t>(kTaskRows)*width);
+            vector_ptrs.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence)
+                vector_ptrs[occurrence]=vector_of(slots[begin+occurrence]);
+            for(int i=0;i<mr;++i)
+                qwen_dequant_row(data,type,width,row0+i,
+                    decoded.data()+static_cast<std::size_t>(i)*width);
+            qwen_f32_gemm_rows(decoded.data(),mr,vector_ptrs.data(),count,width,values.data());
+        }
+        for(int occurrence=0;occurrence<count;++occurrence)
+            for(int i=0;i<mr;++i)
+                store(slots[begin+occurrence],row0+i,
+                      values[static_cast<std::size_t>(i)*count+occurrence]);
+    }
+}
+
 // Prefill twin of nemotron_cpu_moe, gathered by expert like
 // qwen_cpu_moe_rows: each routed expert's up and down rows are decoded once
 // per chunk and multiplied against every token routed to it. Everything is
@@ -5435,125 +5524,47 @@ void nemotron_cpu_moe_rows(
     }
     groups.clear();
     for(int expert=0;expert<experts;++expert)if(counts[expert])groups.push_back(expert);
-    const int group_count=static_cast<int>(groups.size());
-    using Fold=void(*)(const std::uint8_t*,int,std::uint64_t,int,std::int16_t*,float*);
-    // FLYWEIGHT_ROWS_I16=0 holds the int16 fold off for A/B, as it does in
-    // qwen_cpu_moe_rows.
-    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
-    auto direct_fold=[](std::uint32_t type)->Fold{
-        if((flyweight_cpu_features()&8u)==0)return nullptr;
-        if(rows_i16_setting&&rows_i16_setting[0]=='0')return nullptr;
-        switch(type){
-            case 16:return qwen_iq2xxs_fold_rows_vnni512;
-            case 17:return qwen_iq2xs_fold_rows_vnni512;
-            case 18:return qwen_iq3xxs_fold_rows_vnni512;
-            case 21:return qwen_iq3s_fold_rows_vnni512;
-            case 22:return qwen_iq2s_fold_rows_vnni512;
-            case 23:return qwen_iq4xs_fold_rows_vnni512;
-            default:return nullptr;
-        }
-    };
-    constexpr int kTaskRows=16;
     const int threads=qwen_cpu_thread_count(runtime);
-    // One projection stage: for every routed expert, `outputs_per_route`
-    // weight rows of width `width` against the vectors of the routes that
-    // picked it; `store(route, row, value)` receives each result.
-    // `vector_of(route)` is the float input of a route, and `i16_index(route)`
-    // its row in the int16 activations when the stage quantized them.
-    auto stage=[&](const std::uint8_t*base,std::uint64_t expert_bytes,std::uint32_t type,
-                   int width,int outputs_per_route,auto vector_of,auto i16_index,
-                   const std::int16_t*acts_i16,const float*acts_scales,auto store){
-        const Fold fold=width%256==0?direct_fold(type):nullptr;
-        const bool use_i16=fold&&acts_i16;
-        const int blocks=(outputs_per_route+kTaskRows-1)/kTaskRows;
-        const int scale_blocks=width/256;
-        #pragma omp parallel for schedule(dynamic,4) num_threads(threads)
-        for(int task=0;task<group_count*blocks;++task){
-            const int expert=groups[task/blocks];
-            const int row0=(task%blocks)*kTaskRows;
-            const int mr=std::min(kTaskRows,outputs_per_route-row0);
-            const int begin=offsets[expert],count=counts[expert];
-            const auto*data=base+static_cast<std::uint64_t>(expert)*expert_bytes;
-            thread_local std::vector<float> values;
-            values.resize(static_cast<std::size_t>(kTaskRows)*count);
-            if(count<=2){
-                // One or two tokens: a direct dot beats decoding the rows.
-                for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence)
-                    values[static_cast<std::size_t>(i)*count+occurrence]=qwen_quant_dot(
-                        data,type,vector_of(slots[begin+occurrence]),width,row0+i);
-            }else if(use_i16){
-                thread_local std::vector<std::int16_t> folded;
-                thread_local std::vector<float> folded_scales;
-                thread_local std::vector<const std::int16_t*> act_ptrs;
-                thread_local std::vector<const float*> act_scale_ptrs;
-                folded.resize(static_cast<std::size_t>(kTaskRows)*width);
-                folded_scales.resize(static_cast<std::size_t>(kTaskRows)*scale_blocks);
-                act_ptrs.resize(count);act_scale_ptrs.resize(count);
-                for(int occurrence=0;occurrence<count;++occurrence){
-                    const auto index=static_cast<std::size_t>(i16_index(slots[begin+occurrence]));
-                    act_ptrs[occurrence]=acts_i16+index*width;
-                    act_scale_ptrs[occurrence]=acts_scales+index*scale_blocks;
-                }
-                fold(data,width,row0,mr,folded.data(),folded_scales.data());
-                qwen_i16_gemm_k256_vnni512(folded.data(),folded_scales.data(),mr,
-                    act_ptrs.data(),act_scale_ptrs.data(),count,width,values.data());
-            }else{
-                thread_local std::vector<float> decoded;
-                thread_local std::vector<const float*> vector_ptrs;
-                decoded.resize(static_cast<std::size_t>(kTaskRows)*width);
-                vector_ptrs.resize(count);
-                for(int occurrence=0;occurrence<count;++occurrence)
-                    vector_ptrs[occurrence]=vector_of(slots[begin+occurrence]);
-                for(int i=0;i<mr;++i)
-                    qwen_dequant_row(data,type,width,row0+i,
-                        decoded.data()+static_cast<std::size_t>(i)*width);
-                qwen_f32_gemm_rows(decoded.data(),mr,vector_ptrs.data(),count,width,values.data());
-            }
-            for(int occurrence=0;occurrence<count;++occurrence)
-                for(int i=0;i<mr;++i)
-                    store(slots[begin+occurrence],row0+i,
-                          values[static_cast<std::size_t>(i)*count+occurrence]);
-        }
-    };
-    // int16 activations for a stage whose weights fold directly, quantized
-    // once per vector rather than once per (expert, row block).
+    // Up + relu2. The input is per token, so its int16 copy is per row.
+    const NemotronFold up_fold=
+        expert_in%256==0?nemotron_direct_fold(up_tensor.type):nullptr;
     thread_local std::vector<std::int16_t> tl_acts;
     thread_local std::vector<float> tl_act_scales;
-    auto quantize=[&](std::uint32_t type,int width,int vectors,auto vector_at)
-        ->std::pair<const std::int16_t*,const float*>{
-        if(width%256!=0||!direct_fold(type))return {nullptr,nullptr};
-        tl_acts.resize(static_cast<std::size_t>(vectors)*width);
-        tl_act_scales.resize(static_cast<std::size_t>(vectors)*(width/256));
-        auto*acts=tl_acts.data();auto*scales=tl_act_scales.data();
+    const std::int16_t* up_acts=nullptr;
+    const float* up_act_scales=nullptr;
+    if(up_fold){
+        const int scale_blocks=expert_in/256;
+        tl_acts.resize(static_cast<std::size_t>(rows)*expert_in);
+        tl_act_scales.resize(static_cast<std::size_t>(rows)*scale_blocks);
+        auto*acts=tl_acts.data();
+        auto*scales=tl_act_scales.data();
         #pragma omp parallel for schedule(static) num_threads(threads)
-        for(int index=0;index<vectors;++index)
-            qwen_quantize_i16_k256_vnni512(vector_at(index),width,
-                acts+static_cast<std::size_t>(index)*width,
-                scales+static_cast<std::size_t>(index)*(width/256));
-        return {acts,scales};
-    };
-    // Up + relu2: per token input, so the int16 copy is per row.
-    {
-        auto input_of=[&](int index){return inputs+static_cast<std::size_t>(index)*expert_in;};
-        const auto up_acts=quantize(up_tensor.type,expert_in,rows,input_of);
-        stage(up_base,up_bytes,up_tensor.type,expert_in,expert_ff,
-            [&](int route){return input_of(route/top_k);},
-            [&](int route){return route/top_k;},
-            up_acts.first,up_acts.second,
-            [&](int route,int row,float value){
-                activated[static_cast<std::size_t>(route)*expert_ff+row]=
-                    value>0.0f?value*value:0.0f;
-            });
+        for(int row=0;row<rows;++row)
+            qwen_quantize_i16_k256_vnni512(
+                inputs+static_cast<std::size_t>(row)*expert_in,expert_in,
+                acts+static_cast<std::size_t>(row)*expert_in,
+                scales+static_cast<std::size_t>(row)*scale_blocks);
+        up_acts=acts;
+        up_act_scales=scales;
     }
+    nemotron_grouped_projection(
+        up_base,up_bytes,up_tensor.type,expert_in,expert_ff,
+        groups,offsets,counts,slots,up_fold,up_acts,up_act_scales,threads,
+        [&](int route){return inputs+static_cast<std::size_t>(route/top_k)*expert_in;},
+        [&](int route){return route/top_k;},
+        [&](int route,int row,float value){
+            activated[static_cast<std::size_t>(route)*expert_ff+row]=
+                value>0.0f?value*value:0.0f;
+        });
     // Down, per route, into route_outputs.
-    {
-        auto activated_of=[&](int route){return activated+static_cast<std::size_t>(route)*expert_ff;};
-        stage(down_base,down_bytes,down_tensor.type,expert_ff,expert_in,
-            activated_of,[](int route){return route;},nullptr,nullptr,
-            [&](int route,int row,float value){
-                route_outputs[static_cast<std::size_t>(route)*expert_in+row]=value;
-            });
-    }
+    nemotron_grouped_projection(
+        down_base,down_bytes,down_tensor.type,expert_ff,expert_in,
+        groups,offsets,counts,slots,nullptr,nullptr,nullptr,threads,
+        [&](int route){return activated+static_cast<std::size_t>(route)*expert_ff;},
+        [](int route){return route;},
+        [&](int route,int row,float value){
+            route_outputs[static_cast<std::size_t>(route)*expert_in+row]=value;
+        });
     // The weighted sum over each token's routes, in rank order.
     #pragma omp parallel for schedule(static) num_threads(threads)
     for(int row=0;row<rows;++row){

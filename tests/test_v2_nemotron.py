@@ -10,7 +10,7 @@ import unittest.mock
 from pathlib import Path
 
 from flyweight import server
-from flyweight.v2 import V2Model
+from flyweight.v2 import V2Error, V2Model
 
 from tests.nemotron_gguf_fixture import NemotronSpec, build_nemotron_gguf, reference_greedy
 
@@ -71,8 +71,10 @@ class NemotronConfigTests(unittest.TestCase):
         path.write_bytes(raw)
         model = V2Model(path)
         _MODELS.append(model)
-        with self.assertRaises(Exception) as caught:
-            _native(model)
+        # The plan build refuses at runtime creation, before any device is
+        # touched, so this needs no GPU.
+        with self.assertRaises(V2Error) as caught:
+            model.native_runtime(context_limit=64, mtp_drafts=0, expert_mode="cpu")
         self.assertIn("ssm", str(caught.exception))
 
 
