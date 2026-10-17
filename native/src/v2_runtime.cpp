@@ -490,6 +490,23 @@ struct QwenLayerPlan {
     float shared_down_scale = 1.0f;
     std::uint64_t state_first = 0;
     std::uint64_t state_second = 0;
+    // Nemotron H (Bolt): three block kinds per layer. `mamba` marks an SSM
+    // block, `attention` an attention one; neither flag means MoE-only and the
+    // block front is skipped entirely. The routed experts are sized per block
+    // (Bolt runs 240..496 of them), so width, stride and top-k live here; the
+    // latent projections are optional per bridge as the config says.
+    bool mamba = false;
+    std::uint32_t expert_count = 0, expert_ff = 0, moe_latent = 0, expert_used = 0;
+    std::uint64_t latent_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t latent_up = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t shexp_up = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t shexp_down = std::numeric_limits<std::uint64_t>::max();
+    // SSM block role indexes into static_tensors (the conv bias is optional in
+    // llama.cpp conversions, so later roles shift when it is absent and the
+    // decoder must not guess positions).
+    std::uint64_t ssm_in_role = 0, ssm_conv_role = 0, ssm_dt_role = 0,
+        ssm_a_role = 0, ssm_d_role = 0, ssm_norm_role = 0, ssm_out_role = 0;
+    std::uint64_t ssm_conv_bias_role = std::numeric_limits<std::uint64_t>::max();
     // qwen4exp PLE conv ring: (kernel-1)*dilation trailing columns of the
     // hc-wide gated-value stream. Only meaningful when ple_conv is set; the
     // block that owns it is a DeltaNet block, so first/second are taken.
@@ -943,6 +960,10 @@ struct FlyweightV2QwenRuntime {
     // LFM2 / LFM2-MoE (Liquid): the non-attention blocks are a gated short
     // convolution rather than DeltaNet, and the MoE has no shared expert.
     bool lfm2 = false;
+    // nemotron_h_moe (Nemotron 3.5 Bolt / Lightning): Mamba-2 blocks beside
+    // plain GQA and latent-space MoE blocks. No RoPE anywhere, relu² expert
+    // activations, per-layer expert geometry.
+    bool nemotron = false;
     // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
     // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
     // bookends in the forward paths and, at bring-up, disables CUDA graphs
@@ -2605,10 +2626,14 @@ void build_tokenizer_tables(FlyweightV2Model& m) {
     m.control_tokens.clear();
     for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
-    // LFM2 spells <think> and </think> as user-defined (type 4) tokens that
-    // its template emits as text; llama.cpp splits those out exactly like the
-    // control tokens, and BPE would otherwise shred them into "<", "think", ">".
-    const bool user_defined_specials=m.tokenizer_pre=="lfm2";
+    // LFM2 and Nemotron H spell their chat tags (<think>, <tool_call>,
+    // <tool_response> and their closers) as user-defined (type 4) tokens that
+    // their templates emit as text; llama.cpp splits those out exactly like the
+    // control tokens, and BPE would otherwise shred them into "<", "think",
+    // ">". Nemotron is keyed on the architecture: its `pixtral` pre-tokenizer
+    // name is shared with Mistral checkpoints.
+    const bool user_defined_specials=m.tokenizer_pre=="lfm2"||
+        m.architecture=="nemotron_h_moe";
     // Longest first, so a control token that prefixes another still matches the
     // longer one when scanning input left to right.
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++){
@@ -2714,6 +2739,12 @@ int parse(FlyweightV2Model& m) {
         else if(suffix(".attention.value_length_mla"))target=&m.config.value_length_mla;
         else if(suffix(".kda.head_dim"))target=&m.config.attention_head_dim;
         else if(suffix(".ssm.conv_kernel"))target=&m.config.conv_kernel;
+        // Nemotron H reads the Mamba-2 geometry under the `.ssm.*` family.
+        else if(suffix(".ssm.state_size"))target=&m.config.ssm_state_size;
+        else if(suffix(".ssm.group_count"))target=&m.config.ssm_group_count;
+        else if(suffix(".ssm.inner_size"))target=&m.config.ssm_inner_size;
+        else if(suffix(".ssm.time_step_rank"))target=&m.config.ssm_time_step_rank;
+        else if(suffix(".moe_latent_size"))target=&m.config.moe_latent_size;
         // LFM2's gated short convolution names its width after the rolling
         // cache it keeps (l_cache = kernel taps, the state is one fewer).
         else if(suffix(".shortconv.l_cache"))target=&m.config.conv_kernel;
@@ -2811,6 +2842,11 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=24 && key.compare(key.size()-24,24,".full_attention_interval")==0 && (type==4 || type==10)) m.config.full_attention_interval=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".attention.head_count_kv")==0 && type==9) m.config.attention_kv_heads_by_layer=read_uint_array(type);
         else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.head_count")==0 && type==9) m.config.attention_heads_by_layer=read_uint_array(type);
+        // Nemotron H Bolt sizes its routed experts per block: the FF width and
+        // top-k arrive as arrays. The scalar branches in set_config only take
+        // type 4/10, so an array falls through to here.
+        else if (key.size()>=27 && key.compare(key.size()-27,27,".expert_feed_forward_length")==0 && type==9) m.config.expert_ff_by_layer=read_uint_array(type);
+        else if (key.size()>=18 && key.compare(key.size()-18,18,".expert_used_count")==0 && type==9) m.config.expert_used_by_layer=read_uint_array(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.sliding_window")==0 && (type==4 || type==10)) m.config.sliding_window=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && type==9) {
             const auto element_type=r.get<uint32_t>();
@@ -3004,6 +3040,28 @@ int parse(FlyweightV2Model& m) {
                 m.architecture+" GGUF is missing shortconv.l_cache");
         if(m.architecture=="lfm2moe")m.config.expert_weights_norm=true;
     }
+    // Nemotron H: the per-layer KV-head array is 0 on the Mamba-2 and MoE
+    // blocks, so the scalar the attention geometry reads is lifted out the
+    // same way LFM2 does it. Bolt's per-layer top-k folds its maximum into
+    // the scalar the shared runtime paths size their route buffers by.
+    if(m.architecture=="nemotron_h_moe"){
+        const auto&kv_by_layer=m.config.attention_kv_heads_by_layer;
+        if(!m.config.attention_kv_heads){
+            if(kv_by_layer.empty())
+                throw std::runtime_error(
+                    "nemotron_h GGUF carries no attention.head_count_kv");
+            m.config.attention_kv_heads=*std::max_element(
+                kv_by_layer.begin(),kv_by_layer.end());
+        }
+        if(!m.config.attention_heads){
+            for(const auto heads:m.config.attention_heads_by_layer)
+                m.config.attention_heads=std::max(m.config.attention_heads,heads);
+        }
+        if(!m.config.expert_used_count){
+            for(const auto used:m.config.expert_used_by_layer)
+                m.config.expert_used_count=std::max(m.config.expert_used_count,used);
+        }
+    }
     if(m.architecture=="qwen_image"||m.architecture=="qwenimage21-dit"){
         m.architecture="qwenimage21-dit";
         m.config.architecture="qwenimage21-dit";
@@ -3187,17 +3245,18 @@ std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayer
 }
 
 // DeepSeek-shaped routing: sigmoid probabilities ranked by a score-correction
-// bias, the picked weights L1-normalized and scaled. Laguna, K2-Horizon and
-// LFM2-MoE route this way; Qwen and Gemma 4 take the plain softmax top-k.
+// bias, the picked weights L1-normalized and scaled. Laguna, K2-Horizon,
+// LFM2-MoE and Nemotron H route this way; Qwen and Gemma 4 take the plain
+// softmax top-k.
 bool qwen_sigmoid_bias_router(const FlyweightV2QwenRuntime& runtime) {
-    return runtime.laguna||runtime.k2horizon||runtime.lfm2;
+    return runtime.laguna||runtime.k2horizon||runtime.lfm2||runtime.nemotron;
 }
 
 // Qwen gates its shared expert on a learned projection parked at moe_base+5.
 // The DeepSeek-shaped families have no such tensor and their shared branch is
 // always on, so reading that slot would pick up whatever the layout put there.
 bool qwen_shared_expert_gated(const FlyweightV2QwenRuntime& runtime) {
-    return !runtime.laguna&&!runtime.k2horizon&&!runtime.lfm2;
+    return !runtime.laguna&&!runtime.k2horizon&&!runtime.lfm2&&!runtime.nemotron;
 }
 
 // LFM2-MoE routes every token through its experts alone: there is no shared
@@ -3208,8 +3267,10 @@ bool qwen_has_shared_expert(const FlyweightV2QwenRuntime& runtime) {
 }
 
 // The per-sequence state of a non-attention block, in floats: its causal-conv
-// ring and, for DeltaNet, the recurrent matrix behind it. LFM2's short conv
-// keeps only the last l_cache-1 columns of b*x and has no recurrence. Every
+// ring and, for DeltaNet and Mamba-2, the recurrent tensor behind it. LFM2's
+// short conv keeps only the last l_cache-1 columns of b*x and has no
+// recurrence; Nemotron H keeps the same size ring plus a d_state*d_inner
+// selective-scan state, and a MoE-only block keeps nothing at all. Every
 // sizing, snapshot and spill site reads this one definition.
 struct QwenRecurrentState { std::uint64_t conv = 0, recurrent = 0; };
 QwenRecurrentState qwen_recurrent_state(
@@ -3221,6 +3282,17 @@ QwenRecurrentState qwen_recurrent_state(
                     runtime.model->config.conv_kernel *
                     (runtime.model->config.conv_kernel - 1),
                 0};
+    if (runtime.nemotron) {
+        // Only the SSM blocks carry state; safe when the runtime is being
+        // asked about a block the plan has not classified yet, too.
+        if (!layer.mamba || layer.static_tensors.size() < 2) return {0, 0};
+        const auto& conv = tensors[layer.static_tensors.at(layer.ssm_conv_role)];
+        return {tensor_elements(conv) /
+                    runtime.model->config.conv_kernel *
+                    (runtime.model->config.conv_kernel - 1),
+                static_cast<std::uint64_t>(runtime.model->config.ssm_state_size) *
+                    runtime.model->config.ssm_inner_size};
+    }
     const auto& a = tensors[layer.static_tensors.at(8)];
     const auto& norm = tensors[layer.static_tensors.at(9)];
     return {tensor_elements(tensors[layer.static_tensors.at(6)]),
@@ -3975,6 +4047,246 @@ void build_lfm2_plan(FlyweightV2QwenRuntime& runtime) {
     runtime.scratch_elements=std::max(
         runtime.scratch_elements,
         2u*std::max(runtime.moe_intermediate,model.config.dense_intermediate_size));
+}
+
+// Nemotron H MoE (`nemotron_h_moe`, NVIDIA's Nemotron 3.5 Bolt). Every block
+// opens with one RMS norm and runs exactly one of three sublayers: a Mamba-2 selective-scan block
+// (ssm_in → depthwise conv over x|B|C → scan), plain GQA attention with no
+// RoPE and no per-head norms, or a sigmoid-routed latent-space MoE (the
+// experts run from the moe_latent_size reduction, relu² activated, plus an
+// always-on unweighted shared expert at full width). Semantics follow
+// llama.cpp's src/models/nemotron-h.cpp and build_mamba2_layer; the details
+// are in plans/nemotron-h-moe.md.
+//
+// Slot layout. The decoders read the roles through the named fields, since
+// the optional conv bias shifts everything after it:
+//
+//   mamba   0 attn_norm, 1 ssm_in, 2 ssm_conv1d, [conv1d.bias,]
+//           dt.bias, ssm_a, ssm_d, ssm_norm, ssm_out
+//   attn    0 attn_norm, 1 attn_q, 2 attn_k, 3 attn_v, 4 attn_output
+//   moe     0 attn_norm, 1 ffn_gate_inp, [exp_probs_b,] [latent_down,
+//           latent_up,] up_shexp, down_shexp
+void build_nemotron_plan(FlyweightV2QwenRuntime& runtime) {
+    auto& model=*runtime.model;
+    runtime.nemotron=true;
+    runtime.token_embeddings=tensor_index(model,"token_embd.weight");
+    runtime.final_norm=tensor_index(model,"output_norm.weight");
+    runtime.lm_head=has_tensor(model,"output.weight")
+        ?tensor_index(model,"output.weight"):runtime.token_embeddings;
+    runtime.lm_head_type=model.tensors[runtime.lm_head].type;
+    runtime.static_tensor_bytes+=model.tensors[runtime.token_embeddings].size;
+    runtime.static_tensor_bytes+=model.tensors[runtime.final_norm].size;
+    if(runtime.lm_head!=runtime.token_embeddings)
+        runtime.static_tensor_bytes+=model.tensors[runtime.lm_head].size;
+    if(model.config.expert_gating_func&&model.config.expert_gating_func!=2)
+        throw std::runtime_error("native Nemotron H expects sigmoid expert gating");
+    const auto& expert_ff_by_layer=model.config.expert_ff_by_layer;
+    const auto& expert_used_by_layer=model.config.expert_used_by_layer;
+    const auto hidden=model.config.hidden_size;
+    const auto& inner=model.config.ssm_inner_size;
+    const auto& group=model.config.ssm_group_count;
+    const auto& d_state=model.config.ssm_state_size;
+    const auto& time_step=model.config.ssm_time_step_rank;
+    if(!inner||!group||!d_state||!time_step)
+        throw std::runtime_error("native Nemotron H requires the ssm geometry keys");
+    const auto d_in_proj=2ull*inner+2ull*group*d_state+time_step;
+    const auto conv_channels=inner+2ull*group*d_state;
+    runtime.layers.reserve(model.config.layer_count);
+    for(std::uint32_t layer_index=0;layer_index<model.config.layer_count;++layer_index){
+        const std::string prefix="blk."+std::to_string(layer_index)+".";
+        QwenLayerPlan layer;
+        layer.mamba=has_tensor(model,prefix+"ssm_in.weight");
+        layer.attention=has_tensor(model,prefix+"attn_q.weight");
+        if((layer.mamba&&layer.attention)||
+           (!layer.mamba&&!layer.attention&&
+            !has_tensor(model,prefix+"ffn_gate_inp.weight")))
+            throw std::runtime_error(
+                "nemotron_h block "+std::to_string(layer_index)+
+                " is not exactly one of SSM, attention or MoE");
+        // One pre-norm per block whatever the sublayer, at slot 0 like every
+        // family's.
+        add_static_tensor(runtime,layer,prefix+"attn_norm.weight");
+        if(layer.mamba){
+            layer.ssm_in_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_in.weight");
+            layer.ssm_conv_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_conv1d.weight");
+            if(has_tensor(model,prefix+"ssm_conv1d.bias")){
+                // The conversion names the taps and the bias separately, so a
+                // checkpoint without the bias shifts every later role and the
+                // decoder must not guess positions.
+                layer.ssm_conv_bias_role=layer.static_tensors.size();
+                add_static_tensor(runtime,layer,prefix+"ssm_conv1d.bias");
+            }
+            layer.ssm_dt_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_dt.bias");
+            layer.ssm_a_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_a");
+            layer.ssm_d_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_d");
+            layer.ssm_norm_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_norm.weight");
+            layer.ssm_out_role=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ssm_out.weight");
+            const auto&in_proj=model.tensors[layer.static_tensors[layer.ssm_in_role]];
+            const auto&conv=model.tensors[layer.static_tensors[layer.ssm_conv_role]];
+            const auto&norm=model.tensors[layer.static_tensors[layer.ssm_norm_role]];
+            const auto&out=model.tensors[layer.static_tensors[layer.ssm_out_role]];
+            if(in_proj.shape.size()<2||in_proj.shape[0]!=hidden||
+               in_proj.shape[1]!=d_in_proj)
+                throw std::runtime_error(
+                    "nemotron_h ssm_in must project hidden x d_in_proj ("+
+                    std::to_string(d_in_proj)+")");
+            if(conv.type!=0||conv.shape.size()<2||conv.shape[0]!=model.config.conv_kernel||
+               conv.shape[1]!=conv_channels)
+                throw std::runtime_error(
+                    "nemotron_h ssm_conv1d must be an f32 {d_conv, xBC} tensor");
+            if(norm.shape.size()<2||norm.shape[0]!=inner/group||
+               norm.shape[1]!=group)
+                throw std::runtime_error(
+                    "nemotron_h ssm_norm must be {d_inner/n_group, n_group}");
+            if(out.shape.size()<2||out.shape[0]!=inner||out.shape[1]!=hidden)
+                throw std::runtime_error(
+                    "nemotron_h ssm_out must project d_inner back to hidden");
+            const auto&dt=model.tensors[layer.static_tensors[layer.ssm_dt_role]];
+            const auto&a=model.tensors[layer.static_tensors[layer.ssm_a_role]];
+            const auto&d=model.tensors[layer.static_tensors[layer.ssm_d_role]];
+            if(tensor_elements(dt)!=time_step||tensor_elements(a)!=time_step||
+               tensor_elements(d)!=time_step)
+                throw std::runtime_error(
+                    "nemotron_h ssm_dt.bias / ssm_a / ssm_d must have one entry per head");
+        }else if(layer.attention){
+            for(const char* suffix:{
+                "attn_q.weight","attn_k.weight","attn_v.weight","attn_output.weight"
+            })add_static_tensor(runtime,layer,prefix+suffix);
+            // No RoPE on this arch: the decoders never touch rotary_dim.
+            layer.attention_heads=model.config.attention_heads;
+            layer.kv_heads=layer_index<model.config.attention_kv_heads_by_layer.size()
+                ?model.config.attention_kv_heads_by_layer[layer_index]
+                :model.config.attention_kv_heads;
+            if(!layer.attention_heads||!layer.kv_heads)
+                throw std::runtime_error("nemotron_h attention geometry is incomplete");
+            const auto&q=model.tensors[layer.static_tensors[1]];
+            const auto&k=model.tensors[layer.static_tensors[2]];
+            const auto&v=model.tensors[layer.static_tensors[3]];
+            const auto&o=model.tensors[layer.static_tensors[4]];
+            layer.head_dim=static_cast<std::uint32_t>(k.shape[1]/layer.kv_heads);
+            const auto q_width=static_cast<std::uint64_t>(layer.attention_heads)*layer.head_dim;
+            if(!layer.head_dim||k.shape[1]%layer.kv_heads||v.shape[1]!=k.shape[1]||
+               q.shape[1]!=q_width||o.shape[0]!=q_width||o.shape[1]!=hidden)
+                throw std::runtime_error(
+                    "nemotron_h attention projections disagree with the head counts "
+                    "on layer "+std::to_string(layer_index));
+        }else{
+            add_static_tensor(runtime,layer,prefix+"ffn_gate_inp.weight");
+            {
+                // The router's width is the block's expert count: Bolt's GGUF
+                // stores only the maximum as the scalar expert_count.
+                const auto&router=model.tensors[layer.static_tensors[1]];
+                if(router.shape.size()<2||router.shape[0]!=hidden)
+                    throw std::runtime_error("nemotron_h ffn_gate_inp must project from hidden");
+                layer.expert_count=static_cast<std::uint32_t>(router.shape[1]);
+                if(layer.expert_count>model.config.expert_count)
+                    throw std::runtime_error(
+                        "nemotron_h block routes over more experts than expert_count");
+            }
+            if(has_tensor(model,prefix+"exp_probs_b.bias")){
+                add_static_tensor(runtime,layer,prefix+"exp_probs_b.bias");
+                layer.router_bias=layer.static_tensors.back();
+                // The sigmoid router ranks probs + bias; the bias must have
+                // one entry per expert.
+                const auto&bias=model.tensors[layer.router_bias];
+                if(bias.shape.empty()||bias.shape[0]!=layer.expert_count)
+                    throw std::runtime_error(
+                        "nemotron_h exp_probs_b must have one entry per expert");
+            }
+            if(model.config.moe_latent_size&&
+               has_tensor(model,prefix+"ffn_latent_down.weight")&&
+               has_tensor(model,prefix+"ffn_latent_up.weight")){
+                layer.latent_down=layer.static_tensors.size();
+                add_static_tensor(runtime,layer,prefix+"ffn_latent_down.weight");
+                layer.latent_up=layer.static_tensors.size();
+                add_static_tensor(runtime,layer,prefix+"ffn_latent_up.weight");
+                layer.moe_latent=model.config.moe_latent_size;
+                const auto&down=model.tensors[layer.static_tensors[layer.latent_down]];
+                const auto&up=model.tensors[layer.static_tensors[layer.latent_up]];
+                if(down.shape.size()<2||down.shape[0]!=hidden||
+                   down.shape[1]!=layer.moe_latent||
+                   up.shape.size()<2||up.shape[0]!=layer.moe_latent||
+                   up.shape[1]!=hidden)
+                    throw std::runtime_error(
+                        "nemotron_h ffn_latent_down/up must bridge hidden x moe_latent_size");
+            }
+            layer.shexp_up=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ffn_up_shexp.weight");
+            layer.shexp_down=layer.static_tensors.size();
+            add_static_tensor(runtime,layer,prefix+"ffn_down_shexp.weight");
+            const auto&shexp_up=model.tensors[layer.static_tensors[layer.shexp_up]];
+            const auto&shexp_down=model.tensors[layer.static_tensors[layer.shexp_down]];
+            if(shexp_up.shape.size()<2||shexp_up.shape[0]!=hidden||
+               shexp_down.shape.size()<2||shexp_down.shape[0]!=shexp_up.shape[1]||
+               shexp_down.shape[1]!=hidden)
+                throw std::runtime_error(
+                    "nemotron_h shared expert projections must round-trip hidden");
+            if(model.config.expert_shared_intermediate_size&&
+               shexp_up.shape[1]!=model.config.expert_shared_intermediate_size)
+                throw std::runtime_error(
+                    "nemotron_h shared expert width disagrees with "
+                    "expert_shared_feed_forward_length");
+            // The two stacked expert matrices are expert tensors, not static
+            // slots. Their FF width is the up stack's; the per-layer array
+            // Bolt carries (a uniform conversion has the scalar) must agree.
+            const std::array<std::string,2> experts={
+                prefix+"ffn_up_exps.weight",prefix+"ffn_down_exps.weight",
+            };
+            for(std::size_t role=0;role<experts.size();++role){
+                layer.expert_tensors[role]=tensor_index(model,experts[role]);
+                runtime.expert_tensor_bytes+=
+                    model.tensors[layer.expert_tensors[role]].size;
+            }
+            const auto&up=model.tensors[layer.expert_tensors[0]];
+            const auto&down=model.tensors[layer.expert_tensors[1]];
+            layer.expert_ff=up.shape.size()<2?0:static_cast<std::uint32_t>(up.shape[1]);
+            const std::uint64_t configured_ff=layer_index<expert_ff_by_layer.size()
+                ?expert_ff_by_layer[layer_index]:model.config.expert_intermediate_size;
+            layer.expert_used=static_cast<std::uint32_t>(
+                layer_index<expert_used_by_layer.size()
+                    ?expert_used_by_layer[layer_index]:model.config.expert_used_count);
+            if(!layer.expert_ff||!layer.expert_used)
+                throw std::runtime_error(
+                    "nemotron_h MoE layer "+std::to_string(layer_index)+
+                    " has empty expert geometry");
+            if(configured_ff&&configured_ff!=layer.expert_ff)
+                throw std::runtime_error(
+                    "nemotron_h MoE layer "+std::to_string(layer_index)+
+                    " expert width disagrees with expert_feed_forward_length");
+            if(layer.expert_used>layer.expert_count)
+                throw std::runtime_error(
+                    "nemotron_h MoE layer "+std::to_string(layer_index)+
+                    " routes more experts than it has");
+            if(up.shape.size()<3||down.shape.size()<3||
+               up.shape[2]!=layer.expert_count||down.shape[2]!=layer.expert_count||
+               up.shape[0]!=(layer.moe_latent?layer.moe_latent:hidden)||
+               up.shape[1]!=layer.expert_ff||
+               down.shape[0]!=layer.expert_ff||
+               down.shape[1]!=(layer.moe_latent?layer.moe_latent:hidden))
+                throw std::runtime_error(
+                    "nemotron_h exps geometry disagrees with the config on layer "+
+                    std::to_string(layer_index));
+        }
+        for(auto index:layer.static_tensors){
+            const auto&t=model.tensors[index];
+            if(t.shape.size()==2)runtime.scratch_elements=std::max(
+                runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));
+        }
+        runtime.layers.push_back(std::move(layer));
+    }
+    // Workspace width: the widest intermediate the MoE branches write, so the
+    // routed (per block) and shared relu2 activations all fit one layout.
+    runtime.moe_intermediate=static_cast<std::uint32_t>(
+        model.config.expert_shared_intermediate_size);
+    for(const auto&plan:runtime.layers)runtime.moe_intermediate=std::max(
+        runtime.moe_intermediate,plan.expert_ff);
 }
 
 void build_gemma4_plan(FlyweightV2QwenRuntime& runtime) {
@@ -4999,6 +5311,260 @@ void gemma_cpu_moe(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan&laye
             sum+=weights[rank]*expert_scales[expert]*expert_value;
         }
         output[row]=sum;
+    }
+}
+
+// Nemotron H routed experts for one token on the CPU, straight from the
+// mapping. Each expert is an up/down pair with relu2 between and no gate.
+// `input` is what the experts read -- the ffn_latent_down reduction when the
+// block has the latent bridge, else the normed stream -- and `output` comes
+// back at that same width, the routing-weighted sum over `selected`.
+void nemotron_cpu_moe(
+    const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    const std::int32_t* selected, const float* weights, int routed_count,
+    const float* input, float* activated, float* output
+) {
+    const auto experts=static_cast<int>(layer.expert_count);
+    const int expert_ff=static_cast<int>(layer.expert_ff);
+    const int expert_in=static_cast<int>(
+        layer.moe_latent?layer.moe_latent:runtime.model->config.hidden_size);
+    if(routed_count<0||routed_count>256)
+        throw std::runtime_error("native CPU MoE routed count is unsupported");
+    const auto&up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+    const auto&down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+    for(const auto type:{up_tensor.type,down_tensor.type})
+        if(!qwen_cpu_expert_type_supported(type))
+            throw std::runtime_error(
+                "unsupported native Nemotron H expert quantization: "+std::to_string(type));
+    const auto up_bytes=up_tensor.size/experts,down_bytes=down_tensor.size/experts;
+    const auto*up_base=tensor_data(*runtime.model,up_tensor);
+    const auto*down_base=tensor_data(*runtime.model,down_tensor);
+    #if defined(_OPENMP)
+    const QwenDecodeCaller decode_caller(qwen_cpu_decode_thread_count(runtime));
+    #endif
+    // Up + relu2, one task per (rank, ff row).
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_decode_thread_count(runtime))
+    for(int task=0;task<routed_count*expert_ff;++task){
+        qwen_pin_decode_member();
+        const int rank=task/expert_ff,row=task%expert_ff,expert=selected[rank];
+        if(expert<0||expert>=experts){activated[task]=0.0f;continue;}
+        const float value=qwen_quant_dot(
+            up_base+static_cast<std::uint64_t>(expert)*up_bytes,up_tensor.type,
+            input,expert_in,row);
+        activated[task]=value>0.0f?value*value:0.0f;
+    }
+    // Down and the weighted sum, one task per output channel walking the ranks.
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_decode_thread_count(runtime))
+    for(int channel=0;channel<expert_in;++channel){
+        qwen_pin_decode_member();
+        float sum=0.0f;
+        for(int rank=0;rank<routed_count;++rank){
+            const int expert=selected[rank];
+            if(expert<0||expert>=experts)continue;
+            sum+=weights[rank]*qwen_quant_dot(
+                down_base+static_cast<std::uint64_t>(expert)*down_bytes,down_tensor.type,
+                activated+static_cast<std::size_t>(rank)*expert_ff,expert_ff,channel);
+        }
+        output[channel]=sum;
+    }
+}
+
+void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
+                      std::uint64_t row,float*output);
+void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,
+                        int elements,float*out);
+
+// Prefill twin of nemotron_cpu_moe, gathered by expert like
+// qwen_cpu_moe_rows: each routed expert's up and down rows are decoded once
+// per chunk and multiplied against every token routed to it. Everything is
+// compact per row: `selected`/`weights` carry layer.expert_used routes per row
+// as route_topk_sigmoid_bias_rows wrote them, `inputs`/`outputs` one
+// expert-input-width row each (the latent width when the block bridges
+// through ffn_latent_down/up, else hidden). `activated` holds one expert_ff
+// slice per route and `route_outputs` one expert-input-width slice per route,
+// so the weighted sum over a token's routes is a separate, race-free pass.
+//
+// The up projection of the codebook formats whose integer codes fold exactly
+// (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) takes the int16 VNNI GEMM
+// against 14-bit activations when the CPU has it -- the gate/up path the Qwen
+// prefill uses for those stacks; everything else, and every down projection,
+// dequantizes rows into an f32 GEMM. The down input is relu2 output, whose
+// squared tails a 14-bit block scale flattens: int16 there was ~12% faster on
+// the Bolt IQ2_XXS prefill but moved its greedy output, where int16 up alone
+// reproduced the f32 tokens exactly.
+void nemotron_cpu_moe_rows(
+    const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer, int rows,
+    const std::int32_t* selected, const float* weights, const float* inputs,
+    float* activated, float* route_outputs, float* outputs
+) {
+    const int experts=static_cast<int>(layer.expert_count);
+    const int expert_ff=static_cast<int>(layer.expert_ff);
+    const int top_k=static_cast<int>(layer.expert_used);
+    const int expert_in=static_cast<int>(
+        layer.moe_latent?layer.moe_latent:runtime.model->config.hidden_size);
+    const auto&up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+    const auto&down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+    for(const auto type:{up_tensor.type,down_tensor.type})
+        if(!qwen_cpu_expert_type_supported(type))
+            throw std::runtime_error(
+                "unsupported native Nemotron H expert quantization: "+std::to_string(type));
+    const auto up_bytes=up_tensor.size/experts,down_bytes=down_tensor.size/experts;
+    const auto*up_base=tensor_data(*runtime.model,up_tensor);
+    const auto*down_base=tensor_data(*runtime.model,down_tensor);
+    const int routes=rows*top_k;
+    // CSR over routes by expert. Filled before the parallel regions and only
+    // read inside them; bound to references so the workers see this thread's
+    // tables rather than their own empty thread_local instances.
+    thread_local std::vector<int> tl_counts,tl_offsets,tl_slots,tl_groups;
+    auto&counts=tl_counts;auto&offsets=tl_offsets;auto&slots=tl_slots;auto&groups=tl_groups;
+    counts.assign(experts,0);
+    for(int route=0;route<routes;++route){
+        const int expert=selected[route];
+        if(expert<0||expert>=experts)
+            throw std::runtime_error("native Nemotron H rows MoE selected an invalid expert");
+        ++counts[expert];
+    }
+    offsets.assign(experts+1,0);
+    for(int expert=0;expert<experts;++expert)offsets[expert+1]=offsets[expert]+counts[expert];
+    slots.resize(routes);
+    {
+        thread_local std::vector<int> tl_cursor;
+        auto&cursor=tl_cursor;
+        cursor.assign(offsets.begin(),offsets.end()-1);
+        for(int route=0;route<routes;++route)slots[cursor[selected[route]]++]=route;
+    }
+    groups.clear();
+    for(int expert=0;expert<experts;++expert)if(counts[expert])groups.push_back(expert);
+    const int group_count=static_cast<int>(groups.size());
+    using Fold=void(*)(const std::uint8_t*,int,std::uint64_t,int,std::int16_t*,float*);
+    // FLYWEIGHT_ROWS_I16=0 holds the int16 fold off for A/B, as it does in
+    // qwen_cpu_moe_rows.
+    static const char* rows_i16_setting=std::getenv("FLYWEIGHT_ROWS_I16");
+    auto direct_fold=[](std::uint32_t type)->Fold{
+        if((flyweight_cpu_features()&8u)==0)return nullptr;
+        if(rows_i16_setting&&rows_i16_setting[0]=='0')return nullptr;
+        switch(type){
+            case 16:return qwen_iq2xxs_fold_rows_vnni512;
+            case 17:return qwen_iq2xs_fold_rows_vnni512;
+            case 18:return qwen_iq3xxs_fold_rows_vnni512;
+            case 21:return qwen_iq3s_fold_rows_vnni512;
+            case 22:return qwen_iq2s_fold_rows_vnni512;
+            case 23:return qwen_iq4xs_fold_rows_vnni512;
+            default:return nullptr;
+        }
+    };
+    constexpr int kTaskRows=16;
+    const int threads=qwen_cpu_thread_count(runtime);
+    // One projection stage: for every routed expert, `outputs_per_route`
+    // weight rows of width `width` against the vectors of the routes that
+    // picked it; `store(route, row, value)` receives each result.
+    // `vector_of(route)` is the float input of a route, and `i16_index(route)`
+    // its row in the int16 activations when the stage quantized them.
+    auto stage=[&](const std::uint8_t*base,std::uint64_t expert_bytes,std::uint32_t type,
+                   int width,int outputs_per_route,auto vector_of,auto i16_index,
+                   const std::int16_t*acts_i16,const float*acts_scales,auto store){
+        const Fold fold=width%256==0?direct_fold(type):nullptr;
+        const bool use_i16=fold&&acts_i16;
+        const int blocks=(outputs_per_route+kTaskRows-1)/kTaskRows;
+        const int scale_blocks=width/256;
+        #pragma omp parallel for schedule(dynamic,4) num_threads(threads)
+        for(int task=0;task<group_count*blocks;++task){
+            const int expert=groups[task/blocks];
+            const int row0=(task%blocks)*kTaskRows;
+            const int mr=std::min(kTaskRows,outputs_per_route-row0);
+            const int begin=offsets[expert],count=counts[expert];
+            const auto*data=base+static_cast<std::uint64_t>(expert)*expert_bytes;
+            thread_local std::vector<float> values;
+            values.resize(static_cast<std::size_t>(kTaskRows)*count);
+            if(count<=2){
+                // One or two tokens: a direct dot beats decoding the rows.
+                for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence)
+                    values[static_cast<std::size_t>(i)*count+occurrence]=qwen_quant_dot(
+                        data,type,vector_of(slots[begin+occurrence]),width,row0+i);
+            }else if(use_i16){
+                thread_local std::vector<std::int16_t> folded;
+                thread_local std::vector<float> folded_scales;
+                thread_local std::vector<const std::int16_t*> act_ptrs;
+                thread_local std::vector<const float*> act_scale_ptrs;
+                folded.resize(static_cast<std::size_t>(kTaskRows)*width);
+                folded_scales.resize(static_cast<std::size_t>(kTaskRows)*scale_blocks);
+                act_ptrs.resize(count);act_scale_ptrs.resize(count);
+                for(int occurrence=0;occurrence<count;++occurrence){
+                    const auto index=static_cast<std::size_t>(i16_index(slots[begin+occurrence]));
+                    act_ptrs[occurrence]=acts_i16+index*width;
+                    act_scale_ptrs[occurrence]=acts_scales+index*scale_blocks;
+                }
+                fold(data,width,row0,mr,folded.data(),folded_scales.data());
+                qwen_i16_gemm_k256_vnni512(folded.data(),folded_scales.data(),mr,
+                    act_ptrs.data(),act_scale_ptrs.data(),count,width,values.data());
+            }else{
+                thread_local std::vector<float> decoded;
+                thread_local std::vector<const float*> vector_ptrs;
+                decoded.resize(static_cast<std::size_t>(kTaskRows)*width);
+                vector_ptrs.resize(count);
+                for(int occurrence=0;occurrence<count;++occurrence)
+                    vector_ptrs[occurrence]=vector_of(slots[begin+occurrence]);
+                for(int i=0;i<mr;++i)
+                    qwen_dequant_row(data,type,width,row0+i,
+                        decoded.data()+static_cast<std::size_t>(i)*width);
+                qwen_f32_gemm_rows(decoded.data(),mr,vector_ptrs.data(),count,width,values.data());
+            }
+            for(int occurrence=0;occurrence<count;++occurrence)
+                for(int i=0;i<mr;++i)
+                    store(slots[begin+occurrence],row0+i,
+                          values[static_cast<std::size_t>(i)*count+occurrence]);
+        }
+    };
+    // int16 activations for a stage whose weights fold directly, quantized
+    // once per vector rather than once per (expert, row block).
+    thread_local std::vector<std::int16_t> tl_acts;
+    thread_local std::vector<float> tl_act_scales;
+    auto quantize=[&](std::uint32_t type,int width,int vectors,auto vector_at)
+        ->std::pair<const std::int16_t*,const float*>{
+        if(width%256!=0||!direct_fold(type))return {nullptr,nullptr};
+        tl_acts.resize(static_cast<std::size_t>(vectors)*width);
+        tl_act_scales.resize(static_cast<std::size_t>(vectors)*(width/256));
+        auto*acts=tl_acts.data();auto*scales=tl_act_scales.data();
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for(int index=0;index<vectors;++index)
+            qwen_quantize_i16_k256_vnni512(vector_at(index),width,
+                acts+static_cast<std::size_t>(index)*width,
+                scales+static_cast<std::size_t>(index)*(width/256));
+        return {acts,scales};
+    };
+    // Up + relu2: per token input, so the int16 copy is per row.
+    {
+        auto input_of=[&](int index){return inputs+static_cast<std::size_t>(index)*expert_in;};
+        const auto up_acts=quantize(up_tensor.type,expert_in,rows,input_of);
+        stage(up_base,up_bytes,up_tensor.type,expert_in,expert_ff,
+            [&](int route){return input_of(route/top_k);},
+            [&](int route){return route/top_k;},
+            up_acts.first,up_acts.second,
+            [&](int route,int row,float value){
+                activated[static_cast<std::size_t>(route)*expert_ff+row]=
+                    value>0.0f?value*value:0.0f;
+            });
+    }
+    // Down, per route, into route_outputs.
+    {
+        auto activated_of=[&](int route){return activated+static_cast<std::size_t>(route)*expert_ff;};
+        stage(down_base,down_bytes,down_tensor.type,expert_ff,expert_in,
+            activated_of,[](int route){return route;},nullptr,nullptr,
+            [&](int route,int row,float value){
+                route_outputs[static_cast<std::size_t>(route)*expert_in+row]=value;
+            });
+    }
+    // The weighted sum over each token's routes, in rank order.
+    #pragma omp parallel for schedule(static) num_threads(threads)
+    for(int row=0;row<rows;++row){
+        float*output=outputs+static_cast<std::size_t>(row)*expert_in;
+        std::fill(output,output+expert_in,0.0f);
+        for(int rank=0;rank<top_k;++rank){
+            const int route=row*top_k+rank;
+            const float weight=weights[route];
+            const float*values=route_outputs+static_cast<std::size_t>(route)*expert_in;
+            for(int channel=0;channel<expert_in;++channel)output[channel]+=weight*values[channel];
+        }
     }
 }
 
@@ -15492,7 +16058,9 @@ std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
     if(m.tokenizer_pre=="laguna")return laguna_pretokenize(text);
     if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
-    if(m.tokenizer_pre=="lfm2")return lfm2_pretokenize(text);
+    // llama.cpp gives `pixtral` (Nemotron H's vocabulary) the same llama3
+    // pattern as lfm2: digit runs of up to three.
+    if(m.tokenizer_pre=="lfm2"||m.tokenizer_pre=="pixtral")return lfm2_pretokenize(text);
     // Three names, one regex: Ling's tokenizer.json carries the llama3 pattern
     // verbatim (single digits, no case split), and Qwen2's is the same
     // pattern spelled with apostrophes.
@@ -15527,7 +16095,8 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
        m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
        m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
        m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
-       m->tokenizer_pre=="bailingmoe3"||m->tokenizer_pre=="lfm2"){
+       m->tokenizer_pre=="bailingmoe3"||m->tokenizer_pre=="lfm2"||
+       m->tokenizer_pre=="pixtral"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -15538,7 +16107,7 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
         // pre-token that is itself a vocabulary entry is emitted whole, before
         // BPE gets the chance to assemble it some other way, which the merge
         // table alone does not guarantee.
-        const bool ignore_merges=m->tokenizer_pre=="lfm2";
+        const bool ignore_merges=m->tokenizer_pre=="lfm2"||m->tokenizer_pre=="pixtral";
         auto flush=[&](size_t end){
             if(end<=plain)return;
             const auto segment=input.substr(plain,end-plain);
@@ -15624,6 +16193,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     const bool qwen4exp=m->config.architecture=="qwen4exp";
     const bool k2horizon=m->config.architecture=="k2-horizon";
     const bool lfm2=m->config.architecture=="lfm2"||m->config.architecture=="lfm2moe";
+    const bool nemotron=m->config.architecture=="nemotron_h_moe";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
     if((m->config.architecture=="qwen3"||m->config.architecture=="qwen3vl")&&
@@ -15633,7 +16203,8 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
-    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon&&!lfm2)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer, K2-Horizon and LFM2 models");
+    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon&&!lfm2&&!nemotron)
+        throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer, K2-Horizon, LFM2 and Nemotron H models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
@@ -15704,6 +16275,28 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(muse&&runtime->options.mtp_drafts)throw std::runtime_error("native Muse Glimmer MTP is not implemented");
     if(k2horizon&&runtime->options.mtp_drafts)throw std::runtime_error("native K2-Horizon MTP is not implemented");
     if(lfm2&&runtime->options.mtp_drafts)throw std::runtime_error("LFM2 checkpoints carry no MTP draft block");
+    if(nemotron&&runtime->options.mtp_drafts)
+        throw std::runtime_error("native Nemotron H MTP is not implemented");
+    // Nemotron H's routed experts are relu2 up/down pairs with no gate, which
+    // no grouped GPU kernel computes, so they run on the CPU from the mapping.
+    // `auto` (hybrid) degrades to that like any format without a GPU kernel;
+    // the modes that promise every expert on the card cannot be honored.
+    if(nemotron&&runtime->expert_mode==flyweight::v2::ExpertExecutionMode::streamed_gpu)
+        throw std::runtime_error(
+            "Nemotron H routed experts run on the CPU only (no grouped GPU "
+            "kernel for their relu2 up/down pair): use --moe-device cpu or auto");
+    if(nemotron&&runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid){
+        std::fprintf(stderr,
+            "[flyweight] routed experts stay on the CPU MoE: Nemotron H's relu2 "
+            "experts have no grouped GPU kernel\n");
+        runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
+        runtime->options.moe_device=
+            flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
+    }
+    if(nemotron&&runtime->lookup_drafts){
+        std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: Nemotron H has no draft verification path\n");
+        runtime->lookup_drafts=0;
+    }
     // Speculative verification rewinds recurrent state through the DeltaNet
     // snapshot and fold machinery, which knows nothing of the short-conv ring.
     if(lfm2&&runtime->lookup_drafts){
@@ -15755,12 +16348,14 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     runtime->qwen4exp=qwen4exp;
     runtime->k2horizon=k2horizon;
+    runtime->nemotron=nemotron;
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
     else if(muse)build_muse_glimmer_plan(*runtime);
     else if(qwen4exp)build_qwen4exp_plan(*runtime);
     else if(k2horizon)build_k2horizon_plan(*runtime);
     else if(lfm2)build_lfm2_plan(*runtime);
+    else if(nemotron)build_nemotron_plan(*runtime);
     else build_qwen_plan(*runtime);
     qwen_load_nvfp4_weight_scales(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
@@ -16641,7 +17236,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // Anything else leaves these regions empty and keeps the sequential path.
         std::uint64_t delta_value_heads=0;
         for(const auto&layer:runtime->layers){
-            if(layer.attention||runtime->lfm2)continue;
+            // Only DeltaNet blocks carry the ssm_alpha/ssm_beta layout this
+            // probes for: LFM2's short-conv and Nemotron H's Mamba-2/MoE
+            // blocks reserve recurrent state through qwen_recurrent_state
+            // instead, and neither static slot exists on them.
+            if(layer.attention||runtime->lfm2||runtime->nemotron)continue;
             const auto heads=runtime->model->tensors[layer.static_tensors[8]].shape[0];
             const auto dim=runtime->model->tensors[layer.static_tensors[9]].shape[0];
             if(dim==flyweight::v2::workspace::kDeltaDim)delta_value_heads=heads;
@@ -17566,7 +18165,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // short-conv slots decode one after another as well.
         if(decode_slots>1&&runtime->model->config.expert_count&&
            prepare_policy.routed_cpu_execution_allowed()&&
-           !runtime->gemma4&&!runtime->laguna&&!runtime->lfm2){
+           !runtime->gemma4&&!runtime->laguna&&!runtime->lfm2&&
+           !runtime->nemotron){
             const std::uint64_t by_workspace=runtime->workspace_bytes/runtime->decode_slice_bytes;
             runtime->multi_decode_capacity=static_cast<std::uint32_t>(
                 std::min(std::min(decode_slots,by_workspace),std::uint64_t{4}));
@@ -20769,6 +21369,8 @@ void qwen_prefill_snapshot_copy(
         const auto recurrent_bytes=recurrent.recurrent*sizeof(float);
         const auto live_conv=runtime.state+layer.state_first;
         const auto live_recurrent=runtime.state+layer.state_second;
+        // A Nemotron H MoE-only block keeps no state at all.
+        if(!conv_bytes)continue;
         launch_copy(restore?cursor:live_conv,restore?live_conv:cursor,conv_bytes);
         cursor+=conv_bytes;
         if(!recurrent_bytes)continue;
@@ -23142,7 +23744,182 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                        layer.hc_attn_inject);
         }else rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
-        if(runtime->lfm2&&!layer.attention){
+        bool nemotron_done=false;
+        if(runtime->nemotron&&layer.mamba){
+            // Mamba-2 block, llama.cpp's build_mamba2_layer: ssm_in to
+            // z|x|B|C|dt, depthwise causal conv (taps {channel, tap}) with
+            // bias and silu over x|B|C alone, then the selective scan. dt is
+            // the projection tail read raw -- the conv never sees it -- and
+            // the ssm_dt bias joins before softplus inside the scan kernels.
+            const auto&config=runtime->model->config;
+            const int inner=static_cast<int>(config.ssm_inner_size);
+            const int d_state=static_cast<int>(config.ssm_state_size);
+            const int groups=static_cast<int>(config.ssm_group_count);
+            const int heads=static_cast<int>(config.ssm_time_step_rank);
+            const int conv_channels=inner+2*groups*d_state;
+            const int d_in_proj=2*inner+2*groups*d_state+heads;
+            if(static_cast<std::uint64_t>(d_in_proj)>runtime->scratch_elements)
+                throw std::runtime_error("native Nemotron H SSM scratch is too small");
+            dense(layer.ssm_in_role,normalized,first,hidden_size,d_in_proj);
+            int kernel_size=static_cast<int>(config.conv_kernel);
+            std::uint64_t conv_state=runtime->state+layer.state_first;
+            auto conv_weights=tensor(layer.ssm_conv_role);
+            std::uint64_t conv_bias=
+                layer.ssm_conv_bias_role!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime->device_tensors[layer.static_tensors.at(layer.ssm_conv_bias_role)]
+                    :0;
+            // The conv input is the xBC segment: `first` skips the z half.
+            std::uint64_t conv_source=first+static_cast<std::uint64_t>(inner)*sizeof(float);
+            void*conv_args[]={const_cast<std::uint64_t*>(&conv_source),&conv_weights,
+                              &conv_bias,&conv_state,const_cast<std::uint64_t*>(&second),
+                              const_cast<int*>(&conv_channels),&kernel_size};
+            launch_named("nemotron_ssm_conv_step",
+                (static_cast<std::uint32_t>(conv_channels)+255)/256,1,256,conv_args);
+            std::uint64_t dt_raw=first+
+                static_cast<std::uint64_t>(inner+conv_channels)*sizeof(float);
+            auto dt_bias=tensor(layer.ssm_dt_role),a=tensor(layer.ssm_a_role);
+            auto d=tensor(layer.ssm_d_role),z=first;
+            // head_dim is ssm_d_inner / ssm_time_step_rank, the per-head span
+            // the state packing uses.
+            const int head_dim=inner/heads;
+            std::uint64_t scan_state=runtime->state+layer.state_second;
+            void*scan_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&dt_raw),
+                              &dt_bias,&a,&d,const_cast<std::uint64_t*>(&z),
+                              &scan_state,const_cast<std::uint64_t*>(&third),
+                              const_cast<int*>(&heads),const_cast<int*>(&head_dim),
+                              const_cast<int*>(&d_state),const_cast<int*>(&groups)};
+            launch_named("nemotron_ssm_step",
+                (static_cast<std::uint32_t>(inner)+255)/256,1,256,scan_args);
+            auto norm_weights=tensor(layer.ssm_norm_role);
+            void*norm_args[]={const_cast<std::uint64_t*>(&third),&norm_weights,
+                              const_cast<std::uint64_t*>(&second),
+                              const_cast<int*>(&inner),const_cast<int*>(&groups),
+                              const_cast<float*>(&epsilon)};
+            launch_named("nemotron_ssm_norm",static_cast<std::uint32_t>(groups),1,256,norm_args);
+            dense(layer.ssm_out_role,second,residual,inner,hidden_size);
+            add(residual,hidden);
+            nemotron_done=true;
+        }else if(runtime->nemotron&&layer.attention){
+            // Plain GQA: Q/K/V straight into the cache with no RoPE and no
+            // per-head norm, 1/sqrt(head_dim) scaling.
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            dense(1,normalized,first,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={const_cast<std::uint64_t*>(&second),&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            std::uint64_t attended=third;int tokens=view.tokens,first_slot=view.first;
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            // `second` is free for the attended sum: its keys went to the cache.
+            if(profile)profile_record(profile->recurrent_start);
+            qwen_decode_attention_full(*runtime,launch_named,first,second,
+                cache_keys,cache_values,attention_scores,attended,
+                heads,kv_heads,head_dim,tokens,capacity,first_slot,scale);
+            if(profile)profile_record(profile->recurrent_end);
+            dense(4,attended,residual,q_size,hidden_size);
+            add(residual,hidden);
+            nemotron_done=true;
+        }else if(runtime->nemotron){
+            // MoE-only block: one norm, no sublayer front. The router reads
+            // the unprojected normed stream; selection ranks sigmoid(logits)
+            // + exp_probs_b, the picked weights stay unbiased, sum-normalized
+            // and times expert_weights_scale. The routed experts read the
+            // latent reduction (or the normed stream when the block has no
+            // bridge) on the CPU; the relu2 shared expert runs on device
+            // while they do.
+            const int layer_experts=static_cast<int>(layer.expert_count);
+            const int layer_top_k=static_cast<int>(layer.expert_used);
+            const int expert_in=static_cast<int>(
+                layer.moe_latent?layer.moe_latent:hidden_size);
+            // Host staging sized to this layer: selected ids, route weights,
+            // the expert input, the activated scratch and the expert output.
+            const auto layer_weights_offset=device_align(layer_top_k*sizeof(std::int32_t));
+            const auto layer_input_offset=layer_weights_offset+device_align(layer_top_k*sizeof(float));
+            const auto layer_cpu_activated_offset=layer_input_offset+device_align(hidden_size*sizeof(float));
+            const auto layer_cpu_output_offset=layer_cpu_activated_offset+device_align(layer_top_k*runtime->moe_intermediate*sizeof(float));
+            if(layer_cpu_output_offset+device_align(hidden_size*sizeof(float))>
+               runtime->expert_staging_bytes)
+                throw std::runtime_error("native CPU MoE workspace overflow");
+            auto*layer_cpu_weights=reinterpret_cast<float*>(staging+layer_weights_offset);
+            auto*cpu_input=reinterpret_cast<float*>(staging+layer_input_offset);
+            auto*cpu_activated=reinterpret_cast<float*>(staging+layer_cpu_activated_offset);
+            auto*cpu_output=reinterpret_cast<float*>(staging+layer_cpu_output_offset);
+            dense_matvec(layer.static_tensors.at(1),normalized,router_logits,
+                         hidden_size,layer_experts);
+            std::uint64_t router_bias=
+                layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime->device_tensors[layer.router_bias]:0;
+            int normalize=runtime->model->config.expert_weights_norm?1:0;
+            float weight_scale=runtime->model->config.expert_weights_scale;
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&router_bias,
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&route_weights),
+                               const_cast<int*>(&layer_experts),
+                               const_cast<int*>(&layer_top_k),
+                               &normalize,&weight_scale};
+            launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                         static_cast<std::uint32_t>(2*layer_experts*sizeof(float)));
+            std::uint64_t expert_input=normalized;
+            if(layer.moe_latent){
+                dense(layer.latent_down,normalized,fourth,hidden_size,expert_in);
+                expert_input=fourth;
+            }
+            // Routes and the expert input travel together behind one event,
+            // so the CPU never reads a staging buffer the DMA has not filled.
+            if(flyweight_gpu_download(selected_host,selected_device,
+                   static_cast<std::uint64_t>(layer_top_k)*sizeof(std::int32_t),
+                   runtime->stream)!=0||
+               flyweight_gpu_download(layer_cpu_weights,route_weights,
+                   static_cast<std::uint64_t>(layer_top_k)*sizeof(float),
+                   runtime->stream)!=0||
+               flyweight_gpu_download(cpu_input,expert_input,
+                   static_cast<std::uint64_t>(expert_in)*sizeof(float),
+                   runtime->stream)!=0)
+                throw std::runtime_error("native Nemotron H route transfer failed");
+            if(flyweight_gpu_event_record(runtime->route_event,runtime->stream)!=0)
+                throw std::runtime_error("native Qwen route event failed");
+            // The shared expert, relu2-activated and never gated, into `third`.
+            const int shared_ff=static_cast<int>(
+                runtime->model->tensors[layer.static_tensors.at(layer.shexp_up)].shape[1]);
+            dense(layer.shexp_up,normalized,first,hidden_size,shared_ff);
+            int relu_count=shared_ff;
+            void*relu_args[]={const_cast<std::uint64_t*>(&first),
+                              const_cast<std::uint64_t*>(&second),&relu_count};
+            launch_named("nemotron_relu2_mul",
+                (static_cast<std::uint32_t>(shared_ff)+255)/256,1,256,relu_args);
+            dense(layer.shexp_down,second,third,shared_ff,hidden_size);
+            const auto route_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            if(flyweight_gpu_event_sync(runtime->route_event)!=0)
+                throw std::runtime_error("native Qwen route event failed");
+            if(timing_enabled())runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
+            const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            nemotron_cpu_moe(*runtime,layer,selected_host,layer_cpu_weights,
+                layer_top_k,cpu_input,cpu_activated,cpu_output);
+            if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
+            // residual = routed (projected back up) + shared + stream; the
+            // swap after the block makes it the next layer's input.
+            if(layer.moe_latent){
+                if(flyweight_gpu_upload(fourth,cpu_output,
+                       static_cast<std::uint64_t>(expert_in)*sizeof(float),
+                       runtime->stream)!=0)
+                    throw std::runtime_error("native CPU MoE output upload failed");
+                dense(layer.latent_up,fourth,residual,expert_in,hidden_size);
+            }else if(flyweight_gpu_upload(residual,cpu_output,
+                         static_cast<std::uint64_t>(hidden_size)*sizeof(float),
+                         runtime->stream)!=0)
+                throw std::runtime_error("native CPU MoE output upload failed");
+            add(residual,third);
+            add(residual,hidden);
+            nemotron_done=true;
+        }else if(runtime->lfm2&&!layer.attention){
             // LFM2 gated short conv: in_proj to [b | c | x], c * conv(b * x)
             // against this slot's l_cache-1 column ring, out_proj, residual.
             const int channels=hidden_size;
@@ -23640,6 +24417,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             else add(residual,hidden);
             moe_base=7;
         }
+        // A Nemotron H block is one sublayer, merged into the stream above;
+        // there is no feed-forward half behind it.
+        if(!nemotron_done){
         if(runtime->qwen4exp){
             if(!front_done)
                 hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
@@ -24005,6 +24785,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(runtime->qwen4exp)hc_post(third);
         else add(residual,third);
         if(profile)profile_record(profile->expert_end);
+        }
         std::swap(hidden,residual);
         if(qwen_lm_diag_enabled()&&(layer_number==0||layer_number==3||layer_number==33||layer_number==39)){
             static int lc=0;
@@ -24759,7 +25540,8 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
             }
         } else if (!position_indexed_only) {
             const auto recurrent = qwen_recurrent_state(runtime, layer);
-            ranges.emplace_back(layer.state_first, recurrent.conv * sizeof(float));
+            if (recurrent.conv)
+                ranges.emplace_back(layer.state_first, recurrent.conv * sizeof(float));
             if (recurrent.recurrent)
                 ranges.emplace_back(layer.state_second, recurrent.recurrent * sizeof(float));
         }

@@ -1109,6 +1109,8 @@ void route_topk_sigmoid_bias_rows(
     }
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 // LFM2 gated short convolution, one token. `projected` is in_proj's output,
 // [b | c | x] each `channels` wide; the block computes c * conv(b * x) with a
 // depthwise causal kernel and no activation. The state holds the previous
@@ -1159,6 +1161,246 @@ void lfm2_conv_rows(
         if (history > 0) channel_state[history - 1] = bx;
         output[(long long)row * channels + channel] = source[channels + channel] * value;
     }
+}
+
+// Nemotron H Mamba-2. `projected` is ssm_in's whole output with the segment
+// order the conversion fixes (z | x | B | C | dt), so the conv part points
+// `d_inner` channels in and covers x + B + C; the conv is llama.cpp's
+// depthwise causal one with the tap block {channel, tap}, bias added after and
+// silu on top, and the ring holds the previous kernel_size-1 raw values of
+// that same segment per channel.
+extern "C" __global__
+void nemotron_ssm_conv_step(
+    const float* projected, const float* weights, const float* bias,
+    float* state, float* output, const int channels, const int kernel_size
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int history = kernel_size - 1;
+    float* channel_state = state + (long long)channel * history;
+    const float* taps = weights + (long long)channel * kernel_size;
+    const float raw = projected[channel];
+    float value = taps[history] * raw;
+    for (int index = 0; index < history; ++index)
+        value += taps[index] * channel_state[index];
+    for (int index = 0; index + 1 < history; ++index)
+        channel_state[index] = channel_state[index + 1];
+    if (history > 0) channel_state[history - 1] = raw;
+    if (bias) value += bias[channel];
+    // silu over the whole x|B|C, spelt out rather than through a helper so the
+    // host translation needs no device functions of its own.
+    output[channel] = value / (1.0f + expf(-value));
+}
+
+// Row-batched twin of nemotron_ssm_conv_step: as in lfm2_conv_rows the thread
+// per channel walks the chunk's rows in order, so the state the chunk ends
+// with is the one decode would leave. `projected` is row-major, each row one
+// full ssm_in output.
+extern "C" __global__
+void nemotron_ssm_conv_rows(
+    const float* projected, const float* weights, const float* bias,
+    float* state, float* output, const int rows, const int channels,
+    const int kernel_size, const long long row_stride
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int history = kernel_size - 1;
+    float* channel_state = state + (long long)channel * history;
+    const float* taps = weights + (long long)channel * kernel_size;
+    for (int row = 0; row < rows; ++row) {
+        const float* source = projected + (long long)row * row_stride + channel;
+        const float raw = *source;
+        float value = taps[history] * raw;
+        for (int index = 0; index < history; ++index)
+            value += taps[index] * channel_state[index];
+        for (int index = 0; index + 1 < history; ++index)
+            channel_state[index] = channel_state[index + 1];
+        if (history > 0) channel_state[history - 1] = raw;
+        if (bias) value += bias[channel];
+        output[(long long)row * channels + channel] =
+            value / (1.0f + expf (-value));
+    }
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The selective scan, one thread per (head, channel-within-head) row. The
+// state cell for row (h, i1), state index i0 sits at
+// ((h * head_dim + i1) * d_state + i0), the llama.cpp i1/nc layout; decay is
+// exp(softplus(dt + dt_bias) * A[h]) applied to the whole row's cells and the
+// driving term is x * softplus(dt) (B per head-group, heads repeated over
+// groups as h / (n_heads / n_groups)). y gets the D skip and the silu(z) gate
+// folded in here: llama.cpp applies them as separate elementwise ops straight
+// after the scan, so collapsing them saves the pass without moving any math.
+// dt is read raw from the projection tail; scale was folded into the whole
+// ssm_in output before the conv, matching llama.cpp's scaled mul_mat.
+extern "C" __global__
+void nemotron_ssm_step(
+    const float* xbc, const float* dt, const float* dt_bias, const float* a,
+    const float* d, const float* z, float* state, float* output,
+    const int n_heads, const int head_dim, const int d_state,
+    const int n_groups
+) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head = row / head_dim;
+    if (head >= n_heads) return;
+    const int i1 = row % head_dim;
+    const int heads_per_group = n_heads / n_groups;
+    const int group = head / heads_per_group;
+    // dt arrives raw from the projection tail; the ssm_dt bias joins before
+    // softplus, llama.cpp's `ggml_add(dt, ssm_dt_b)` inside build_mamba2_layer.
+    const float dt_raw = dt[head] + (dt_bias ? dt_bias[head] : 0.0f);
+    const float gated_dt = dt_raw > 20.0f
+        ? dt_raw
+        : log1pf(expf(dt_raw));
+    const float decay = expf(gated_dt * a[head]);
+    const float x_dt = xbc[row] * gated_dt;
+    const float* channel_b = xbc + n_heads * head_dim + group * d_state;
+    const float* channel_c = xbc + n_heads * head_dim + n_groups * d_state +
+        group * d_state;
+    float* cell = state + (long long)row * d_state;
+    float value = 0.0f;
+    for (int i0 = 0; i0 < d_state; ++i0) {
+        const float next = cell[i0] * decay + channel_b[i0] * x_dt;
+        value += next * channel_c[i0];
+        cell[i0] = next;
+    }
+    value += xbc[row] * d[head];
+    // silu(z) gate, spelt out so the host translation needs no device
+    // functions of its own.
+    const float gate = z[row];
+    output[row] = value * gate / (1.0f + expf(-gate));
+}
+
+// Row-batched scan, same state layout: the thread per (head, channel-within-
+// head) row walks the chunk's rows in order, so the chunk ends with exactly
+// the state token-by-token decode would leave. Each row's x|B|C sits in
+// row-major `xbc` (`d_inner + 2*n_group*d_state` channels, `xbc_stride` apart),
+// already bias-added and silu'd; x is this thread's channel, so d_inner is
+// just n_heads*head_dim. dt is each row's projection tail (dt_bias added
+// here), z each row's projection head; the D skip and the silu(z) gate fold
+// in before the strided per-row write, mirroring the decode kernel.
+extern "C" __global__
+void nemotron_ssm_scan_rows(
+    const float* xbc, const long long xbc_stride,
+    const float* dt, const long long dt_stride,
+    const float* z, const long long z_stride,
+    const float* dt_bias, const float* a, const float* d,
+    float* state, float* output, const long long output_stride,
+    const int rows, const int n_heads, const int head_dim,
+    const int d_state, const int n_groups
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head = channel / head_dim;
+    if (head >= n_heads) return;
+    const int heads_per_group = n_heads / n_groups;
+    const int group = head / heads_per_group;
+    const float decay_a = a[head];
+    const float d_value = d[head];
+    const float bias = dt_bias ? dt_bias[head] : 0.0f;
+    float* cell = state + (long long)channel * d_state;
+    const long long level = (long long)(n_heads * head_dim)
+        + (long long)(group * d_state);
+    for (int row = 0; row < rows; ++row) {
+        const float raw = dt[(long long)row * dt_stride + head] + bias;
+        const float gated_dt = raw > 20.0f ? raw : log1pf(expf(raw));
+        const float decay = expf(gated_dt * decay_a);
+        const float x = xbc[(long long)row * xbc_stride + channel];
+        const float x_dt = x * gated_dt;
+        const float* channel_b = xbc + (long long)row * xbc_stride + level;
+        const float* channel_c = xbc + (long long)row * xbc_stride + level +
+            (long long)(n_groups * d_state);
+        float value = 0.0f;
+        for (int index = 0; index < d_state; ++index) {
+            const float next = cell[index] * decay + channel_b[index] * x_dt;
+            value += next * channel_c[index];
+            cell[index] = next;
+        }
+        value += x * d_value;
+        // silu(z) gate, spelt out rather than through a helper so the host
+        // translation needs no device functions of its own.
+        const float gate = z[(long long)row * z_stride + channel];
+        output[(long long)row * output_stride + channel] =
+            value * gate / (1.0f + expf(-gate));
+    }
+}
+
+// relu(x)^2, the MoE activation of every Nemotron H expert (there is no gate
+// projection in a latent-MoE bridge).
+extern "C" __global__
+void nemotron_relu2_mul(
+    const float* input, float* output, const int elements
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    const float value = input[index];
+    output[index] = value > 0.0f ? value * value : 0.0f;
+}
+
+// Strided rows twin for prefill: relu(x)^2 written back row by row, so the
+// routed-expert or shared-expert projection output does not have to be
+// re-copied into a compact buffer first.
+extern "C" __global__
+void nemotron_relu2_rows(
+    const float* input, const long long input_stride,
+    float* output, const long long output_stride,
+    const int rows, const int width
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows * width) return;
+    const int row = index / width, column = index % width;
+    const float value = input[(long long)row * input_stride + column];
+    output[(long long)row * output_stride + column] =
+        value > 0.0f ? value * value : 0.0f;
+}
+
+// The Mamba epilogue: grouped RMS norm over d_inner channels, one block per
+// n_group chunk. Every chunk of d_inner/n_group channels gets its own RMS;
+// the ssm_norm weight {d_inner/n_group, n_group} laid out ggml row-major
+// indexes them as plain global channels, so weight[base + index] is exact.
+extern "C" __global__
+void nemotron_ssm_norm(
+    const float* y, const float* weights, float* output,
+    const int d_inner, const int n_groups, const float epsilon
+) {
+    const int chunk = d_inner / n_groups;
+    const int base = blockIdx.x * chunk;
+    float partial = 0.0f;
+    for (int index = threadIdx.x; index < chunk; index += blockDim.x)
+        partial += y[base + index] * y[base + index];
+    // block_reduce_sum leaves the total in thread 0 only.
+    __shared__ float inverse;
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) inverse = rsqrtf(partial / (float)chunk + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < chunk; index += blockDim.x)
+        output[base + index] = y[base + index] * inverse * weights[base + index];
+}
+
+// Row-batched twin: one block per (row, group), strided both sides.
+extern "C" __global__
+void nemotron_ssm_norm_rows(
+    const float* y, const long long y_stride, const float* weights,
+    float* output, const long long output_stride,
+    const int rows, const int d_inner, const int n_groups,
+    const float epsilon
+) {
+    const int row = blockIdx.y;
+    if (row >= rows) return;
+    const int chunk = d_inner / n_groups;
+    const long long base = (long long)row * y_stride + (long long)blockIdx.x * chunk;
+    float partial = 0.0f;
+    for (int index = threadIdx.x; index < chunk; index += blockDim.x)
+        partial += y[base + index] * y[base + index];
+    __shared__ float inverse;
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) inverse = rsqrtf(partial / (float)chunk + epsilon);
+    __syncthreads();
+    const long long output_base =
+        (long long)row * output_stride + (long long)blockIdx.x * chunk;
+    for (int index = threadIdx.x; index < chunk; index += blockDim.x)
+        output[output_base + index] = y[base + index] * inverse *
+            weights[(long long)blockIdx.x * chunk + index];
 }
 
 extern "C" __global__

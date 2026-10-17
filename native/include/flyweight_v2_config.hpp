@@ -90,6 +90,20 @@ struct ModelConfig {
     std::uint32_t hyper_connection_count=0, sinkhorn_iterations=0;
     float sinkhorn_epsilon=0.0f;
     std::uint32_t expert_shared_count=0, hash_layer_count=0;
+    // Nemotron H Mamba-2 geometry. The dt heads (`ssm_time_step_rank`) are
+    // the scan's heads, each ssm_inner_size/heads channels wide; ssm_in
+    // projects to 2*inner + 2*groups*state + heads values (z | x B C | dt) and
+    // the causal conv runs over the inner + 2*groups*state x|B|C channels.
+    std::uint32_t ssm_state_size=0, ssm_group_count=0;
+    std::uint32_t ssm_inner_size=0, ssm_time_step_rank=0;
+    // Width of the latent space the routed experts live in (Bolt compresses
+    // every routed expert's input and output through shared ffn_latent_down /
+    // ffn_latent_up projections). Zero on archs without the latent pair.
+    std::uint32_t moe_latent_size=0;
+    // Nemotron H Bolt sizes its routed experts per block: their FF width and
+    // top-k are per-layer arrays (the expert count is the router's width),
+    // while the scalar config fields keep the maxima.
+    std::vector<std::uint32_t> expert_ff_by_layer, expert_used_by_layer;
     // qwen4exp gated residual: the same hyper_connection_count streams as
     // deepseek4 above, but mixed by a low-rank silu/sigmoid gate instead of a
     // Sinkhorn router. Zero low_rank means the architecture has no gated

@@ -4660,7 +4660,8 @@ def serve(
 # markup and the result blocks. Anything else gets the generic Hermes prompt and
 # our own rendering, which is what a checkpoint without tool support needs.
 NATIVE_TOOL_ARCHITECTURES = (
-    "deepseek4", "bailingmoe3", "k2-horizon", "muse-glimmer", "lfm2", "lfm2moe"
+    "deepseek4", "bailingmoe3", "k2-horizon", "muse-glimmer", "lfm2", "lfm2moe",
+    "nemotron_h_moe",
 )
 
 
