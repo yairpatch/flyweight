@@ -95,6 +95,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_rows_grid = RowsMatmulGrid::per_token,
      .lm_head_argmax = "f32_lm_head_argmax_warp",
      .embedding = "qwen_f32_embedding", .embedding_rows = "qwen_f32_embedding_rows",
+     .grouped_expert_prefix = "f32",
      .cpu_expert = true},
     // f16: warp matvec plus embedding/rows; the LM head projects through the
     // matvec dispatch, so no fused argmax kernel exists yet.

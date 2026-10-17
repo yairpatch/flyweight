@@ -4886,6 +4886,69 @@ void q5k_grouped_swiglu_rows(
 }
 
 extern "C" __global__
+void q5k_grouped_relu2(
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float up = 0.0f;
+    for (int input = threadIdx.x << 2; input < input_size;
+         input += blockDim.x << 2) {
+        const long long absolute = (long long)row * input_size + input;
+        const long long block = absolute >> 8;
+        const int rem = (int)(absolute & 255);
+        const int si = ((rem >> 6) << 1) | ((rem >> 5) & 1);
+        const float* vec = vector + input;
+        up += q5k_quad(up_packed + block * 176, rem, si, vec);
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[expert * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void q5k_grouped_relu2_rows(
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        up += q5k_value(up_packed, absolute) * value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[route * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
 void q5k_grouped_accumulate(
     const unsigned long long* down_ptrs,
     const float* activated,
@@ -7885,6 +7948,153 @@ __device__ __forceinline__ float q20_value(
     return d * (float)(((base[2 + (within >> 2)] >> (2 * (within & 3))) & 3) - 1);
 }
 
+extern "C" __global__
+void f32_grouped_swiglu(
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,
+    const float* vector, float* activated,
+    const int input_size, const int output_size, const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const float* gate_row = ((const float*)gate_ptrs[expert]) + (long long)row * input_size;
+    const float* up_row = ((const float*)up_ptrs[expert]) + (long long)row * input_size;
+    float gate = 0.0f, up = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        const float v = vector[i];
+        gate += gate_row[i] * v;
+        up += up_row[i] * v;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void f32_grouped_swiglu_rows(
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,
+    const int* counts, const float* vectors, float* activated,
+    const int input_size, const int output_size, const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const float* gate_row = ((const float*)gate_ptrs[route]) + (long long)row * input_size;
+    const float* up_row = ((const float*)up_ptrs[route]) + (long long)row * input_size;
+    const float* vector = vectors + token * input_size;
+    float gate = 0.0f, up = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        const float v = vector[i];
+        gate += gate_row[i] * v;
+        up += up_row[i] * v;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[route * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void f32_grouped_relu2(
+    const unsigned long long* up_ptrs,
+    const float* vector, float* activated,
+    const int input_size, const int output_size, const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const float* up_row = ((const float*)up_ptrs[expert]) + (long long)row * input_size;
+    float up = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        up += up_row[i] * vector[i];
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[expert * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void f32_grouped_relu2_rows(
+    const unsigned long long* up_ptrs,
+    const int* counts, const float* vectors, float* activated,
+    const int input_size, const int output_size, const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const float* up_row = ((const float*)up_ptrs[route]) + (long long)row * input_size;
+    const float* vector = vectors + token * input_size;
+    float up = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        up += up_row[i] * vector[i];
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[route * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void f32_grouped_accumulate(
+    const unsigned long long* down_ptrs, const float* activated,
+    float* output, const float* weights,
+    const int input_size, const int output_size, const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int expert = 0; expert < experts; ++expert) {
+        const float weight = weights[expert];
+        if (weight == 0.0f) continue;
+        const float* down_row = ((const float*)down_ptrs[expert]) + (long long)row * input_size;
+        const float* act = activated + expert * input_size;
+        for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+            partial += weight * down_row[i] * act[i];
+        }
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void f32_grouped_accumulate_rows(
+    const unsigned long long* down_ptrs, const float* activated,
+    float* output, const float* weights, const int* counts,
+    const int input_size, const int output_size, const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (row >= output_size || token >= rows) return;
+    const int base = token * top_k;
+    const int count = counts[token];
+    float partial = 0.0f;
+    for (int rank = 0; rank < count; ++rank) {
+        const int route = base + rank;
+        const float weight = weights[route];
+        if (weight == 0.0f) continue;
+        const float* down_row = ((const float*)down_ptrs[route]) + (long long)row * input_size;
+        const float* act = activated + route * input_size;
+        for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+            partial += weight * down_row[i] * act[i];
+        }
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + row] += partial;
+}
+
 #define FLYWEIGHT_GROUPED_EXPERTS(prefix, octet_at)                                    \
 extern "C" __global__                                                           \
 void prefix##_grouped_swiglu(                                                   \
@@ -7954,6 +8164,64 @@ R"FLYWEIGHT_CUDA(void prefix##_grouped_swiglu_rows(                             
     if (threadIdx.x == 0)                                                       \
         activated[route * output_size + row] =                                  \
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;    \
+}                                                                               \
+extern "C" __global__                                                           \
+void prefix##_grouped_relu2(                                                    \
+    const unsigned long long* up_ptrs,                                          \
+    const float* vector, float* activated,                                      \
+    const int input_size, const int output_size, const int experts              \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int expert = blockIdx.y;                                              \
+    if (row >= output_size || expert >= experts) return;                        \
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[expert];     \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float up = 0.0f, u[8];                                                      \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(up_packed, block, within, u);                                  \
+        const float* values = vector + octet * 8;                               \
+        for (int k = 0; k < 8; ++k) up += u[k] * values[k];                     \
+    }                                                                           \
+    up = block_reduce_sum(up);                                                  \
+    if (threadIdx.x == 0) {                                                     \
+        const float val = fmaxf(0.0f, up);                                      \
+        activated[expert * output_size + row] = val * val;                      \
+    }                                                                           \
+}                                                                               \
+extern "C" __global__                                                           \
+void prefix##_grouped_relu2_rows(                                               \
+    const unsigned long long* up_ptrs,                                          \
+    const int* counts, const float* vectors, float* activated,                  \
+    const int input_size, const int output_size, const int top_k,               \
+    const int rows                                                              \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int route = blockIdx.y;                                               \
+    const int token = route / top_k;                                            \
+    const int rank = route - token * top_k;                                     \
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;   \
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[route];      \
+    const float* vector = vectors + token * input_size;                         \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float up = 0.0f, u[8];                                                      \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(up_packed, block, within, u);                                  \
+        const float* values = vector + octet * 8;                               \
+        for (int k = 0; k < 8; ++k) up += u[k] * values[k];                     \
+    }                                                                           \
+    up = block_reduce_sum(up);                                                  \
+    if (threadIdx.x == 0) {                                                     \
+        const float val = fmaxf(0.0f, up);                                      \
+        activated[route * output_size + row] = val * val;                       \
+    }                                                                           \
 }                                                                               \
 extern "C" __global__                                                           \
 void prefix##_grouped_accumulate(                                               \
@@ -8567,6 +8835,65 @@ void q4k_grouped_swiglu_rows(
     if (threadIdx.x == 0)
         activated[route * output_size + row] =
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q4k_grouped_relu2(
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        up += q4k_value(up_packed, absolute) * value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[expert * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void q4k_grouped_relu2_rows(
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        up += q4k_value(up_packed, absolute) * value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[route * output_size + row] = val * val;
+    }
 }
 
 extern "C" __global__
@@ -9380,6 +9707,68 @@ void q6k_grouped_swiglu_rows(
 }
 
 extern "C" __global__
+void q6k_grouped_relu2(
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float up = 0.0f;
+    for (int input = threadIdx.x << 2; input < input_size;
+         input += blockDim.x << 2) {
+        const long long absolute = (long long)row * input_size + input;
+        const long long block = absolute >> 8;
+        const int within = (int)(absolute & 255);
+        const float* vec = vector + input;
+        up += q6k_quad(up_packed + block * 210, within, vec);
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[expert * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void q6k_grouped_relu2_rows(
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        up += q6k_value(up_packed, absolute) * value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[route * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
 void q6k_accumulate_transposed(
     const unsigned char* packed,
     const float* vector,
@@ -9464,6 +9853,8 @@ void q6k_grouped_accumulate_rows(
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[token * output_size + row] += partial;
 }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 
 extern "C" __global__
 void q8_grouped_swiglu(
@@ -9560,6 +9951,81 @@ void q8_grouped_swiglu_rows(
     if (threadIdx.x == 0)
         activated[route * output_size + row] =
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q8_grouped_relu2(
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float up_scale = __half2float(
+            *((const __half*)(up_packed + block * 34))
+        );
+        const signed char up_value = *((const signed char*)(
+            up_packed + block * 34 + 2 + within
+        ));
+        const float input_value = vector[input];
+        up += ((float)up_value * up_scale) * input_value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[expert * output_size + row] = val * val;
+    }
+}
+
+extern "C" __global__
+void q8_grouped_relu2_rows(
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float up_scale = __half2float(
+            *((const __half*)(up_packed + block * 34))
+        );
+        const signed char up_value = *((const signed char*)(
+            up_packed + block * 34 + 2 + within
+        ));
+        const float input_value = vector[input];
+        up += ((float)up_value * up_scale) * input_value;
+    }
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0) {
+        const float val = fmaxf(0.0f, up);
+        activated[route * output_size + row] = val * val;
+    }
 }
 
 extern "C" __global__

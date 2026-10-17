@@ -43,7 +43,9 @@ def _native(model: V2Model, **options):
     if not V2Model.gpu_info()["available"]:
         raise unittest.SkipTest("native CUDA runtime is unavailable")
     options.setdefault("context_limit", 64)
-    runtime = model.native_runtime(mtp_drafts=0, expert_mode="cpu", **options)
+    options.setdefault("mtp_drafts", 0)
+    options.setdefault("expert_mode", "cpu")
+    runtime = model.native_runtime(**options)
     runtime.prepare()
     return runtime
 
@@ -212,6 +214,48 @@ class NemotronNativeTests(unittest.TestCase):
         finally:
             runtime.close()
         self.assertEqual(first, second)
+
+    def test_expert_placement_modes_decode_match_reference(self):
+        """Verify parity across expert placement modes (cpu, auto, hybrid, gpu).
+
+        Tests single-token decode steps, ensuring GPU grouped kernels (relu²,
+        accumulate) match float64 CPU reference across multiple consecutive
+        requests (exercising cache residency, hits, and misses).
+        """
+        model, spec, weights = _model()
+        expected = reference_greedy(spec, weights, self.PROMPT, 8)
+        for mode in ("cpu", "auto", "hybrid", "gpu"):
+            with self.subTest(expert_mode=mode):
+                runtime = _native(model, expert_mode=mode)
+                try:
+                    for run_idx in range(2):
+                        runtime.reset()
+                        produced: list[int] = []
+                        runtime.generate(self.PROMPT, 8, produced.append)
+                        self.assertEqual(
+                            produced,
+                            expected,
+                            f"Expert mode {mode} run {run_idx} diverged from reference",
+                        )
+                finally:
+                    runtime.close()
+
+    def test_expert_placement_modes_batched_prefill_match_reference(self):
+        """Verify prefill parity across placement modes with chunked & pipelined prefill."""
+        cases = (("4", self.PROMPT), (None, [(index * 37) % 96 for index in range(160)]))
+        for mode in ("auto", "hybrid", "gpu"):
+            for rows, prompt in cases:
+                environment = {"FLYWEIGHT_PREFILL_ROWS": rows} if rows else {}
+                with self.subTest(expert_mode=mode, rows=rows, tokens=len(prompt)), \
+                        unittest.mock.patch.dict(os.environ, environment):
+                    model, spec, weights = _model()
+                    runtime = _native(model, expert_mode=mode, context_limit=256)
+                    try:
+                        produced: list[int] = []
+                        runtime.generate(prompt, 6, produced.append)
+                    finally:
+                        runtime.close()
+                    self.assertEqual(produced, reference_greedy(spec, weights, prompt, 6))
 
 
 class NemotronToolCallTests(unittest.TestCase):
