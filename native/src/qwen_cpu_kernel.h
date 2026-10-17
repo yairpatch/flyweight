@@ -218,6 +218,15 @@ float qwen_iq3s_dot_q8_k_vnni512(
     std::uint64_t row
 );
 
+// IQ2_XXS row against Q8_K activations: codebook magnitudes, masked signs,
+// group scales into dpbusd. Requires AVX512-VNNI (feature bit 3).
+float qwen_iq2xxs_dot_q8_k_vnni512(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+);
+
 // IQ3_S row to float; bit-identical to the AVX2 decoder.
 void qwen_iq3s_dequant_row_vnni512(
     const std::uint8_t* packed,

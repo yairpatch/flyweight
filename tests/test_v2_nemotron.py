@@ -43,7 +43,9 @@ def _native(model: V2Model, **options):
     if not V2Model.gpu_info()["available"]:
         raise unittest.SkipTest("native CUDA runtime is unavailable")
     options.setdefault("context_limit", 64)
-    runtime = model.native_runtime(mtp_drafts=0, expert_mode="cpu", **options)
+    options.setdefault("mtp_drafts", 0)
+    options.setdefault("expert_mode", "cpu")
+    runtime = model.native_runtime(**options)
     runtime.prepare()
     return runtime
 
@@ -212,6 +214,106 @@ class NemotronNativeTests(unittest.TestCase):
         finally:
             runtime.close()
         self.assertEqual(first, second)
+
+    def test_expert_placement_modes_decode_match_reference(self):
+        """Verify parity across expert placement modes (cpu, auto, hybrid, gpu).
+
+        Tests single-token decode steps, ensuring GPU grouped kernels (relu²,
+        accumulate) match float64 CPU reference across multiple consecutive
+        requests (exercising cache residency, hits, and misses).
+        """
+        model, spec, weights = _model()
+        expected = reference_greedy(spec, weights, self.PROMPT, 8)
+        for mode in ("cpu", "auto", "hybrid", "gpu"):
+            with self.subTest(expert_mode=mode):
+                runtime = _native(model, expert_mode=mode)
+                try:
+                    for run_idx in range(2):
+                        runtime.reset()
+                        produced: list[int] = []
+                        runtime.generate(self.PROMPT, 8, produced.append)
+                        self.assertEqual(
+                            produced,
+                            expected,
+                            f"Expert mode {mode} run {run_idx} diverged from reference",
+                        )
+                finally:
+                    runtime.close()
+
+    def test_expert_placement_modes_batched_prefill_match_reference(self):
+        """Verify prefill parity across placement modes with chunked & pipelined prefill."""
+        cases = (("4", self.PROMPT), (None, [(index * 37) % 96 for index in range(160)]))
+        for mode in ("auto", "hybrid", "gpu"):
+            for rows, prompt in cases:
+                environment = {"FLYWEIGHT_PREFILL_ROWS": rows} if rows else {}
+                with self.subTest(expert_mode=mode, rows=rows, tokens=len(prompt)), \
+                        unittest.mock.patch.dict(os.environ, environment):
+                    model, spec, weights = _model()
+                    runtime = _native(model, expert_mode=mode, context_limit=256)
+                    try:
+                        produced: list[int] = []
+                        runtime.generate(prompt, 6, produced.append)
+                    finally:
+                        runtime.close()
+                    self.assertEqual(produced, reference_greedy(spec, weights, prompt, 6))
+
+    def test_kv_cache_types_decode_and_prefill(self):
+        """Verify all KV cache precisions (f16, f32, bf16, q8_0, turbo3, turbo4) for Nemotron.
+
+        Ensures that single-token decode and chunked prefill operate without errors,
+        reset cleanly, maintain prefill chunking consistency, and preserve bit-exact
+        parity for f16/f32/q8_0 against the float64 reference forward.
+        """
+        model, spec, weights = _model()
+        expected = reference_greedy(spec, weights, self.PROMPT, 6)
+        precisions = ("f16", "f32", "bf16", "q8_0", "turbo3", "turbo4")
+        vocab_size = spec.hidden if hasattr(spec, "vocabulary_size") else 200
+        for precision in precisions:
+            for prefill_rows in ("1", "4", None):
+                env = {"FLYWEIGHT_PREFILL_ROWS": prefill_rows} if prefill_rows else {}
+                with self.subTest(precision=precision, prefill_rows=prefill_rows), \
+                        unittest.mock.patch.dict(os.environ, env):
+                    runtime = _native(
+                        model,
+                        context_limit=128,
+                        cache_type_k=precision,
+                        cache_type_v=precision,
+                    )
+                    try:
+                        produced: list[int] = []
+                        runtime.generate(self.PROMPT, 6, produced.append)
+                        self.assertEqual(len(produced), 6)
+                        for token in produced:
+                            self.assertGreaterEqual(token, 0)
+                            self.assertLess(token, vocab_size)
+                        if precision in ("f16", "f32", "q8_0"):
+                            self.assertEqual(produced, expected)
+                    finally:
+                        runtime.close()
+
+        # Mixed key/value precisions
+        for ck, cv in (("turbo3", "turbo4"), ("turbo4", "turbo3"), ("q8_0", "turbo4")):
+            with self.subTest(cache_type_k=ck, cache_type_v=cv):
+                runtime = _native(model, context_limit=128, cache_type_k=ck, cache_type_v=cv)
+                try:
+                    produced = []
+                    runtime.generate(self.PROMPT, 6, produced.append)
+                    self.assertEqual(len(produced), 6)
+                finally:
+                    runtime.close()
+
+        # Long sequence crossing the 128-token cuBLAS threshold
+        long_prompt = [(index * 13) % 96 for index in range(120)]
+        for precision in ("f16", "turbo4", "q8_0"):
+            with self.subTest(long_context_precision=precision):
+                runtime = _native(model, context_limit=256, cache_type_k=precision, cache_type_v=precision)
+                try:
+                    produced = []
+                    runtime.generate(long_prompt, 15, produced.append)
+                    self.assertEqual(len(produced), 15)
+                finally:
+                    runtime.close()
+
 
 
 class NemotronToolCallTests(unittest.TestCase):

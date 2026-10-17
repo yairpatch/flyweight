@@ -713,6 +713,7 @@ bool load_cublas() {
     if (g_cublas.attempted) return false;
     // NVIDIA-only; every caller has a kernel path to fall back to.
     if (platform_is_hip()) return false;
+    if (!driver_ready()) return false;
     g_cublas.attempted = true;
 #if defined(_WIN32)
     const wchar_t* names[] = {
@@ -1133,6 +1134,10 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
     }
+    if (!platform_is_hip()) {
+        load_cublas();
+        load_cublas_lt();
+    }
     if (platform_is_hip()) {
         // The corpus assumes a 32-lane warp throughout; CDNA (and RDNA forced
         // into wave64) would run every reduction over half its lanes.
@@ -1158,6 +1163,11 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
 extern "C" int flyweight_gpu_wddm() {
     if (flyweight_backend_is_cpu()) return 0;
     return g_wddm;
+}
+
+extern "C" int flyweight_gpu_cublas_available() {
+    if (flyweight_backend_is_cpu() || platform_is_hip()) return 0;
+    return load_cublas() ? 1 : 0;
 }
 
 struct Entry {
@@ -1682,30 +1692,45 @@ extern "C" int flyweight_gpu_compile(
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
              // Grouped routed-expert kernels: the IQ codebook formats, plus
              // Q2_K gate/up and Q4_0 down for a Q2_K-packed MoE checkpoint.
+             "f32_grouped_swiglu", "f32_grouped_swiglu_rows",
+             "f32_grouped_relu2", "f32_grouped_relu2_rows",
+             "f32_grouped_accumulate", "f32_grouped_accumulate_rows",
              "q2k_grouped_swiglu", "q2k_grouped_swiglu_rows",
+             "q2k_grouped_relu2", "q2k_grouped_relu2_rows",
              "q2k_grouped_accumulate", "q2k_grouped_accumulate_rows",
              "q40_grouped_swiglu", "q40_grouped_swiglu_rows",
+             "q40_grouped_relu2", "q40_grouped_relu2_rows",
              "q40_grouped_accumulate", "q40_grouped_accumulate_rows",
              "iq2xs_grouped_swiglu", "iq2xs_grouped_swiglu_rows",
+             "iq2xs_grouped_relu2", "iq2xs_grouped_relu2_rows",
              "iq2xs_grouped_accumulate", "iq2xs_grouped_accumulate_rows",
              "iq3xxs_grouped_swiglu", "iq3xxs_grouped_swiglu_rows",
+             "iq3xxs_grouped_relu2", "iq3xxs_grouped_relu2_rows",
              "iq3xxs_grouped_accumulate", "iq3xxs_grouped_accumulate_rows",
              "iq3s_grouped_swiglu", "iq3s_grouped_swiglu_rows",
+             "iq3s_grouped_relu2", "iq3s_grouped_relu2_rows",
              "iq3s_grouped_accumulate", "iq3s_grouped_accumulate_rows",
              "iq3s_q8_mmq_routed",
              "iq4xs_grouped_swiglu", "iq4xs_grouped_swiglu_rows",
+             "iq4xs_grouped_relu2", "iq4xs_grouped_relu2_rows",
              "iq4xs_grouped_accumulate", "iq4xs_grouped_accumulate_rows",
              "iq1s_grouped_swiglu", "iq1s_grouped_swiglu_rows",
+             "iq1s_grouped_relu2", "iq1s_grouped_relu2_rows",
              "iq1s_grouped_accumulate", "iq1s_grouped_accumulate_rows",
              "iq1m_grouped_swiglu", "iq1m_grouped_swiglu_rows",
+             "iq1m_grouped_relu2", "iq1m_grouped_relu2_rows",
              "iq1m_grouped_accumulate", "iq1m_grouped_accumulate_rows",
              "iq4nl_grouped_swiglu", "iq4nl_grouped_swiglu_rows",
+             "iq4nl_grouped_relu2", "iq4nl_grouped_relu2_rows",
              "iq4nl_grouped_accumulate", "iq4nl_grouped_accumulate_rows",
              "iq2xxs_grouped_swiglu", "iq2xxs_grouped_swiglu_rows",
+             "iq2xxs_grouped_relu2", "iq2xxs_grouped_relu2_rows",
              "iq2xxs_grouped_accumulate", "iq2xxs_grouped_accumulate_rows",
              "iq2s_grouped_swiglu", "iq2s_grouped_swiglu_rows",
+             "iq2s_grouped_relu2", "iq2s_grouped_relu2_rows",
              "iq2s_grouped_accumulate", "iq2s_grouped_accumulate_rows",
              "q20_grouped_swiglu", "q20_grouped_swiglu_rows",
+             "q20_grouped_relu2", "q20_grouped_relu2_rows",
              "q20_grouped_accumulate", "q20_grouped_accumulate_rows",
              "q20_matmul_rows", "q20_matvec_transposed_warp",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
@@ -1733,7 +1758,9 @@ extern "C" int flyweight_gpu_compile(
               "qwen_shared_scale_rows_bf16", "bf16_matmul_rows",
              "qwen_delta_recurrent_rows", "route_topk_rows", "rms_norm_rows",
               "q5k_grouped_swiglu_rows", "q5k_grouped_accumulate_rows", "q6k_grouped_swiglu",
+              "q5k_grouped_relu2", "q5k_grouped_relu2_rows",
               "q4k_grouped_swiglu_rows", "q4k_grouped_accumulate_rows",
+              "q4k_grouped_relu2", "q4k_grouped_relu2_rows",
              "q4k_value_experts", "q4k_value_experts_rows",
              "q5k_value_experts", "q5k_value_experts_rows",
              "q6k_value_experts", "q6k_value_experts_rows",
@@ -1741,7 +1768,9 @@ extern "C" int flyweight_gpu_compile(
               "q4k_matvec_transposed", "q4k_lm_head_argmax_warp",
               "q6k_lm_head_argmax_warp", "q6k_matvec_transposed",
              "q6k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
+             "q6k_grouped_relu2", "q6k_grouped_relu2_rows",
              "q8_grouped_swiglu", "q8_grouped_swiglu_rows",
+             "q8_grouped_relu2", "q8_grouped_relu2_rows",
              "q8_grouped_accumulate_rows", "nvfp4_grouped_swiglu_rows",
              "nvfp4_grouped_accumulate_rows", "nvfp4_matvec_transposed",
              "nvfp4_swiglu_transposed", "kv_attention_prefill",

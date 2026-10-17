@@ -300,6 +300,73 @@ float qwen_iq3s_dot_q8_k_vnni512(
     return result;
 }
 
+float qwen_iq2xxs_dot_q8_k_vnni512(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+) {
+    const int blocks = elements / 256;
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq2xxsBlockBytes;
+    const __m512i zero = _mm512_setzero_si512();
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq2xxsBlockBytes;
+        const auto& q8 = input[block];
+        alignas(32) std::int32_t group_scales[8];
+        for (int g = 0; g < 8; ++g) {
+            std::uint32_t high = 0;
+            std::memcpy(&high, base + 2 + g * 8 + 4, sizeof(high));
+            group_scales[g] = static_cast<std::int32_t>(1 + 2 * ((high >> 28) & 15));
+        }
+        const __m512i scales512 = _mm512_castsi256_si512(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(group_scales)));
+        __m512i accumulator = zero;
+        for (int pair = 0; pair < 4; ++pair) {
+            std::uint32_t low0 = 0, high0 = 0, low1 = 0, high1 = 0;
+            std::memcpy(&low0, base + 2 + (2 * pair) * 8, sizeof(low0));
+            std::memcpy(&high0, base + 2 + (2 * pair) * 8 + 4, sizeof(high0));
+            std::memcpy(&low1, base + 2 + (2 * pair + 1) * 8, sizeof(low1));
+            std::memcpy(&high1, base + 2 + (2 * pair + 1) * 8 + 4, sizeof(high1));
+
+            alignas(64) std::uint8_t mags[64];
+            std::memcpy(mags + 0,  kIq2xxsGrid[(low0 >> 0) & 255], 8);
+            std::memcpy(mags + 8,  kIq2xxsGrid[(low0 >> 8) & 255], 8);
+            std::memcpy(mags + 16, kIq2xxsGrid[(low0 >> 16) & 255], 8);
+            std::memcpy(mags + 24, kIq2xxsGrid[(low0 >> 24) & 255], 8);
+            std::memcpy(mags + 32, kIq2xxsGrid[(low1 >> 0) & 255], 8);
+            std::memcpy(mags + 40, kIq2xxsGrid[(low1 >> 8) & 255], 8);
+            std::memcpy(mags + 48, kIq2xxsGrid[(low1 >> 16) & 255], 8);
+            std::memcpy(mags + 56, kIq2xxsGrid[(low1 >> 24) & 255], 8);
+
+            const std::uint64_t sign_mask =
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 0) & 127]) << 0) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 7) & 127]) << 8) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 14) & 127]) << 16) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 21) & 127]) << 24) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 0) & 127]) << 32) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 7) & 127]) << 40) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 14) & 127]) << 48) |
+                (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 21) & 127]) << 56);
+
+            const __m512i magnitudes = _mm512_load_si512(static_cast<const void*>(mags));
+            const __m512i activation = _mm512_loadu_si512(
+                static_cast<const void*>(q8.values + pair * 64));
+            const __m512i signed_activation = _mm512_mask_sub_epi8(
+                activation, static_cast<__mmask64>(sign_mask), zero, activation);
+            const __m512i dots = _mm512_dpbusd_epi32(zero, magnitudes, signed_activation);
+            accumulator = _mm512_add_epi32(
+                accumulator,
+                _mm512_mullo_epi32(
+                    dots, _mm512_permutexvar_epi32(scale_lane_select(pair), scales512)));
+        }
+        result += half_value(base) * 0.125f * q8.scale *
+            static_cast<float>(_mm512_reduce_add_epi32(accumulator));
+    }
+    return result;
+}
+
 // IQ3_S row to float: gathered unsigned magnitudes, the sign bits as a mask
 // over the float sign bit, one multiply by d * (1 + 2 * scale). Same values
 // and operation order as the AVX2 decoder, so bit-identical to it.

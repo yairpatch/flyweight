@@ -2051,10 +2051,14 @@ QwenExpertHistory& record_expert_access(
     FlyweightV2QwenRuntime& runtime, std::uint32_t layer, std::uint32_t expert
 ) {
     const auto experts = runtime.model->config.expert_count;
+    const auto index = static_cast<std::size_t>(layer) * experts + expert;
+    if (index >= runtime.expert_history.size()) {
+        static QwenExpertHistory dummy{};
+        return dummy;
+    }
     if (!runtime.cache_admission_enabled &&
         runtime.active_sequence < runtime.sequences.size()) {
         auto& sequence = runtime.sequences[runtime.active_sequence];
-        const auto index = static_cast<std::size_t>(layer) * experts + expert;
         if (sequence.prompt_expert_frequency.size() ==
             static_cast<std::size_t>(runtime.layers.size()) * experts) {
             auto& frequency = sequence.prompt_expert_frequency[index];
@@ -2069,9 +2073,7 @@ QwenExpertHistory& record_expert_access(
         const std::uint32_t record[2] = {layer, expert};
         std::fwrite(record, sizeof(record), 1, expert_trace_file());
     }
-    auto& history = runtime.expert_history[
-        static_cast<std::size_t>(layer) * experts + expert
-    ];
+    auto& history = runtime.expert_history[index];
     ++runtime.expert_clock;
     if (history.frequency != std::numeric_limits<std::uint32_t>::max()) {
         ++history.frequency;
@@ -2113,10 +2115,13 @@ std::size_t select_expert_cache_slot(
         ++runtime.expert_cache_prompt_bypasses;
         return kNoExpertSlot;
     }
-    auto& candidate = runtime.expert_history[
-        static_cast<std::size_t>(layer) *
-            runtime.model->config.expert_count + expert
-    ];
+    const auto candidate_index = static_cast<std::size_t>(layer) *
+        runtime.model->config.expert_count + expert;
+    if (candidate_index >= runtime.expert_history.size()) {
+        if (record_access) record_expert_access(runtime, layer, expert);
+        return kNoExpertSlot;
+    }
+    auto& candidate = runtime.expert_history[candidate_index];
     if (record_access) record_expert_access(runtime, layer, expert);
     if(!runtime.whole_expert_layer_slots.empty()){
         if(layer>=runtime.whole_expert_layer_slots.size()||
@@ -4605,10 +4610,11 @@ bool qwen_iq_avx512_enabled(){
 using QwenIqQ8Dot=float(*)(const std::uint8_t*,const QwenQ8KBlock*,int,std::uint64_t);
 bool qwen_iq_q8_admitted(std::uint32_t type){
     const auto features=flyweight_cpu_features();
-    if((features&8u)!=0)return type==19||type==21;
+    if((features&8u)!=0)return type==16||type==19||type==21;
     return (features&4u)!=0&&type==19;
 }
 QwenIqQ8Dot qwen_iq_q8_dot(std::uint32_t type){
+    if(type==16)return &qwen_iq2xxs_dot_q8_k_vnni512;
     if(type==21)return &qwen_iq3s_dot_q8_k_vnni512;
     return (flyweight_cpu_features()&8u)!=0
         ?&qwen_iq1s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_avx_vnni;
@@ -4914,6 +4920,7 @@ std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
 // one (or a width that does not divide) falls that layer back to the
 // per-expert GEMM, and those few do not decide the budget for the rest.
 bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
+    if (runtime.nemotron) return false;
     if (!runtime.int8_tensor_cores) return false;
     const int hidden = static_cast<int>(runtime.model->config.hidden_size);
     const int intermediate = static_cast<int>(runtime.moe_intermediate);
@@ -4961,6 +4968,17 @@ std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool 
     if(type==12)return rows?"q4k_grouped_swiglu_rows":"q4k_grouped_swiglu";
     if(type!=13)throw std::runtime_error(qwen_grouped_expert_unsupported(type));
     return rows?"q5k_grouped_swiglu_rows":"q5k_grouped_swiglu";
+}
+
+std::string nemotron_grouped_relu2_name(std::uint32_t type, bool rows) {
+    const char* suffix = rows ? "_grouped_relu2_rows" : "_grouped_relu2";
+    auto iq = qwen_grouped_expert_kernel(type, suffix);
+    if (!iq.empty()) return iq;
+    if (type == 8) return rows ? "q8_grouped_relu2_rows" : "q8_grouped_relu2";
+    if (type == 14) return rows ? "q6k_grouped_relu2_rows" : "q6k_grouped_relu2";
+    if (type == 12) return rows ? "q4k_grouped_relu2_rows" : "q4k_grouped_relu2";
+    if (type == 13) return rows ? "q5k_grouped_relu2_rows" : "q5k_grouped_relu2";
+    throw std::runtime_error(qwen_grouped_expert_unsupported(type));
 }
 
 // Row-batched grouped accumulate, which the prefill path launches by name for
@@ -5020,8 +5038,9 @@ int qwen_launch_grouped_accumulate(
 bool qwen_model_has_grouped_experts(const FlyweightV2QwenRuntime& runtime) {
     for(const auto& layer:runtime.layers){
         if(layer.dense_ffn||!layer.expert_tensors[0])continue;
-        for(const auto index:layer.expert_tensors)
-            if(qwen_grouped_expert_prefix(runtime.model->tensors[index].type))return true;
+        const int roles = runtime.nemotron ? 2 : 3;
+        for(int role = 0; role < roles; ++role)
+            if(qwen_grouped_expert_prefix(runtime.model->tensors[layer.expert_tensors[role]].type))return true;
     }
     return false;
 }
@@ -5044,8 +5063,9 @@ bool qwen_gpu_experts_executable(const FlyweightV2QwenRuntime& runtime) {
     }
     for(const auto& layer:runtime.layers){
         if(layer.dense_ffn||!layer.expert_tensors[0])continue;
-        for(const auto index:layer.expert_tensors)
-            if(!qwen_gpu_expert_type_supported(runtime.model->tensors[index].type))
+        const int roles = runtime.nemotron ? 2 : 3;
+        for(int role = 0; role < roles; ++role)
+            if(!qwen_gpu_expert_type_supported(runtime.model->tensors[layer.expert_tensors[role]].type))
                 return false;
     }
     return true;
@@ -5339,6 +5359,23 @@ void nemotron_cpu_moe(
     const auto up_bytes=up_tensor.size/experts,down_bytes=down_tensor.size/experts;
     const auto*up_base=tensor_data(*runtime.model,up_tensor);
     const auto*down_base=tensor_data(*runtime.model,down_tensor);
+    static const char* q8_setting = std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
+    static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
+    const bool use_iq_q8_up = qwen_iq_q8_admitted(up_tensor.type)
+        && expert_in % 256 == 0
+        && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
+        && !(q8_setting && q8_setting[0] == '0');
+    const bool use_iq_q8_down = qwen_iq_q8_admitted(down_tensor.type)
+        && expert_ff % 256 == 0
+        && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
+        && !(q8_setting && q8_setting[0] == '0');
+    std::vector<QwenQ8KBlock> input_q8, activated_q8;
+    const auto up_dot = qwen_iq_q8_dot(up_tensor.type);
+    if (use_iq_q8_up) {
+        input_q8.resize(expert_in / 256);
+        qwen_quantize_q8_k_avx2(input, expert_in, input_q8.data());
+    }
+    const auto* in_q8_ptr = input_q8.data();
     #if defined(_OPENMP)
     const QwenDecodeCaller decode_caller(qwen_cpu_decode_thread_count(runtime));
     #endif
@@ -5348,11 +5385,25 @@ void nemotron_cpu_moe(
         qwen_pin_decode_member();
         const int rank=task/expert_ff,row=task%expert_ff,expert=selected[rank];
         if(expert<0||expert>=experts){activated[task]=0.0f;continue;}
-        const float value=qwen_quant_dot(
-            up_base+static_cast<std::uint64_t>(expert)*up_bytes,up_tensor.type,
-            input,expert_in,row);
+        const float value = use_iq_q8_up
+            ? up_dot(up_base+static_cast<std::uint64_t>(expert)*up_bytes,
+                     in_q8_ptr,expert_in,row)
+            : qwen_quant_dot(
+                up_base+static_cast<std::uint64_t>(expert)*up_bytes,up_tensor.type,
+                input,expert_in,row);
         activated[task]=value>0.0f?value*value:0.0f;
     }
+    const auto down_dot = qwen_iq_q8_dot(down_tensor.type);
+    if (use_iq_q8_down) {
+        activated_q8.resize(static_cast<std::size_t>(routed_count) * (expert_ff / 256));
+        for (int rank = 0; rank < routed_count; ++rank) {
+            qwen_quantize_q8_k_avx2(
+                activated + static_cast<std::size_t>(rank) * expert_ff,
+                expert_ff,
+                activated_q8.data() + static_cast<std::size_t>(rank) * (expert_ff / 256));
+        }
+    }
+    const auto* act_q8_ptr = activated_q8.data();
     // Down and the weighted sum, one task per output channel walking the ranks.
     #pragma omp parallel for schedule(static) num_threads(qwen_cpu_decode_thread_count(runtime))
     for(int channel=0;channel<expert_in;++channel){
@@ -5361,9 +5412,14 @@ void nemotron_cpu_moe(
         for(int rank=0;rank<routed_count;++rank){
             const int expert=selected[rank];
             if(expert<0||expert>=experts)continue;
-            sum+=weights[rank]*qwen_quant_dot(
-                down_base+static_cast<std::uint64_t>(expert)*down_bytes,down_tensor.type,
-                activated+static_cast<std::size_t>(rank)*expert_ff,expert_ff,channel);
+            const float dot_val = use_iq_q8_down
+                ? down_dot(down_base+static_cast<std::uint64_t>(expert)*down_bytes,
+                           act_q8_ptr + static_cast<std::size_t>(rank) * (expert_ff / 256),
+                           expert_ff,channel)
+                : qwen_quant_dot(
+                    down_base+static_cast<std::uint64_t>(expert)*down_bytes,down_tensor.type,
+                    activated+static_cast<std::size_t>(rank)*expert_ff,expert_ff,channel);
+            sum+=weights[rank]*dot_val;
         }
         output[channel]=sum;
     }
@@ -5508,6 +5564,7 @@ void nemotron_cpu_moe_rows(
     auto&counts=tl_counts;auto&offsets=tl_offsets;auto&slots=tl_slots;auto&groups=tl_groups;
     counts.assign(experts,0);
     for(int route=0;route<routes;++route){
+        if(weights[route]==0.0f)continue;
         const int expert=selected[route];
         if(expert<0||expert>=experts)
             throw std::runtime_error("native Nemotron H rows MoE selected an invalid expert");
@@ -5515,12 +5572,23 @@ void nemotron_cpu_moe_rows(
     }
     offsets.assign(experts+1,0);
     for(int expert=0;expert<experts;++expert)offsets[expert+1]=offsets[expert]+counts[expert];
-    slots.resize(routes);
+    const int active_routes=offsets[experts];
+    if(active_routes==0){
+        for(int row=0;row<rows;++row){
+            float*output=outputs+static_cast<std::size_t>(row)*expert_in;
+            std::fill(output,output+expert_in,0.0f);
+        }
+        return;
+    }
+    slots.resize(active_routes);
     {
         thread_local std::vector<int> tl_cursor;
         auto&cursor=tl_cursor;
         cursor.assign(offsets.begin(),offsets.end()-1);
-        for(int route=0;route<routes;++route)slots[cursor[selected[route]]++]=route;
+        for(int route=0;route<routes;++route){
+            if(weights[route]==0.0f)continue;
+            slots[cursor[selected[route]]++]=route;
+        }
     }
     groups.clear();
     for(int expert=0;expert<experts;++expert)if(counts[expert])groups.push_back(expert);
@@ -16288,22 +16356,6 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(lfm2&&runtime->options.mtp_drafts)throw std::runtime_error("LFM2 checkpoints carry no MTP draft block");
     if(nemotron&&runtime->options.mtp_drafts)
         throw std::runtime_error("native Nemotron H MTP is not implemented");
-    // Nemotron H's routed experts are relu2 up/down pairs with no gate, which
-    // no grouped GPU kernel computes, so they run on the CPU from the mapping.
-    // `auto` (hybrid) degrades to that like any format without a GPU kernel;
-    // the modes that promise every expert on the card cannot be honored.
-    if(nemotron&&runtime->expert_mode==flyweight::v2::ExpertExecutionMode::streamed_gpu)
-        throw std::runtime_error(
-            "Nemotron H routed experts run on the CPU only (no grouped GPU "
-            "kernel for their relu2 up/down pair): use --moe-device cpu or auto");
-    if(nemotron&&runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid){
-        std::fprintf(stderr,
-            "[flyweight] routed experts stay on the CPU MoE: Nemotron H's relu2 "
-            "experts have no grouped GPU kernel\n");
-        runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
-        runtime->options.moe_device=
-            flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
-    }
     if(nemotron&&runtime->lookup_drafts){
         std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: Nemotron H has no draft verification path\n");
         runtime->lookup_drafts=0;
@@ -18158,9 +18210,19 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // Dense checkpoints have no routed experts, so there is nothing to size
         // a paging slot from -- and expert_count is zero, which would trap.
         std::uint64_t one_expert=0;
-        if(runtime->model->config.expert_count)
-            for(const auto&layer:runtime->layers){if(layer.dense_ffn)continue;std::uint64_t bytes=0;for(auto tensor:layer.expert_tensors)bytes+=runtime->model->tensors[tensor].size/runtime->model->config.expert_count;one_expert=std::max(one_expert,bytes);}
-        runtime->expert_staging_bytes=device_align(one_expert*runtime->model->config.expert_used_count*2);
+        std::uint32_t max_expert_used=runtime->model->config.expert_used_count;
+        for(const auto&layer:runtime->layers){
+            if(layer.dense_ffn||!layer.expert_tensors[0])continue;
+            const auto exp_count=layer.expert_count?layer.expert_count:runtime->model->config.expert_count;
+            if(!exp_count)continue;
+            const int roles=runtime->nemotron?2:3;
+            std::uint64_t bytes=0;
+            for(int r=0;r<roles;++r)
+                bytes+=runtime->model->tensors[layer.expert_tensors[r]].size/exp_count;
+            one_expert=std::max(one_expert,bytes);
+            max_expert_used=std::max(max_expert_used,layer.expert_used?layer.expert_used:runtime->model->config.expert_used_count);
+        }
+        runtime->expert_staging_bytes=device_align(one_expert*max_expert_used*2);
         runtime->host_staging_bytes=std::max(
             runtime->expert_staging_bytes,
             device_align(runtime->rows_host_layout.bytes));
@@ -18270,7 +18332,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             return (routed_env?routed_env[0]=='1':runtime->options.routed_moe!=0)&&
                 qwen_routed_mmq_available(*runtime);
         }();
-        if(stream_auto)
+        if(runtime->nemotron)
+            stream_request=0;
+        else if(stream_auto)
             stream_request=routed_stream?256:48;
         // Pinned→device bandwidth probe (ExLlama EXL3_MOE_STREAM_T pattern):
         // scale the auto MiB budget with sqrt(bw/25) and raise the per-expert
@@ -19020,7 +19084,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         const bool gpu_at_decode=!qwen_expert_policy(
             *runtime,flyweight::v2::ExpertExecutionPhase::decode).is_cpu();
         const bool experts_executable=qwen_gpu_experts_executable(*runtime);
-        const bool needs_placement=qwen_model_has_grouped_experts(*runtime)&&
+        const bool needs_placement=!runtime->nemotron&&qwen_model_has_grouped_experts(*runtime)&&
             !seeded_placement&&runtime->whole_expert_layer_slots.empty();
         if(gpu_at_decode&&runtime->model->config.expert_count&&
            (!experts_executable||needs_placement)){
@@ -19034,7 +19098,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 std::vector<std::uint32_t> seen;
                 for(const auto& layer:runtime->layers){
                     if(layer.dense_ffn||!layer.expert_tensors[0])continue;
-                    for(const auto index:layer.expert_tensors){
+                    const int roles = runtime->nemotron ? 2 : 3;
+                    for(int r = 0; r < roles; ++r){
+                        const auto index = layer.expert_tensors[r];
                         const auto type=runtime->model->tensors[index].type;
                         if(qwen_gpu_expert_type_supported(type))continue;
                         if(std::find(seen.begin(),seen.end(),type)!=seen.end())continue;
@@ -19336,8 +19402,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 return layer.mova_v_exps!=std::numeric_limits<std::uint64_t>::max();
             };
             std::uint64_t expert_bytes=0;
+            const int model_roles=runtime->nemotron?2:3;
             for(const auto& layer:runtime->layers){
-                for(int role=0;role<3;++role)
+                for(int role=0;role<model_roles;++role)
                     expert_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
                 if(has_mova(layer))
                     expert_bytes+=runtime->model->tensors[layer.mova_v_exps].size;
@@ -19368,13 +19435,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             for(std::uint32_t index=0;index<runtime->layers.size();++index){
                 const auto& layer=runtime->layers[index];
                 std::uint64_t layer_bytes=0;
-                for(int role=0;role<3;++role)
+                for(int role=0;role<model_roles;++role)
                     layer_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
                 if(has_mova(layer))
                     layer_bytes+=runtime->model->tensors[layer.mova_v_exps].size;
                 if(planned+layer_bytes>budget)break;
                 planned+=layer_bytes;++covered;
-                for(int role=0;role<3;++role){
+                for(int role=0;role<model_roles;++role){
                     spans.push_back(tensor_span(layer.expert_tensors[role]));
                     span_layer.push_back(index);
                 }
@@ -19924,6 +19991,7 @@ inline int qwen_cublas_attention_min_tokens(){
 inline bool qwen_cublas_attention_eligible(
     const FlyweightV2QwenRuntime&runtime,int tokens,int first_slot,int capacity
 ){
+    if(!flyweight_gpu_cublas_available())return false;
     const char*env=std::getenv("FLYWEIGHT_CUBLAS_ATTENTION");
     const bool enabled=!env||env[0]!='0';
     return flyweight::v2::attention::cublas_eligible(
@@ -19964,6 +20032,8 @@ inline bool qwen_turbo_cublas_attention(
         }
         return false;
     };
+    if(!flyweight_gpu_cublas_available())
+        return decline("cuBLAS unavailable");
     if(!(ck==cv&&kv_type_is_turbo(ck))&&!kv_mixed_stageable(ck,cv))
         return decline("cache types neither a matched turbo pair nor a stageable mix");
     if(!runtime.turbo_kv_stage)return decline("no staging buffer");
@@ -20021,6 +20091,7 @@ inline bool qwen_unwrap_cublas_attention(
     std::uint64_t attended, int heads, int kv_heads, int head_dim,
     int tokens, int capacity, int first_slot, float scale
 ){
+    if(!flyweight_gpu_cublas_available())return false;
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
     if(ck!=cv||(ck!=1&&ck!=2))return false;
     if(tokens<qwen_cublas_attention_min_tokens())return false;
@@ -22822,13 +22893,19 @@ static void qwen_run_hybrid_experts(
             const auto device_base =
                 runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
             std::uint64_t role_offset = 0;
-            for (int role = 0; role < 3; ++role) {
+            const int roles = runtime.nemotron ? 2 : 3;
+            for (int role = 0; role < roles; ++role) {
                 const auto bytes =
                     runtime.model->tensors[layer.expert_tensors[role]].size / experts;
                 const auto pointer = device_base + role_offset;
-                if (role == 0) gate_pointers[gpu_count] = pointer;
-                else if (role == 1) up_pointers[gpu_count] = pointer;
-                else down_pointers[gpu_count] = pointer;
+                if (runtime.nemotron) {
+                    if (role == 0) up_pointers[gpu_count] = pointer;
+                    else down_pointers[gpu_count] = pointer;
+                } else {
+                    if (role == 0) gate_pointers[gpu_count] = pointer;
+                    else if (role == 1) up_pointers[gpu_count] = pointer;
+                    else down_pointers[gpu_count] = pointer;
+                }
                 role_offset += bytes;
             }
             if (slot.native_valid && runtime.expert_native_cache)
@@ -22864,10 +22941,11 @@ static void qwen_run_hybrid_experts(
             scratch_used + runtime.expert_slot_bytes + scratch_table_reserve <=
                 runtime.expert_staging_bytes) {
             const auto scratch_base = runtime.expert_staging + scratch_used;
+            const int roles = runtime.nemotron ? 2 : 3;
             bool placed = false;
             if (layer.expert_dma) {
                 std::uint64_t role_offset = 0;
-                for (int role = 0; role < 3; ++role) {
+                for (int role = 0; role < roles; ++role) {
                     const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
                     const auto bytes = tensor.size / experts;
                     const auto offset = static_cast<std::uint64_t>(expert) * bytes;
@@ -22883,11 +22961,11 @@ static void qwen_run_hybrid_experts(
             } else {
                 const auto bundle_start = staging_cursor;
                 std::uint64_t bundle_bytes = 0;
-                for (int role = 0; role < 3; ++role)
+                for (int role = 0; role < roles; ++role)
                     bundle_bytes += runtime.model->tensors[layer.expert_tensors[role]].size / experts;
                 if (staging_cursor + bundle_bytes <= runtime.expert_staging_bytes) {
                     const double t_stage = moe_now();
-                    for (int role = 0; role < 3; ++role) {
+                    for (int role = 0; role < roles; ++role) {
                         const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
                         const auto bytes = tensor.size / experts;
                         const auto offset = static_cast<std::uint64_t>(expert) * bytes;
@@ -22908,13 +22986,18 @@ static void qwen_run_hybrid_experts(
             if (placed) {
                 scratch_used += runtime.expert_slot_bytes;
                 std::uint64_t role_offset = 0;
-                for (int role = 0; role < 3; ++role) {
+                for (int role = 0; role < roles; ++role) {
                     const auto bytes =
                         runtime.model->tensors[layer.expert_tensors[role]].size / experts;
                     const auto pointer = scratch_base + role_offset;
-                    if (role == 0) gate_pointers[gpu_count] = pointer;
-                    else if (role == 1) up_pointers[gpu_count] = pointer;
-                    else down_pointers[gpu_count] = pointer;
+                    if (runtime.nemotron) {
+                        if (role == 0) up_pointers[gpu_count] = pointer;
+                        else down_pointers[gpu_count] = pointer;
+                    } else {
+                        if (role == 0) gate_pointers[gpu_count] = pointer;
+                        else if (role == 1) up_pointers[gpu_count] = pointer;
+                        else down_pointers[gpu_count] = pointer;
+                    }
                     role_offset += bytes;
                 }
                 gpu_compact_weights[gpu_count] = route_weights[rank];
@@ -22964,9 +23047,10 @@ static void qwen_run_hybrid_experts(
         runtime.expert_residency[cache_key] = slot_index;
         const auto slot_base =
             runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
+        const int roles = runtime.nemotron ? 2 : 3;
         if (layer.expert_dma) {
             std::uint64_t role_offset = 0;
-            for (int role = 0; role < 3; ++role) {
+            for (int role = 0; role < roles; ++role) {
                 const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
                 const auto bytes = tensor.size / experts;
                 const auto offset = static_cast<std::uint64_t>(expert) * bytes;
@@ -22994,7 +23078,7 @@ static void qwen_run_hybrid_experts(
         } else {
             const auto bundle_start = staging_cursor;
             const double t_stage = moe_now();
-            for (int role = 0; role < 3; ++role) {
+            for (int role = 0; role < roles; ++role) {
                 const auto& tensor = runtime.model->tensors[layer.expert_tensors[role]];
                 const auto bytes = tensor.size / experts;
                 const auto offset = static_cast<std::uint64_t>(expert) * bytes;
@@ -23017,13 +23101,18 @@ static void qwen_run_hybrid_experts(
         // the down scale rides on the up scale, because the accumulate is
         // linear. The slot upload is queued before the grouped kernels below.
         std::uint64_t role_offset = 0;
-        for (int role = 0; role < 3; ++role) {
+        for (int role = 0; role < roles; ++role) {
             const auto bytes =
                 runtime.model->tensors[layer.expert_tensors[role]].size / experts;
             const auto pointer = slot_base + role_offset;
-            if (role == 0) gate_pointers[gpu_count] = pointer;
-            else if (role == 1) up_pointers[gpu_count] = pointer;
-            else down_pointers[gpu_count] = pointer;
+            if (runtime.nemotron) {
+                if (role == 0) up_pointers[gpu_count] = pointer;
+                else down_pointers[gpu_count] = pointer;
+            } else {
+                if (role == 0) gate_pointers[gpu_count] = pointer;
+                else if (role == 1) up_pointers[gpu_count] = pointer;
+                else down_pointers[gpu_count] = pointer;
+            }
             role_offset += bytes;
         }
         if (slot.native_valid && runtime.expert_native_cache)
@@ -23101,7 +23190,7 @@ static void qwen_run_hybrid_experts(
         const auto down_scale_table = up_scale_table + gpu_count * sizeof(float);
         if (moe_profile_enabled()) moe_prof.table += moe_now() - t_table;
         const auto gate_type = runtime.model->tensors[layer.expert_tensors[0]].type;
-        const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
+        const auto down_type = runtime.model->tensors[layer.expert_tensors[runtime.nemotron ? 1 : 2]].type;
         if (!qwen_gpu_expert_type_supported(gate_type) ||
             !qwen_gpu_expert_type_supported(down_type))
             throw std::runtime_error(
@@ -23144,7 +23233,35 @@ static void qwen_run_hybrid_experts(
                     std::fprintf(stderr, "[nvfp4-tc] hybrid fallback status=%d experts=%d\n", status, gpu_count);
             }
         }
-        if (!tensor_cores_done) {
+        if (runtime.nemotron) {
+            const double t_launch = moe_now();
+            const auto up_type =
+                runtime.model->tensors[layer.expert_tensors[0]].type;
+            const auto down_type =
+                runtime.model->tensors[layer.expert_tensors[1]].type;
+            void* up_args[] = {
+                const_cast<std::uint64_t*>(&up_table),
+                const_cast<std::uint64_t*>(&normalized),
+                const_cast<std::uint64_t*>(&activated),
+                const_cast<int*>(&hidden_size),
+                const_cast<int*>(&intermediate),
+                &gpu_count};
+            profile_record(profile?profile->expert_gate_up_start:0);
+            launch(
+                nemotron_grouped_relu2_name(up_type, false).c_str(),
+                intermediate, gpu_count, 256, up_args);
+            profile_record(profile?profile->expert_gate_up_end:0);
+            if(profile)profile->expert_subprofile_mask|=2;
+            profile_record(profile?profile->expert_down_start:0);
+            int status = qwen_launch_grouped_accumulate(
+                runtime.stream, down_type, down_table, activated, third,
+                weight_table, intermediate, hidden_size, gpu_count);
+            profile_record(profile?profile->expert_down_end:0);
+            if(profile)profile->expert_subprofile_mask|=4;
+            if (status != 0)
+                throw std::runtime_error("native hybrid MoE down projection failed");
+            if (moe_profile_enabled()) moe_prof.queue += moe_now() - t_launch;
+        } else if (!tensor_cores_done) {
             const double t_launch = moe_now();
             void* gate_up_args[] = {
                 const_cast<std::uint64_t*>(&gate_table),
@@ -23243,9 +23360,15 @@ static void qwen_run_hybrid_experts(
             }
             ~SplitActive() { if (armed) qwen_cpu_moe_split_active = false; }
         } split_active;
-        qwen_cpu_moe(
-            runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
-            cpu_count, cpu_input, cpu_activated, cpu_output);
+        if (runtime.nemotron) {
+            nemotron_cpu_moe(
+                runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
+                cpu_count, cpu_input, cpu_activated, cpu_output);
+        } else {
+            qwen_cpu_moe(
+                runtime, layer, cpu_selected.data(), cpu_compact_weights.data(),
+                cpu_count, cpu_input, cpu_activated, cpu_output);
+        }
         if (moe_profile_enabled()) moe_prof.cpu_compute += moe_now() - t_cpu;
         if (timing_enabled())
             runtime.expert_compute_nanoseconds +=
@@ -23911,22 +24034,37 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             if(flyweight_gpu_event_sync(runtime->route_event)!=0)
                 throw std::runtime_error("native Qwen route event failed");
             if(timing_enabled())runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
-            const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-            nemotron_cpu_moe(*runtime,layer,selected_host,layer_cpu_weights,
-                layer_top_k,cpu_input,cpu_activated,cpu_output);
-            if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-            // residual = routed (projected back up) + shared + stream; the
-            // swap after the block makes it the next layer's input.
-            if(layer.moe_latent){
-                if(flyweight_gpu_upload(fourth,cpu_output,
-                       static_cast<std::uint64_t>(expert_in)*sizeof(float),
-                       runtime->stream)!=0)
+            if(expert_policy.is_cpu()){
+                const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+                nemotron_cpu_moe(*runtime,layer,selected_host,layer_cpu_weights,
+                    layer_top_k,cpu_input,cpu_activated,cpu_output);
+                if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
+                // residual = routed (projected back up) + shared + stream; the
+                // swap after the block makes it the next layer's input.
+                if(layer.moe_latent){
+                    if(flyweight_gpu_upload(fourth,cpu_output,
+                           static_cast<std::uint64_t>(expert_in)*sizeof(float),
+                           runtime->stream)!=0)
+                        throw std::runtime_error("native CPU MoE output upload failed");
+                    dense(layer.latent_up,fourth,residual,expert_in,hidden_size);
+                }else if(flyweight_gpu_upload(residual,cpu_output,
+                             static_cast<std::uint64_t>(hidden_size)*sizeof(float),
+                             runtime->stream)!=0)
                     throw std::runtime_error("native CPU MoE output upload failed");
-                dense(layer.latent_up,fourth,residual,expert_in,hidden_size);
-            }else if(flyweight_gpu_upload(residual,cpu_output,
-                         static_cast<std::uint64_t>(hidden_size)*sizeof(float),
-                         runtime->stream)!=0)
-                throw std::runtime_error("native CPU MoE output upload failed");
+            }else{
+                flyweight_gpu_memset(second,0,expert_in*sizeof(float),runtime->stream);
+                qwen_run_hybrid_experts(
+                    *runtime,layer,layer_number,expert_policy,layer_top_k,
+                    expert_in,layer.expert_ff,layer_experts,staging,
+                    layer_cpu_output_offset+device_align(expert_in*sizeof(float)),
+                    selected_host,layer_cpu_weights,cpu_input,cpu_activated,cpu_output,
+                    expert_input,activated,second,first,false,launch_named,profile);
+                if(layer.moe_latent){
+                    dense(layer.latent_up,second,residual,expert_in,hidden_size);
+                }else{
+                    flyweight_gpu_copy_device(residual,second,hidden_size*sizeof(float),runtime->stream);
+                }
+            }
             add(residual,third);
             add(residual,hidden);
             nemotron_done=true;
@@ -26566,7 +26704,8 @@ void qwen_drop_expert_pages_for_sweep(
     const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
     for (const auto& layer : runtime.layers) {
         if (layer.dense_ffn || !layer.expert_tensors[0]) continue;
-        for (int role = 0; role < 3; ++role) {
+        const int roles = runtime.nemotron ? 2 : 3;
+        for (int role = 0; role < roles; ++role) {
             const auto& tensor =
                 runtime.model->tensors[layer.expert_tensors[role]];
             const auto* address = tensor_data(*runtime.model, tensor);
@@ -27130,12 +27269,15 @@ static void qwen_seed_prefill_experts(
     // the placement phase.
     std::vector<std::vector<std::uint32_t>> ranked(runtime.layers.size());
     for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
+        const auto& plan=runtime.layers[layer];
+        if(plan.dense_ffn || !plan.expert_count) continue;
+        const auto layer_experts=plan.expert_count;
         const auto slot_begin=runtime.expert_slots.size()*layer/cache_layers;
         const auto slot_end=runtime.expert_slots.size()*(layer+1)/cache_layers;
         const auto layer_budget=std::min(per_layer,slot_end-slot_begin);
         auto& candidates=ranked[layer];
-        candidates.reserve(experts);
-        for(std::uint32_t expert=0;expert<experts;++expert){
+        candidates.reserve(layer_experts);
+        for(std::uint32_t expert=0;expert<layer_experts;++expert){
             const auto index=static_cast<std::size_t>(layer)*experts+expert;
             const auto prompt_frequency=useful_prompt&&
                 index<sequence.prompt_expert_frequency.size()
@@ -27214,33 +27356,35 @@ static void qwen_seed_prefill_experts(
             continue;
         }
         const auto& plan=runtime.layers[layer];
+        const int roles=runtime.nemotron?2:3;
+        const auto layer_experts=plan.expert_count?plan.expert_count:experts;
         std::uint64_t bundle_bytes=0;
-        for(int role=0;role<3;++role)
-            bundle_bytes+=runtime.model->tensors[plan.expert_tensors[role]].size/experts;
+        for(int role=0;role<roles;++role)
+            bundle_bytes+=runtime.model->tensors[plan.expert_tensors[role]].size/layer_experts;
         const auto slot_index=select_expert_cache_slot(
             runtime,layer,expert,false,false);
         if(slot_index==kNoExpertSlot)continue;
-            if(bundle_bytes>runtime.host_staging_bytes)
-                throw std::runtime_error("native Qwen prefill cache seed expert exceeds staging capacity");
-            if(cursor+bundle_bytes>runtime.host_staging_bytes)flush();
-            const auto bundle_start=cursor;
-            for(int role=0;role<3;++role){
-                const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
-                const auto bytes=tensor.size/experts;
-                const auto offset=static_cast<std::uint64_t>(expert)*bytes;
-                std::memcpy(staging+cursor,tensor_data(*runtime.model,tensor)+offset,bytes);
-                cursor+=bytes;
-            }
-            auto& slot=runtime.expert_slots[slot_index];
-            if(slot.valid)runtime.expert_residency.erase(slot.key);
-            slot.key=key;slot.valid=true;slot.pinned=true;
-            slot.prefetch_pins=0;slot.last_used=++runtime.expert_clock;
-            runtime.expert_residency[key]=slot_index;
-            pending.push_back({runtime.expert_cache+slot_index*runtime.expert_slot_bytes,
-                               bundle_start,bundle_bytes});
-            ++seeded;
-            ++selected;
-            uploaded_bytes+=bundle_bytes;
+        if(bundle_bytes>runtime.host_staging_bytes)
+            throw std::runtime_error("native Qwen prefill cache seed expert exceeds staging capacity");
+        if(cursor+bundle_bytes>runtime.host_staging_bytes)flush();
+        const auto bundle_start=cursor;
+        for(int role=0;role<roles;++role){
+            const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
+            const auto bytes=tensor.size/layer_experts;
+            const auto offset=static_cast<std::uint64_t>(expert)*bytes;
+            std::memcpy(staging+cursor,tensor_data(*runtime.model,tensor)+offset,bytes);
+            cursor+=bytes;
+        }
+        auto& slot=runtime.expert_slots[slot_index];
+        if(slot.valid)runtime.expert_residency.erase(slot.key);
+        slot.key=key;slot.valid=true;slot.pinned=true;
+        slot.prefetch_pins=0;slot.last_used=++runtime.expert_clock;
+        runtime.expert_residency[key]=slot_index;
+        pending.push_back({runtime.expert_cache+slot_index*runtime.expert_slot_bytes,
+                           bundle_start,bundle_bytes});
+        ++seeded;
+        ++selected;
+        uploaded_bytes+=bundle_bytes;
     }
     flush();
     runtime.prefill_cache_seeded_experts+=seeded;
@@ -27278,8 +27422,11 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
     struct Candidate { std::uint32_t expert; std::uint32_t frequency; std::uint64_t last_used; };
     std::vector<std::vector<Candidate>> ranked(runtime.layers.size());
     for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
+        const auto& plan=runtime.layers[layer];
+        if(plan.dense_ffn || !plan.expert_count) continue;
+        const auto layer_experts=plan.expert_count;
         auto& list=ranked[layer];
-        for(std::uint32_t expert=0;expert<experts;++expert){
+        for(std::uint32_t expert=0;expert<layer_experts;++expert){
             const auto& history=runtime.expert_history[static_cast<std::size_t>(layer)*experts+expert];
             if(history.frequency)list.push_back({expert,history.frequency,history.last_used});
         }
@@ -27299,13 +27446,15 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
             any=true;
             const auto expert=ranked[layer][rank].expert;
             const auto& plan=runtime.layers[layer];
+            const int roles=runtime.nemotron?2:3;
+            const auto layer_experts=plan.expert_count?plan.expert_count:experts;
             std::uint64_t bundle=0;
-            for(int role=0;role<3;++role)
-                bundle+=runtime.model->tensors[plan.expert_tensors[role]].size/experts;
+            for(int role=0;role<roles;++role)
+                bundle+=runtime.model->tensors[plan.expert_tensors[role]].size/layer_experts;
             if(bundle>budget-selected_bytes)continue;
-            for(int role=0;role<3;++role){
+            for(int role=0;role<roles;++role){
                 const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
-                const auto bytes=tensor.size/experts;
+                const auto bytes=tensor.size/layer_experts;
                 ranges.push_back({tensor.source?tensor.source:runtime.model->data,
                     tensor.offset+static_cast<std::uint64_t>(expert)*bytes,bytes});
             }
