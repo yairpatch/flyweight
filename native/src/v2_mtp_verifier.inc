@@ -776,6 +776,21 @@ void qwen_forward_rows(
             }
             void*nvfp4_args[]={&matrix,&input,&output,&input_size,&output_size,
                                &rows,const_cast<float*>(&scale)};
+            static const int nvfp4_rows_max=[]{
+                const char*setting=std::getenv("FLYWEIGHT_NVFP4_ROWS_MAX");
+                return setting&&setting[0]?std::atoi(setting):8;
+            }();
+            // A few rows (a draft round's verify, a prompt's short tail): the
+            // shared-tile GEMM spends a 32-token tile on each, measured at
+            // ~0.8 ms a call for 2 rows on Bolt's ssm_in. The warp matvec's
+            // rows twin reads the weights once for all of them.
+            if(rows<=std::min(nvfp4_rows_max,8)){
+                void*rows_args[]={&matrix,&input,&output,&input_size,&output_size,
+                                  &rows,const_cast<float*>(&scale)};
+                launch("nvfp4_matvec_transposed_warp_rows",(output_size+7)/8,1,256,rows_args);
+                dense_trace("nvfp4_matvec_transposed_warp_rows");
+                return;
+            }
             launch("nvfp4_matmul_tiled",(output_size+31)/32,
                    (static_cast<std::uint32_t>(rows)+31)/32,256,nvfp4_args);
             dense_trace("nvfp4_matmul_tiled");
@@ -1199,17 +1214,27 @@ void qwen_forward_rows(
             const int d_in_proj=2*inner+2*groups*d_state+heads;
             const int head_dim=inner/heads;
             int conv_kernel=static_cast<int>(config.conv_kernel);
-            dense(layer.ssm_in_role,normalized,first,hidden_size,d_in_proj);
+            // Fold capture, as for DeltaNet below: during a draft round's
+            // verify the projections land in the block's retention arena, so
+            // a rejection can replay just the conv and scan over the accepted
+            // rows (nemotron_mtp_fold).
+            const bool fold_capture=
+                runtime.mtp_fold_capture&&span_begin==0&&rows<=8;
+            if(runtime.mtp_fold_capture&&!fold_capture)
+                runtime.mtp_fold_valid=false;
+            const auto projection=fold_capture
+                ?runtime.state+layer.mtp_retain_qkv:first;
+            dense(layer.ssm_in_role,normalized,projection,hidden_size,d_in_proj);
             auto conv_weights=tensor(layer.ssm_conv_role);
             std::uint64_t conv_state=runtime.state+layer.state_first;
             std::uint64_t conv_bias=
                 layer.ssm_conv_bias_role!=std::numeric_limits<std::uint64_t>::max()
                     ?runtime.device_tensors[layer.static_tensors.at(layer.ssm_conv_bias_role)]:0;
-            // The conv input is the xBC segment: `first` skips the z half per
-            // row, and the rows stride the full d_in_proj projection.
-            std::uint64_t conv_source=first+static_cast<std::uint64_t>(inner)*sizeof(float);
+            // The conv input is the xBC segment: the projection skips the z
+            // half per row, and the rows stride the full d_in_proj.
+            std::uint64_t conv_source=projection+static_cast<std::uint64_t>(inner)*sizeof(float);
             // dt is read raw off the projection tail, z off its head.
-            std::uint64_t dt_row=first+
+            std::uint64_t dt_row=projection+
                 static_cast<std::uint64_t>(inner+conv_channels)*sizeof(float);
             auto dt_bias=tensor(layer.ssm_dt_role),a=tensor(layer.ssm_a_role);
             auto d=tensor(layer.ssm_d_role);
@@ -1229,7 +1254,7 @@ void qwen_forward_rows(
             phase(layer_number,"ssm");
             void*scan_args[]={const_cast<std::uint64_t*>(&second),&conv_stride,
                               const_cast<std::uint64_t*>(&dt_row),&proj_stride,
-                              const_cast<std::uint64_t*>(&first),&proj_stride,
+                              const_cast<std::uint64_t*>(&projection),&proj_stride,
                               &dt_bias,&a,&d,&scan_state,
                               const_cast<std::uint64_t*>(&third),&inner_stride,
                               &rows,const_cast<int*>(&heads),const_cast<int*>(&head_dim),
@@ -3040,7 +3065,31 @@ void qwen_forward_rows(
         }
         if(any_cpu){
             const auto cpu_expert_started=std::chrono::steady_clock::now();
-            if(runtime.nemotron){
+            if(runtime.nemotron&&
+               expert_phase==flyweight::v2::ExpertExecutionPhase::verification){
+                // A draft round's verify has a token or two per expert, where
+                // the chunk path's per-expert fold and f32 expansion cost more
+                // than they save. Each row takes decode's own routine instead
+                // -- same dots, same numerics as the step it stands in for --
+                // over its CPU routes (the GPU-taken ones carry weight 0).
+                const int moe_in=static_cast<int>(layer.moe_latent?layer.moe_latent:hidden_size);
+                for(int row=0;row<rows;++row){
+                    std::array<std::int32_t,256> row_selected{};
+                    std::array<float,256> row_weights{};
+                    int count=0;
+                    for(int rank=0;rank<layer_top_k;++rank){
+                        const int route=row*layer_top_k+rank;
+                        if(weights_host[route]==0.0f)continue;
+                        row_selected[count]=selected_host[route];
+                        row_weights[count]=weights_host[route];
+                        ++count;
+                    }
+                    float*row_output=output_host+static_cast<std::size_t>(row)*moe_in;
+                    if(!count){std::fill(row_output,row_output+moe_in,0.0f);continue;}
+                    nemotron_cpu_moe(runtime,layer,row_selected.data(),row_weights.data(),count,
+                        input_host+static_cast<std::size_t>(row)*moe_in,activated_host,row_output);
+                }
+            }else if(runtime.nemotron){
                 nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,input_host,activated_host,down_host,output_host);
             }else{
                 qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);

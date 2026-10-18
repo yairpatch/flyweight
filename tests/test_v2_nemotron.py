@@ -461,6 +461,59 @@ class NemotronQuantizedTests(unittest.TestCase):
                 self.assertEqual(result["tokens"], self.expected_long)
 
 
+_SPECULATIVE_RUNS = """
+import json, sys
+from flyweight.v2 import V2Model
+model = V2Model(sys.argv[1])
+prompt = json.loads(sys.argv[2])
+result = {}
+for mode in ("cpu", "auto", "gpu"):
+    runtime = model.native_runtime(context_limit=256, mtp_drafts=0, expert_mode=mode)
+    runtime.prepare()
+    produced = []
+    runtime.generate(prompt, 64, produced.append)
+    info = runtime.info
+    result[mode] = {"tokens": produced, "accepted": info["mtp_accepted_tokens"],
+                    "rejected": info["mtp_rejected_tokens"]}
+    runtime.close()
+print(json.dumps(result))
+"""
+
+
+class NemotronSpeculativeTests(unittest.TestCase):
+    """Draft rounds: verify a batch of drafted rows, keep the agreeing prefix.
+
+    A rejection restores the Mamba-2 conv rings and scan states from the
+    round's snapshot and replays the accepted rows, so the output must equal
+    plain greedy decoding. Prompt-lookup drafts with a one-token match make
+    nearly every step a round; the tied head makes the fixture's greedy run
+    settle into cycles, so rounds also accept, not just reject.
+    """
+
+    def test_lookup_rounds_match_the_reference(self):
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        holder = tempfile.TemporaryDirectory(prefix="flyweight-nemotron-spec-")
+        _WORKSPACES.append(holder)
+        path = Path(holder.name) / "nemotron_h_moe.gguf"
+        spec, weights = build_nemotron_gguf(path, NemotronSpec(tied_head=True))
+        prompt = [40, 72, 5, 33, 64, 12] * 6 + [40, 72]
+        expected = reference_greedy(spec, weights, prompt, 64)
+        environment = dict(os.environ, FLYWEIGHT_LOOKUP_DRAFTS="4",
+                           FLYWEIGHT_LOOKUP_NGRAM_MIN="1",
+                           FLYWEIGHT_IQ2_Q8_DECODE="0", FLYWEIGHT_Q8_ACTIVATIONS="0")
+        completed = subprocess.run(
+            [sys.executable, "-c", _SPECULATIVE_RUNS, str(path), json.dumps(prompt)],
+            env=environment, capture_output=True, text=True, timeout=600)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        for mode, run in result.items():
+            with self.subTest(expert_mode=mode):
+                self.assertEqual(run["tokens"], expected)
+                self.assertGreater(run["accepted"], 0, "no round accepted a draft")
+                self.assertGreater(run["rejected"], 0, "no round rolled back")
+
+
 class NemotronToolCallTests(unittest.TestCase):
     def test_template_renders_tools_with_the_generic_markers(self):
         # The checkpoint's own template renders the schemas and calls; its
