@@ -3048,6 +3048,11 @@ void qwen_forward_rows(
             if(expert_policy.records_prefill_frequency())
                 runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-cpu_expert_started).count();
+        }else if(!runtime.nemotron){
+            // queue_combine uploads output_host and adds it whether or not the
+            // sweep ran; skipped, it still holds the previous span's routed
+            // sum, which would land in the residual a second time.
+            std::memset(output_host,0,static_cast<std::size_t>(rows)*hidden_size*sizeof(float));
         }
         span.cpu_ran=any_cpu;
         if(runtime.nemotron){

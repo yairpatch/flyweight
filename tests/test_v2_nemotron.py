@@ -240,6 +240,29 @@ class NemotronNativeTests(unittest.TestCase):
                 finally:
                     runtime.close()
 
+    def test_whole_layer_and_resident_placement_match_reference(self):
+        # --n-gpu-layers pins whole MoE blocks and `resident` uploads every
+        # one; both lay out two expert tensors at each block's own expert
+        # count and must skip the Mamba-2 and attention blocks, which route
+        # none (a third role and the global count overran the slots).
+        if V2Model.select_backend("auto") != "cuda":
+            raise unittest.SkipTest("the CPU backend runs every expert on the CPU")
+        model, spec, weights = _model()
+        expected = reference_greedy(spec, weights, self.PROMPT, 8)
+        for options in ({"expert_mode": "hybrid", "gpu_layers": 1},
+                        {"expert_mode": "hybrid", "gpu_layers": 2},
+                        {"expert_mode": "resident"}):
+            with self.subTest(**options):
+                runtime = _native(model, **options)
+                try:
+                    produced: list[int] = []
+                    runtime.generate(self.PROMPT, 8, produced.append)
+                    self.assertEqual(produced, expected)
+                    self.assertGreater(runtime.info["expert_cache_hits"], 0,
+                                       "no expert ran on the GPU")
+                finally:
+                    runtime.close()
+
     def test_expert_placement_modes_batched_prefill_match_reference(self):
         """Verify prefill parity across placement modes with chunked & pipelined prefill."""
         cases = (("4", self.PROMPT), (None, [(index * 37) % 96 for index in range(160)]))

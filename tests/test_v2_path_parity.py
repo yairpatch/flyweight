@@ -370,6 +370,23 @@ class MoePathParityTests(_ParityCase):
                     del os.environ["FLYWEIGHT_PREFILL_ROWS"]
                 self._assert_same(f"len={len(prompt)} unchunked", blocking, unchunked)
 
+    def test_layer_split_prefill_matches_cpu(self):
+        # --n-gpu-layers pins the last MoE layers whole on the GPU, so a split
+        # prefill runs every route of those layers there and skips their CPU
+        # sweep. The combine still adds the CPU output buffer, which must then
+        # be zero rather than the previous layer's routed sum.
+        if V2Model.select_backend("auto") != "cuda":
+            raise unittest.SkipTest("the CPU backend runs every expert on the CPU")
+        for prompt in _prompts(self._spec.vocabulary, self.LENGTHS):
+            with self.subTest(prompt_tokens=len(prompt)):
+                expected = _blocking_run(self._runtime(), prompt, self.TOKENS)
+                split = self._runtime(expert_mode="hybrid", gpu_layers=2)
+                self._assert_same(
+                    f"len={len(prompt)} layer split", expected,
+                    _blocking_run(split, prompt, self.TOKENS))
+                self.assertGreater(split.info["expert_cache_hits"], 0,
+                                   "no expert ran on the GPU")
+
 
 class PrefillExpertStreamParityTests(_ParityCase):
     """Qwen3.5 MoE fixture: streamed prefill experts vs the resident path.
@@ -411,6 +428,10 @@ class PrefillExpertStreamParityTests(_ParityCase):
         cls._model.close()
 
     def _generate(self, **options):
+        tokens, info = self._generate_info(**options)
+        return tokens, int(info["prefill_streamed_bytes"])
+
+    def _generate_info(self, **options):
         prompt = _prompts(self._spec.vocabulary, (40,))[0]
         # Closed before the next runtime opens, not deferred to test teardown:
         # mmap registration is exclusive, so a still-open runtime would leave
@@ -420,9 +441,17 @@ class PrefillExpertStreamParityTests(_ParityCase):
         try:
             runtime.prepare()
             tokens = _blocking_run(runtime, prompt, self.TOKENS)
-            return tokens, int(runtime.info["prefill_streamed_bytes"])
+            return tokens, runtime.info
         finally:
             runtime.close()
+
+    def test_seed_places_experts(self):
+        # The resident reference below leans on the seed, but a seed that
+        # places nothing still passes it (both sides then page on demand).
+        _, info = self._generate_info(
+            expert_mode="legacy-hybrid", hybrid_prefill="split")
+        self.assertGreater(int(info["prefill_cache_seeded_experts"]), 0,
+                           "the prefill cache seed placed no expert")
 
     def test_streamed_all_matches_resident_all(self):
         resident, resident_streamed = self._generate(
