@@ -235,6 +235,8 @@ void qwen_forward_rows(
 ) {
     // Chunk boundary: pick up any layers the background registration finished.
     qwen_absorb_registration(runtime);
+    runtime.capture_rows=static_cast<std::uint32_t>(total_rows);
+    runtime.capture_position=runtime.position;
     // The row range every launch below operates over. The phase driver near
     // the bottom installs a span's (begin, count) before invoking each phase
     // function, so `rows` is the current span's row count and `span_begin` its
@@ -1210,6 +1212,8 @@ void qwen_forward_rows(
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){dense_rows(layer.static_tensors.at(role),input,output,input_size,output_size,staged);};
         phase(layer_number,"pre");
+        if(runtime.capture_layers)
+            qwen_capture_layer_rows(runtime,layer_number,hidden,rows,span_begin,runtime.stream);
         if(runtime.qwen4exp){
             if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
                 ple_rows(layer);
@@ -3736,7 +3740,9 @@ void qwen_forward_rows(
             }
         }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
-        if(flyweight_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
+        if(flyweight_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
+        qwen_dflash_inject(runtime);
+        if(flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
         if(verify_moe_profile){
             auto&vp=qwen_verify_moe_profile();
             for(std::size_t l=0;l<vp.recorded.size();++l){
@@ -3750,6 +3756,7 @@ void qwen_forward_rows(
         }
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);
     }
+    else qwen_dflash_inject(runtime);
     // Every MTP hand-over out of the rows path -- the per-row states the
     // commit replays over, the last row that seeds the next round's draft, and
     // the pointer the round driver reads -- is in STREAM space on qwen4exp:

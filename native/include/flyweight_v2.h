@@ -915,6 +915,17 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime* 
 /* Writes one attention layer's live KV window as f32 for the TurboQuant
    quality harness: int32 count, int32 head_dim, then the keys and the values. */
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_dump_kv(FlyweightV2QwenRuntime* runtime, uint32_t layer_index, const char* path);
+/* The last forward's DFlash target features (FLYWEIGHT_CAPTURE_LAYERS): up to
+   capacity_rows rows of layers*hidden floats, the first at *position. */
+/* One DFlash draft at the runtime's position for `token` (the last token the
+   target produced): the draft block's logits for rows 1..block-1, the LiLiCorr
+   candidates and lattice scores, and the walk's drafts. Pass logits = NULL to
+   read only `block` and `topk`. `count` is 0 when no anchor row exists. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_dflash_probe(FlyweightV2QwenRuntime* runtime,
+    uint32_t token, float* logits, uint64_t logits_capacity, int32_t* candidates,
+    uint64_t candidates_capacity, float* scores, uint64_t scores_capacity, uint32_t* drafts,
+    uint32_t drafts_capacity, uint32_t* count, uint32_t* block, uint32_t* topk);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_captured_features(FlyweightV2QwenRuntime* runtime, float* output, uint32_t capacity_rows, uint32_t* rows, uint32_t* layers, uint64_t* position);
 /* The host prompt cache on disk, so a session survives a restart. `save`
    first spills every slot's conversation into the host cache, then writes
    each entry as one file under `directory` (unchanged ones only have their

@@ -563,8 +563,9 @@ def _add_runtime_options(
     )
     add(
         placement, "--mtp-model", type=Path, metavar="PATH",
-        help="optional MTP-only GGUF overlay; when omitted, the draft head "
-             "embedded in the target model is used",
+        help="optional MTP-only GGUF overlay, or a DFlash drafter GGUF for "
+             "Nemotron H; when omitted, the draft head embedded in the "
+             "target model is used",
     )
     add(
         placement, "--mmproj", type=Path, metavar="PATH",

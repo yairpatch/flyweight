@@ -957,6 +957,20 @@ void qwen_copy_vector(
     if (index < elements) output[index] = input[index];
 }
 
+// Row copy between two row strides (floats): the DFlash target-feature
+// capture writes each layer's rows into its slice of a wider feature row.
+extern "C" __global__
+void qwen_copy_rows_strided(
+    const float* source, float* destination, const int width, const int rows,
+    const long long source_stride, const long long destination_stride
+) {
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || column >= width) return;
+    destination[(long long)row * destination_stride + column] =
+        source[(long long)row * source_stride + column];
+}
+
 // Expert grouping for the prefill GEMM path: pack the rows routed to one
 // expert into a contiguous tile so the batched matmul kernels see an
 // ordinary matrix, and fold the result back weighted per route. Rows within
@@ -15717,5 +15731,498 @@ FLYWEIGHT_VALUE_EXPERTS(q5k, q5k_value)
 FLYWEIGHT_VALUE_EXPERTS(q6k, q6k_value)
 FLYWEIGHT_VALUE_EXPERTS(q8, q8_0_value_at)
 #undef FLYWEIGHT_VALUE_EXPERTS
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// DFlash drafter (llama.cpp's dflash arch with the LiLiCorr head, the draft
+// model that ships beside Nemotron 3.5 Bolt). One block of `rows` draft rows at
+// consecutive positions; the host driver is v2_dflash.inc.
+
+// Sum over the block, valid in every thread. `scratch` holds blockDim.x floats.
+__device__ __forceinline__ float dflash_block_sum(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float total = scratch[0];
+    __syncthreads();
+    return total;
+}
+
+__device__ __forceinline__ float dflash_block_max(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride)
+            scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float total = scratch[0];
+    __syncthreads();
+    return total;
+}
+
+// Per-head RMS norm with a weight, then NEOX rotary at position_base + row
+// when `rotate` is set (pairs j, j + head_dim/2; theta_j = p * base^(-2j/d)).
+// In place. grid (heads, rows), block 128; head_dim <= 256 and even.
+extern "C" __global__ void dflash_head_norm_rope_rows(
+    float* x, const float* weight, const int heads, const int head_dim,
+    const int row_stride, const float epsilon, const int position_base,
+    const float freq_base, const int rotate
+) {
+    __shared__ float values[256];
+    __shared__ float scratch[128];
+    const int head = blockIdx.x, row = blockIdx.y;
+    float* v = x + (long long)row * row_stride + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float t = v[d];
+        values[d] = t;
+        sum += t * t;
+    }
+    const float inverse = rsqrtf(dflash_block_sum(sum, scratch) / (float)head_dim + epsilon);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        values[d] = values[d] * inverse * weight[d];
+    __syncthreads();
+    if (!rotate) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) v[d] = values[d];
+        return;
+    }
+    const int half = head_dim >> 1;
+    const float position = (float)(position_base + row);
+    for (int j = threadIdx.x; j < half; j += blockDim.x) {
+        const float theta = position * powf(freq_base, -2.0f * (float)j / (float)head_dim);
+        const float c = cosf(theta), s = sinf(theta);
+        const float a = values[j], b = values[j + half];
+        v[j] = a * c - b * s;
+        v[j + half] = a * s + b * c;
+    }
+}
+
+// The DFlash2 dynamic depthwise conv over the block rows (build_dflash2_conv,
+// two taps): w(c, tap, i) = coeff[i][c/group + groups*tap + 2*groups*side]
+// + base[c + channels*tap + 2*channels*side], out[i][c] = residual[i][c] +
+// w(c,0,i) x[i][c] + w(c,1,i) x[i-1][c], x[-1] = 0. `residual` may be null or
+// alias `out`. grid ((channels+255)/256, rows), block 256.
+extern "C" __global__ void dflash_conv_rows(
+    const float* x, const float* coeff, const float* base, const float* residual,
+    float* out, const int channels, const int group, const int side
+) {
+    const int row = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int groups = channels / group;
+    const int g = c / group;
+    const float* cf = coeff + (long long)row * 4 * groups;
+    const float w0 = cf[g + 2 * groups * side] + base[c + 2 * channels * side];
+    const float w1 = cf[g + groups + 2 * groups * side] + base[c + channels + 2 * channels * side];
+    const long long at = (long long)row * channels + c;
+    const float previous = row > 0 ? x[at - channels] : 0.0f;
+    float value = w0 * x[at] + w1 * previous;
+    if (residual) value += residual[at];
+    out[at] = value;
+}
+
+// Context ring bookkeeping before an injection: forget every slot holding a
+// position >= invalidate_from (rows a later forward rewrote or rolled back),
+// then claim [claim_first, claim_first + claim_rows). grid ceil(slots/256).
+extern "C" __global__ void dflash_ring_tags(
+    int* tags, const int slots, const int invalidate_from, const int claim_first,
+    const int claim_rows
+) {
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= slots) return;
+    int tag = tags[slot];
+    if (tag >= invalidate_from) tag = -1;
+    const int offset = ((slot - claim_first % slots) % slots + slots) % slots;
+    if (offset < claim_rows) tag = claim_first + offset;
+    tags[slot] = tag;
+}
+
+// K and V rows into their ring slots (position % slots) of one layer.
+// grid ((width+255)/256, rows), block 256.
+extern "C" __global__ void dflash_ring_store(
+    const float* k, const float* v, float* ring_k, float* ring_v, const int width,
+    const int position_base, const int slots
+) {
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const long long slot = (long long)((position_base + row) % slots);
+    ring_k[slot * width + i] = k[(long long)row * width + i];
+    ring_v[slot * width + i] = v[(long long)row * width + i];
+}
+
+// Draft-block attention: non-causal; query row i sees every block row and each
+// ring slot whose position p satisfies p < position0 and position0 + i - p <
+// window; the head's sink logit joins the softmax denominator only.
+// grid (heads, rows), block 128, dynamic shared (slots + rows) floats.
+extern "C" __global__ void dflash_block_attention(
+    const float* q, const float* block_k, const float* block_v,
+    const float* ring_k, const float* ring_v, const int* tags, const float* sinks,
+    float* out, const int rows, const int heads, const int kv_heads,
+    const int head_dim, const int slots, const int position0, const int window,
+    const float scale
+) {
+    extern __shared__ float scores[];
+    __shared__ float query[256];
+    __shared__ float scratch[128];
+    const int head = blockIdx.x, row = blockIdx.y;
+    const int kv = head / (heads / kv_heads);
+    const int kv_width = kv_heads * head_dim;
+    const float* qh = q + ((long long)row * heads + head) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) query[d] = qh[d];
+    __syncthreads();
+    const float masked = -3.402823466e+38f;
+    const int total = slots + rows;
+    float local = masked;
+    for (int j = threadIdx.x; j < total; j += blockDim.x) {
+        const float* key = 0;
+        if (j < slots) {
+            const int p = tags[j];
+            if (p >= 0 && p < position0 && position0 + row - p < window)
+                key = ring_k + (long long)j * kv_width + kv * head_dim;
+        } else key = block_k + (long long)(j - slots) * kv_width + kv * head_dim;
+        float s = masked;
+        if (key) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += query[d] * key[d];
+            s = dot * scale;
+        }
+        scores[j] = s;
+        local = fmaxf(local, s);
+    }
+    const float sink = sinks[head];
+    const float m = fmaxf(dflash_block_max(local, scratch), sink);
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < total; j += blockDim.x) {
+        const float e = scores[j] == masked ? 0.0f : expf(scores[j] - m);
+        scores[j] = e;
+        sum += e;
+    }
+    const float denominator = dflash_block_sum(sum, scratch) + expf(sink - m);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < total; ++j) {
+            const float w = scores[j];
+            if (w == 0.0f) continue;
+            const float* value = j < slots
+                ? ring_v + (long long)j * kv_width + kv * head_dim
+                : block_v + (long long)(j - slots) * kv_width + kv * head_dim;
+            acc += w * value[d];
+        }
+        out[((long long)row * heads + head) * head_dim + d] = acc / denominator;
+    }
+}
+
+extern "C" __global__ void dflash_swiglu(
+    const float* gate, const float* up, float* out, const int count
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float g = gate[i];
+    out[i] = g / (1.0f + expf(-g)) * up[i];
+}
+
+// x[row][i] = act(x[row][i] + bias[i]); act 1 is silu. grid ((width+255)/256, rows).
+extern "C" __global__ void dflash_bias_act_rows(
+    float* x, const float* bias, const int width, const int act
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const long long at = (long long)blockIdx.y * width + i;
+    float value = x[at] + (bias ? bias[i] : 0.0f);
+    if (act == 1) value = value / (1.0f + expf(-value));
+    x[at] = value;
+}
+
+// target[row][i] += delta[row][i] + bias[i]. grid ((width+255)/256, rows).
+extern "C" __global__ void dflash_add_rows(
+    float* target, const float* delta, const float* bias, const int width
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const long long at = (long long)blockIdx.y * width + i;
+    target[at] += delta[at] + (bias ? bias[i] : 0.0f);
+}
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// Two-stage top-k for the drafter's 131072-wide rows. Stage one: block
+// (chunk, row) scans its slice and leaves its top-k values and ids (k <= 8,
+// descending, ties to the lower id) and its (max, sum exp(x - max)) at
+// partial + ((row * chunks + chunk) * 18). grid (chunks, rows), block 256.
+extern "C" __global__ void dflash_topk_chunks(
+    const float* logits, const int vocabulary, const int k, const int chunks, float* partial
+) {
+    __shared__ float values[256 * 8];
+    __shared__ int indices[256 * 8];
+    __shared__ float scratch[256];
+    __shared__ float best_value[256];
+    __shared__ int best_slot[256];
+    const float masked = -3.402823466e+38f;
+    const int row = blockIdx.y, chunk = blockIdx.x;
+    const int span = (vocabulary + chunks - 1) / chunks;
+    const int begin = chunk * span, end = min(vocabulary, begin + span);
+    const float* x = logits + (long long)row * vocabulary;
+    float top[8];
+    int top_id[8];
+    for (int r = 0; r < 8; ++r) { top[r] = masked; top_id[r] = 0x7fffffff; }
+    float local_max = masked;
+    for (int v = begin + threadIdx.x; v < end; v += blockDim.x) {
+        const float value = x[v];
+        local_max = fmaxf(local_max, value);
+        if (value > top[k - 1]) {
+            int at = k - 1;
+            while (at > 0 && value > top[at - 1]) {
+                top[at] = top[at - 1];
+                top_id[at] = top_id[at - 1];
+                --at;
+            }
+            top[at] = value;
+            top_id[at] = v;
+        }
+    }
+    const float m = dflash_block_max(local_max, scratch);
+    float sum = 0.0f;
+    for (int v = begin + threadIdx.x; v < end; v += blockDim.x) sum += expf(x[v] - m);
+    const float total = dflash_block_sum(sum, scratch);
+    for (int r = 0; r < 8; ++r) {
+        values[threadIdx.x * 8 + r] = r < k ? top[r] : masked;
+        indices[threadIdx.x * 8 + r] = r < k ? top_id[r] : 0x7fffffff;
+    }
+    __syncthreads();
+    float* out = partial + ((long long)row * chunks + chunk) * 18;
+    for (int r = 0; r < k; ++r) {
+        float bv = masked;
+        int bs = -1;
+        for (int c = 0; c < 8; ++c) {
+            const int slot = threadIdx.x * 8 + c;
+            if (indices[slot] == 0x7fffffff) continue;
+            const float value = values[slot];
+            if (bs < 0 || value > bv || (value == bv && indices[slot] < indices[bs])) {
+                bv = value;
+                bs = slot;
+            }
+        }
+        best_value[threadIdx.x] = bv;
+        best_slot[threadIdx.x] = bs;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if ((int)threadIdx.x < stride) {
+                const int a = best_slot[threadIdx.x], b = best_slot[threadIdx.x + stride];
+                const float av = best_value[threadIdx.x], bvv = best_value[threadIdx.x + stride];
+                if (b >= 0 && (a < 0 || bvv > av || (bvv == av && indices[b] < indices[a]))) {
+                    best_value[threadIdx.x] = bvv;
+                    best_slot[threadIdx.x] = b;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const int slot = best_slot[0];
+            out[r] = slot >= 0 ? values[slot] : masked;
+            out[8 + r] = __uint_as_float((unsigned int)(slot >= 0 ? indices[slot] : 0x7fffffff));
+            if (slot >= 0) indices[slot] = 0x7fffffff;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[16] = m;
+        out[17] = total;
+    }
+}
+
+// Stage two: one block per row merges the chunks' candidates and partial
+// sums into the row's top-k ids and log-softmax values. grid rows, block 256.
+extern "C" __global__ void dflash_topk_merge(
+    const float* partial, const int k, const int chunks, int* ids, float* logprobs
+) {
+    __shared__ float scratch[256];
+    __shared__ float best_value[256];
+    __shared__ int best_id[256];
+    __shared__ int taken[8];
+    const float masked = -3.402823466e+38f;
+    const int row = blockIdx.x;
+    const float* in = partial + (long long)row * chunks * 18;
+    float local_max = masked;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) local_max = fmaxf(local_max, in[c * 18 + 16]);
+    const float m = dflash_block_max(local_max, scratch);
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x)
+        if (in[c * 18 + 17] > 0.0f) sum += in[c * 18 + 17] * expf(in[c * 18 + 16] - m);
+    const float log_sum = m + logf(dflash_block_sum(sum, scratch));
+    for (int r = 0; r < k; ++r) {
+        float bv = masked;
+        int bid = 0x7fffffff;
+        for (int e = threadIdx.x; e < chunks * k; e += blockDim.x) {
+            const int c = e / k, j = e % k;
+            const float value = in[c * 18 + j];
+            const int id = (int)__float_as_uint(in[c * 18 + 8 + j]);
+            if (id == 0x7fffffff) continue;
+            bool used = false;
+            for (int t = 0; t < r; ++t) used = used || taken[t] == id;
+            if (used) continue;
+            if (value > bv || (value == bv && id < bid)) { bv = value; bid = id; }
+        }
+        best_value[threadIdx.x] = bv;
+        best_id[threadIdx.x] = bid;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if ((int)threadIdx.x < stride) {
+                const float av = best_value[threadIdx.x], bvv = best_value[threadIdx.x + stride];
+                const int a = best_id[threadIdx.x], b = best_id[threadIdx.x + stride];
+                if (b != 0x7fffffff && (a == 0x7fffffff || bvv > av || (bvv == av && b < a))) {
+                    best_value[threadIdx.x] = bvv;
+                    best_id[threadIdx.x] = b;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            taken[r] = best_id[0];
+            ids[row * k + r] = best_id[0] == 0x7fffffff ? 0 : best_id[0];
+            logprobs[row * k + r] = best_value[0] - log_sum;
+        }
+        __syncthreads();
+    }
+}
+
+// LiLiCorr candidate features [lp, p, lp - lp_top, r/(k-1), r == 0], their
+// LayerNorm (eps 1e-5) with weight and bias, then silu(W_up f + b_up) into
+// `out` (nodes x width). W_up is ne [5, width]. grid nodes, block 256.
+extern "C" __global__ void dflash_lilicorr_features(
+    const float* logprobs, const float* norm_weight, const float* norm_bias,
+    const float* up, const float* up_bias, float* out, const int k, const int width
+) {
+    __shared__ float feature[5];
+    const int node = blockIdx.x;
+    if (threadIdx.x == 0) {
+        const int rank = node % k;
+        const float lp = logprobs[node];
+        const float top = logprobs[node - rank];
+        float f[5] = {lp, expf(lp), lp - top, (float)rank / (float)(k - 1), rank == 0 ? 1.0f : 0.0f};
+        float mean = 0.0f;
+        for (int i = 0; i < 5; ++i) mean += f[i];
+        mean /= 5.0f;
+        float variance = 0.0f;
+        for (int i = 0; i < 5; ++i) variance += (f[i] - mean) * (f[i] - mean);
+        variance /= 5.0f;
+        const float inverse = rsqrtf(variance + 1e-5f);
+        for (int i = 0; i < 5; ++i)
+            feature[i] = (f[i] - mean) * inverse * norm_weight[i] + norm_bias[i];
+    }
+    __syncthreads();
+    for (int o = threadIdx.x; o < width; o += blockDim.x) {
+        float value = up_bias[o];
+        for (int i = 0; i < 5; ++i) value += up[o * 5 + i] * feature[i];
+        out[(long long)node * width + o] = value / (1.0f + expf(-value));
+    }
+}
+
+// Node states: x = ((tok + b_tok) + (pass[slot] + b_pass)) + (fs + b_fs)
+// + (slot_embedding[slot] + rank_embedding[rank]).
+// grid ((width+255)/256, nodes), block 256.
+extern "C" __global__ void dflash_lilicorr_input(
+    float* x, const float* tok, const float* tok_bias, const float* pass,
+    const float* pass_bias, const float* fs, const float* fs_bias,
+    const float* slot_embedding, const float* rank_embedding, const int k, const int width
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const int node = blockIdx.y, slot = node / k, rank = node % k;
+    const long long at = (long long)node * width + i;
+    const float t = tok[at] + tok_bias[i];
+    const float p = pass[(long long)slot * width + i] + pass_bias[i];
+    const float f = fs[at] + fs_bias[i];
+    const float position = slot_embedding[(long long)slot * width + i] +
+        rank_embedding[(long long)rank * width + i];
+    x[at] = ((t + p) + f) + position;
+}
+
+// LiLiCorr node attention: every node attends to every node of its block
+// through the learned bias (ne [nodes, nodes, heads] = [key, query, head]).
+// qkv rows are [q | k | v], each heads x head_dim. grid (heads, nodes),
+// block 64 (nodes <= 64).
+extern "C" __global__ void dflash_node_attention(
+    const float* qkv, const float* bias, float* out, const int nodes,
+    const int heads, const int head_dim, const float scale
+) {
+    __shared__ float weights[64];
+    __shared__ float scratch[64];
+    const int head = blockIdx.x, query = blockIdx.y;
+    const int width = heads * head_dim;
+    const float* q = qkv + (long long)query * 3 * width + head * head_dim;
+    const float masked = -3.402823466e+38f;
+    float s = masked;
+    if ((int)threadIdx.x < nodes) {
+        const float* key = qkv + (long long)threadIdx.x * 3 * width + width + head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) dot += q[d] * key[d];
+        s = dot * scale + bias[((long long)head * nodes + query) * nodes + threadIdx.x];
+    }
+    const float m = dflash_block_max(s, scratch);
+    const float e = (int)threadIdx.x < nodes ? expf(s - m) : 0.0f;
+    const float total = dflash_block_sum(e, scratch);
+    weights[threadIdx.x] = e / total;
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < nodes; ++j)
+            acc += weights[j] * qkv[(long long)j * 3 * width + 2 * width + head * head_dim + d];
+        out[(long long)query * width + head * head_dim + d] = acc;
+    }
+}
+
+// out[node] = [x[node], anchor, x[node] * anchor]. grid ((width+255)/256, nodes).
+extern "C" __global__ void dflash_factor_concat(
+    const float* x, const float* anchor, float* out, const int width
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const long long node = blockIdx.y;
+    const float a = anchor[i], v = x[node * width + i];
+    float* row = out + node * 3 * width;
+    row[i] = v;
+    row[width + i] = a;
+    row[2 * width + i] = v * a;
+}
+
+// x / max(||x||, eps) per row. grid rows, block 256.
+extern "C" __global__ void dflash_l2_normalize_rows(
+    float* x, const int width, const float epsilon
+) {
+    __shared__ float scratch[256];
+    float* row = x + (long long)blockIdx.x * width;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) sum += row[i] * row[i];
+    const float norm = fmaxf(sqrtf(dflash_block_sum(sum, scratch)), epsilon);
+    for (int i = threadIdx.x; i < width; i += blockDim.x) row[i] = row[i] / norm;
+}
+
+// Lattice scores: score[0][0][j] = scale IN[0][j].AO, and for slot s >= 1
+// score[s][p][j] = scale IN[s][j].OUT[s-1][p], written at s*k*k + p*k + j.
+// grid k + (slots-1)*k*k, block 128.
+extern "C" __global__ void dflash_lattice_scores(
+    const float* in_factor, const float* out_factor, const float* anchor_factor,
+    float* scores, const int k, const int width, const float scale
+) {
+    __shared__ float scratch[128];
+    int index = blockIdx.x, slot, previous, rank;
+    if (index < k) { slot = 0; previous = 0; rank = index; }
+    else {
+        index -= k;
+        slot = 1 + index / (k * k);
+        previous = (index / k) % k;
+        rank = index % k;
+    }
+    const float* a = in_factor + ((long long)slot * k + rank) * width;
+    const float* b = slot == 0 ? anchor_factor
+        : out_factor + ((long long)(slot - 1) * k + previous) * width;
+    float dot = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dot += a[i] * b[i];
+    const float total = dflash_block_sum(dot, scratch);
+    if (threadIdx.x == 0) scores[slot * k * k + previous * k + rank] = scale * total;
+}
 )FLYWEIGHT_CUDA";
 }
