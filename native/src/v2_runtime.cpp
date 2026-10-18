@@ -497,6 +497,9 @@ struct QwenLayerPlan {
     // latent projections are optional per bridge as the config says.
     bool mamba = false;
     std::uint32_t expert_count = 0, expert_ff = 0, moe_latent = 0, expert_used = 0;
+    // This block's slice of the GPU expert cache, counted over the MoE blocks
+    // only (see qwen_cache_slice).
+    std::uint32_t cache_slice = 0;
     std::uint64_t latent_down = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t latent_up = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t shexp_up = std::numeric_limits<std::uint64_t>::max();
@@ -964,6 +967,7 @@ struct FlyweightV2QwenRuntime {
     // plain GQA and latent-space MoE blocks. No RoPE anywhere, relu² expert
     // activations, per-layer expert geometry.
     bool nemotron = false;
+    std::uint32_t nemotron_moe_layers = 0;
     // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
     // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
     // bookends in the forward paths and, at bring-up, disables CUDA graphs
@@ -1597,6 +1601,35 @@ std::size_t qwen_cache_layer_count(const FlyweightV2QwenRuntime& runtime) {
     return runtime.layers.size();
 }
 
+// Routed experts in one layer, zero where it routes none. Nemotron H sizes
+// them per block, and its Mamba-2 and attention blocks route none.
+std::uint32_t qwen_layer_expert_count(
+    const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
+    if (layer.dense_ffn) return 0;
+    return runtime.nemotron ? layer.expert_count : runtime.model->config.expert_count;
+}
+
+// Every (layer, expert) the cache could ever hold.
+std::uint64_t qwen_cache_expert_total(const FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.nemotron)
+        return static_cast<std::uint64_t>(qwen_cache_layer_count(runtime)) *
+            runtime.model->config.expert_count;
+    std::uint64_t total = 0;
+    for (const auto& layer : runtime.layers) total += layer.expert_count;
+    return total;
+}
+
+// The slot cache is cut into one even slice per layer. Nemotron H's Mamba-2
+// and attention blocks route no experts, so its slices cover the MoE blocks
+// alone; one per layer left 48 of Bolt's 88 slices unreachable.
+std::size_t qwen_cache_slice_count(const FlyweightV2QwenRuntime& runtime) {
+    return runtime.nemotron ? runtime.nemotron_moe_layers : qwen_cache_layer_count(runtime);
+}
+
+std::size_t qwen_cache_slice(const FlyweightV2QwenRuntime& runtime, std::uint32_t layer) {
+    return runtime.nemotron ? runtime.layers[layer].cache_slice : layer;
+}
+
 constexpr std::size_t kNoExpertSlot = std::numeric_limits<std::size_t>::max();
 
 // GGUF quantization block sizes (bytes per block). kQ8/kQ4K/kQ5K/kQ6K and
@@ -2136,9 +2169,10 @@ std::size_t select_expert_cache_slot(
                 "native Laguna whole-layer expert slot is out of range");
         return slot;
     }
-    const auto cache_layers = qwen_cache_layer_count(runtime);
-    const auto slot_begin = runtime.expert_slots.size() * layer / cache_layers;
-    const auto slot_end = runtime.expert_slots.size() * (layer + 1) / cache_layers;
+    const auto cache_layers = qwen_cache_slice_count(runtime);
+    const auto slice = qwen_cache_slice(runtime, layer);
+    const auto slot_begin = runtime.expert_slots.size() * slice / cache_layers;
+    const auto slot_end = runtime.expert_slots.size() * (slice + 1) / cache_layers;
     auto begin = runtime.expert_slots.begin() + static_cast<std::ptrdiff_t>(slot_begin);
     auto end = runtime.expert_slots.begin() + static_cast<std::ptrdiff_t>(slot_end);
     if (begin == end) {
@@ -4292,6 +4326,8 @@ void build_nemotron_plan(FlyweightV2QwenRuntime& runtime) {
         model.config.expert_shared_intermediate_size);
     for(const auto&plan:runtime.layers)runtime.moe_intermediate=std::max(
         runtime.moe_intermediate,plan.expert_ff);
+    for(auto&plan:runtime.layers)
+        if(plan.expert_count)plan.cache_slice=runtime.nemotron_moe_layers++;
 }
 
 void build_gemma4_plan(FlyweightV2QwenRuntime& runtime) {
@@ -18714,9 +18750,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             auto cache=(available/slot_budget)*runtime->expert_slot_bytes;
             // Never allocate more cache than the whole expert set (every
             // (layer,expert) resident => zero misses); saves VRAM on big GPUs.
-            const auto max_cache=static_cast<std::uint64_t>(
-                qwen_cache_layer_count(*runtime))*
-                runtime->model->config.expert_count*runtime->expert_slot_bytes;
+            const auto max_cache=
+                qwen_cache_expert_total(*runtime)*runtime->expert_slot_bytes;
             if(cache>max_cache)cache=max_cache;
             const char*whole_layer_setting=
                 std::getenv("FLYWEIGHT_LAGUNA_WHOLE_LAYERS");
@@ -18737,22 +18772,35 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // measured a 22% GPU hit rate and 46 tok/s against 71% and 57.
             // So `all`, or any N past the fit, takes the cache, the same "as
             // much on the GPU as fits" the dense spill gives.
+            // The layers a whole-layer split can hold, and how many of them,
+            // counted from the last, fit `slots` whole. Nemotron H's blocks
+            // differ in expert count (and most route none), so the fit walks
+            // them rather than dividing by one width.
+            std::vector<std::uint32_t> moe_layers;
+            for(std::uint32_t layer=0;layer<runtime->layers.size();++layer)
+                if(qwen_layer_expert_count(*runtime,runtime->layers[layer]))
+                    moe_layers.push_back(layer);
+            auto whole_layers_fitting=[&](std::uint64_t slots){
+                std::size_t count=0;
+                for(auto layer=moe_layers.rbegin();layer!=moe_layers.rend();++layer){
+                    const auto experts=qwen_layer_expert_count(*runtime,runtime->layers[*layer]);
+                    if(experts>slots)break;
+                    slots-=experts;++count;
+                }
+                return count;
+            };
             bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
             if(explicit_layers){
-                const auto experts=runtime->model->config.expert_count;
-                std::size_t moe_layers=0;
-                for(const auto&layer:runtime->layers)moe_layers+=layer.dense_ffn?0:1;
                 const std::size_t wanted=std::min<std::size_t>(
-                    moe_layers,runtime->options.gpu_layers);
-                const std::size_t fit=experts
-                    ?std::min<std::size_t>(moe_layers,cache/runtime->expert_slot_bytes/experts)
-                    :0;
+                    moe_layers.size(),runtime->options.gpu_layers);
+                const std::size_t fit=
+                    whole_layers_fitting(cache/runtime->expert_slot_bytes);
                 if(wanted>fit){
                     std::fprintf(stderr,
                         "[flyweight] --n-gpu-layers: %zu MoE layers asked for, %zu of "
                         "%zu fit whole; caching the hottest experts of every layer "
                         "instead, which keeps more of the routing on the GPU\n",
-                        wanted,fit,moe_layers);
+                        wanted,fit,moe_layers.size());
                     explicit_layers=false;
                 }
             }
@@ -18761,15 +18809,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                   (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
                  (!whole_layer_setting||whole_layer_setting[0]!='0'));
             if(whole_layer_enabled&&!runtime->options.strict_resident){
-                const auto experts=runtime->model->config.expert_count;
-                std::vector<std::uint32_t> candidates;
-                for(std::uint32_t layer=0;layer<runtime->layers.size();++layer)
-                    if(!runtime->layers[layer].dense_ffn)
-                        candidates.push_back(layer);
-                std::size_t layer_count=experts
-                    ?std::min<std::size_t>(
-                        candidates.size(),cache/runtime->expert_slot_bytes/experts)
-                    :0;
+                std::size_t layer_count=
+                    whole_layers_fitting(cache/runtime->expert_slot_bytes);
                 char*end=nullptr;
                 const auto requested=whole_layer_setting
                     ?std::strtoul(whole_layer_setting,&end,10):0;
@@ -18782,10 +18823,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     runtime->layers.size(),-1);
                 std::size_t slot=0;
                 for(std::size_t index=0;index<layer_count;++index){
-                    const auto layer=candidates[candidates.size()-layer_count+index];
+                    const auto layer=moe_layers[moe_layers.size()-layer_count+index];
                     runtime->whole_expert_layer_slots[layer]=
                         static_cast<std::int32_t>(slot);
-                    slot+=experts;
+                    slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
                 }
                 cache=slot*runtime->expert_slot_bytes;
                 if(!layer_count)
@@ -18800,15 +18841,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // of expert_used_count so a layer can cover a full route without
             // immediate thrash. Below either bar, drop the cache and let the
             // hybrid→CPU fallback below take over.
-            const auto cache_layers=qwen_cache_layer_count(*runtime);
+            const auto cache_layers=qwen_cache_slice_count(*runtime);
             const auto slot_count=cache/runtime->expert_slot_bytes;
             const auto min_slots=std::max<std::uint64_t>(
                 runtime->model->config.expert_used_count,cache_layers);
             runtime->expert_cache_bytes=slot_count<min_slots?0:cache;
         }
-        const auto resident_expert_bytes=static_cast<std::uint64_t>(
-            qwen_cache_layer_count(*runtime))*
-            runtime->model->config.expert_count*runtime->expert_slot_bytes;
+        const auto resident_expert_bytes=
+            qwen_cache_expert_total(*runtime)*runtime->expert_slot_bytes;
         if(runtime->options.strict_resident&&resident_expert_bytes&&
            runtime->expert_cache_bytes<resident_expert_bytes){
             auto mib=[](std::uint64_t bytes){
@@ -19208,19 +19248,21 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 static_cast<unsigned long long>(runtime->aliased_tensor_bytes/(1024ull*1024)),
                 static_cast<unsigned long long>(runtime->static_arena_bytes/(1024ull*1024)));
         if(runtime->options.strict_resident&&resident_expert_bytes){
-            const auto experts=runtime->model->config.expert_count;
             const auto cache_layers=qwen_cache_layer_count(*runtime);
+            const int roles=runtime->nemotron?2:3;
+            std::size_t slot_index=0;
             for(std::uint32_t layer=0;layer<cache_layers;++layer){
                 const auto&plan=layer<runtime->layers.size()
                     ? runtime->layers[layer]:runtime->mtp_layer_plan;
-                for(std::uint32_t expert=0;expert<experts;++expert){
-                    const auto slot_index=
-                        static_cast<std::size_t>(layer)*experts+expert;
+                // Nemotron H packs only its MoE blocks, each at its own width.
+                const auto experts=runtime->nemotron
+                    ?plan.expert_count:runtime->model->config.expert_count;
+                for(std::uint32_t expert=0;expert<experts;++expert,++slot_index){
                     auto&slot=runtime->expert_slots[slot_index];
                     const auto slot_base=runtime->expert_cache+
                         slot_index*runtime->expert_slot_bytes;
                     std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){
+                    for(int role=0;role<roles;++role){
                         const auto&t=runtime->model->tensors[
                             plan.expert_tensors[role]];
                         const auto bytes=t.size/experts;
@@ -19249,19 +19291,20 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 static_cast<unsigned long long>(
                     resident_expert_bytes/(1024ull*1024)));
         }else if(!runtime->whole_expert_layer_slots.empty()){
-            const auto experts=runtime->model->config.expert_count;
+            const int roles=runtime->nemotron?2:3;
             std::size_t prepared=0;
             for(std::uint32_t layer=0;layer<runtime->layers.size();++layer){
                 const auto first_slot=runtime->whole_expert_layer_slots[layer];
                 if(first_slot<0)continue;
                 const auto&plan=runtime->layers[layer];
+                const auto experts=qwen_layer_expert_count(*runtime,plan);
                 for(std::uint32_t expert=0;expert<experts;++expert){
                     const auto slot_index=static_cast<std::size_t>(first_slot)+expert;
                     auto&slot=runtime->expert_slots.at(slot_index);
                     const auto slot_base=runtime->expert_cache+
                         slot_index*runtime->expert_slot_bytes;
                     std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){
+                    for(int role=0;role<roles;++role){
                         const auto&t=runtime->model->tensors[
                             plan.expert_tensors[role]];
                         const auto bytes=t.size/experts;
@@ -19401,9 +19444,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             auto has_mova=[](const QwenLayerPlan& layer){
                 return layer.mova_v_exps!=std::numeric_limits<std::uint64_t>::max();
             };
+            // Layers routing no experts (dense FFN, Nemotron H's Mamba-2 and
+            // attention blocks) leave expert_tensors at tensor 0, which must
+            // neither be charged to the budget nor registered once per layer.
             std::uint64_t expert_bytes=0;
+            std::uint32_t expert_layers=0;
             const int model_roles=runtime->nemotron?2:3;
             for(const auto& layer:runtime->layers){
+                if(!qwen_layer_expert_count(*runtime,layer))continue;
+                ++expert_layers;
                 for(int role=0;role<model_roles;++role)
                     expert_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
                 if(has_mova(layer))
@@ -19434,6 +19483,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             std::uint64_t planned=0;std::uint32_t covered=0;
             for(std::uint32_t index=0;index<runtime->layers.size();++index){
                 const auto& layer=runtime->layers[index];
+                if(!qwen_layer_expert_count(*runtime,layer))continue;
                 std::uint64_t layer_bytes=0;
                 for(int role=0;role<model_roles;++role)
                     layer_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
@@ -19497,14 +19547,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 std::fprintf(stderr,
                     "[flyweight] direct expert paging: registering %.1f GiB "
                     "(%u/%zu expert layers%s) in the background\n",
-                    planned/1073741824.0,covered,runtime->layers.size(),
+                    planned/1073741824.0,covered,
+                    static_cast<std::size_t>(expert_layers),
                     embedding_fits?" + embeddings":"");
-                if(covered<runtime->layers.size())
+                if(covered<expert_layers)
                     std::fprintf(stderr,
                         "[flyweight] %zu expert layers exceed the %.1f GiB "
                         "registration budget and keep staged copies; raise host RAM "
                         "or set FLYWEIGHT_EXPERT_REGISTER_MIB to tune\n",
-                        runtime->layers.size()-covered,budget/1073741824.0);
+                        static_cast<std::size_t>(expert_layers-covered),
+                        budget/1073741824.0);
                 auto* target=runtime;
                 target->registration_thread=std::thread([target,merged,promoted,
                                                          registration_started]{
@@ -27231,7 +27283,7 @@ static void qwen_seed_prefill_experts(
     }
     const auto started=std::chrono::steady_clock::now();
     const auto experts=runtime.model->config.expert_count;
-    const auto cache_layers=qwen_cache_layer_count(runtime);
+    const auto cache_layers=qwen_cache_slice_count(runtime);
     const auto& sequence=runtime.sequences[runtime.active_sequence];
     std::uint32_t max_history_frequency=0;
     for(const auto frequency:sequence.prompt_expert_history)
@@ -27269,11 +27321,11 @@ static void qwen_seed_prefill_experts(
     // the placement phase.
     std::vector<std::vector<std::uint32_t>> ranked(runtime.layers.size());
     for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
-        const auto& plan=runtime.layers[layer];
-        if(plan.dense_ffn || !plan.expert_count) continue;
-        const auto layer_experts=plan.expert_count;
-        const auto slot_begin=runtime.expert_slots.size()*layer/cache_layers;
-        const auto slot_end=runtime.expert_slots.size()*(layer+1)/cache_layers;
+        const auto layer_experts=qwen_layer_expert_count(runtime,runtime.layers[layer]);
+        if(!layer_experts) continue;
+        const auto slice=qwen_cache_slice(runtime,layer);
+        const auto slot_begin=runtime.expert_slots.size()*slice/cache_layers;
+        const auto slot_end=runtime.expert_slots.size()*(slice+1)/cache_layers;
         const auto layer_budget=std::min(per_layer,slot_end-slot_begin);
         auto& candidates=ranked[layer];
         candidates.reserve(layer_experts);
@@ -27422,9 +27474,8 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
     struct Candidate { std::uint32_t expert; std::uint32_t frequency; std::uint64_t last_used; };
     std::vector<std::vector<Candidate>> ranked(runtime.layers.size());
     for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
-        const auto& plan=runtime.layers[layer];
-        if(plan.dense_ffn || !plan.expert_count) continue;
-        const auto layer_experts=plan.expert_count;
+        const auto layer_experts=qwen_layer_expert_count(runtime,runtime.layers[layer]);
+        if(!layer_experts) continue;
         auto& list=ranked[layer];
         for(std::uint32_t expert=0;expert<layer_experts;++expert){
             const auto& history=runtime.expert_history[static_cast<std::size_t>(layer)*experts+expert];
