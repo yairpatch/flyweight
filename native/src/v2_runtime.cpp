@@ -21956,6 +21956,18 @@ int flyweight_v2_qwen_runtime_dump_kv(
 void gemma4_prefill_rows(
     FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows);
 
+// Dense NVFP4 decode and short-batch projections against Q8 activations
+// (nvfp4_q8_matvec_transposed_*), as llama.cpp runs this format.
+// FLYWEIGHT_NVFP4_Q8=0 keeps the float-activation warp kernels for A/B;
+// FLYWEIGHT_IQ2_Q8_DECODE=0 turns it off with every other Q8 matvec.
+bool qwen_nvfp4_q8_enabled() {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("FLYWEIGHT_NVFP4_Q8");
+        return !(setting && setting[0] == '0');
+    }();
+    return enabled;
+}
+
 // Minimum row count before a prefill NVFP4 GEMM takes the Blackwell
 // block-scaled FP4 tensor-core path, shared by the streamed experts and the
 // dense projections. The repack and activation quantization amortize with
@@ -23870,6 +23882,22 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(format&&format->matvec_q8_warp&&
            q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size,
                      format->q8_flat32))return;
+        // Dense NVFP4 against the same Q8 activation, carrying the tensor's
+        // weight_scale_2 the generic Q8 matvecs have no seam for.
+        if(type==40&&qwen_nvfp4_q8_enabled()&&iq2_q8_enabled&&(input_size&63)==0){
+            if(input!=normalized||input!=q8_cached_input){
+                void*quant_args[]={&input,const_cast<std::uint64_t*>(&dense_q8),
+                    const_cast<std::uint64_t*>(&dense_q8_scales),&input_size};
+                launch_named("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
+                q8_cached_input=(input==normalized)?input:0;
+            }
+            float scale=qwen_nvfp4_weight_scale(*runtime,index);
+            void*args[]={&matrix,const_cast<std::uint64_t*>(&dense_q8),
+                const_cast<std::uint64_t*>(&dense_q8_scales),&output,
+                &input_size,&output_size,&scale};
+            launch_named("nvfp4_q8_matvec_transposed_warp",(output_size+7)/8,1,256,args);
+            return;
+        }
         const int status=qwen_matvec_driver(
             type,matrix,input,output,input_size,output_size,launch_stream,
             qwen_nvfp4_weight_scale(*runtime,index));

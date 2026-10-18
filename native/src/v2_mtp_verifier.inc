@@ -784,6 +784,27 @@ void qwen_forward_rows(
             // shared-tile GEMM spends a 32-token tile on each, measured at
             // ~0.8 ms a call for 2 rows on Bolt's ssm_in. The warp matvec's
             // rows twin reads the weights once for all of them.
+            static const bool q8_kill=[]{
+                const char*setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
+                return setting&&setting[0]=='0';
+            }();
+            if(rows<=std::min(nvfp4_rows_max,8)&&qwen_nvfp4_q8_enabled()&&!q8_kill&&
+               (input_size&63)==0){
+                int scale_stride=(input_size/32)*2;
+                if(q8_cached_input!=input||q8_cached_width!=input_size){
+                    std::uint64_t all_q8=small_q8,all_scales=small_q8_scales;
+                    void*quant_args[]={&input,&all_q8,&all_scales,&input_size,&scale_stride};
+                    launch("quantize_q8_blocks_rows",(input_size+255)/256,
+                           static_cast<std::uint32_t>(rows),256,quant_args);
+                    q8_cached_input=input;q8_cached_width=input_size;
+                }
+                void*q8_args[]={&matrix,&small_q8,&small_q8_scales,&output,
+                                &input_size,&output_size,&rows,&scale_stride,
+                                const_cast<float*>(&scale)};
+                launch("nvfp4_q8_matvec_transposed_rows",(output_size+7)/8,1,256,q8_args);
+                dense_trace("nvfp4_q8_matvec_transposed_rows");
+                return;
+            }
             if(rows<=std::min(nvfp4_rows_max,8)){
                 void*rows_args[]={&matrix,&input,&output,&input_size,&output_size,
                                   &rows,const_cast<float*>(&scale)};
@@ -2437,6 +2458,32 @@ void qwen_forward_rows(
         const bool nemotron_cpu_layer=
             (expert_policy.is_cpu()||expert_policy.hybrid_prefill_cpu)&&
             runtime.nemotron&&!layer.attention&&!layer.mamba;
+        // A draft round's verify has a token or two per expert, where the
+        // chunk path's per-expert fold and f32 expansion cost more than they
+        // save. Each row takes decode's own routine instead -- same dots, same
+        // numerics as the step it stands in for -- over its CPU routes (the
+        // GPU-taken ones carry weight 0).
+        auto nemotron_verify_rows_cpu=[&](){
+            const int moe_in=static_cast<int>(layer.moe_latent?layer.moe_latent:hidden_size);
+            for(int row=0;row<rows;++row){
+                std::array<std::int32_t,256> row_selected{};
+                std::array<float,256> row_weights{};
+                int count=0;
+                for(int rank=0;rank<layer_top_k;++rank){
+                    const int route=row*layer_top_k+rank;
+                    if(weights_host[route]==0.0f)continue;
+                    row_selected[count]=selected_host[route];
+                    row_weights[count]=weights_host[route];
+                    ++count;
+                }
+                float*row_output=output_host+static_cast<std::size_t>(row)*moe_in;
+                if(!count){std::fill(row_output,row_output+moe_in,0.0f);continue;}
+                nemotron_cpu_moe(runtime,layer,row_selected.data(),row_weights.data(),count,
+                    input_host+static_cast<std::size_t>(row)*moe_in,activated_host,row_output);
+            }
+        };
+        const bool verify_phase=
+            expert_phase==flyweight::v2::ExpertExecutionPhase::verification;
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(flyweight_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         // Nemotron's MoE core records no router-end event to split against.
@@ -2480,7 +2527,8 @@ void qwen_forward_rows(
             }
         if(nemotron_cpu_layer){
             const auto cpu_expert_started=std::chrono::steady_clock::now();
-            nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,
+            if(verify_phase)nemotron_verify_rows_cpu();
+            else nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,
                 input_host,activated_host,down_host,output_host);
             runtime.prefill_expert_nanoseconds+=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3065,30 +3113,8 @@ void qwen_forward_rows(
         }
         if(any_cpu){
             const auto cpu_expert_started=std::chrono::steady_clock::now();
-            if(runtime.nemotron&&
-               expert_phase==flyweight::v2::ExpertExecutionPhase::verification){
-                // A draft round's verify has a token or two per expert, where
-                // the chunk path's per-expert fold and f32 expansion cost more
-                // than they save. Each row takes decode's own routine instead
-                // -- same dots, same numerics as the step it stands in for --
-                // over its CPU routes (the GPU-taken ones carry weight 0).
-                const int moe_in=static_cast<int>(layer.moe_latent?layer.moe_latent:hidden_size);
-                for(int row=0;row<rows;++row){
-                    std::array<std::int32_t,256> row_selected{};
-                    std::array<float,256> row_weights{};
-                    int count=0;
-                    for(int rank=0;rank<layer_top_k;++rank){
-                        const int route=row*layer_top_k+rank;
-                        if(weights_host[route]==0.0f)continue;
-                        row_selected[count]=selected_host[route];
-                        row_weights[count]=weights_host[route];
-                        ++count;
-                    }
-                    float*row_output=output_host+static_cast<std::size_t>(row)*moe_in;
-                    if(!count){std::fill(row_output,row_output+moe_in,0.0f);continue;}
-                    nemotron_cpu_moe(runtime,layer,row_selected.data(),row_weights.data(),count,
-                        input_host+static_cast<std::size_t>(row)*moe_in,activated_host,row_output);
-                }
+            if(runtime.nemotron&&verify_phase){
+                nemotron_verify_rows_cpu();
             }else if(runtime.nemotron){
                 nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,input_host,activated_host,down_host,output_host);
             }else{

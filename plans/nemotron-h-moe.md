@@ -123,6 +123,15 @@ measured ~12% faster but moved the greedy output where int16 up alone
 reproduced the f32 tokens exactly: relu² outputs have squared tails a narrow
 block scale flattens.
 
+The dense NVFP4 projections (`ssm_in`, `ssm_out`) take Q8 activations at decode
+and in batches of up to 8 rows (`nvfp4_q8_matvec_transposed_{warp,rows}`), the
+way llama.cpp runs NVFP4 against Q8_1. `FLYWEIGHT_NVFP4_Q8=0` restores the
+float-activation warp kernels. Same 7x256 A/B against float: 99.4% teacher-forced,
+level with the float GPU kernels' 99.4%, 3/7 continuations moved against their
+4/7. Against llama.cpp, teacher-forced: 98.99% against float's 99.08% (one token
+in 1086, a top-2 swap at margin 0.41). A 2-row verify drops from 60 to 44 ms in
+`cpu` mode and from 38 to 34 ms in `auto`.
+
 ## Next levers
 
 1. Prefill: stream experts to the GPU through the relu² grouped kernels (the
