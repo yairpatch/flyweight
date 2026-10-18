@@ -2402,33 +2402,20 @@ void qwen_forward_rows(
     // route downloads.
     auto cpu_phase=[&](RowsSpan&span,std::uint32_t layer_number){
         install_span(span);
+        const QwenRouteEpoch route_epoch(runtime);
         auto&layer=runtime.layers[layer_number];
         const int layer_top_k=static_cast<int>(layer.expert_used?layer.expert_used:top_k);
         const int layer_experts=static_cast<int>(layer.expert_count?layer.expert_count:experts);
-        if((expert_policy.is_cpu()||expert_policy.hybrid_prefill_cpu)&&runtime.nemotron&&!layer.attention&&!layer.mamba){
-            // Nemotron H routed experts: relu2 on the CPU over the compact
-            // routes and inputs queue_core sent down.
-            const auto route_wait_started=std::chrono::steady_clock::now();
-            if(flyweight_gpu_event_sync(span.route_event)!=0)
-                throw std::runtime_error("native Nemotron H rows route synchronization failed");
-            runtime.route_wait_nanoseconds+=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now()-route_wait_started).count();
-            const auto cpu_expert_started=std::chrono::steady_clock::now();
-            nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,
-                input_host,activated_host,down_host,output_host);
-            runtime.prefill_expert_nanoseconds+=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now()-cpu_expert_started).count();
-            span.pager_started=route_wait_started;
-            span.gpu_experts=false;
-            span.cpu_ran=true;
-            span.latent_layer=layer.moe_latent?&layer:nullptr;
-            return;
-        }
+        // Nemotron H routed experts on the CPU: relu2 over the compact routes
+        // and inputs queue_core sent down, once the routes below are pruned
+        // and recorded for the cache seed like every other model's.
+        const bool nemotron_cpu_layer=
+            (expert_policy.is_cpu()||expert_policy.hybrid_prefill_cpu)&&
+            runtime.nemotron&&!layer.attention&&!layer.mamba;
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(flyweight_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
-        if(profile_prefill){
+        // Nemotron's MoE core records no router-end event to split against.
+        if(profile_prefill&&!nemotron_cpu_layer){
             float core_ms=0.0f,router_ms=0.0f,transfer_ms=0.0f;
             if(flyweight_gpu_event_elapsed(runtime.prefill_layer_start_event,runtime.prefill_core_end_event,&core_ms)!=0||
                flyweight_gpu_event_elapsed(runtime.prefill_core_end_event,runtime.prefill_router_end_event,&router_ms)!=0||
@@ -2466,6 +2453,18 @@ void qwen_forward_rows(
                     record_expert_access(runtime,layer_number,
                         static_cast<std::uint32_t>(selected_host[route]));
             }
+        if(nemotron_cpu_layer){
+            const auto cpu_expert_started=std::chrono::steady_clock::now();
+            nemotron_cpu_moe_rows(runtime,layer,rows,selected_host,weights_host,
+                input_host,activated_host,down_host,output_host);
+            runtime.prefill_expert_nanoseconds+=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-cpu_expert_started).count();
+            span.gpu_experts=false;
+            span.cpu_ran=true;
+            span.latent_layer=layer.moe_latent?&layer:nullptr;
+            return;
+        }
         const bool gpu_rows_allowed=
             expert_policy.routed_gpu_execution_allowed()&&
             !runtime.expert_slots.empty();
@@ -2540,6 +2539,7 @@ void qwen_forward_rows(
                 if(resident!=runtime.expert_residency.end()){
                     slot_index=resident->second;
                     record_expert_cache_hit(runtime,runtime.expert_slots[slot_index]);
+                    runtime.expert_slots[slot_index].route_epoch=runtime.expert_route_epoch;
                     if(verify_moe_profile)++qwen_verify_moe_profile().hits;
                 }else{
                     ++runtime.expert_cache_misses;
@@ -2562,6 +2562,7 @@ void qwen_forward_rows(
                     admitted.key=cache_key;
                     admitted.valid=true;
                     admitted.native_valid=false;
+                    admitted.route_epoch=runtime.expert_route_epoch;
                     runtime.expert_residency[cache_key]=slot_index;
                     const auto admitted_base=
                         runtime.expert_cache+slot_index*runtime.expert_slot_bytes;

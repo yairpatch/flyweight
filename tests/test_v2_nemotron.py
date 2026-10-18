@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -11,6 +13,7 @@ from pathlib import Path
 
 from flyweight import server
 from flyweight.v2 import V2Error, V2Model
+from flyweight.v2_server import NativeV2Tokenizer
 
 from tests.nemotron_gguf_fixture import NemotronSpec, build_nemotron_gguf, reference_greedy
 
@@ -78,6 +81,35 @@ class NemotronConfigTests(unittest.TestCase):
         with self.assertRaises(V2Error) as caught:
             model.native_runtime(context_limit=64, mtp_drafts=0, expert_mode="cpu")
         self.assertIn("ssm", str(caught.exception))
+
+    def test_layer_norm_epsilon_is_the_rms_fallback(self):
+        # llama.cpp reads nemotron_h's norm epsilon from layer_norm_epsilon
+        # when the RMS key is absent; the generic 1e-6 default would differ.
+        model, _, _ = _model(NemotronSpec(epsilon_key="layer_norm_epsilon"))
+        self.assertAlmostEqual(model.config["rms_norm_epsilon"], 1e-5, places=9)
+
+    def test_variants_the_plan_does_not_compute_are_refused(self):
+        # Each is something llama.cpp's nemotron_h applies; running without it
+        # would be a different model, so creation fails instead.
+        cases = (
+            (NemotronSpec(expert_group_count=2), "grouped expert routing"),
+            (NemotronSpec(expert_scales=True), "per-expert weight scales"),
+            (NemotronSpec(attention_bias=True), "attention biases"),
+        )
+        for spec, message in cases:
+            with self.subTest(refused=message):
+                model, _, _ = _model(spec)
+                with self.assertRaises(V2Error) as caught:
+                    model.native_runtime(
+                        context_limit=64, mtp_drafts=0, expert_mode="cpu")
+                self.assertIn(message, str(caught.exception))
+
+    def test_stop_set_includes_end_of_sequence(self):
+        # `</s>` ends generation in llama.cpp beside the <|im_end|> eos.
+        model, _, _ = _model()
+        tokens = NativeV2Tokenizer(model).eos_token_ids
+        self.assertIn(model.token_id("<|im_end|>"), tokens)
+        self.assertIn(model.token_id("</s>"), tokens)
 
 
 class NemotronTokenizerTests(unittest.TestCase):
@@ -337,6 +369,96 @@ class NemotronNativeTests(unittest.TestCase):
                 finally:
                     runtime.close()
 
+
+
+# Runs inside the subprocess of NemotronQuantizedTests: every placement and
+# chunking the runtime offers over one quantized fixture, as JSON.
+_QUANTIZED_RUNS = """
+import json, os, sys
+from flyweight.v2 import V2Model
+model = V2Model(sys.argv[1])
+cases = json.loads(sys.argv[2])
+result = []
+for case in cases:
+    os.environ.pop("FLYWEIGHT_PREFILL_ROWS", None)
+    if case["rows"]:
+        os.environ["FLYWEIGHT_PREFILL_ROWS"] = case["rows"]
+    runtime = model.native_runtime(mtp_drafts=0, **case["options"])
+    runtime.prepare()
+    produced = []
+    runtime.generate(case["prompt"], case["count"], produced.append)
+    result.append({"tokens": produced, "hits": runtime.info["expert_cache_hits"]})
+    runtime.close()
+print(json.dumps(result))
+"""
+
+
+class NemotronQuantizedTests(unittest.TestCase):
+    """The released Bolt's tensor formats against the float64 forward.
+
+    IQ2_XXS routed and shared experts (CPU dots and the GPU relu² kernels),
+    NVFP4 ssm_in/ssm_out with their out-of-line scale and Q8_0 everywhere
+    else, at widths that admit those kernels; the reference runs on the
+    decoded values. Activation rounding is the one thing that may separate
+    the two, and on a random model it flips greedy steps whose logit lead or
+    top-k routing gap is narrow (a 1e-3 routing gap is common). So these runs
+    turn the int8 activation paths and the FP4 tensor-core prefill off --
+    switches read once per process, hence the subprocess -- and pin the
+    decoders and kernels exactly; what the rounding costs on a real
+    checkpoint is bench_kernel_quality's question.
+    """
+
+    PROMPT = [40, 72, 5, 101, 33, 64, 12, 90, 7, 55, 21]
+    LONG = [(index * 37) % 96 for index in range(160)]
+
+    @classmethod
+    def setUpClass(cls):
+        holder = tempfile.TemporaryDirectory(prefix="flyweight-nemotron-q-")
+        _WORKSPACES.append(holder)
+        cls.path = Path(holder.name) / "nemotron_h_moe.gguf"
+        cls.spec, cls.weights = build_nemotron_gguf(
+            cls.path, NemotronSpec(quantized=True))
+        cls.expected = reference_greedy(cls.spec, cls.weights, cls.PROMPT, 8)
+        cls.expected_long = reference_greedy(cls.spec, cls.weights, cls.LONG, 6)
+
+    def _run(self, cases):
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        environment = dict(os.environ, FLYWEIGHT_IQ2_Q8_DECODE="0",
+                           FLYWEIGHT_Q8_ACTIVATIONS="0",
+                           FLYWEIGHT_NVFP4_PREFILL_TC="0")
+        completed = subprocess.run(
+            [sys.executable, "-c", _QUANTIZED_RUNS, str(self.path), json.dumps(cases)],
+            env=environment, capture_output=True, text=True, timeout=900)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+
+    def test_decode_and_prefill_match_the_reference_in_every_placement(self):
+        placements = ({"expert_mode": "cpu"}, {"expert_mode": "auto"},
+                      {"expert_mode": "hybrid"}, {"expert_mode": "gpu"},
+                      {"expert_mode": "hybrid", "gpu_layers": 2},
+                      {"expert_mode": "resident"})
+        cases = [{"options": dict(options, context_limit=64), "rows": rows,
+                  "prompt": self.PROMPT, "count": 8}
+                 for options in placements for rows in ("1", None)]
+        gpu = V2Model.select_backend("auto") == "cuda"
+        for case, result in zip(cases, self._run(cases)):
+            with self.subTest(**case["options"], rows=case["rows"]):
+                self.assertEqual(result["tokens"], self.expected)
+                if gpu and case["options"]["expert_mode"] != "cpu":
+                    self.assertGreater(result["hits"], 0, "no expert ran on the GPU")
+
+    def test_chunked_prefill_matches_the_reference(self):
+        # 4- and 12-row chunks carry the conv ring and scan state across
+        # boundaries; the default 160-row chunk runs the two-half pipelined
+        # driver on the large-row Q8_0, NVFP4 and IQ2_XXS kernels.
+        cases = [{"options": {"expert_mode": mode, "context_limit": 256}, "rows": rows,
+                  "prompt": self.LONG, "count": 6}
+                 for mode in ("cpu", "auto") for rows in ("4", "12", None)]
+        for case, result in zip(cases, self._run(cases)):
+            with self.subTest(expert_mode=case["options"]["expert_mode"],
+                              rows=case["rows"]):
+                self.assertEqual(result["tokens"], self.expected_long)
 
 
 class NemotronToolCallTests(unittest.TestCase):

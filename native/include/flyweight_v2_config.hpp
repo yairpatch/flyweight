@@ -40,6 +40,9 @@ struct ModelConfig {
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;
     float rms_norm_epsilon=0.0f, rope_freq_base=0.0f;
+    // `.attention.layer_norm_epsilon`: Nemotron H's fallback when the RMS key
+    // is absent, as llama.cpp reads it.
+    float layer_norm_epsilon=0.0f;
     // Interleaved M-RoPE (`rope.dimension_sections`, Qwen3-VL / Qwen3.5):
     // rotary pairs per temporal, height, width and extra component. All zero
     // means plain RoPE, where a text token's single position rotates every
