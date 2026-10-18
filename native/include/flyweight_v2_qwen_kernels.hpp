@@ -11053,6 +11053,138 @@ void nvfp4_matvec_transposed_warp_rows(
     }
 }
 
+// NVFP4 against Q8 activations: E2M1 doubled is {0,1,2,3,4,6,8,12} with a
+// sign bit, which fits int8, so a 16-value sub-block becomes four DP4A words
+// under half its E4M3 scale -- what llama.cpp's MMVQ does for this format. A
+// 32-value Q8 group is two sub-blocks, the low and high halves the Q8 matvec
+// macros already split their scales by.
+__device__ const signed char kNvfp4Q8Values[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// One sub-block's eight nibble bytes (byte j: value j low, value j+8 high) as
+// four words in value order.
+__device__ __forceinline__ void nvfp4_q8_subblock_words(
+    const unsigned char* nibbles, int* words) {
+    unsigned int lo, hi;
+    memcpy(&lo, nibbles, 4);
+    memcpy(&hi, nibbles + 4, 4);
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const unsigned int word = half ? hi : lo;
+        words[half] =
+            ((int)(unsigned char)kNvfp4Q8Values[(word >> 0) & 15])
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 8) & 15] << 8)
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 16) & 15] << 16)
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 24) & 15] << 24);
+        words[half + 2] =
+            ((int)(unsigned char)kNvfp4Q8Values[(word >> 4) & 15])
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 12) & 15] << 8)
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 20) & 15] << 16)
+            | ((int)(unsigned char)kNvfp4Q8Values[(word >> 28) & 15] << 24);
+    }
+}
+
+// Q8 group g of a row: block g/2, sub-blocks 2*(g&1) and 2*(g&1)+1.
+__device__ __forceinline__ void nvfp4_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const unsigned char* base = row_data + (linear_group >> 1) * 36;
+    const int sub = (linear_group & 1) * 2;
+    nvfp4_q8_subblock_words(base + 4 + sub * 8, words);
+    nvfp4_q8_subblock_words(base + 4 + (sub + 1) * 8, words + 4);
+    *scale_low = 0.5f * ue4m3_to_float(base[sub]);
+    *scale_high = 0.5f * ue4m3_to_float(base[sub + 1]);
+}
+
+// Warp per output row, eight rows per block, as the float warp kernel. The
+// activation is one Q8 group per lane step; `scale` is weight_scale_2.
+extern "C" __global__
+void nvfp4_q8_matvec_transposed_warp(
+    const unsigned char* packed, const signed char* vector,
+    const __half* vector_scales, float* output,
+    const int input_size, const int output_size, const float scale
+) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= output_size) return;
+    const int groups = input_size >> 5;
+    const unsigned char* row_data = packed + (long long)row * (input_size >> 6) * 36;
+    float partial = 0.0f;
+    for (int g = lane; g < groups; g += 32) {
+        int words[8];
+        float scale_low, scale_high;
+        nvfp4_q8_decode(row_data, g, words, &scale_low, &scale_high);
+        const int4* activation_vectors = (const int4*)(vector + (long long)g * 32);
+        const int4 a0 = activation_vectors[0], a1 = activation_vectors[1];
+        int dot_low = 0, dot_high = 0;
+        dot_low = __dp4a(words[0], a0.x, dot_low);
+        dot_low = __dp4a(words[1], a0.y, dot_low);
+        dot_low = __dp4a(words[2], a0.z, dot_low);
+        dot_low = __dp4a(words[3], a0.w, dot_low);
+        dot_high = __dp4a(words[4], a1.x, dot_high);
+        dot_high = __dp4a(words[5], a1.y, dot_high);
+        dot_high = __dp4a(words[6], a1.z, dot_high);
+        dot_high = __dp4a(words[7], a1.w, dot_high);
+        partial += ((float)dot_low * scale_low + (float)dot_high * scale_high)
+            * __half2float(vector_scales[g]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if (lane == 0) output[row] = partial * scale;
+}
+
+// The same over up to eight Q8 rows (activation r at vectors + r*input_size,
+// its scales at vector_scales + r*scale_stride): each group is decoded once
+// and dotted against every row, so a short batch reads the weights once.
+extern "C" __global__
+void nvfp4_q8_matvec_transposed_rows(
+    const unsigned char* packed, const signed char* vectors,
+    const __half* vector_scales, float* outputs,
+    const int input_size, const int output_size,
+    const int rows, const int scale_stride, const float scale
+) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= output_size) return;
+    const int groups = input_size >> 5;
+    const unsigned char* row_data = packed + (long long)row * (input_size >> 6) * 36;
+    float partial[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) partial[r] = 0.0f;
+    for (int g = lane; g < groups; g += 32) {
+        int words[8];
+        float scale_low, scale_high;
+        nvfp4_q8_decode(row_data, g, words, &scale_low, &scale_high);
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= rows) continue;
+            const int4* activation_vectors = (const int4*)(
+                vectors + (long long)r * input_size + (long long)g * 32);
+            const int4 a0 = activation_vectors[0], a1 = activation_vectors[1];
+            int dot_low = 0, dot_high = 0;
+            dot_low = __dp4a(words[0], a0.x, dot_low);
+            dot_low = __dp4a(words[1], a0.y, dot_low);
+            dot_low = __dp4a(words[2], a0.z, dot_low);
+            dot_low = __dp4a(words[3], a0.w, dot_low);
+            dot_high = __dp4a(words[4], a1.x, dot_high);
+            dot_high = __dp4a(words[5], a1.y, dot_high);
+            dot_high = __dp4a(words[6], a1.z, dot_high);
+            dot_high = __dp4a(words[7], a1.w, dot_high);
+            partial[r] += ((float)dot_low * scale_low + (float)dot_high * scale_high)
+                * __half2float(vector_scales[(long long)r * scale_stride + g]);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= rows) continue;
+        float value = partial[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0) outputs[(long long)r * output_size + row] = value * scale;
+    }
+}
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 extern "C" __global__
 void nvfp4_swiglu_transposed(
     const unsigned char* gate_packed,

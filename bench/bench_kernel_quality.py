@@ -103,6 +103,9 @@ ARMS: dict[str, dict[str, str]] = {
     # exact-precision path, so its distance from the reference is the
     # summation-order floor an activation change has to be judged against.
     "experts-gpu": {"FLYWEIGHT_KQ_EXPERT_MODE": "gpu"},
+    # Dense NVFP4 decode and short-batch projections against Q8 activations.
+    # Run with FLYWEIGHT_NVFP4_Q8=0 in the environment (the float reference).
+    "nvfp4-q8": {"FLYWEIGHT_NVFP4_Q8": "1"},
 }
 
 
