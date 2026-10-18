@@ -10992,6 +10992,66 @@ void nvfp4_matvec_transposed_warp(
         partial += __shfl_down_sync(0xffffffff, partial, offset);
     if (lane == 0) output[row] = partial * scale;
 }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The same warp matvec over up to eight input rows: each lane decodes its
+// sub-block once and applies it to every row, so a draft round's verify (or a
+// prompt's short tail) reads the weights once instead of once per row -- the
+// all-NVFP4 projections are what bound a decode step's GPU half. The per-row
+// accumulation is the single-row kernel's, in the same order, so each row is
+// bitwise what that kernel would produce for it.
+extern "C" __global__
+void nvfp4_matvec_transposed_warp_rows(
+    const unsigned char* packed, const float* vectors, float* outputs,
+    const int input_size, const int output_size, const int rows,
+    const float scale
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    const int subblocks = input_size >> 4;
+    const long long row_blocks = (long long)row * (input_size >> 6);
+    float partial[8];
+    for (int r = 0; r < 8; ++r) partial[r] = 0.0f;
+    for (int sb = lane; sb < subblocks; sb += 32) {
+        const unsigned char* base = packed + (row_blocks + (sb >> 2)) * 36;
+        const int sub = sb & 3;
+        const float block_scale = ue4m3_to_float(base[sub]);
+        const unsigned int lo = *(const unsigned int*)(base + 4 + sub * 8);
+        const unsigned int hi = *(const unsigned int*)(base + 8 + sub * 8);
+        float w[16];
+        for (int k = 0; k < 4; ++k) {
+            w[k] = fp4_e2m1_to_float((int)(lo >> (8 * k)) & 15);
+            w[4 + k] = fp4_e2m1_to_float((int)(hi >> (8 * k)) & 15);
+            w[8 + k] = fp4_e2m1_to_float((int)(lo >> (8 * k + 4)) & 15);
+            w[12 + k] = fp4_e2m1_to_float((int)(hi >> (8 * k + 4)) & 15);
+        }
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= rows) break;
+            const float* v = vectors + (long long)r * input_size + sb * 16;
+            const float4 v0 = *(const float4*)(v);
+            const float4 v1 = *(const float4*)(v + 4);
+            const float4 v2 = *(const float4*)(v + 8);
+            const float4 v3 = *(const float4*)(v + 12);
+            float acc = 0.0f;
+            acc += w[0] * v0.x;  acc += w[1] * v0.y;  acc += w[2] * v0.z;  acc += w[3] * v0.w;
+            acc += w[4] * v1.x;  acc += w[5] * v1.y;  acc += w[6] * v1.z;  acc += w[7] * v1.w;
+            acc += w[8] * v2.x;  acc += w[9] * v2.y;  acc += w[10] * v2.z; acc += w[11] * v2.w;
+            acc += w[12] * v3.x; acc += w[13] * v3.y; acc += w[14] * v3.z; acc += w[15] * v3.w;
+            partial[r] += block_scale * acc;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= rows) break;
+        float value = partial[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        if (lane == 0) outputs[(long long)r * output_size + row] = value * scale;
+    }
+}
 
 extern "C" __global__
 void nvfp4_swiglu_transposed(

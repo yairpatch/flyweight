@@ -16458,10 +16458,6 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(lfm2&&runtime->options.mtp_drafts)throw std::runtime_error("LFM2 checkpoints carry no MTP draft block");
     if(nemotron&&runtime->options.mtp_drafts)
         throw std::runtime_error("native Nemotron H MTP is not implemented");
-    if(nemotron&&runtime->lookup_drafts){
-        std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: Nemotron H has no draft verification path\n");
-        runtime->lookup_drafts=0;
-    }
     // Speculative verification rewinds recurrent state through the DeltaNet
     // snapshot and fold machinery, which knows nothing of the short-conv ring.
     if(lfm2&&runtime->lookup_drafts){
@@ -17257,6 +17253,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                         *ple_conv.shape[1]*sizeof(float));
                 }
                 if(target.attention)continue;
+                if(runtime->nemotron){
+                    // Mamba-2 blocks only: their conv ring and scan state, in
+                    // the one sizing every other snapshot site reads.
+                    const auto state=qwen_recurrent_state(*runtime,target);
+                    if(!state.conv)continue;
+                    target.snapshot_first=reserve(state.conv*sizeof(float));
+                    target.snapshot_second=reserve(state.recurrent*sizeof(float));
+                    continue;
+                }
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
                 const auto&norm=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
@@ -17271,6 +17276,18 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
                 if(target.attention)continue;
+                if(runtime->nemotron){
+                    // A Mamba-2 block's fold input is its whole ssm_in row
+                    // (z|xBC|dt); see nemotron_mtp_fold.
+                    if(!target.mamba)continue;
+                    const auto&config=runtime->model->config;
+                    const std::uint64_t d_in_proj=2ull*config.ssm_inner_size+
+                        2ull*config.ssm_group_count*config.ssm_state_size+
+                        config.ssm_time_step_rank;
+                    target.mtp_retain_qkv=reserve(9ULL*d_in_proj*sizeof(float));
+                    runtime->mtp_delta_layers=true;
+                    continue;
+                }
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
                 target.mtp_retain_qkv=reserve(9ULL*conv.shape[1]*sizeof(float));
@@ -21431,11 +21448,19 @@ void qwen_snapshot_delta_state(FlyweightV2QwenRuntime& runtime, bool restore) {
             launch_copy(restore?saved:live,restore?live:saved,ple_bytes);
         }
         if(layer.attention)continue;
-        const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
-        const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
-        const auto&norm=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
-        const auto conv_bytes=conv.shape[0]*conv.shape[1]*sizeof(float);
-        const auto recurrent_bytes=a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float);
+        std::uint64_t conv_bytes=0,recurrent_bytes=0;
+        if(runtime.nemotron){
+            const auto state=qwen_recurrent_state(runtime,layer);
+            if(!state.conv)continue;
+            conv_bytes=state.conv*sizeof(float);
+            recurrent_bytes=state.recurrent*sizeof(float);
+        }else{
+            const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
+            const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
+            const auto&norm=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
+            conv_bytes=conv.shape[0]*conv.shape[1]*sizeof(float);
+            recurrent_bytes=a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float);
+        }
         const auto live_conv=runtime.state+layer.state_first;
         const auto live_recurrent=runtime.state+layer.state_second;
         const auto saved_conv=runtime.state+layer.snapshot_first;
@@ -21455,6 +21480,56 @@ void qwen_snapshot_delta_state(FlyweightV2QwenRuntime& runtime, bool restore) {
 // correctly for the accepted prefix. The caller must restore the state
 // snapshot first. The verifier caps at 8 rows, far below the chunked-WY
 // threshold, so mirroring the sequential kernel selection is exhaustive.
+// Nemotron H's fold: replay each Mamba-2 block's causal conv and selective
+// scan over the `rows` accepted rows from the restored snapshot, reading the
+// ssm_in projections the verify pass wrote into the block's retention arena.
+// The same rows kernels on the same inputs the verify pass ran, so the state
+// is bitwise what that pass held after those rows; the outputs land in the
+// idle rows workspace and are discarded.
+void nemotron_mtp_fold(FlyweightV2QwenRuntime& runtime, int rows) {
+    const auto&layout=runtime.rows_workspace_layout;
+    std::uint64_t convolved=layout.second.address(runtime.workspace);
+    std::uint64_t output=layout.third.address(runtime.workspace);
+    const auto&config=runtime.model->config;
+    int inner=static_cast<int>(config.ssm_inner_size);
+    int d_state=static_cast<int>(config.ssm_state_size);
+    int groups=static_cast<int>(config.ssm_group_count);
+    int heads=static_cast<int>(config.ssm_time_step_rank);
+    int conv_channels=inner+2*groups*d_state;
+    int conv_kernel=static_cast<int>(config.conv_kernel);
+    int head_dim=inner/heads;
+    long long conv_stride=conv_channels,inner_stride=inner;
+    long long proj_stride=2LL*inner+2LL*groups*d_state+heads;
+    auto launch=[&](const char*name,std::uint32_t gx,void**args){
+        if(flyweight_gpu_launch_named(name,gx,1,256,0,runtime.stream,args)!=0)
+            throw std::runtime_error(std::string("native Nemotron H fold kernel failed: ")+name);
+    };
+    for(const auto&layer:runtime.layers){
+        if(!layer.mamba)continue;
+        auto tensor=[&](std::uint64_t role){
+            return runtime.device_tensors[layer.static_tensors.at(role)];
+        };
+        std::uint64_t z=runtime.state+layer.mtp_retain_qkv;
+        std::uint64_t conv_source=z+static_cast<std::uint64_t>(inner)*sizeof(float);
+        std::uint64_t dt_row=z+static_cast<std::uint64_t>(inner+conv_channels)*sizeof(float);
+        std::uint64_t conv_weights=tensor(layer.ssm_conv_role);
+        std::uint64_t conv_bias=
+            layer.ssm_conv_bias_role!=std::numeric_limits<std::uint64_t>::max()
+                ?tensor(layer.ssm_conv_bias_role):0;
+        std::uint64_t conv_state=runtime.state+layer.state_first;
+        std::uint64_t scan_state=runtime.state+layer.state_second;
+        std::uint64_t dt_bias=tensor(layer.ssm_dt_role),a=tensor(layer.ssm_a_role),
+            d=tensor(layer.ssm_d_role);
+        void*conv_args[]={&conv_source,&conv_weights,&conv_bias,&conv_state,&convolved,
+                          &rows,&conv_channels,&conv_kernel,&proj_stride};
+        launch("nemotron_ssm_conv_rows",(static_cast<std::uint32_t>(conv_channels)+255)/256,conv_args);
+        void*scan_args[]={&convolved,&conv_stride,&dt_row,&proj_stride,&z,&proj_stride,
+                          &dt_bias,&a,&d,&scan_state,&output,&inner_stride,
+                          &rows,&heads,&head_dim,&d_state,&groups};
+        launch("nemotron_ssm_scan_rows",(static_cast<std::uint32_t>(inner)+255)/256,scan_args);
+    }
+}
+
 void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
     const auto&layout=runtime.rows_workspace_layout;
     // Scratch: conv output, recurrence output and the gate operand land in the
@@ -28062,9 +28137,13 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         // re-running the whole forward.
         const auto rollback_started=std::chrono::steady_clock::now();
         qwen_snapshot_delta_state(runtime,true);
-        qwen_mtp_fold_delta_state(runtime,static_cast<int>(valid));
-        if(std::getenv("FLYWEIGHT_MTP_FOLD_CHECK"))
-            qwen_mtp_fold_check(runtime,inputs.data(),valid);
+        if(runtime.nemotron){
+            nemotron_mtp_fold(runtime,static_cast<int>(valid));
+        }else{
+            qwen_mtp_fold_delta_state(runtime,static_cast<int>(valid));
+            if(std::getenv("FLYWEIGHT_MTP_FOLD_CHECK"))
+                qwen_mtp_fold_check(runtime,inputs.data(),valid);
+        }
         qwen_mtp_commit_true_cache(
             runtime,base_cache_tokens,inputs.data(),valid,batch_hidden);
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);

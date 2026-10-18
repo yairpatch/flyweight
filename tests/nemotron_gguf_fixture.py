@@ -93,6 +93,7 @@ class NemotronSpec:
         expert_scales: bool = False,
         attention_bias: bool = False,
         epsilon_key: str = "layer_norm_rms_epsilon",
+        tied_head: bool = False,
     ):
         # The quantized layout needs every IQ2_XXS row a whole 256-value
         # block, and 256-multiples are what admit the int8/int16 kernels.
@@ -111,6 +112,10 @@ class NemotronSpec:
         self.expert_scales = expert_scales
         self.attention_bias = attention_bias
         self.epsilon_key = epsilon_key
+        # output.weight a copy of token_embd: each step's argmax leans to the
+        # token it read, so greedy settles into short cycles a draft can
+        # predict, which is what a speculative round's accept path needs.
+        self.tied_head = tied_head
         self.expert_used = {3: 2, 5: 3, 7: 2}
         self.experts_scale = 2.5
 
@@ -186,7 +191,11 @@ def build_nemotron_gguf(
 
     projection("token_embd.weight", spec.hidden, len(VOCABULARY), scale=1.0)
     vector("output_norm.weight", spec.hidden)
-    projection("output.weight", spec.hidden, len(VOCABULARY), scale=0.7)
+    if spec.tied_head:
+        add("output.weight", (spec.hidden, len(VOCABULARY)),
+            weights["token_embd.weight"], GGML_Q8_0)
+    else:
+        projection("output.weight", spec.hidden, len(VOCABULARY), scale=0.7)
     for layer in range(spec.layers):
         prefix = f"blk.{layer}."
         vector(prefix + "attn_norm.weight", spec.hidden)

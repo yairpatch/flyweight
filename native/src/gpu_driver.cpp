@@ -1821,6 +1821,7 @@ extern "C" int flyweight_gpu_compile(
              "bf16_lm_head_argmax_warp", "qwen_bf16_lm_head_argmax_rows",
              "nvfp4_matmul_rows", "nvfp4_matmul_tiled",
              "nvfp4_matvec_transposed_warp",
+             "nvfp4_matvec_transposed_warp_rows",
              "qwen_nvfp4_embedding", "qwen_nvfp4_embedding_rows",
              "q8_matmul_tiled", "q8_matvec_transposed_pair",
              "q8_matvec_transposed_triple", "delta_conv_chunk",
