@@ -1,13 +1,16 @@
 # Nemotron H MoE (Nemotron 3.5 Bolt, `nemotron_h_moe`)
 
-> **STATUS 2026-10-17**: runs natively on branch `feat/nemotron-h-moe`. Target
-> checkpoint `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf` (22 GB). Decode
-> and batched prefill match an independent float64 forward on the fixture;
-> tokenization matches llama.cpp token for token; the real checkpoint answers
-> coherently, calls tools through its own template, and retrieves a fact
-> planted 6.9K tokens into a 13.4K prompt. Routed experts run on the CPU only.
-> Semantics reference: llama.cpp `src/models/nemotron-h.cpp` and
-> `src/models/mamba-base.cpp` (`build_mamba2_layer`).
+> **STATUS 2026-10-18**: merged (#140, #142, #143). Target checkpoint
+> `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf` (22 GB). Decode and batched
+> prefill match an independent float64 forward on the f32 fixture and on a
+> quantized one in the released formats; tokenization matches llama.cpp token
+> for token. Teacher-forced against upstream llama.cpp (cd0a5b6, the first
+> build that loads Bolt's per-block router widths) the real checkpoint agrees
+> on 98.6-99.2% of greedy steps in every placement mode, every miss a top-2
+> swap within 0.41 nats. Routed experts run on the CPU, the GPU expert cache,
+> whole GPU layers (`-ngl`) or fully resident. Semantics reference: llama.cpp
+> `src/models/nemotron-h.cpp` and `src/models/mamba-base.cpp`
+> (`build_mamba2_layer`).
 
 ## What the checkpoint is
 
@@ -78,46 +81,69 @@ Plus `down_shexp(relu²(up_shexp(h)))`.
   snapshot nothing. Prefix reuse restores Mamba state from checkpoints like
   DeltaNet's.
 - Decode: the shared expert and latent projections run on the GPU while
-  `nemotron_cpu_moe` computes the routed experts from the mapping.
+  the routed experts run through the expert cache (`qwen_run_hybrid_experts`
+  with the gateless `<type>_grouped_relu2` / accumulate kernels) or, for
+  misses and in `cpu` mode, `nemotron_cpu_moe` from the mapping. On
+  AVX512-VNNI the CPU up projection takes the latent stream as Q8_K (the
+  IQ2_XXS VNNI dot); the down projection stays float -- see below.
 - Prefill (`v2_mtp_verifier.inc`): Mamba rows, attention through the one-launch
   warp prefill kernel (per-row decode dispatch for <= 8 rows), and
   `nemotron_cpu_moe_rows`, which groups routes by expert so each expert's
   weights are decoded once per chunk. `queue_combine` projects the latent sum
   back up. Works under the two-half pipelined driver.
-- Expert placement: `auto` keeps experts on the CPU with a note; `resident`
-  refuses. MTP, lookup drafts and multi-slot batched decode are off.
+- Expert placement: every mode. The cache is sliced over the MoE blocks only
+  (the Mamba-2 and attention blocks route nothing), `-ngl N` pins the last N
+  MoE blocks at their own expert counts, `resident` packs every block's
+  experts. NVFP4 experts stay on the CPU (no relu² kernel). Grouped routing,
+  per-expert `ffn_*_exps.scale` and attention biases are refused at load.
+  MTP, lookup drafts and multi-slot batched decode are off.
 
-## Numbers (5070 Ti Laptop 12 GB, 9955HX, 2026-10-17)
+## Numbers (5070 Ti Laptop 12 GB, 9955HX, 2026-10-18)
 
 GPU holds 4.7 GB of weights; 16.3 GB of experts stay mapped in RAM.
 
-| | |
-| --- | --- |
-| decode | 30-32 tok/s |
-| prefill, 2755-token prompt | 50 -> 207 tok/s (expert grouping) |
+| | flyweight | llama.cpp cd0a5b6 (experts on CPU) |
+| --- | --- | --- |
+| decode, `cpu` | ~41 tok/s (39 all-float, 45 with int8 down) | 41-46 tok/s |
+| decode, `auto` | 46-48 tok/s | |
+| prefill, 2117-token prompt | ~350 tok/s | 422 tok/s |
 
-Prefill is now all CPU expert compute (13.0 of 13.3 s). The up projection takes
-the int16 VNNI fold (`FLYWEIGHT_ROWS_I16=0` holds it off); the down projection
-stays f32. int16 down measured ~12% faster but moved the greedy output where
-int16 up alone reproduced the f32 tokens exactly: relu² outputs have squared
-tails a 14-bit block scale flattens.
+The 2026-10-17 numbers (30-32 decode, 207 prefill) predate the GPU expert
+cache and the VNNI dot. Prefill is still dominated by the CPU expert GEMMs.
 
-Decode spends ~20 ms/token in the CPU experts, ~420 MB of IQ2_XXS read at
-~20 GB/s: the AVX2 float IQ2_XXS dot is compute-bound, not DRAM-bound.
+**Activation precision.** The prefill up projection takes the int16 VNNI fold
+(`FLYWEIGHT_ROWS_I16=0` holds it off), decode's the Q8_K VNNI dot
+(`FLYWEIGHT_IQ1S_Q8=0` holds it off). The down projection stays f32 in both
+(`FLYWEIGHT_NEMOTRON_Q8_DOWN=1` opts decode into Q8_K). bench_kernel_quality on
+Bolt, 7 prompts x 256 tokens against all-float decode: Q8_K up agrees 99.6%
+teacher-forced, inside the 99.3% of the float GPU kernels (another exact-
+precision path), median first greedy divergence ~token 98; adding Q8_K down
+pulls that divergence to token 12 for ~8% decode. In prefill, int16 down
+measured ~12% faster but moved the greedy output where int16 up alone
+reproduced the f32 tokens exactly: relu² outputs have squared tails a narrow
+block scale flattens.
 
 ## Next levers
 
-1. Prefill: stream experts to the GPU with relu² grouped kernels (a gateless
-   twin of the routed MMQ path). A 2K chunk touches nearly every expert, so
-   ~16 GB over 7 GB/s PCIe is still several times faster than the CPU GEMMs.
-2. Decode: an IQ2_XXS Q8_K VNNI dot (as IQ1_S and IQ3_S have), or a GPU
-   expert cache once the relu² kernels exist.
-3. The Bolt MTP head, if NVIDIA ships one as GGUF.
+1. Prefill: stream experts to the GPU through the relu² grouped kernels (the
+   prefill stream arena is Qwen's 3-role SwiGLU only). A 2K chunk touches
+   nearly every expert, so ~16 GB over 7 GB/s PCIe is still several times
+   faster than the CPU GEMMs; llama.cpp is 1.2x ahead here.
+2. Vision: upstream runs Bolt as a VL model (`--mmproj`, RADIO encoder,
+   images and video); flyweight has no Nemotron vision path.
+3. The MTP draft layer: llama.cpp loads it (`nextn`), this GGUF omits it.
 
 ## Tests
 
 `tests/nemotron_gguf_fixture.py` writes a toy checkpoint (Mamba, attention and
 three heterogeneous MoE blocks, one without the latent bridge) and carries an
-independent float64 forward. `tests/test_v2_nemotron.py` pins decode,
-4-row and pipelined prefill, prefix reuse, reset and the CPU backend against
-that forward, plus the tokenizer and the tool-call markers.
+independent float64 forward; `NemotronSpec(quantized=True)` stores it as Bolt
+does (IQ2_XXS experts, NVFP4 + `.scale` ssm projections, Q8_0 elsewhere) from
+random well-formed codes the reference decodes. `tests/test_v2_nemotron.py`
+pins decode, chunked and pipelined prefill, every placement mode, `-ngl`,
+`resident`, prefix reuse, reset and the CPU backend against that forward, plus
+the tokenizer, tool-call markers, refused variants and the epsilon fallback.
+The quantized runs switch the int8 activation paths and the FP4 tensor-core
+prefill off (in a subprocess: both are read once per process) -- on a random
+model their rounding flips steps whose logit lead or 1e-3-wide routing gap is
+narrow, which is a quality question for the bench, not a parity one.

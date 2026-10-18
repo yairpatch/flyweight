@@ -166,6 +166,42 @@ int main() {
     }
     std::printf("qwen_iq3s_vnni512: %d rows, worst rel error %.2e vs exact, %.2e vs float path\n",
                 kRows, worst3_tight, worst3_loose);
+    // IQ2_XXS, Nemotron H Bolt's expert format, the same way. The pinned d
+    // leaves every grid index, sign selector and scale nibble random.
+    constexpr std::uint64_t kIq2xxsRowBytes = static_cast<std::uint64_t>(kBlocks) * kIq2xxsBlockBytes;
+    std::vector<std::uint8_t> packed2(kIq2xxsRowBytes * kRows);
+    for (auto& byte : packed2) byte = static_cast<std::uint8_t>(generator());
+    for (int row = 0; row < kRows; ++row)
+        for (int block = 0; block < kBlocks; ++block) {
+            auto* base = packed2.data() + row * kIq2xxsRowBytes + block * kIq2xxsBlockBytes;
+            base[0] = 0x00; base[1] = 0x3c;
+        }
+    double worst2_tight = 0.0, worst2_loose = 0.0;
+    for (int row = 0; row < kRows; ++row) {
+        const auto* row_data = packed2.data() + row * kIq2xxsRowBytes;
+        double exact = 0.0, magnitude = 0.0;
+        for (int index = 0; index < kElements; ++index) {
+            const double term = static_cast<double>(qwen_iq2xxs_value(row_data, index)) * dequantized[index];
+            exact += term;
+            magnitude += std::fabs(term);
+        }
+        const float kernel = qwen_iq2xxs_dot_q8_k_vnni512(packed2.data(), quantized.data(), kElements, row);
+        const float floating = qwen_quant_dot_avx2(packed2.data(), 16, input.data(), kElements, row);
+        const double tight = std::fabs(kernel - exact) / (magnitude + 1e-6);
+        const double loose = std::fabs(kernel - floating) / (magnitude + 1e-6);
+        worst2_tight = std::max(worst2_tight, tight);
+        worst2_loose = std::max(worst2_loose, loose);
+        if (tight > 2e-5) {
+            std::printf("iq2xxs row %d: kernel %.6f vs exact %.6f (rel %.2e)\n", row, kernel, exact, tight);
+            ++failures;
+        }
+        if (loose > 1e-2) {
+            std::printf("iq2xxs row %d: kernel %.6f vs float path %.6f (rel %.2e)\n", row, kernel, floating, loose);
+            ++failures;
+        }
+    }
+    std::printf("qwen_iq2xxs_vnni512: %d rows, worst rel error %.2e vs exact, %.2e vs float path\n",
+                kRows, worst2_tight, worst2_loose);
     std::printf("qwen_iq1s_vnni512_contract: %d rows, worst rel error %.2e vs exact, %.2e vs float path, dequant bit-exact\n",
                 kRows, worst_tight, worst_loose);
     return failures ? 1 : 0;

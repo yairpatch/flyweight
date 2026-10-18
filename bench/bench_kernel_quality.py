@@ -93,6 +93,16 @@ ARMS: dict[str, dict[str, str]] = {
     "experts-float": {"FLYWEIGHT_Q8_EXPERTS": "0"},
     # Every Q8-activation path off: dense projections, heads and experts.
     "all-float": {"FLYWEIGHT_IQ2_Q8_DECODE": "0"},
+    # Nemotron H CPU expert decode on the int8 Q8_K dot (up is the default,
+    # down is opt-in). Run with
+    # FLYWEIGHT_IQ1S_Q8=0 in the environment (the float reference) and
+    # --expert-mode cpu, so every routed expert takes the arm's path.
+    "nemotron-q8-up": {"FLYWEIGHT_IQ1S_Q8": "1", "FLYWEIGHT_NEMOTRON_Q8_DOWN": "0"},
+    "nemotron-q8-both": {"FLYWEIGHT_IQ1S_Q8": "1", "FLYWEIGHT_NEMOTRON_Q8_DOWN": "1"},
+    # The routed experts on the GPU kernels (float activations): another
+    # exact-precision path, so its distance from the reference is the
+    # summation-order floor an activation change has to be judged against.
+    "experts-gpu": {"FLYWEIGHT_KQ_EXPERT_MODE": "gpu"},
 }
 
 
@@ -244,6 +254,11 @@ def cmd_kernel(args) -> int:
 # model mode (real weights, subprocess arms)
 
 
+def _expert_mode(args) -> str | None:
+    # An arm may pin its own placement; otherwise every arm takes --expert-mode.
+    return os.environ.get("FLYWEIGHT_KQ_EXPERT_MODE") or args.expert_mode
+
+
 def run_worker(args) -> int:
     """One arm: greedy continuations + teacher-forced agreement as JSON."""
     from flyweight.v2 import V2Model
@@ -262,6 +277,7 @@ def run_worker(args) -> int:
             context_limit=args.context, gpu_cache_bytes=args.gpu_cache_mib * 1024 * 1024,
             cache_type_k="f16", cache_type_v="f16", context_explicit=True,
             prefill_checkpoint_interval=args.checkpoint_interval,
+            expert_mode=_expert_mode(args),
         ) as runtime:
             runtime.prepare()
             out["info"] = {k: int(runtime.info[k]) for k in
@@ -312,6 +328,8 @@ def cmd_model(args) -> int:
                "--gpu-cache-mib", str(args.gpu_cache_mib),
                "--tokens", str(args.tokens),
                "--checkpoint-interval", str(args.checkpoint_interval)]
+        if args.expert_mode:
+            cmd += ["--expert-mode", args.expert_mode]
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                               timeout=args.timeout)
         if proc.returncode != 0:
@@ -404,6 +422,8 @@ def _agree_all(args, label, ref_prompts) -> dict[str, float]:
            "--gpu-cache-mib", str(args.gpu_cache_mib),
            "--checkpoint-interval", str(args.checkpoint_interval),
            "--agree-refs", refs_blob]
+    if args.expert_mode:
+        cmd += ["--expert-mode", args.expert_mode]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                           timeout=args.timeout)
     try:
@@ -434,6 +454,7 @@ def run_agreebatch(args) -> int:
             context_limit=args.context, gpu_cache_bytes=args.gpu_cache_mib * 1024 * 1024,
             cache_type_k="f16", cache_type_v="f16", context_explicit=True,
             prefill_checkpoint_interval=args.checkpoint_interval,
+            expert_mode=_expert_mode(args),
         ) as runtime:
             runtime.prepare()
             for name, reference in refs.items():
@@ -476,6 +497,8 @@ def main() -> int:
     pm.add_argument("--context", type=int, default=4096)
     pm.add_argument("--gpu-cache-mib", type=int, default=9000)
     pm.add_argument("--tokens", type=int, default=64)
+    pm.add_argument("--expert-mode", default=None,
+                    help="runtime expert_mode for every arm (e.g. cpu)")
     pm.add_argument("--checkpoint-interval", type=int, default=0,
                     help="mid-prefill checkpoint spacing; 0 (end-only) keeps full "
                          "1024-row chunks so the 512-row WY floor and the 512-token "
@@ -492,12 +515,16 @@ def main() -> int:
     pw.add_argument("--context", type=int, default=4096)
     pw.add_argument("--gpu-cache-mib", type=int, default=9000)
     pw.add_argument("--tokens", type=int, default=64)
+    pw.add_argument("--expert-mode", default=None,
+                    help="runtime expert_mode for every arm (e.g. cpu)")
     pw.add_argument("--checkpoint-interval", type=int, default=0)
 
     pa = sub.add_parser("agreebatch", help=argparse.SUPPRESS)
     pa.add_argument("model")
     pa.add_argument("--context", type=int, default=4096)
     pa.add_argument("--gpu-cache-mib", type=int, default=9000)
+    pa.add_argument("--expert-mode", default=None,
+                    help="runtime expert_mode for every arm (e.g. cpu)")
     pa.add_argument("--checkpoint-interval", type=int, default=0)
     pa.add_argument("--agree-refs", default="{}")
 

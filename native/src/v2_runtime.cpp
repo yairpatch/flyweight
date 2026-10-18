@@ -562,6 +562,9 @@ struct QwenExpertSlot {
     // sequences may predict the same resident expert, and the first one to
     // consume its route must not release the second one's protection.
     std::uint32_t prefetch_pins = 0;
+    // The routing pass that last handed this slot to a kernel (see
+    // QwenRouteEpoch); a slot of the open pass is not evictable.
+    std::uint64_t route_epoch = 0;
 };
 
 struct QwenExpertHistory {
@@ -1234,6 +1237,7 @@ struct FlyweightV2QwenRuntime {
     std::int64_t nvfp4_tensor_core_moe_last_status = 0;
     std::unordered_map<std::uint64_t, std::size_t> expert_residency;
     std::uint64_t expert_clock = 0;
+    std::uint64_t expert_route_epoch = 1;
     std::uint64_t expert_cache_hits = 0;
     std::uint64_t expert_cache_misses = 0;
     std::uint64_t expert_cache_evictions = 0;
@@ -1631,6 +1635,19 @@ std::size_t qwen_cache_slice(const FlyweightV2QwenRuntime& runtime, std::uint32_
 }
 
 constexpr std::size_t kNoExpertSlot = std::numeric_limits<std::size_t>::max();
+
+// One routing pass (a layer's routes in decode, a span's in rows). Its hits
+// and admissions point kernels it has not launched yet at their slots, and a
+// later miss in the same pass could pick one of those slots as its victim and
+// queue the new expert's upload over it first. The pass stamps the slots it
+// hands out with a fresh epoch; select_expert_cache_slot never evicts one.
+struct QwenRouteEpoch {
+    FlyweightV2QwenRuntime& runtime;
+    explicit QwenRouteEpoch(FlyweightV2QwenRuntime& value) : runtime(value) {
+        ++runtime.expert_route_epoch;
+    }
+    ~QwenRouteEpoch() { ++runtime.expert_route_epoch; }
+};
 
 // GGUF quantization block sizes (bytes per block). kQ8/kQ4K/kQ5K/kQ6K and
 // kBlockElements live in src/qwen_kquant.h beside the decoders that use them.
@@ -2195,9 +2212,12 @@ std::size_t select_expert_cache_slot(
         ++runtime.expert_cache_admissions;
         return static_cast<std::size_t>(free_slot - runtime.expert_slots.begin());
     }
+    const auto open_epoch = runtime.expert_route_epoch;
     auto victim = std::min_element(begin, end, [&](const QwenExpertSlot& left, const QwenExpertSlot& right) {
-        const bool left_protected = left.pinned || left.prefetch_pins;
-        const bool right_protected = right.pinned || right.prefetch_pins;
+        const bool left_protected =
+            left.pinned || left.prefetch_pins || left.route_epoch == open_epoch;
+        const bool right_protected =
+            right.pinned || right.prefetch_pins || right.route_epoch == open_epoch;
         if (left_protected != right_protected) return !left_protected;
         const auto left_expert = static_cast<std::uint32_t>(left.key);
         const auto right_expert = static_cast<std::uint32_t>(right.key);
@@ -2213,7 +2233,7 @@ std::size_t select_expert_cache_slot(
     // victim once every unpinned slot in the layer is hotter than it. Treating
     // the seed pin as absolute left the cache unable to replace a single slot
     // after seeding -- evictions stayed at 0 for whole generations.
-    if (victim->prefetch_pins) {
+    if (victim->prefetch_pins || victim->route_epoch == open_epoch) {
         ++runtime.expert_cache_rejections;
         return kNoExpertSlot;
     }
@@ -2900,6 +2920,7 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && (type==4 || type==10)) m.config.sliding_window_period=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=12 && key.compare(key.size()-12,12,".logit_scale")==0 && (type==6 || type==12)) m.config.logit_scale=read_float(type);
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.layer_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.rms_norm_epsilon=read_float(type);
+        else if (key.size()>=29 && key.compare(key.size()-29,29,".attention.layer_norm_epsilon")==0 && key.rfind("clip.",0)!=0 && (type==6 || type==12)) m.config.layer_norm_epsilon=read_float(type);
         else if (key.size()>=28 && key.compare(key.size()-28,28,".attention.group_norm_groups")==0 && (type==4 || type==10)) m.config.norm_groups=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.key_length")==0 && (type==4 || type==10)) m.config.key_length=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=23 && key.compare(key.size()-23,23,".attention.value_length")==0 && (type==4 || type==10)) m.config.value_length=static_cast<uint32_t>(read_uint(type));
@@ -3084,6 +3105,8 @@ int parse(FlyweightV2Model& m) {
     // same way LFM2 does it. Bolt's per-layer top-k folds its maximum into
     // the scalar the shared runtime paths size their route buffers by.
     if(m.architecture=="nemotron_h_moe"){
+        if(!m.config.rms_norm_epsilon)
+            m.config.rms_norm_epsilon=m.config.layer_norm_epsilon;
         const auto&kv_by_layer=m.config.attention_kv_heads_by_layer;
         if(!m.config.attention_kv_heads){
             if(kv_by_layer.empty())
@@ -4119,6 +4142,12 @@ void build_nemotron_plan(FlyweightV2QwenRuntime& runtime) {
         runtime.static_tensor_bytes+=model.tensors[runtime.lm_head].size;
     if(model.config.expert_gating_func&&model.config.expert_gating_func!=2)
         throw std::runtime_error("native Nemotron H expects sigmoid expert gating");
+    // Variants llama.cpp's nemotron_h computes and this plan does not: refuse
+    // them rather than run them as something else.
+    if(model.config.expert_group_count>1)
+        throw std::runtime_error(
+            "native Nemotron H does not implement grouped expert routing "
+            "(expert_group_count "+std::to_string(model.config.expert_group_count)+")");
     const auto& expert_ff_by_layer=model.config.expert_ff_by_layer;
     const auto& expert_used_by_layer=model.config.expert_used_by_layer;
     const auto hidden=model.config.hidden_size;
@@ -4205,6 +4234,10 @@ void build_nemotron_plan(FlyweightV2QwenRuntime& runtime) {
                 :model.config.attention_kv_heads;
             if(!layer.attention_heads||!layer.kv_heads)
                 throw std::runtime_error("nemotron_h attention geometry is incomplete");
+            for(const char*bias:{"attn_q.bias","attn_k.bias","attn_v.bias","attn_output.bias"})
+                if(has_tensor(model,prefix+bias))
+                    throw std::runtime_error(
+                        "native Nemotron H does not apply attention biases ("+prefix+bias+")");
             const auto&q=model.tensors[layer.static_tensors[1]];
             const auto&k=model.tensors[layer.static_tensors[2]];
             const auto&v=model.tensors[layer.static_tensors[3]];
@@ -4217,6 +4250,11 @@ void build_nemotron_plan(FlyweightV2QwenRuntime& runtime) {
                     "nemotron_h attention projections disagree with the head counts "
                     "on layer "+std::to_string(layer_index));
         }else{
+            for(const char*scaled:{"ffn_up_exps.scale","ffn_down_exps.scale"})
+                if(has_tensor(model,prefix+scaled))
+                    throw std::runtime_error(
+                        "native Nemotron H does not apply per-expert weight scales ("+
+                        prefix+scaled+")");
             add_static_tensor(runtime,layer,prefix+"ffn_gate_inp.weight");
             {
                 // The router's width is the block's expert count: Bolt's GGUF
@@ -4646,8 +4684,13 @@ bool qwen_iq_avx512_enabled(){
 using QwenIqQ8Dot=float(*)(const std::uint8_t*,const QwenQ8KBlock*,int,std::uint64_t);
 bool qwen_iq_q8_admitted(std::uint32_t type){
     const auto features=flyweight_cpu_features();
-    if((features&8u)!=0)return type==16||type==19||type==21;
+    if((features&8u)!=0)return type==19||type==21;
     return (features&4u)!=0&&type==19;
+}
+// Nemotron H's experts add IQ2_XXS (512-bit kernel only). Qwen's IQ2_XXS
+// gate/up stacks stay on the float dot until a quality A/B admits them.
+bool nemotron_iq_q8_admitted(std::uint32_t type){
+    return qwen_iq_q8_admitted(type)||(type==16&&(flyweight_cpu_features()&8u)!=0);
 }
 QwenIqQ8Dot qwen_iq_q8_dot(std::uint32_t type){
     if(type==16)return &qwen_iq2xxs_dot_q8_k_vnni512;
@@ -5006,6 +5049,13 @@ std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool 
     return rows?"q5k_grouped_swiglu_rows":"q5k_grouped_swiglu";
 }
 
+// Whether a gateless relu² grouped kernel exists for this up type (NVFP4
+// has none), so Nemotron's experts only go to the GPU where it can run them.
+bool nemotron_relu2_supported(std::uint32_t type) {
+    return !qwen_grouped_expert_kernel(type, "_grouped_relu2").empty() ||
+           type == 8 || type == 12 || type == 13 || type == 14;
+}
+
 std::string nemotron_grouped_relu2_name(std::uint32_t type, bool rows) {
     const char* suffix = rows ? "_grouped_relu2_rows" : "_grouped_relu2";
     auto iq = qwen_grouped_expert_kernel(type, suffix);
@@ -5103,6 +5153,9 @@ bool qwen_gpu_experts_executable(const FlyweightV2QwenRuntime& runtime) {
         for(int role = 0; role < roles; ++role)
             if(!qwen_gpu_expert_type_supported(runtime.model->tensors[layer.expert_tensors[role]].type))
                 return false;
+        if(runtime.nemotron&&
+           !nemotron_relu2_supported(runtime.model->tensors[layer.expert_tensors[0]].type))
+            return false;
     }
     return true;
 }
@@ -5395,14 +5448,24 @@ void nemotron_cpu_moe(
     const auto up_bytes=up_tensor.size/experts,down_bytes=down_tensor.size/experts;
     const auto*up_base=tensor_data(*runtime.model,up_tensor);
     const auto*down_base=tensor_data(*runtime.model,down_tensor);
+    // The up projection takes the latent stream as Q8_K, as IQ1_S/IQ3_S
+    // gate/up do in qwen_cpu_moe and as llama.cpp's CPU dot does; on Bolt
+    // (bench_kernel_quality, 7 prompts x 256 tokens against all-float) it
+    // agrees 99.6% teacher-forced, inside the 99.3% of the float GPU kernels.
+    // The down input is relu² output, whose squared tails a 7-bit block scale
+    // flattens: Q8_K there moved the median first greedy divergence from
+    // token ~100 to 12, so it stays float like prefill's down projection
+    // unless FLYWEIGHT_NEMOTRON_Q8_DOWN=1 asks for it.
     static const char* q8_setting = std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
     static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
-    const bool use_iq_q8_up = qwen_iq_q8_admitted(up_tensor.type)
+    static const char* q8_down_setting = std::getenv("FLYWEIGHT_NEMOTRON_Q8_DOWN");
+    const bool use_iq_q8_up = nemotron_iq_q8_admitted(up_tensor.type)
         && expert_in % 256 == 0
         && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
         && !(q8_setting && q8_setting[0] == '0');
-    const bool use_iq_q8_down = qwen_iq_q8_admitted(down_tensor.type)
+    const bool use_iq_q8_down = nemotron_iq_q8_admitted(down_tensor.type)
         && expert_ff % 256 == 0
+        && q8_down_setting && q8_down_setting[0] == '1'
         && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
         && !(q8_setting && q8_setting[0] == '0');
     std::vector<QwenQ8KBlock> input_q8, activated_q8;
@@ -5677,6 +5740,9 @@ void nemotron_cpu_moe_rows(
         for(int rank=0;rank<top_k;++rank){
             const int route=row*top_k+rank;
             const float weight=weights[route];
+            // A zero weight is a route the GPU took or the gather skipped;
+            // its route_outputs slice was never written this call.
+            if(weight==0.0f)continue;
             const float*values=route_outputs+static_cast<std::size_t>(route)*expert_in;
             for(int channel=0;channel<expert_in;++channel)output[channel]+=weight*values[channel];
         }
@@ -16617,8 +16683,10 @@ int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->layers=static_cast<std::uint32_t>(runtime->layers.size());
     std::uint32_t pinned_layers=0;
     for(std::size_t index=0;index<runtime->layers.size();++index){
-        if(runtime->layers[index].dense_ffn)++out->dense_ffn_layers;
-        else ++out->moe_layers;
+        const auto&plan=runtime->layers[index];
+        // Nemotron H's Mamba-2 and attention blocks are neither.
+        if(plan.dense_ffn)++out->dense_ffn_layers;
+        else if(!runtime->nemotron||plan.expert_count)++out->moe_layers;
         if(index<runtime->whole_expert_layer_slots.size()&&
            runtime->whole_expert_layer_slots[index]>=0)++pinned_layers;
     }
@@ -16627,8 +16695,8 @@ int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,Flyweigh
         ?std::numeric_limits<std::uint32_t>::max():pinned_layers;
     out->parallel_sequences=static_cast<std::uint32_t>(slots);
     out->expert_cache_slots=runtime->expert_slots.size();
-    out->expert_bundles=static_cast<std::uint64_t>(out->moe_layers)*
-        runtime->model->config.expert_count;
+    out->expert_bundles=runtime->nemotron?qwen_cache_expert_total(*runtime):
+        static_cast<std::uint64_t>(out->moe_layers)*runtime->model->config.expert_count;
     out->context_limit=runtime->options.context_limit;
     out->cache_type_k=runtime->options.cache_type_k;
     out->cache_type_v=runtime->options.cache_type_v;
@@ -16642,7 +16710,12 @@ int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->swa_layers=static_cast<uint32_t>(std::count_if(runtime->layers.begin(),runtime->layers.end(),[](const QwenLayerPlan&layer){return layer.attention_window!=0;}));
     out->sliding_window=runtime->model->config.sliding_window;
     out->swa_full=runtime->options.swa_full?1:0;
-    out->deltanet_layers=out->layers-out->attention_layers;
+    // The recurrent layers: Nemotron H's are its Mamba-2 blocks, beside
+    // MoE-only blocks that carry no state.
+    out->deltanet_layers=runtime->nemotron
+        ?static_cast<uint32_t>(std::count_if(runtime->layers.begin(),runtime->layers.end(),
+            [](const QwenLayerPlan&layer){return layer.mamba;}))
+        :out->layers-out->attention_layers;
     out->hidden_size=runtime->model->config.hidden_size;
     out->expert_count=runtime->model->config.expert_count;
     out->expert_used_count=runtime->model->config.expert_used_count;
@@ -21432,13 +21505,18 @@ void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
 // keep the smallest nucleus whose cumulative weight fraction reaches top_p,
 // after a hard cap of cap_k (0 = no extra cap), always keeping at least one.
 // Reorders selected/weights into descending-weight order over the kept set and
-// renormalizes the kept weights to sum to 1 (so the MoE combination preserves
-// scale). Returns the number of experts kept. No model-specific constants:
+// renormalizes the kept weights to the sum the full set had (so the MoE
+// combination preserves scale). Returns the number of experts kept. No model-specific constants:
 // this is a function of the router distribution alone, so it generalizes to
 // any MoE (Qwen, Gemma, DeepSeek, ...) and any expert quantization.
 static int apply_expert_router_policy(std::int32_t* selected, float* weights,
         int count, int cap_k, float top_p) {
     if(count<=0) return count;
+    // The kept weights take over the whole route set's sum, which is 1 only
+    // for a plain normalized router: Nemotron H's carry expert_weights_scale.
+    float original=0.0f;
+    for(int i=0;i<count;++i) original+=weights[i];
+    if(original<=0.0f) original=1.0f;
     if(cap_k>0 && cap_k<count) count=cap_k;
     std::array<int,256> order{};
     for(int i=0;i<count;++i) order[i]=i;
@@ -21457,7 +21535,7 @@ static int apply_expert_router_policy(std::int32_t* selected, float* weights,
     float sum=0.0f;
     for(int i=0;i<keep;++i) sum+=w[i];
     if(sum<=0.0f) sum=1.0f;
-    for(int i=0;i<keep;++i){ selected[i]=e[i]; weights[i]=w[i]/sum; }
+    for(int i=0;i<keep;++i){ selected[i]=e[i]; weights[i]=w[i]/sum*original; }
     return keep;
 }
 
@@ -22921,6 +22999,7 @@ static void qwen_run_hybrid_experts(
     const std::uint64_t scratch_table_reserve = device_align(
         256ull * (3 * sizeof(std::uint64_t) + 4 * sizeof(float)));
     auto& moe_prof = qwen_moe_profile();
+    const QwenRouteEpoch route_epoch(runtime);
     for (int rank = 0; rank < route_count; ++rank) {
         const int expert = selected[rank];
         if (expert < 0 || expert >= experts)
@@ -22941,6 +23020,7 @@ static void qwen_run_hybrid_experts(
             if (expert_policy.residency_may_change())
                 slot.last_used = history.last_used;
             record_expert_cache_hit(runtime, slot);
+            slot.route_epoch = runtime.expert_route_epoch;
             if (moe_profile_enabled()) moe_prof.access += moe_now() - t_access;
             const auto device_base =
                 runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
@@ -23096,6 +23176,7 @@ static void qwen_run_hybrid_experts(
         slot.valid = true;
         slot.native_valid = false;
         slot.last_used = ++runtime.expert_clock;
+        slot.route_epoch = runtime.expert_route_epoch;
         runtime.expert_residency[cache_key] = slot_index;
         const auto slot_base =
             runtime.expert_cache + slot_index * runtime.expert_slot_bytes;

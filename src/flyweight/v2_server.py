@@ -462,13 +462,16 @@ class NativeV2Tokenizer:
             value = config.get(field)
             if value is not None and value != 0xFFFFFFFF:
                 eos.append(int(value))
-        # Names still cover checkpoints whose metadata omits the ids.
+        # Names still cover checkpoints whose metadata omits the ids. `</s>`
+        # ends generation in llama.cpp whatever the metadata says (Nemotron H's
+        # vocabulary keeps it at 2 beside its <|im_end|> eos).
         for text in (
             "<|im_end|>",
             "<|ifm|im_end|>",
             "<|endoftext|>",
             "<turn|>",
             "<eos>",
+            "</s>",
         ):
             try:
                 eos.append(model.token_id(text))

@@ -17,6 +17,14 @@ forward, written from llama.cpp's src/models/nemotron-h.cpp,
 src/models/mamba-base.cpp (`build_mamba2_layer`) and the f32
 `ggml_ssm_conv` / `ggml_ssm_scan` kernels, so a test can pin the native
 runtime's semantics rather than only its self-consistency.
+
+`NemotronSpec(quantized=True)` stores the tensors the way the released Bolt
+GGUF does instead -- IQ2_XXS routed and shared experts, NVFP4 `ssm_in` /
+`ssm_out` with their out-of-line f32 `.scale`, Q8_0 attention, latent
+projections, embeddings and head -- at widths (multiples of 256) that admit
+the int8 and int16 expert kernels. The codes are random but well formed, and
+the reference runs on their decoded values, so the quantized kernels answer
+to the same float64 forward.
 """
 from __future__ import annotations
 
@@ -31,6 +39,9 @@ GGUF_BOOL = 7
 GGUF_STRING = 8
 GGUF_ARRAY = 9
 GGML_F32 = 0
+GGML_Q8_0 = 8
+GGML_IQ2_XXS = 16
+GGML_NVFP4 = 40
 
 ALIGNMENT = 32
 
@@ -73,17 +84,33 @@ class NemotronSpec:
     def __init__(
         self,
         *,
-        hidden: int = 64,
+        hidden: int | None = None,
         layers: int = 8,
-        moe_latent: int = 32,
-        shared_intermediate: int = 48,
+        moe_latent: int | None = None,
+        shared_intermediate: int | None = None,
+        quantized: bool = False,
+        expert_group_count: int = 0,
+        expert_scales: bool = False,
+        attention_bias: bool = False,
+        epsilon_key: str = "layer_norm_rms_epsilon",
     ):
-        self.hidden = hidden
+        # The quantized layout needs every IQ2_XXS row a whole 256-value
+        # block, and 256-multiples are what admit the int8/int16 kernels.
+        self.quantized = quantized
+        self.hidden = hidden or (256 if quantized else 64)
         self.layers = layers
-        self.moe_latent = moe_latent
-        self.shared_intermediate = shared_intermediate
-        self.expert_ff = {3: 24, 5: 32, 7: 28}
+        self.moe_latent = moe_latent or (256 if quantized else 32)
+        self.shared_intermediate = shared_intermediate or (256 if quantized else 48)
+        self.expert_ff = ({3: 256, 5: 512, 7: 256} if quantized
+                          else {3: 24, 5: 32, 7: 28})
         self.expert_count = {3: 10, 5: 12, 7: 8}
+        # Variants the runtime must refuse (grouped routing, per-expert
+        # scales, attention biases) or read (the epsilon under llama.cpp's
+        # fallback key) rather than silently run differently.
+        self.expert_group_count = expert_group_count
+        self.expert_scales = expert_scales
+        self.attention_bias = attention_bias
+        self.epsilon_key = epsilon_key
         self.expert_used = {3: 2, 5: 3, 7: 2}
         self.experts_scale = 2.5
 
@@ -110,30 +137,52 @@ def build_nemotron_gguf(
     """
     spec = spec or NemotronSpec()
     rng = np.random.default_rng(seed)
-    tensors: list[tuple[str, tuple[int, ...], np.ndarray]] = []
+    tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
     weights: dict[str, np.ndarray] = {}
 
-    def add(name: str, shape: tuple[int, ...], data: np.ndarray) -> None:
+    def add(name: str, shape: tuple[int, ...], data: np.ndarray,
+            kind: int = GGML_F32) -> None:
+        # `data` is the target values; a quantized kind stores them (or, for
+        # the codebook kinds, random codes of the same scale) and the
+        # reference sees exactly what the bytes decode to.
         data = np.ascontiguousarray(data, dtype=np.float32)
-        tensors.append((name, shape, data))
-        weights[name] = data
+        if not spec.quantized or kind == GGML_F32:
+            raw, decoded = data.tobytes(), data
+        else:
+            raw, decoded = _PACKERS[kind](data, rng)
+        tensors.append((name, shape, kind if spec.quantized else GGML_F32, raw))
+        weights[name] = decoded.reshape(data.shape)
 
-    def projection(name: str, inputs: int, outputs: int, scale: float = 0.2) -> None:
-        add(name, (inputs, outputs), rng.standard_normal((outputs, inputs)) * scale)
+    def projection(name: str, inputs: int, outputs: int, scale: float = 0.2,
+                   kind: int = GGML_Q8_0) -> None:
+        add(name, (inputs, outputs), rng.standard_normal((outputs, inputs)) * scale,
+            kind)
 
     def stacked(name: str, shape: tuple[int, ...]) -> None:
         # permuted: the GGUF dims are (in, out, experts), so the natural
         # (experts, out, in) write stores exactly that.
         data = rng.standard_normal((shape[2], shape[1], shape[0])) * 0.2
-        add(name, shape, data)
+        add(name, shape, data, GGML_IQ2_XXS)
 
     def vector(name: str, size: int, base: float = 1.0, scale: float = 0.1) -> None:
         add(name, (size,), base + rng.standard_normal(size) * scale)
 
-    def relu2_init(name: str, inputs: int, outputs: int) -> None:
+    def relu2_init(name: str, inputs: int, outputs: int,
+                   kind: int = GGML_Q8_0) -> None:
         # relu² carries no saturation: keep magnitudes small so the routed
         # sums stay near the linear regime.
-        add(name, (inputs, outputs), rng.standard_normal((outputs, inputs)) * 0.08)
+        add(name, (inputs, outputs), rng.standard_normal((outputs, inputs)) * 0.08,
+            kind)
+
+    def nvfp4_projection(name: str, inputs: int, outputs: int) -> None:
+        # NVFP4 with the out-of-line per-tensor weight_scale_2, as Bolt ships
+        # ssm_in / ssm_out; the reference folds the scale in.
+        projection(name, inputs, outputs, kind=GGML_NVFP4)
+        if spec.quantized:
+            scale = np.array([NVFP4_TENSOR_SCALE], dtype=np.float32)
+            tensors.append((name[:-len(".weight")] + ".scale", (1,), GGML_F32,
+                            scale.tobytes()))
+            weights[name] = weights[name] * NVFP4_TENSOR_SCALE
 
     projection("token_embd.weight", spec.hidden, len(VOCABULARY), scale=1.0)
     vector("output_norm.weight", spec.hidden)
@@ -142,7 +191,7 @@ def build_nemotron_gguf(
         prefix = f"blk.{layer}."
         vector(prefix + "attn_norm.weight", spec.hidden)
         if spec.is_mamba(layer):
-            projection(prefix + "ssm_in.weight", spec.hidden, D_IN_PROJ)
+            nvfp4_projection(prefix + "ssm_in.weight", spec.hidden, D_IN_PROJ)
             # {taps, channels}: the taps of one channel are contiguous, the
             # GGUF dims the same (kernel, inner + 2*n_group*d_state).
             add(prefix + "ssm_conv1d.weight", (CONV_KERNEL, CONV_CHANNELS),
@@ -162,7 +211,7 @@ def build_nemotron_gguf(
             chunk = D_INNER // N_GROUP
             add(prefix + "ssm_norm.weight", (chunk, N_GROUP),
                 (1.0 + rng.standard_normal((N_GROUP, chunk)) * 0.1))
-            projection(prefix + "ssm_out.weight", D_INNER, spec.hidden)
+            nvfp4_projection(prefix + "ssm_out.weight", D_INNER, spec.hidden)
         elif spec.is_attention(layer):
             projection(prefix + "attn_q.weight", spec.hidden,
                        ATTN_HEADS * ATTN_HEAD_DIM)
@@ -172,16 +221,19 @@ def build_nemotron_gguf(
                        ATTN_KV_HEADS * ATTN_HEAD_DIM)
             projection(prefix + "attn_output.weight",
                        ATTN_HEADS * ATTN_HEAD_DIM, spec.hidden)
+            if spec.attention_bias:
+                vector(prefix + "attn_q.bias", ATTN_HEADS * ATTN_HEAD_DIM, 0.0)
         else:
             experts = spec.expert_count[layer]
             ff = spec.expert_ff[layer]
-            relu2_init(prefix + "ffn_gate_inp.weight", spec.hidden, experts)
+            relu2_init(prefix + "ffn_gate_inp.weight", spec.hidden, experts,
+                       kind=GGML_F32)
             add(prefix + "exp_probs_b.bias", (experts,),
                 rng.standard_normal(experts) * 0.3)
             relu2_init(prefix + "ffn_up_shexp.weight", spec.hidden,
-                       spec.shared_intermediate)
+                       spec.shared_intermediate, kind=GGML_IQ2_XXS)
             relu2_init(prefix + "ffn_down_shexp.weight",
-                       spec.shared_intermediate, spec.hidden)
+                       spec.shared_intermediate, spec.hidden, kind=GGML_IQ2_XXS)
             if spec.has_latent(layer):
                 relu2_init(prefix + "ffn_latent_down.weight", spec.hidden,
                            spec.moe_latent)
@@ -196,6 +248,8 @@ def build_nemotron_gguf(
                         (spec.hidden, ff, experts))
                 stacked(prefix + "ffn_down_exps.weight",
                         (ff, spec.hidden, experts))
+            if spec.expert_scales:
+                vector(prefix + "ffn_up_exps.scale", experts)
 
     # Printable ASCII as single-character tokens, then the specials, so text
     # tokenizes with a two-entry merge table.
@@ -239,7 +293,7 @@ def build_nemotron_gguf(
         _kv(arch + ".attention.head_count", GGUF_UINT32,
             struct.pack("<I", ATTN_HEADS)),
         _kv(arch + ".attention.head_count_kv", GGUF_ARRAY, _uint_array(kv_heads)),
-        _kv(arch + ".attention.layer_norm_rms_epsilon", GGUF_FLOAT32,
+        _kv(arch + ".attention." + spec.epsilon_key, GGUF_FLOAT32,
             struct.pack("<f", 1e-5)),
         _kv(arch + ".ssm.conv_kernel", GGUF_UINT32,
             struct.pack("<I", CONV_KERNEL)),
@@ -256,17 +310,20 @@ def build_nemotron_gguf(
         _kv("tokenizer.ggml.eos_token_id", GGUF_UINT32, struct.pack("<I", eos)),
         _kv("general.alignment", GGUF_UINT32, struct.pack("<I", ALIGNMENT)),
     ]
+    if spec.expert_group_count:
+        metadata.append(_kv(arch + ".expert_group_count", GGUF_UINT32,
+                            struct.pack("<I", spec.expert_group_count)))
 
     infos = bytearray()
     payloads = bytearray()
-    for name, shape, data in tensors:
+    for name, shape, kind, raw in tensors:
         offset = len(payloads)
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
-        infos += struct.pack("<IQ", GGML_F32, offset)
-        raw = data.tobytes()
-        assert len(raw) == int(np.prod(shape)) * 4, name
+        infos += struct.pack("<IQ", kind, offset)
+        elements, block_elements, block_bytes = int(np.prod(shape)), *_BLOCKS[kind]
+        assert len(raw) == elements // block_elements * block_bytes, name
         payloads += raw
         payloads += b"\0" * ((-len(payloads)) % ALIGNMENT)
 
@@ -298,10 +355,122 @@ def _string_array(values) -> bytes:
     )
 
 
+# The ssm_in / ssm_out weight_scale_2. Not 1, so a dropped scale shows.
+NVFP4_TENSOR_SCALE = 0.75
+
+# (elements, bytes) per block of each stored kind.
+_BLOCKS = {GGML_F32: (1, 4), GGML_Q8_0: (32, 34), GGML_IQ2_XXS: (256, 66),
+           GGML_NVFP4: (64, 36)}
+
+
+def _pack_q8_0(data: np.ndarray, rng) -> tuple[bytes, np.ndarray]:
+    """GGML Q8_0: per 32 values an f16 d = amax/127 and 32 int8 codes."""
+    blocks = data.reshape(-1, 32).astype(np.float64)
+    d = (np.abs(blocks).max(axis=1) / 127.0).astype(np.float16)
+    d64 = d.astype(np.float64)[:, None]
+    codes = np.clip(np.round(np.divide(blocks, d64, out=np.zeros_like(blocks),
+                                       where=d64 > 0)), -127, 127).astype(np.int8)
+    raw = np.concatenate([d.view(np.uint8).reshape(-1, 2), codes.view(np.uint8)], axis=1)
+    return raw.tobytes(), (d64 * codes).astype(np.float32).reshape(data.shape)
+
+
+_IQ2XXS_TABLES: tuple[np.ndarray, np.ndarray] | None = None
+
+
+def _iq2xxs_tables() -> tuple[np.ndarray, np.ndarray]:
+    """iq2xxs_grid (256x8 magnitudes) and ksigns_iq2xs (128 sign bytes), parsed
+    from the runtime's header as qwen4exp_gguf_fixture does for IQ2_S; those
+    tables are llama.cpp's, checked entry for entry."""
+    global _IQ2XXS_TABLES
+    if _IQ2XXS_TABLES is None:
+        import re
+        header = (Path(__file__).resolve().parents[1] / "native" / "src"
+                  / "qwen_iq_tables.h").read_text()
+        grid_body = header.split("kIq2xxsGrid[256][8] = {", 1)[1].split("};", 1)[0]
+        signs_body = header.split("kIq2xxsSigns[128] = {", 1)[1].split("};", 1)[0]
+        grid = np.array([int(v) for v in re.findall(r"\d+", grid_body)], np.float64)
+        signs = np.array([int(v) for v in re.findall(r"\d+", signs_body)], np.uint8)
+        assert grid.size == 256 * 8 and signs.size == 128
+        _IQ2XXS_TABLES = grid.reshape(256, 8), signs
+    return _IQ2XXS_TABLES
+
+
+def _pack_iq2_xxs(data: np.ndarray, rng) -> tuple[bytes, np.ndarray]:
+    """GGML IQ2_XXS: per 256 values an f16 d, then per 32 values four grid
+    indices and a word of four 7-bit sign selectors under a 4-bit scale;
+    value = d * (0.5 + scale) * 0.25 * grid * sign. The codes are random --
+    any well-formed block serves -- with d set so each block keeps the rms of
+    the values it stands for."""
+    grid, signs = _iq2xxs_tables()
+    blocks = data.reshape(-1, 256).astype(np.float64)
+    count = len(blocks)
+    indices = rng.integers(0, 256, size=(count, 8, 4))
+    selectors = rng.integers(0, 128, size=(count, 8, 4))
+    scales = rng.integers(0, 16, size=(count, 8))
+    negate = (signs[selectors][..., None] >> np.arange(8)) & 1
+    unit = ((0.5 + scales)[:, :, None, None] * 0.25 * grid[indices]
+            * np.where(negate == 1, -1.0, 1.0)).reshape(count, 256)
+    target = np.sqrt(np.mean(blocks * blocks, axis=1))
+    d = (target / np.sqrt(np.mean(unit * unit, axis=1))).astype(np.float16)
+    decoded = d.astype(np.float64)[:, None] * unit
+    words = (scales.astype(np.uint32) << 28) | sum(
+        selectors[:, :, lane].astype(np.uint32) << (7 * lane) for lane in range(4))
+    subs = np.concatenate([indices.astype(np.uint8),
+                           words.astype("<u4")[..., None].view(np.uint8)], axis=2)
+    raw = np.concatenate([d.view(np.uint8).reshape(count, 2),
+                          subs.reshape(count, 64)], axis=1)
+    return raw.tobytes(), decoded.astype(np.float32).reshape(data.shape)
+
+
+# ggml's kvalues_mxfp4 (twice E2M1) and ggml_ue4m3_to_fp32 (which halves), so
+# the decode below is llama.cpp's dequantize_row_nvfp4 rather than ours.
+_MXFP4_VALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
+                         np.float64)
+
+
+def _ue4m3(byte: int) -> float:
+    if byte in (0, 0x7F):
+        return 0.0
+    exponent, mantissa = (byte >> 3) & 0xF, byte & 7
+    raw = mantissa * 2.0 ** -9 if exponent == 0 else (1 + mantissa / 8) * 2.0 ** (exponent - 7)
+    return raw * 0.5
+
+
+_UE4M3 = np.array([_ue4m3(byte) for byte in range(0x80)])
+
+
+def _pack_nvfp4(data: np.ndarray, rng) -> tuple[bytes, np.ndarray]:
+    """GGML NVFP4: per 64 values four E4M3 scales (one per 16) and 32 bytes of
+    split-half nibbles (byte j of a sub-block: value j low, j+8 high). Random
+    nibbles under the positive scale nearest each sub-block's rms, divided by
+    the tensor scale the caller applies on top."""
+    subs = data.reshape(-1, 4, 16).astype(np.float64)
+    nibbles = rng.integers(0, 16, size=subs.shape)
+    unit_rms = float(np.sqrt(np.mean(_MXFP4_VALUES ** 2)))
+    want = np.sqrt(np.mean(subs * subs, axis=2)) / unit_rms / NVFP4_TENSOR_SCALE
+    candidates = np.arange(1, 0x7F)
+    scale_bytes = candidates[np.abs(_UE4M3[candidates][None, None, :]
+                                    - want[..., None]).argmin(axis=2)]
+    decoded = _MXFP4_VALUES[nibbles] * _UE4M3[scale_bytes][..., None]
+    packed = (nibbles[..., :8] | (nibbles[..., 8:] << 4)).astype(np.uint8)
+    raw = np.concatenate([scale_bytes.astype(np.uint8),
+                          packed.reshape(len(subs), 32)], axis=1)
+    return raw.tobytes(), decoded.astype(np.float32).reshape(data.shape)
+
+
+_PACKERS = {GGML_Q8_0: _pack_q8_0, GGML_IQ2_XXS: _pack_iq2_xxs, GGML_NVFP4: _pack_nvfp4}
+
+
 def reference_greedy(
-    spec: NemotronSpec, weights: dict[str, np.ndarray], prompt: list[int], count: int
+    spec: NemotronSpec, weights: dict[str, np.ndarray], prompt: list[int], count: int,
+    margins: list[float] | None = None,
 ) -> list[int]:
-    """Greedy continuation of `prompt` by a float64 forward pass."""
+    """Greedy continuation of `prompt` by a float64 forward pass.
+
+    `margins`, when given, collects each produced token's lead over the
+    runner-up logit: a quantized kernel's activation rounding may only be
+    trusted to keep a greedy step whose lead is wide.
+    """
     w = {name: value.astype(np.float64) for name, value in weights.items()}
     eps = 1e-5
 
@@ -436,6 +605,9 @@ def reference_greedy(
                 y = moe(layer, h)
             x = x + y
         logits = w["output.weight"] @ rms(x, w["output_norm.weight"])
+        if margins is not None and position >= len(prompt) - 1:
+            top = np.sort(logits)[-2:]
+            margins.append(float(top[1] - top[0]))
         return int(np.argmax(logits))
 
     produced: list[int] = []
