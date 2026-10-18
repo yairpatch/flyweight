@@ -18,7 +18,7 @@ split between the two, and the runtime measures what fits rather than asking.
 | Laguna 2.1 | GGUF | Per-head attention gate; no MTP |
 | Muse Glimmer | GGUF | Channel-tagged reasoning; native ATEM tool calls; no speculative decoding |
 | LFM2 / LFM2-MoE (LFM2.5) | GGUF | Gated short-conv + GQA hybrid; native pythonic tool calls; no speculative decoding |
-| Nemotron 3.5 Bolt (`nemotron_h_moe`) | GGUF | Mamba-2 + GQA + latent-MoE hybrid; routed experts on the CPU; no speculative decoding |
+| Nemotron 3.5 Bolt (`nemotron_h_moe`) | GGUF | Mamba-2 + GQA + latent-MoE hybrid; routed experts on the CPU; speculative decoding through NVIDIA's DFlash drafter |
 
 Image generation with [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
 or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (RGBA out)
@@ -453,8 +453,9 @@ which, listing sizes and marking cached ones; `--quant` or
 | Qwen (all) | `--mtp-drafts N` with the checkpoint's draft block or a `--mtp-model` overlay. Drafting is trialled against plain decode and kept only when it wins |
 | DeepSeek-V4-Flash | `--mtp-model` pointing at the DSpark draft GGUF |
 | BailingMoE3 | draft block loads; the server does not drive it yet |
+| Nemotron H | `--mtp-model` pointing at the DFlash drafter GGUF (`dflash-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf`), `--mtp-drafts N` drafts per round (default 3): 10-24% faster decode on Bolt (81-86% of drafts accepted). `FLYWEIGHT_LOOKUP_DRAFTS` works too |
 | Qwen without a draft block | `FLYWEIGHT_LOOKUP_DRAFTS=N` (up to 7): prompt-lookup self-speculation, worth 10-15% on code, neutral on prose |
-| Gemma 4, Laguna, Muse Glimmer, K2-Horizon, LFM2, Nemotron H | none |
+| Gemma 4, Laguna, Muse Glimmer, K2-Horizon, LFM2 | none |
 
 Every verified token passes through the request's own sampler, so a
 drafting request answers as a non-drafting one would.

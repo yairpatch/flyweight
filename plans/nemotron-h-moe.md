@@ -96,7 +96,10 @@ Plus `down_shexp(relu²(up_shexp(h)))`.
   MoE blocks at their own expert counts, `resident` packs every block's
   experts. NVFP4 experts stay on the CPU (no relu² kernel). Grouped routing,
   per-expert `ffn_*_exps.scale` and attention biases are refused at load.
-  MTP, lookup drafts and multi-slot batched decode are off.
+  Multi-slot batched decode is off. Speculative rounds run from lookup
+  drafts or from NVIDIA's DFlash drafter (`--mtp-model`, see
+  plans/nemotron-dflash.md), verified as decode-routine rows and rolled back
+  through the Mamba-2 fold.
 
 ## Numbers (5070 Ti Laptop 12 GB, 9955HX, 2026-10-18)
 
@@ -141,6 +144,8 @@ in 1086, a top-2 swap at margin 0.41). A 2-row verify drops from 60 to 44 ms in
 2. Vision: upstream runs Bolt as a VL model (`--mmproj`, RADIO encoder,
    images and video); flyweight has no Nemotron vision path.
 3. The MTP draft layer: llama.cpp loads it (`nextn`), this GGUF omits it.
+   The DFlash drafter covers speculation; its ceiling is the verify row cost
+   (plans/nemotron-dflash.md).
 
 ## Tests
 

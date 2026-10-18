@@ -120,6 +120,21 @@ bool timing_enabled() {
 // a layer can never change execution path mid-token.
 struct FlyweightV2QwenRuntime;
 void qwen_absorb_registration(FlyweightV2QwenRuntime& runtime);
+// The DFlash drafter (v2_dflash.inc).
+void qwen_dflash_plan(FlyweightV2QwenRuntime& runtime, std::uint32_t drafts);
+void qwen_dflash_mark_persistent(const FlyweightV2QwenRuntime& runtime,
+                                 std::vector<bool>& persistent, std::vector<bool>& preserve_bf16);
+void qwen_dflash_device_types(FlyweightV2QwenRuntime& runtime);
+std::uint64_t qwen_dflash_device_bytes(FlyweightV2QwenRuntime& runtime);
+void qwen_dflash_allocate(FlyweightV2QwenRuntime& runtime);
+void qwen_dflash_release(FlyweightV2QwenRuntime& runtime);
+void qwen_dflash_invalidate(FlyweightV2QwenRuntime& runtime);
+void qwen_dflash_inject(FlyweightV2QwenRuntime& runtime);
+std::uint32_t qwen_dflash_draft(FlyweightV2QwenRuntime& runtime, std::uint32_t id_last,
+                                std::uint32_t wanted, std::uint32_t* out);
+std::uint32_t qwen_dflash_probe(FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+                                float* logits, std::int32_t* candidates, float* scores,
+                                std::uint32_t* drafts);
 
 // Host RAM left unpinned when expert tensors are registered for direct paging.
 // Registration locks pages, so taking everything would trade the staging memcpy
@@ -332,6 +347,11 @@ struct Reader {
 // first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/runtime code.
 struct FlyweightV2Model : flyweight::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf", chat_template; flyweight::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors; std::unique_ptr<FlyweightV2Model> mtp_sidecar;
+    // A DFlash drafter attached through --mtp-model (llama.cpp's dflash arch
+    // with the LiLiCorr head). Its tensors are appended to `tensors` under a
+    // "dflash." prefix with their bytes left in this mapping; its own config
+    // (geometry, target_layers) stays on the sidecar.
+    std::unique_ptr<FlyweightV2Model> dflash_sidecar;
     // The mmproj vision tower attached beside a Qwen checkpoint, and the
     // `clip.*` keys parsed off whichever file carried them (the sidecar's own
     // `vision` is what the tower reads; the base model's stays absent).
@@ -957,6 +977,49 @@ struct QwenEngineTask {
     bool cancelled = false;
 };
 
+// The DFlash drafter's plan and device state (v2_dflash.inc). Tensor fields
+// index model->tensors (the sidecar's tensors, appended under "dflash.").
+struct QwenDflash {
+    struct Block {
+        std::uint64_t attn_norm = 0, attn_conv_proj = 0, attn_conv_base = 0, q = 0, k = 0,
+            v = 0, q_norm = 0, k_norm = 0, sinks = 0, o = 0, ffn_norm = 0,
+            ffn_conv_proj = 0, ffn_conv_base = 0, gate = 0, up = 0, down = 0;
+    };
+    struct Corrector {
+        std::uint64_t attn_norm = 0, in_proj = 0, in_proj_bias = 0, out = 0, out_bias = 0,
+            ffn_norm = 0, up = 0, up_bias = 0, down = 0, down_bias = 0;
+    };
+    // Geometry.
+    std::uint32_t hidden = 0, heads = 0, kv_heads = 0, head_dim = 0, ffn = 0,
+        block = 0, conv_group = 0, window = 0, ring_slots = 0, mask_token = 0,
+        features = 0, drafts = 0;
+    std::uint32_t width = 0, corrector_heads = 0, topk = 0, mlp = 0, factor = 0,
+        nodes = 0, slots = 0;
+    float epsilon = 1e-6f, freq_base = 10000.0f, vector_eps = 1e-4f, logit_scale = 8.0f;
+    // Tensors.
+    std::uint64_t fc = 0, enc_norm = 0, output_norm = 0;
+    std::vector<Block> blocks;
+    std::uint64_t token_proj = 0, token_proj_bias = 0, pass_proj = 0, pass_proj_bias = 0,
+        context_proj = 0, context_proj_bias = 0, feature_norm = 0, feature_norm_bias = 0,
+        feature_up = 0, feature_up_bias = 0, feature_down = 0, feature_down_bias = 0,
+        slot_embedding = 0, rank_embedding = 0, attention_bias = 0, corrector_norm = 0,
+        anchor_norm = 0, factor_input = 0, factor_input_bias = 0, out_head = 0,
+        out_head_bias = 0, in_head = 0, in_head_bias = 0, anchor_head = 0,
+        anchor_head_bias = 0;
+    std::vector<Corrector> correctors;
+    std::vector<std::uint64_t> tensors;       // every tensor the drafter reads
+    std::vector<std::uint64_t> requantized;   // 2-D bf16/f32 weights uploaded as Q8_0
+    // Device state: the per-layer context K/V ring (ring_slots positions each,
+    // position % ring_slots), its position tags, the last few injected
+    // fc+norm rows (the LiLiCorr anchor), and one workspace.
+    std::uint64_t ring_k = 0, ring_v = 0, ring_tags = 0, anchors = 0;
+    std::uint64_t workspace = 0, workspace_bytes = 0;
+    std::uint32_t inject_capacity = 0;
+    std::array<std::int64_t, 16> anchor_positions{};
+    // Counters.
+    std::uint64_t rounds = 0, drafted = 0, draft_nanoseconds = 0, injected_rows = 0;
+};
+
 struct FlyweightV2QwenRuntime {
     FlyweightV2Model* model = nullptr;
     bool gemma4 = false;
@@ -971,6 +1034,19 @@ struct FlyweightV2QwenRuntime {
     // activations, per-layer expert geometry.
     bool nemotron = false;
     std::uint32_t nemotron_moe_layers = 0;
+    // Target-feature capture for a DFlash drafter: the residual stream
+    // entering each listed block, every row of every forward, concatenated in
+    // list order into one feature row per token. capture_slot maps a layer to
+    // its place in the list (-1: not captured).
+    std::vector<int> capture_slot;
+    std::uint32_t capture_layers = 0;
+    std::uint64_t capture_features = 0;
+    std::uint32_t capture_rows_capacity = 0;
+    std::uint32_t capture_rows = 0;
+    std::uint64_t capture_position = 0;
+    // The DFlash drafter, when one is attached (its target layers are the
+    // capture list above).
+    std::unique_ptr<QwenDflash> dflash;
     // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
     // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
     // bookends in the forward paths and, at bring-up, disables CUDA graphs
@@ -2407,6 +2483,16 @@ static const std::vector<QwenImageSpan>& qwen_slot_spans(
 
 void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     qwen_vision_release(runtime);
+    if (runtime.dflash) {
+        if (runtime.stream) flyweight_gpu_stream_sync(runtime.stream);
+        qwen_dflash_release(runtime);
+    }
+    if (runtime.capture_features) {
+        if (runtime.stream) flyweight_gpu_stream_sync(runtime.stream);
+        flyweight_gpu_free(runtime.capture_features);
+        runtime.capture_features = 0;
+        runtime.capture_rows_capacity = 0;
+    }
     for (auto& task : runtime.engine_tasks) qwen_task_free_images(task);
     for (auto& task : runtime.engine_pending) qwen_task_free_images(task);
     // Stop the background registration before anything it writes to goes away.
@@ -2826,6 +2912,9 @@ int parse(FlyweightV2Model& m) {
         else if(suffix(".expert_shared_count"))target=&m.config.expert_shared_count;
         else if(suffix(".hash_layer_count"))target=&m.config.hash_layer_count;
         else if(suffix(".block_size"))target=&m.config.draft_block_size;
+        else if(suffix(".conv_kernel_size"))target=&m.config.dflash_conv_kernel;
+        else if(suffix(".conv_group_size"))target=&m.config.dflash_conv_group;
+        else if(key=="lilicorr.candidate_topk")target=&m.config.lilicorr_topk;
         else if(suffix(".embedding_length"))target=&m.config.hidden_size;
         else if(suffix(".embedding_length_per_layer_input"))target=&m.config.per_layer_embedding_size;
         else if(suffix(".block_count"))target=&m.config.layer_count;
@@ -2935,6 +3024,8 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=19 && key.compare(key.size()-19,19,".rope.freq_base_swa")==0 && (type==6 || type==12)) m.config.rope_freq_base_swa=read_float(type);
         else if (key.size()>=24 && key.compare(key.size()-24,24,".final_logit_softcapping")==0 && (type==6 || type==12)) m.config.final_logit_softcap=read_float(type);
         else if (key.size()>=15 && key.compare(key.size()-15,15,".rope.freq_base")==0 && (type==6 || type==12)) m.config.rope_freq_base=read_float(type);
+        else if (key=="lilicorr.vector_eps" && (type==6 || type==12)) m.config.lilicorr_vector_eps=read_float(type);
+        else if (key=="lilicorr.logit_scale" && (type==6 || type==12)) m.config.lilicorr_logit_scale=read_float(type);
         else if (key.size()>=20 && key.compare(key.size()-20,20,".rope.scaling.factor")==0 && (type==6 || type==12)) m.config.rope_scaling_factor=read_float(type);
         else if (key.size()>=30 && key.compare(key.size()-30,30,".rope.scaling.yarn_attn_factor")==0 && (type==6 || type==12)) m.config.yarn_attn_factor=read_float(type);
         else if (key.size()>=28 && key.compare(key.size()-28,28,".rope.scaling.yarn_beta_fast")==0 && (type==6 || type==12)) m.config.yarn_beta_fast=read_float(type);
@@ -12560,6 +12651,37 @@ int flyweight_v2_model_open(const char* path, FlyweightV2Model** out) { return g
         }
     }
     *out=m.release(); return 0; }); }
+// A DFlash drafter for a Nemotron H target. Only the LiLiCorr variant Bolt
+// ships is implemented: the DFlash2 selector, DSpark's Markov head and a
+// drafter with its own embeddings or head would each draft differently.
+static void attach_dflash_sidecar(FlyweightV2Model& m,std::unique_ptr<FlyweightV2Model> sidecar){
+    if(m.dflash_sidecar)throw std::runtime_error("a DFlash drafter is already attached");
+    if(m.architecture!="nemotron_h_moe")
+        throw std::runtime_error("DFlash drafters run beside Nemotron H (nemotron_h_moe) only; this target is "+m.architecture);
+    const auto& config=sidecar->config;
+    if(config.hidden_size!=m.config.hidden_size)
+        throw std::runtime_error("DFlash drafter width does not match the target");
+    if(config.target_layers.empty())throw std::runtime_error("DFlash drafter names no target layers");
+    for(const auto layer:config.target_layers)
+        if(layer>=m.config.layer_count)
+            throw std::runtime_error("DFlash drafter reads a target layer the model lacks");
+    auto has=[&](const char* name){
+        return std::any_of(sidecar->tensors.begin(),sidecar->tensors.end(),
+            [&](const Tensor& t){return t.name==name;});
+    };
+    if(!has("lilicorr.token_proj.weight"))
+        throw std::runtime_error("only the LiLiCorr DFlash drafter is implemented (no lilicorr.* tensors)");
+    for(const char* other:{"markov_w1.weight","selector_hidden.weight","token_embd.weight","output.weight","d2t"})
+        if(has(other))
+            throw std::runtime_error(std::string("DFlash drafter variant with ")+other+" is not implemented");
+    for(const auto& tensor:sidecar->tensors){
+        auto added=tensor;
+        added.name="dflash."+tensor.name;
+        if(!added.source)added.source=sidecar->data;
+        m.tensors.push_back(std::move(added));
+    }
+    m.dflash_sidecar=std::move(sidecar);
+}
 int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return guarded([&]{
     if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
     if(m->mtp_sidecar)throw std::runtime_error("an MTP sidecar is already attached");
@@ -12567,6 +12689,10 @@ int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return gu
     if(flyweight_v2_model_open(path,&opened)!=0)
         throw std::runtime_error(error.empty()?"failed to open MTP sidecar":error);
     std::unique_ptr<FlyweightV2Model>sidecar(opened);
+    if(sidecar->architecture=="dflash"){
+        attach_dflash_sidecar(*m,std::move(sidecar));
+        return 0;
+    }
     if(sidecar->mtp_layer==std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("MTP sidecar has no draft block");
     if(m->mtp_layer!=std::numeric_limits<std::uint32_t>::max()&&
@@ -16425,6 +16551,17 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         throw std::runtime_error(
             "--n-gpu-layers splits a MoE model's expert layers between GPU and CPU, "
             "which needs --expert-mode auto (or hybrid)");
+    // A DFlash drafter rides the prompt-lookup round (preset drafts) rather
+    // than the in-model MTP path: --mtp-drafts sets its draft count (default
+    // 3, llama.cpp's --spec-draft-n-max), FLYWEIGHT_DFLASH_DRAFTS overrides.
+    std::uint32_t dflash_drafts=0;
+    if(m->dflash_sidecar){
+        dflash_drafts=runtime->options.mtp_drafts?runtime->options.mtp_drafts:3;
+        if(const char*setting=std::getenv("FLYWEIGHT_DFLASH_DRAFTS"))
+            dflash_drafts=static_cast<std::uint32_t>(std::strtoul(setting,nullptr,10));
+        dflash_drafts=std::min<std::uint32_t>(dflash_drafts,7);
+        runtime->options.mtp_drafts=0;
+    }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(const char*lookup=std::getenv("FLYWEIGHT_LOOKUP_DRAFTS")){
         const auto value=std::strtoul(lookup,nullptr,10);
@@ -16458,6 +16595,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(lfm2&&runtime->options.mtp_drafts)throw std::runtime_error("LFM2 checkpoints carry no MTP draft block");
     if(nemotron&&runtime->options.mtp_drafts)
         throw std::runtime_error("native Nemotron H MTP is not implemented");
+    if(m->dflash_sidecar)runtime->lookup_drafts=dflash_drafts;
     // Speculative verification rewinds recurrent state through the DeltaNet
     // snapshot and fold machinery, which knows nothing of the short-conv ring.
     if(lfm2&&runtime->lookup_drafts){
@@ -16510,6 +16648,33 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     runtime->qwen4exp=qwen4exp;
     runtime->k2horizon=k2horizon;
     runtime->nemotron=nemotron;
+    // FLYWEIGHT_CAPTURE_LAYERS=2,19,...: the DFlash target layers whose input
+    // rows every forward records (see capture_slot).
+    if(const char*capture=std::getenv("FLYWEIGHT_CAPTURE_LAYERS")){
+        std::vector<int> layers;
+        for(const char*cursor=capture;*cursor;){
+            char*end=nullptr;
+            const long value=std::strtol(cursor,&end,10);
+            if(end==cursor)break;
+            layers.push_back(static_cast<int>(value));
+            cursor=*end==','?end+1:end;
+        }
+        runtime->capture_slot.assign(m->config.layer_count,-1);
+        for(std::size_t index=0;index<layers.size();++index){
+            if(layers[index]<0||layers[index]>=static_cast<int>(m->config.layer_count))
+                throw std::runtime_error("FLYWEIGHT_CAPTURE_LAYERS names a layer the model lacks");
+            runtime->capture_slot[layers[index]]=static_cast<int>(index);
+        }
+        runtime->capture_layers=static_cast<std::uint32_t>(layers.size());
+    }
+    if(m->dflash_sidecar&&dflash_drafts){
+        // The drafter's target layers are the capture list.
+        const auto& targets=m->dflash_sidecar->config.target_layers;
+        runtime->capture_slot.assign(m->config.layer_count,-1);
+        for(std::size_t index=0;index<targets.size();++index)
+            runtime->capture_slot[targets[index]]=static_cast<int>(index);
+        runtime->capture_layers=static_cast<std::uint32_t>(targets.size());
+    }
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
     else if(muse)build_muse_glimmer_plan(*runtime);
@@ -16519,6 +16684,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     else if(nemotron)build_nemotron_plan(*runtime);
     else build_qwen_plan(*runtime);
     qwen_load_nvfp4_weight_scales(*runtime);
+    if(m->dflash_sidecar&&dflash_drafts)qwen_dflash_plan(*runtime,dflash_drafts);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
     // flyweight::v2::attention so they can be pinned by a contract test.
@@ -16888,6 +17054,7 @@ static void qwen_reset_active_slot(FlyweightV2QwenRuntime& runtime) {
     runtime.cancelled = false;
     runtime.cache_admission_enabled = true;
     qwen_unfreeze_expert_residency(runtime);
+    qwen_dflash_invalidate(runtime);
 }
 int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
@@ -18033,6 +18200,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 persistent[layer.static_tensors[slot]]=true;
             }
         }
+        qwen_dflash_mark_persistent(*runtime,persistent,preserve_bf16);
         if(runtime->options.mtp_drafts){
             for(auto tensor:runtime->mtp_layer_plan.static_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
             for(auto tensor:runtime->mtp_special_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
@@ -18330,6 +18498,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // type and would overwrite the flip -- and before the arena is sized
         // below, which reads the effective size.
         for(const auto index:conv_f32_tensors)runtime->device_tensor_types[index]=0;
+        qwen_dflash_device_types(*runtime);
         // Aliased tensors are read straight out of the GGUF mapping and need no
         // arena space; see qwen_alias_static_tensor.
         for(std::uint64_t index=0;index<persistent.size();++index)if(persistent[index]&&!qwen_alias_static_tensor(*runtime,index))runtime->static_arena_bytes+=device_align(qwen_device_tensor_size(*runtime,index));
@@ -18587,7 +18756,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             runtime->vision_workspace_bytes=vision_workspace_reservation(
                 runtime->model->vision_sidecar->vision,
                 runtime->options.vision_max_tokens);
-        const auto base_total=runtime->vision_workspace_bytes+runtime->static_arena_bytes+runtime->workspace_bytes+runtime->slots_state_bytes+runtime->expert_staging_bytes+runtime->mova_workspace_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
+        const auto base_total=qwen_dflash_device_bytes(*runtime)+runtime->vision_workspace_bytes+runtime->static_arena_bytes+runtime->workspace_bytes+runtime->slots_state_bytes+runtime->expert_staging_bytes+runtime->mova_workspace_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
         const char* nvfp4_persistent_env =
             std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
@@ -18978,6 +19147,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                &runtime->prefill_stream_mirror)!=0)||
            (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
+        if(runtime->capture_layers){
+            runtime->capture_rows_capacity=runtime->forward_rows_capacity;
+            if(flyweight_gpu_alloc(static_cast<std::uint64_t>(runtime->capture_rows_capacity)*
+                   runtime->capture_layers*runtime->model->config.hidden_size*sizeof(float),
+                   &runtime->capture_features)!=0)
+                throw std::runtime_error("failed to allocate the DFlash target-feature capture");
+        }
+        qwen_dflash_allocate(*runtime);
         // Sized above, with the expert cache, so this required window cannot
         // land after the cache has already taken the budget.
         if(runtime->turbo_kv_stage_bytes&&
@@ -21873,6 +22050,42 @@ int flyweight_v2_qwen_imatrix_entry(
     return 0;
 });}
 
+int flyweight_v2_qwen_runtime_captured_features(
+    FlyweightV2QwenRuntime* runtime, float* output, uint32_t capacity_rows,
+    uint32_t* rows, uint32_t* layers, uint64_t* position
+){return guarded([&]{
+    if(!runtime||!rows||!layers||!position)throw std::runtime_error("invalid captured-feature arguments");
+    *layers=runtime->capture_layers;
+    *rows=runtime->capture_layers?runtime->capture_rows:0;
+    *position=runtime->capture_position;
+    if(!output||!*rows)return 0;
+    const auto count=std::min(*rows,capacity_rows);
+    if(flyweight_gpu_stream_sync(runtime->stream)!=0||
+       flyweight_gpu_download(output,runtime->capture_features,
+           static_cast<std::uint64_t>(count)*runtime->capture_layers*
+               runtime->model->config.hidden_size*sizeof(float),runtime->stream)!=0||
+       flyweight_gpu_stream_sync(runtime->stream)!=0)
+        throw std::runtime_error("captured-feature download failed");
+    return 0;
+});}
+int flyweight_v2_qwen_runtime_dflash_probe(
+    FlyweightV2QwenRuntime* runtime, uint32_t token, float* logits, uint64_t logits_capacity,
+    int32_t* candidates, uint64_t candidates_capacity, float* scores, uint64_t scores_capacity,
+    uint32_t* drafts, uint32_t drafts_capacity, uint32_t* count, uint32_t* block, uint32_t* topk
+){return guarded([&]{
+    if(!runtime||!count||!block||!topk)throw std::runtime_error("invalid DFlash probe arguments");
+    if(!runtime->dflash)throw std::runtime_error("no DFlash drafter is attached");
+    const auto&d=*runtime->dflash;
+    *block=d.block;*topk=d.topk;*count=0;
+    if(!logits)return 0;
+    const std::uint64_t vocabulary=runtime->model->config.vocabulary_size;
+    if(logits_capacity<d.slots*vocabulary||!candidates||candidates_capacity<d.nodes||
+       !scores||scores_capacity<static_cast<std::uint64_t>(d.slots)*d.topk*d.topk||
+       !drafts||drafts_capacity<d.drafts)
+        throw std::runtime_error("DFlash probe buffers are too small");
+    *count=qwen_dflash_probe(*runtime,token,logits,candidates,scores,drafts);
+    return 0;
+});}
 int flyweight_v2_qwen_runtime_dump_kv(
     FlyweightV2QwenRuntime* runtime, uint32_t layer_index, const char* path
 ){return guarded([&]{
@@ -21983,6 +22196,31 @@ bool qwen_nvfp4_q8_enabled() {
 // byte-identical), with both outputs equally coherent -- and it buys 2.2x
 // prefill (117 -> 263 tok/s at 1024 on the SM120 laptop), which is the
 // headline number for the serving workloads this checkpoint family targets.
+// DFlash target features (capture_slot): copy `rows` rows of the residual
+// stream entering `layer_number` into its slice of feature rows
+// [row_offset, row_offset+rows).
+void qwen_capture_layer_rows(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer_number,
+    std::uint64_t hidden, int rows, int row_offset, std::uint64_t stream
+) {
+    if (layer_number >= runtime.capture_slot.size()) return;
+    const int slot = runtime.capture_slot[layer_number];
+    if (slot < 0 || !runtime.capture_features) return;
+    if (static_cast<std::uint32_t>(row_offset + rows) > runtime.capture_rows_capacity)
+        throw std::runtime_error("DFlash target-feature capture overflow");
+    int width = static_cast<int>(runtime.model->config.hidden_size);
+    long long source_stride = width;
+    long long destination_stride = static_cast<long long>(runtime.capture_layers) * width;
+    std::uint64_t destination = runtime.capture_features +
+        (static_cast<std::uint64_t>(row_offset) * destination_stride +
+         static_cast<std::uint64_t>(slot) * width) * sizeof(float);
+    void* args[] = {&hidden, &destination, &width, &rows, &source_stride, &destination_stride};
+    if (flyweight_gpu_launch_named("qwen_copy_rows_strided",
+            (static_cast<std::uint32_t>(width) + 255) / 256,
+            static_cast<std::uint32_t>(rows), 256, 0, stream, args) != 0)
+        throw std::runtime_error("DFlash target-feature capture failed");
+}
+
 int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
     static const int override_rows = [] {
         const char* setting = std::getenv("FLYWEIGHT_NVFP4_PREFILL_TC");
@@ -21992,6 +22230,9 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
     return runtime.fp4_tensor_cores ? 16 : 0;
 }
 
+extern "C++" {
+#include "v2_dflash.inc"
+}  // extern "C++"
 #include "v2_mtp_verifier.inc"
 #include "v2_vision.inc"
 #include "v2_diffusion.inc"
@@ -23618,6 +23859,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         qwen_freeze_expert_residency(*runtime);
     qwen_absorb_registration(*runtime);
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
+    runtime->capture_rows=1;
+    runtime->capture_position=runtime->position;
     const auto expert_phase=runtime->cache_admission_enabled
         ?flyweight::v2::ExpertExecutionPhase::decode
         :flyweight::v2::ExpertExecutionPhase::prefill;
@@ -24106,6 +24349,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         const bool front_graph=runtime->qwen4exp&&!layer.attention
             &&!layer.dense_ffn&&graph_eligible;
         bool front_done=false;
+        if(runtime->capture_layers)
+            qwen_capture_layer_rows(*runtime,layer_number,hidden,1,0,launch_stream);
         if(runtime->qwen4exp){
             if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
                 ple_block(layer);
@@ -25253,6 +25498,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     if(runtime->cuda_profile)profile_record(runtime->cuda_lm_end);
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
     if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
+    // Behind the token's download, so the host wakes with the token while the
+    // stream finishes the drafter's context row.
+    qwen_dflash_inject(*runtime);
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_end);
     const auto tail_wait_started=(timing_enabled()||kernel_profile)?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
@@ -25863,6 +26111,9 @@ static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t ta
     // verifier guards the text -- so starting over costs only draft work.
     runtime.mtp_cache_tokens = 0;
     runtime.mtp_has_target_hidden = false;
+    // The DFlash context ring is a runtime global too, and its rows are the
+    // other slot's history.
+    qwen_dflash_invalidate(runtime);
     runtime.active_sequence = target;
 }
 
@@ -26214,9 +26465,10 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         // The restore displaced the live conversation without a slot switch
         // (the one-slot case), so the switch-time MTP invalidation never
         // runs; drafts would otherwise continue from the displaced
-        // conversation's cache.
+        // conversation's cache. The DFlash context ring likewise.
         runtime.mtp_cache_tokens = 0;
         runtime.mtp_has_target_hidden = false;
+        qwen_dflash_invalidate(runtime);
     } else {
         seq.position = e.position;
         seq.last_output_token = e.last_output_token;
@@ -28434,7 +28686,9 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
                 wanted=static_cast<uint32_t>(std::min<uint64_t>(
                     qwen_spec_drafts(*runtime),max_tokens-emitted-1));
                 if(!runtime->options.mtp_drafts){
-                    wanted=qwen_lookup_draft(*runtime,next_token,wanted,lookup.data());
+                    wanted=runtime->dflash
+                        ?qwen_dflash_draft(*runtime,next_token,wanted,lookup.data())
+                        :qwen_lookup_draft(*runtime,next_token,wanted,lookup.data());
                     if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
                 }
             }
@@ -29880,7 +30134,9 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                         qwen_spec_drafts(*runtime),task->max_tokens-task->emitted-1
                     ));
                     if(!runtime->options.mtp_drafts){
-                        wanted=qwen_lookup_draft(*runtime,task->next_token,wanted,lookup.data());
+                        wanted=runtime->dflash
+                            ?qwen_dflash_draft(*runtime,task->next_token,wanted,lookup.data())
+                            :qwen_lookup_draft(*runtime,task->next_token,wanted,lookup.data());
                         if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
                     }
                 }

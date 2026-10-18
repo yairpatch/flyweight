@@ -123,6 +123,12 @@ struct ModelConfig {
         ple_head_vocab_sizes;
     std::vector<std::uint32_t> target_layers;
     std::uint32_t draft_block_size=0;
+    // DFlash drafter geometry (llama.cpp's dflash arch): the depthwise conv's
+    // taps and channel group, and the LiLiCorr re-ranker's candidates per
+    // slot, l2-norm floor and score scale. Zero / 0.0f where the keys are
+    // absent.
+    std::uint32_t dflash_conv_kernel=0, dflash_conv_group=0, lilicorr_topk=0;
+    float lilicorr_vector_eps=0.0f, lilicorr_logit_scale=0.0f;
     // Per-layer SwiGLU clamp bounds, routed experts and shared expert.
     std::vector<float> swiglu_clamp_exp, swiglu_clamp_shexp;
     // Diffusion components loaded from a diffusers directory (Z-Image's

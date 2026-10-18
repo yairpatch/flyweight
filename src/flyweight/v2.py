@@ -3232,6 +3232,63 @@ class V2QwenRuntime:
         result.frombytes(bytes(output))
         return result
 
+    def captured_features(self, capacity: int = 4096):
+        """The last forward's DFlash target features (FLYWEIGHT_CAPTURE_LAYERS):
+        (array [rows, layers*hidden] float32, position of the first row)."""
+        lib = self._lib
+        fn = lib.flyweight_v2_qwen_runtime_captured_features
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+                       ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+                       ctypes.POINTER(ctypes.c_uint64)]
+        fn.restype = ctypes.c_int
+        rows, layers, position = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint64()
+        self.model._check(fn(self._handle, None, 0, ctypes.byref(rows), ctypes.byref(layers), ctypes.byref(position)))
+        width = layers.value * int(str(self.model.config["hidden_size"]))
+        count = min(rows.value, capacity)
+        import numpy as np
+        out = np.empty((count, width), dtype=np.float32)
+        if count:
+            self.model._check(fn(self._handle, out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                 count, ctypes.byref(rows), ctypes.byref(layers), ctypes.byref(position)))
+        return out, position.value
+
+    def dflash_probe(self, token: int):
+        """One DFlash draft at the current position after `token`: a dict with
+        the draft block's `logits` [block-1, vocab], LiLiCorr `candidates`
+        [block-1, topk], lattice `scores` [block-1, topk, topk] and the walk's
+        `drafts`, or None when the drafter has no anchor row yet."""
+        import numpy as np
+        lib = self._lib
+        fn = lib.flyweight_v2_qwen_runtime_dflash_probe
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                       ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                       ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64,
+                       ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                       ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                       ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+                       ctypes.POINTER(ctypes.c_uint32)]
+        fn.restype = ctypes.c_int
+        count, block, topk = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
+        self.model._check(fn(self._handle, int(token), None, 0, None, 0, None, 0, None, 0,
+                             ctypes.byref(count), ctypes.byref(block), ctypes.byref(topk)))
+        slots, k = block.value - 1, topk.value
+        vocabulary = int(str(self.model.config["vocabulary_size"]))
+        logits = np.empty((slots, vocabulary), dtype=np.float32)
+        candidates = np.empty((slots, k), dtype=np.int32)
+        scores = np.empty((slots, k, k), dtype=np.float32)
+        drafts = np.empty(slots, dtype=np.uint32)
+        self.model._check(fn(
+            self._handle, int(token),
+            logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), logits.size,
+            candidates.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), candidates.size,
+            scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), scores.size,
+            drafts.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), drafts.size,
+            ctypes.byref(count), ctypes.byref(block), ctypes.byref(topk)))
+        if not count.value:
+            return None
+        return {"logits": logits, "candidates": candidates, "scores": scores,
+                "drafts": [int(t) for t in drafts[:count.value]]}
+
     def dump_kv(self, layer: int, path: str) -> None:
         """Write one attention layer's live KV window for bench_turboquant.
 
