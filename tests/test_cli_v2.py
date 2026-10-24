@@ -198,7 +198,16 @@ class NativeV2BenchmarkTests(unittest.TestCase):
 
     def test_gpu_layers_takes_llama_cpp_spellings(self) -> None:
         for command in ("generate", "benchmark-v2", "serve-v2"):
-            for value, expected in (("auto", None), ("all", 1 << 30), ("999", 999), ("0", 0)):
+            for value, expected in (
+                ("auto", None),
+                ("all", 1 << 30),
+                ("999", 999),
+                ("0", 0),
+                ("1-10", "1-10"),
+                ("1,3,8,10", "1,3,8,10"),
+                ("1-5,8,10-12", "1-5,8,10-12"),
+                (" 1 - 5 , 8 , 10 - 12 ", "1 - 5 , 8 , 10 - 12"),
+            ):
                 with self.subTest(command=command, value=value):
                     argv = [command, "model.gguf", "-ngl", value]
                     if command == "generate":
@@ -208,8 +217,9 @@ class NativeV2BenchmarkTests(unittest.TestCase):
                     self.assertEqual(_runtime_options(args)["gpu_layers"], expected)
         args = _parser().parse_args(["serve", "model.gguf"])
         self.assertIsNone(args.gpu_layers)
-        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
-            _parser().parse_args(["serve", "model.gguf", "-ngl", "-1"])
+        for invalid in ("-1", "10-1", "1,,2", "abc", "-5", "5-"):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+                _parser().parse_args(["serve", "model.gguf", "-ngl", invalid])
 
     def test_public_command_names_and_short_limit_options(self) -> None:
         serve = _parser().parse_args(

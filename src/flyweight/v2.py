@@ -313,6 +313,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("vision_max_tokens", ctypes.c_uint32),
         ("gpu_layers_explicit", ctypes.c_uint32),
         ("gpu_layers", ctypes.c_uint32),
+        ("gpu_layer_selection", ctypes.c_char_p),
     ]
 
 
@@ -584,7 +585,7 @@ TASK_EVENT_TOKEN = 0
 TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
 TASK_EVENT_PREFILL = 3
-NATIVE_ABI_VERSION = 7
+NATIVE_ABI_VERSION = 8
 # "Let the runtime pick the size" for the host prompt cache, carried through the
 # option struct as a size. Lives here rather than in the CLI so a caller that is
 # not the CLI -- and the runtimes that read it -- can say the same thing.
@@ -1116,6 +1117,11 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(_QwenRuntimeInfo),
                 ]
                 lib.flyweight_v2_qwen_runtime_info.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_runtime_layer_on_gpu.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
+                lib.flyweight_v2_qwen_runtime_layer_on_gpu.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_runtime_plan.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_PlacementPlan),
@@ -2493,7 +2499,7 @@ class V2Model:
         scratch_context: int = 0,
         context_explicit: bool = False,
         vision_max_tokens: int = 0,
-        gpu_layers: int | None = None,
+        gpu_layers: int | str | Sequence[int] | set[int] | None = None,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2905,6 +2911,88 @@ class PromptImage:
     hash: int
 
 
+def parse_layer_selection(
+    spec: int | str | Sequence[int] | set[int] | None,
+) -> tuple[int, int, bytes | None]:
+    """Parse a layer offloading specification.
+
+    Supports:
+        - None or 'auto': auto-fit (explicit=0, count=0, selection=None)
+        - 'all': offload all layers (explicit=1, count=1<<30, selection=None)
+        - integer count (e.g. 10): offload N layers (explicit=1, count=N, selection=None)
+        - layer ranges (e.g. '1-10')
+        - specific layers (e.g. '1,3,8,10')
+        - mixed ranges and specific layers (e.g. '1-5,8,10-12')
+        - collections of integers (e.g. [1, 3, 8, 10], {1, 3, 8}, range(1, 11))
+
+    Returns:
+        (gpu_layers_explicit, gpu_layers_count, gpu_layer_selection_bytes)
+    """
+    if spec is None:
+        return 0, 0, None
+    if isinstance(spec, str):
+        normalized = spec.strip().lower()
+        if not normalized or normalized == "auto":
+            return 0, 0, None
+        if normalized == "all":
+            return 1, 1 << 30, None
+        if "," in spec or "-" in spec:
+            layers: set[int] = set()
+            for part in spec.split(","):
+                p = part.strip()
+                if not p:
+                    raise ValueError(f"empty entry in layer selection: {spec!r}")
+                if "-" in p:
+                    range_parts = p.split("-")
+                    if len(range_parts) != 2:
+                        raise ValueError(f"invalid layer range: {p!r}")
+                    try:
+                        start = int(range_parts[0].strip())
+                        end = int(range_parts[1].strip())
+                    except ValueError as error:
+                        raise ValueError(f"invalid layer range indices in {p!r}") from error
+                    if start < 0 or end < 0 or start > end:
+                        raise ValueError(
+                            f"invalid layer range {start}-{end}: indices must be non-negative and start <= end"
+                        )
+                    layers.update(range(start, end + 1))
+                else:
+                    try:
+                        idx = int(p)
+                    except ValueError as error:
+                        raise ValueError(f"invalid layer index in {p!r}") from error
+                    if idx < 0:
+                        raise ValueError(f"invalid layer index {idx}: must be non-negative")
+                    layers.add(idx)
+            canonical = ",".join(str(x) for x in sorted(layers))
+            return 1, len(layers), canonical.encode("utf-8")
+        try:
+            count = int(spec.strip())
+        except ValueError as error:
+            raise ValueError(
+                f"expected auto, all, a non-negative integer count, or a layer selection; got {spec!r}"
+            ) from error
+        if count < 0:
+            raise ValueError("gpu_layers must be non-negative (None = auto-fit)")
+        return 1, min(count, 0xFFFFFFFF), None
+    if isinstance(spec, int):
+        if spec < 0:
+            raise ValueError("gpu_layers must be non-negative (None = auto-fit)")
+        return 1, min(spec, 0xFFFFFFFF), None
+    if isinstance(spec, (list, tuple, set, range)):
+        layers_set: set[int] = set()
+        for x in spec:
+            idx = int(x)
+            if idx < 0:
+                raise ValueError(f"invalid layer index {idx}: must be non-negative")
+            layers_set.add(idx)
+        canonical = ",".join(str(x) for x in sorted(layers_set))
+        return 1, len(layers_set), canonical.encode("utf-8")
+    raise TypeError(
+        f"gpu_layers must be int, str, sequence of ints, or None; got {type(spec).__name__}"
+    )
+
+
 class V2QwenRuntime:
     """Owns a native Qwen or Gemma 4 execution plan and its CUDA state.
 
@@ -2955,15 +3043,28 @@ class V2QwenRuntime:
         vision_max_tokens: int = 0,
         # llama.cpp's -ngl: a dense model's feed-forward blocks, or a MoE
         # model's whole expert layers, kept on the GPU. None auto-fits.
-        gpu_layers: int | None = None,
+        # Also accepts layer ranges (e.g. '1-10'), specific layers ('1,3,8,10'),
+        # or mixed ('1-5,8,10-12').
+        gpu_layers: int | str | Sequence[int] | set[int] | None = None,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
         # manual budget.
         if device < 0 or context_limit < 0 or gpu_cache_bytes < 0:
             raise ValueError("native Qwen runtime options must be non-negative")
-        if gpu_layers is not None and gpu_layers < 0:
-            raise ValueError("gpu_layers must be non-negative (None = auto-fit)")
+        explicit_gpu_layers, gpu_layers_count, gpu_layer_selection_bytes = (
+            parse_layer_selection(gpu_layers)
+        )
+        model_layer_count = int(model.config.get("layer_count") or 0)
+        if gpu_layer_selection_bytes and model_layer_count:
+            selected_indices = [
+                int(x) for x in gpu_layer_selection_bytes.decode("utf-8").split(",") if x
+            ]
+            for idx in selected_indices:
+                if idx >= model_layer_count:
+                    raise ValueError(
+                        f"layer selection index {idx} exceeds model layer count ({model_layer_count})"
+                    )
         # Context for the slots past the first. Every slot reserves its whole
         # context at prepare whether a conversation fills it or not, so sizing
         # the side slots for side traffic hands the difference to the expert
@@ -3124,16 +3225,33 @@ class V2QwenRuntime:
             2 if routed_moe is None else int(bool(routed_moe)),
             scratch_context,
             int(context_explicit),
-            max(0, int(vision_max_tokens)),
-            int(gpu_layers is not None),
-            min(int(gpu_layers or 0), 0xFFFFFFFF),
+            vision_max_tokens,
+            explicit_gpu_layers,
+            gpu_layers_count,
+            gpu_layer_selection_bytes,
         )
+        self._gpu_layer_selection_buf = gpu_layer_selection_bytes
         self._options = options
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(
                 model._handle, ctypes.byref(options), ctypes.byref(self._handle)
             )
         )
+
+    def is_layer_on_gpu(self, layer: int) -> bool:
+        """Whether a given layer runs its feed-forward/experts on the GPU."""
+        res = self._lib.flyweight_v2_qwen_runtime_layer_on_gpu(
+            self._handle, ctypes.c_uint32(layer)
+        )
+        if res < 0:
+            raise IndexError(f"layer index {layer} out of range")
+        return bool(res)
+
+    @property
+    def gpu_layers(self) -> list[int]:
+        """List of layer indices running feed-forward or experts on the GPU."""
+        count = int(self.info["layers"])
+        return [i for i in range(count) if self.is_layer_on_gpu(i)]
 
     def close(self) -> None:
         if self._handle:
@@ -3262,6 +3380,7 @@ class V2QwenRuntime:
         "immutable_residency", "prefill_cache_seed_auto", "strict_resident",
         "prefill_expert_stream_mib", "scratch_context", "context_explicit",
         "vision_max_tokens", "gpu_layers_explicit",
+        "gpu_layers", "gpu_layer_selection",
     })
 
     def prompt_cache_fingerprint(self) -> str:

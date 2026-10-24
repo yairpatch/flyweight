@@ -165,24 +165,60 @@ def _prefill_cache_seed(value: str) -> int | str:
     return count
 
 
-def _gpu_layers(value: str) -> int | None:
+def _gpu_layers(value: str) -> int | str | None:
     # None is auto-fit. Any count at or past the model's dense blocks keeps
     # them all on the GPU, so `all` (and llama.cpp's habitual 999) need no
     # knowledge of the model here.
-    normalized = value.lower()
+    # Accepts an integer count (e.g. 10), ranges (e.g. 1-10), specific layers
+    # (e.g. 1,3,8,10), or mixed selections (e.g. 1-5,8,10-12).
+    normalized = value.strip().lower()
     if normalized == "auto":
         return None
     if normalized == "all":
         return 1 << 30
+    if "," in value or "-" in value:
+        for part in value.split(","):
+            p = part.strip()
+            if not p:
+                raise argparse.ArgumentTypeError(
+                    "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
+                )
+            if "-" in p:
+                range_parts = p.split("-")
+                if len(range_parts) != 2:
+                    raise argparse.ArgumentTypeError(f"invalid layer range: {p!r}")
+                try:
+                    start = int(range_parts[0].strip())
+                    end = int(range_parts[1].strip())
+                except ValueError as error:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer range indices in {p!r}"
+                    ) from error
+                if start < 0 or end < 0 or start > end:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer range {start}-{end}: indices must be non-negative and start <= end"
+                    )
+            else:
+                try:
+                    idx = int(p)
+                except ValueError as error:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer index in {p!r}"
+                    ) from error
+                if idx < 0:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer index {idx}: must be non-negative"
+                    )
+        return value.strip()
     try:
         count = int(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(
-            "expected auto, all, or a non-negative integer"
+            "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
         ) from error
     if count < 0:
         raise argparse.ArgumentTypeError(
-            "expected auto, all, or a non-negative integer"
+            "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
         )
     return count
 
@@ -485,14 +521,13 @@ def _add_runtime_options(
         placement, "--n-gpu-layers", "-ngl", "--gpu-layers", dest="gpu_layers",
         type=_gpu_layers, default=None, metavar="N",
         help="layers kept on the GPU, the rest on the CPU (llama.cpp's -ngl; "
-             "attention and KV stay on the GPU either way). Dense models: "
-             "blocks whose feed-forward stays on the GPU. MoE models: the last "
-             "N layers hold their whole expert set pinned on the GPU and the "
-             "others' experts always run on the CPU; an N that does not fit "
-             "whole (or all) takes the hot-expert cache over every layer "
-             "instead, which keeps more routing on the GPU. auto, the default, "
-             "fits dense blocks to free VRAM and gives MoE models that cache; "
-             "all keeps as much on the GPU as fits",
+             "attention and KV stay on the GPU either way). Accepts a count (e.g. 10), "
+             "a range (e.g. 1-10), specific layers (e.g. 1,3,8,10), or a mix "
+             "(e.g. 1-5,8,10-12). Dense models: blocks whose feed-forward stays on "
+             "the GPU. MoE models: pinned whole expert layers on GPU, the rest on "
+             "CPU; an N that does not fit whole (or all) takes the hot-expert "
+             "cache over every layer instead. auto fits to free VRAM; all keeps "
+             "as much on the GPU as fits",
     )
     add(
         placement, "--cpu-threads", type=int, default=0, metavar="N",

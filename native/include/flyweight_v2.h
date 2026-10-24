@@ -169,6 +169,7 @@ typedef struct FlyweightV2QwenRuntimeOptions {
                             CPU. MoE models (hybrid placement only): the last N MoE layers hold their
                             whole expert set pinned and the others never page; an N that does not
                             fit whole falls back to the per-expert cache over every layer. */
+    const char* gpu_layer_selection; /* per-layer offloading selection (e.g. "1-10", "1,3,8,10", "1-5,8,10-12"); NULL = use gpu_layers count */
 } FlyweightV2QwenRuntimeOptions;
 
 /* Where a prepared runtime put its weights and arenas, read back after
@@ -899,6 +900,7 @@ FLYWEIGHT_V2_API int flyweight_v2_tensor_view(const FlyweightV2Model* model, uin
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_create(FlyweightV2Model* model, const FlyweightV2QwenRuntimeOptions* options, FlyweightV2QwenRuntime** out);
 FLYWEIGHT_V2_API void flyweight_v2_qwen_runtime_destroy(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime* runtime, FlyweightV2QwenRuntimeInfo* out);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_layer_on_gpu(const FlyweightV2QwenRuntime* runtime, uint32_t layer);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime* runtime, FlyweightV2PlacementPlan* out);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime* runtime);

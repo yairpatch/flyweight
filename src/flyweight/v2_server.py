@@ -2863,7 +2863,7 @@ class NativeV2InferenceService(InferenceService):
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
         dense_requant: str = "off",
-        gpu_layers: int | None = None,
+        gpu_layers: int | str | Sequence[int] | set[int] | None = None,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,

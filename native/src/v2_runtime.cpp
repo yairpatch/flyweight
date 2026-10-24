@@ -986,6 +986,7 @@ struct FlyweightV2QwenRuntime {
     // of 160 elements, so it is served from the mapping like host embeddings.
     std::uint64_t ple_table = std::numeric_limits<std::uint64_t>::max();
     FlyweightV2QwenRuntimeOptions options{};
+    std::string gpu_layer_selection_str;
     flyweight::v2::ExpertExecutionMode expert_mode =
         flyweight::v2::ExpertExecutionMode::streamed_gpu;
     std::vector<QwenLayerPlan> layers;
@@ -8924,7 +8925,7 @@ int plan_memory(FlyweightV2MemoryPlan& out, uint64_t budget, uint64_t static_wei
 }
 
 extern "C" {
-uint32_t flyweight_v2_version() { return 7; }
+uint32_t flyweight_v2_version() { return 8; }
 uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
 uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
 uint64_t flyweight_v2_placement_plan_size() { return sizeof(FlyweightV2PlacementPlan); }
@@ -16366,6 +16367,64 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
 int flyweight_v2_tensor_read(const FlyweightV2Model* m,uint64_t i,void* dst,uint64_t bytes){return guarded([&]{if(!m||m->read_tensor(i,dst,bytes)!=0)throw std::runtime_error("invalid tensor read");return 0;});}
 int flyweight_v2_tensor_read_slice(const FlyweightV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,tensor_data(*m,t)+offset,static_cast<size_t>(bytes));return 0;});}
 int flyweight_v2_tensor_view(const FlyweightV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=tensor_data(*m,t)+offset;return 0;});}
+static std::vector<std::uint32_t> parse_layer_selection_str(const std::string& spec, std::size_t max_layers) {
+    std::vector<std::uint32_t> result;
+    if(spec.empty()) return result;
+    std::stringstream ss(spec);
+    std::string token;
+    while(std::getline(ss, token, ',')){
+        auto start_pos = token.find_first_not_of(" \t\r\n");
+        if(start_pos == std::string::npos){
+            throw std::runtime_error("empty layer selection item in: " + spec);
+        }
+        auto end_pos = token.find_last_not_of(" \t\r\n");
+        std::string item = token.substr(start_pos, end_pos - start_pos + 1);
+        auto dash = item.find('-');
+        if(dash != std::string::npos){
+            std::string start_str = item.substr(0, dash);
+            std::string end_str = item.substr(dash + 1);
+            auto s_start = start_str.find_first_not_of(" \t\r\n");
+            auto s_end = start_str.find_last_not_of(" \t\r\n");
+            auto e_start = end_str.find_first_not_of(" \t\r\n");
+            auto e_end = end_str.find_last_not_of(" \t\r\n");
+            if(s_start == std::string::npos || e_start == std::string::npos){
+                throw std::runtime_error("invalid layer range in: " + item);
+            }
+            char* p1 = nullptr;
+            char* p2 = nullptr;
+            long r_start = std::strtol(start_str.c_str() + s_start, &p1, 10);
+            long r_end = std::strtol(end_str.c_str() + e_start, &p2, 10);
+            if(p1 == start_str.c_str() + s_start || p2 == end_str.c_str() + e_start ||
+               r_start < 0 || r_end < 0 || r_start > r_end){
+                throw std::runtime_error("invalid layer range: " + item);
+            }
+            if(static_cast<std::size_t>(r_end) >= max_layers){
+                throw std::runtime_error(
+                    "layer selection index " + std::to_string(r_end) +
+                    " exceeds model layer count (" + std::to_string(max_layers) + ")");
+            }
+            for(long i = r_start; i <= r_end; ++i){
+                result.push_back(static_cast<std::uint32_t>(i));
+            }
+        } else {
+            char* p = nullptr;
+            long val = std::strtol(item.c_str(), &p, 10);
+            if(p == item.c_str() || val < 0){
+                throw std::runtime_error("invalid layer index: " + item);
+            }
+            if(static_cast<std::size_t>(val) >= max_layers){
+                throw std::runtime_error(
+                    "layer selection index " + std::to_string(val) +
+                    " exceeds model layer count (" + std::to_string(max_layers) + ")");
+            }
+            result.push_back(static_cast<std::uint32_t>(val));
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRuntimeOptions*options,FlyweightV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
@@ -16394,6 +16453,12 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     auto runtime=std::make_unique<FlyweightV2QwenRuntime>();
     runtime->model=m;
     runtime->options=options?*options:FlyweightV2QwenRuntimeOptions{};
+    if(options&&options->gpu_layer_selection)
+        runtime->gpu_layer_selection_str=options->gpu_layer_selection;
+    else if(const char*env=std::getenv("FLYWEIGHT_GPU_LAYERS"))
+        runtime->gpu_layer_selection_str=env;
+    if(!runtime->gpu_layer_selection_str.empty())
+        runtime->options.gpu_layers_explicit=1;
     if(runtime->options.device<0)throw std::runtime_error("Qwen runtime device must be non-negative");
     if(!flyweight::v2::valid_expert_execution_mode(runtime->options.moe_device))
         throw std::runtime_error("Qwen runtime MoE device is invalid");
@@ -16522,6 +16587,9 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     else if(lfm2)build_lfm2_plan(*runtime);
     else if(nemotron)build_nemotron_plan(*runtime);
     else build_qwen_plan(*runtime);
+    if(!runtime->gpu_layer_selection_str.empty()){
+        parse_layer_selection_str(runtime->gpu_layer_selection_str, runtime->layers.size());
+    }
     qwen_load_nvfp4_weight_scales(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
@@ -16701,6 +16769,18 @@ int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->cache_type_k=runtime->options.cache_type_k;
     out->cache_type_v=runtime->options.cache_type_v;
     return 0;
+});}
+int flyweight_v2_qwen_runtime_layer_on_gpu(const FlyweightV2QwenRuntime*runtime,uint32_t layer){return guarded([&]{
+    if(!runtime||layer>=runtime->layers.size())return -1;
+    const auto&l=runtime->layers[layer];
+    if(l.dense_ffn)return l.ffn_on_host?0:1;
+    if(runtime->model->config.expert_count){
+        if(!runtime->whole_expert_layer_slots.empty()&&
+           layer<runtime->whole_expert_layer_slots.size())
+            return runtime->whole_expert_layer_slots[layer]>=0?1:0;
+        return 0;
+    }
+    return 1;
 });}
 int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,FlyweightV2QwenRuntimeInfo*out){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid Qwen runtime info handle");
@@ -17516,7 +17596,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whose first block were dense would silently run a spilled block on
         // weights that were never uploaded. Excluded explicitly.
         const bool dense_spill_model=
-            !runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4;
+            !runtime->layers.empty()&&runtime->layers.front().dense_ffn&&
+            !runtime->gemma4&&!runtime->model->config.expert_count;
         if(runtime->options.gpu_layers_explicit&&!dense_spill_model&&
            !runtime->model->config.expert_count)
             throw std::runtime_error(
@@ -17772,56 +17853,81 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             const char* forced_env=std::getenv("FLYWEIGHT_HOST_FFN_BLOCKS");
             std::uint32_t dense_blocks=0;
             for(const auto&layer:runtime->layers)dense_blocks+=layer.dense_ffn?1u:0u;
-            const bool forced=forced_env||runtime->options.gpu_layers_explicit;
-            const std::uint32_t forced_blocks=forced_env
-                ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10))
-                :dense_blocks-std::min(dense_blocks,runtime->options.gpu_layers);
-            const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
-            const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
-            auto want_more=[&]{
-                return forced?runtime->host_ffn_layers<forced_blocks
-                                 :resident>weight_budget;
-            };
-            auto spill_pass=[&](bool simd_only){
-                for(auto layer=runtime->layers.rbegin();
-                    layer!=runtime->layers.rend()&&want_more();++layer){
-                    if(!layer->dense_ffn||layer->ffn_on_host)continue;
-                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
-                    bool all_simd=true;
-                    for(std::size_t role=1;role<=3;++role)
-                        all_simd=all_simd&&qwen_simd_quant_type(
-                            runtime->model->tensors[layer->static_tensors[ffn_base+role]].type);
-                    if(simd_only&&!all_simd)continue;
-                    std::uint64_t freed=0;
-                    for(std::size_t role=1;role<=3;++role)
-                        freed+=device_align(runtime->model->tensors[
-                            layer->static_tensors[ffn_base+role]].size);
-                    layer->ffn_on_host=true;
-                    resident-=freed;
-                    runtime->host_ffn_bytes+=freed;
-                    ++runtime->host_ffn_layers;
+            const bool has_layer_selection=!runtime->gpu_layer_selection_str.empty();
+            const bool forced=forced_env||runtime->options.gpu_layers_explicit||has_layer_selection;
+            if(has_layer_selection){
+                const auto selected=parse_layer_selection_str(
+                    runtime->gpu_layer_selection_str,runtime->layers.size());
+                std::unordered_set<std::uint32_t> selected_set(
+                    selected.begin(),selected.end());
+                for(std::size_t i=0;i<runtime->layers.size();++i){
+                    auto&layer=runtime->layers[i];
+                    if(!layer.dense_ffn)continue;
+                    if(selected_set.count(static_cast<std::uint32_t>(i))){
+                        layer.ffn_on_host=false;
+                    }else{
+                        layer.ffn_on_host=true;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer.static_tensors[ffn_base+role]].size);
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
                 }
-            };
-            auto spill_pass_naive=[&]{
-                for(auto layer=runtime->layers.begin();
-                    layer!=runtime->layers.end()&&want_more();++layer){
-                    if(!layer->dense_ffn||layer->ffn_on_host)continue;
-                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
-                    std::uint64_t freed=0;
-                    for(std::size_t role=1;role<=3;++role)
-                        freed+=device_align(runtime->model->tensors[
-                            layer->static_tensors[ffn_base+role]].size);
-                    layer->ffn_on_host=true;
-                    resident-=freed;
-                    runtime->host_ffn_bytes+=freed;
-                    ++runtime->host_ffn_layers;
-                }
-            };
-            if(naive_order){
-                spill_pass_naive();
             }else{
-                spill_pass(true);
-                spill_pass(false);
+                const std::uint32_t forced_blocks=forced_env
+                    ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10))
+                    :dense_blocks-std::min(dense_blocks,runtime->options.gpu_layers);
+                const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
+                const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
+                auto want_more=[&]{
+                    return forced?runtime->host_ffn_layers<forced_blocks
+                                     :resident>weight_budget;
+                };
+                auto spill_pass=[&](bool simd_only){
+                    for(auto layer=runtime->layers.rbegin();
+                        layer!=runtime->layers.rend()&&want_more();++layer){
+                        if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                        bool all_simd=true;
+                        for(std::size_t role=1;role<=3;++role)
+                            all_simd=all_simd&&qwen_simd_quant_type(
+                                runtime->model->tensors[layer->static_tensors[ffn_base+role]].type);
+                        if(simd_only&&!all_simd)continue;
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer->static_tensors[ffn_base+role]].size);
+                        layer->ffn_on_host=true;
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
+                };
+                auto spill_pass_naive=[&]{
+                    for(auto layer=runtime->layers.begin();
+                        layer!=runtime->layers.end()&&want_more();++layer){
+                        if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer->static_tensors[ffn_base+role]].size);
+                        layer->ffn_on_host=true;
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
+                };
+                if(naive_order){
+                    spill_pass_naive();
+                }else{
+                    spill_pass(true);
+                    spill_pass(false);
+                }
             }
             // The spill above keeps every block the tight margin can hold.
             // The allocation check further down reserves max(2 GiB, VRAM/8)
@@ -18862,8 +18968,31 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 }
                 return count;
             };
-            bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
-            if(explicit_layers){
+            const bool has_layer_selection=!runtime->gpu_layer_selection_str.empty();
+            bool explicit_layers=runtime->options.gpu_layers_explicit!=0||has_layer_selection;
+            std::vector<std::uint32_t> selected_layers;
+            if(has_layer_selection){
+                selected_layers=parse_layer_selection_str(
+                    runtime->gpu_layer_selection_str,runtime->layers.size());
+            }
+            if(has_layer_selection){
+                std::unordered_set<std::uint32_t> selected_set(
+                    selected_layers.begin(),selected_layers.end());
+                std::uint64_t needed_slots=0;
+                for(const auto layer:moe_layers){
+                    if(selected_set.count(layer))
+                        needed_slots+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                }
+                const auto max_slots=cache/runtime->expert_slot_bytes;
+                if(needed_slots>max_slots){
+                    std::fprintf(stderr,
+                        "[flyweight] --n-gpu-layers: selected MoE layers require %llu expert bundles, but only %llu "
+                        "fit whole; caching the hottest experts of every layer instead\n",
+                        static_cast<unsigned long long>(needed_slots),
+                        static_cast<unsigned long long>(max_slots));
+                    explicit_layers=false;
+                }
+            }else if(explicit_layers){
                 const std::size_t wanted=std::min<std::size_t>(
                     moe_layers.size(),runtime->options.gpu_layers);
                 const std::size_t fit=
@@ -18882,24 +19011,37 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                   (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
                  (!whole_layer_setting||whole_layer_setting[0]!='0'));
             if(whole_layer_enabled&&!runtime->options.strict_resident){
-                std::size_t layer_count=
-                    whole_layers_fitting(cache/runtime->expert_slot_bytes);
-                char*end=nullptr;
-                const auto requested=whole_layer_setting
-                    ?std::strtoul(whole_layer_setting,&end,10):0;
-                if(explicit_layers)
-                    layer_count=std::min<std::size_t>(
-                        layer_count,runtime->options.gpu_layers);
-                else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
-                    layer_count=std::min<std::size_t>(layer_count,requested);
                 runtime->whole_expert_layer_slots.assign(
                     runtime->layers.size(),-1);
                 std::size_t slot=0;
-                for(std::size_t index=0;index<layer_count;++index){
-                    const auto layer=moe_layers[moe_layers.size()-layer_count+index];
-                    runtime->whole_expert_layer_slots[layer]=
-                        static_cast<std::int32_t>(slot);
-                    slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                std::size_t layer_count=0;
+                if(has_layer_selection&&explicit_layers){
+                    std::unordered_set<std::uint32_t> selected_set(
+                        selected_layers.begin(),selected_layers.end());
+                    for(const auto layer:moe_layers){
+                        if(!selected_set.count(layer))continue;
+                        runtime->whole_expert_layer_slots[layer]=
+                            static_cast<std::int32_t>(slot);
+                        slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                        ++layer_count;
+                    }
+                }else{
+                    layer_count=
+                        whole_layers_fitting(cache/runtime->expert_slot_bytes);
+                    char*end=nullptr;
+                    const auto requested=whole_layer_setting
+                        ?std::strtoul(whole_layer_setting,&end,10):0;
+                    if(explicit_layers)
+                        layer_count=std::min<std::size_t>(
+                            layer_count,runtime->options.gpu_layers);
+                    else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
+                        layer_count=std::min<std::size_t>(layer_count,requested);
+                    for(std::size_t index=0;index<layer_count;++index){
+                        const auto layer=moe_layers[moe_layers.size()-layer_count+index];
+                        runtime->whole_expert_layer_slots[layer]=
+                            static_cast<std::int32_t>(slot);
+                        slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                    }
                 }
                 cache=slot*runtime->expert_slot_bytes;
                 if(!layer_count)
