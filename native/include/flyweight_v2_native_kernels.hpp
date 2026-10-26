@@ -507,7 +507,8 @@ __device__ __forceinline__ float delta_block_sum(float* partials, const int coun
     return total;
 }
 
-extern "C" __global__
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(extern "C" __global__
 void qwen_delta_recurrent_split(
     const float* convolved, const float* gates,
     const float* beta_logits, const float* decay_logits,
@@ -574,12 +575,34 @@ void qwen_delta_recurrent_split(
     __syncthreads();
 
     // Decay the state and read the memory out of it, one key group per slice.
+    // When a thread's share of keys fits in registers (32: head_dim 128 at
+    // four slices, every released checkpoint), the decayed values stay there
+    // for the update below instead of a store and a reload, which halves the
+    // state traffic (3.1 MB read twice and written twice per layer before).
+    // Same arithmetic either way, so the results are bit-identical.
+    constexpr int kHeld = 32;
+    const bool held_in_registers = (head_dim + slices - 1) / slices <= kHeld;
+    float held[kHeld];
     float memory_partial = 0.0f;
-    for (int key_index = slice; key_index < head_dim; key_index += slices) {
-        const int state_index = (head * head_dim + key_index) * head_dim + dim;
-        const float decayed = state[state_index] * decay_scale;
-        state[state_index] = decayed;
-        memory_partial += decayed * shared_key[key_index];
+    if (held_in_registers) {
+        #pragma unroll
+        for (int step = 0; step < kHeld; ++step) {
+            const int key_index = slice + step * slices;
+            if (key_index < head_dim) {
+                const int state_index = (head * head_dim + key_index) * head_dim + dim;
+                // Rounded on its own, as the stored value was: left to the
+                // compiler, the product contracts into the update's fma.
+                held[step] = __fmul_rn(state[state_index], decay_scale);
+                memory_partial += held[step] * shared_key[key_index];
+            }
+        }
+    } else {
+        for (int key_index = slice; key_index < head_dim; key_index += slices) {
+            const int state_index = (head * head_dim + key_index) * head_dim + dim;
+            const float decayed = state[state_index] * decay_scale;
+            state[state_index] = decayed;
+            memory_partial += decayed * shared_key[key_index];
+        }
     }
     partials[threadIdx.x] = memory_partial;
     __syncthreads();
@@ -595,11 +618,24 @@ void qwen_delta_recurrent_split(
 
     // Write the outer product back into the state and read the core out of it.
     float core_partial = 0.0f;
-    for (int key_index = slice; key_index < head_dim; key_index += slices) {
-        const int state_index = (head * head_dim + key_index) * head_dim + dim;
-        const float updated = state[state_index] + shared_key[key_index] * delta;
-        state[state_index] = updated;
-        core_partial += updated * shared_query[key_index] * query_inverse_norm;
+    if (held_in_registers) {
+        #pragma unroll
+        for (int step = 0; step < kHeld; ++step) {
+            const int key_index = slice + step * slices;
+            if (key_index < head_dim) {
+                const int state_index = (head * head_dim + key_index) * head_dim + dim;
+                const float updated = held[step] + shared_key[key_index] * delta;
+                state[state_index] = updated;
+                core_partial += updated * shared_query[key_index] * query_inverse_norm;
+            }
+        }
+    } else {
+        for (int key_index = slice; key_index < head_dim; key_index += slices) {
+            const int state_index = (head * head_dim + key_index) * head_dim + dim;
+            const float updated = state[state_index] + shared_key[key_index] * delta;
+            state[state_index] = updated;
+            core_partial += updated * shared_query[key_index] * query_inverse_norm;
+        }
     }
     __syncthreads();
     partials[threadIdx.x] = core_partial;

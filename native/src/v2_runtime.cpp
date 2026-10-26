@@ -27225,6 +27225,41 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             const_cast<std::uint64_t*>(&hc_normed),
             const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
         launch_named("qwen4_group_rms",hc_count,1,256,norm_args);
+        // Three launches instead of six when the mixers are bf16 (every
+        // released qwen4exp GGUF): the down projection and inject logits in
+        // one, the silu, up projection and stream mix in the other. 38.5 ->
+        // 28.9 us per hc_pre standalone, two per layer. FLYWEIGHT_HC_FUSED=0
+        // keeps the chain below for A/B.
+        static const bool env_hc_fused=[]{
+            const char*s=std::getenv("FLYWEIGHT_HC_FUSED");return !s||s[0]!='0';}();
+        const bool has_inject=inject_index!=std::numeric_limits<std::uint64_t>::max();
+        if(env_hc_fused&&hc_low_rank%8==0&&
+           qwen_device_type(*runtime,down_index)==30&&
+           qwen_device_type(*runtime,up_index)==30&&
+           (!has_inject||qwen_device_type(*runtime,inject_index)==30)){
+            std::uint64_t down=runtime->device_tensors[down_index];
+            std::uint64_t up=runtime->device_tensors[up_index];
+            std::uint64_t inject=has_inject?runtime->device_tensors[inject_index]:0;
+            float divisor=static_cast<float>(hc_count);
+            void*down_args[]={const_cast<std::uint64_t*>(&hc_normed),&down,&inject,
+                const_cast<std::uint64_t*>(&hc_low),
+                const_cast<std::uint64_t*>(&hc_gates),
+                const_cast<int*>(&hc_low_rank),const_cast<int*>(&hc_count),
+                const_cast<int*>(&hc_wide_size)};
+            launch_named("qwen4_hc_down_inject",
+                static_cast<std::uint32_t>((hc_low_rank+(has_inject?hc_count:0)+1)/2),
+                1,256,down_args);
+            void*up_args[]={const_cast<std::uint64_t*>(&hc_low),&up,
+                const_cast<std::uint64_t*>(&hc_normed),
+                const_cast<std::uint64_t*>(&normalized),
+                const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size),
+                const_cast<int*>(&hc_low_rank),&divisor};
+            launch_named("qwen4_hc_up_mix",
+                static_cast<std::uint32_t>((hidden_size+7)/8),1,256,up_args,
+                static_cast<std::uint32_t>(hc_low_rank*sizeof(float)));
+            q8_cached_input=0;
+            return;
+        }
         dense_matvec(down_index,hc_normed,hc_low,hc_wide_size,hc_low_rank);
         float divisor=static_cast<float>(hc_count);
         void*silu_args[]={const_cast<std::uint64_t*>(&hc_low),

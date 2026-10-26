@@ -111,6 +111,7 @@ using std::isfinite;
 inline float rsqrtf(float value) { return 1.0f / std::sqrt(value); }
 inline float __frsqrt_rn(float value) { return 1.0f / std::sqrt(value); }
 inline float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
+inline float __fmul_rn(float a, float b) { return a * b; }
 
 // Read-only cache hints are pure performance annotations on device.
 template <class T>
