@@ -477,22 +477,53 @@ void route_topk(
         probabilities[index] /= denominator;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float selected_total = 0.0f;
-        for (int rank = 0; rank < top_k; ++rank) {
+    // Selection is a block-wide argmax per rank. It used to be thread 0
+    // scanning all experts top_k times, which at 512 experts x 10 ranks was
+    // ~27 us of a single thread, once per routed layer per token. The key
+    // packs the probability above the inverted index, so the maximum is the
+    // largest probability and, on a tie, the lowest index -- the same pick the
+    // serial strict-greater scan made, so the routes are unchanged.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    __shared__ unsigned long long warp_best[32];
+    for (int rank = 0; rank < top_k; ++rank) {
+        unsigned long long best = 0ULL;
+        for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+            const float probability = probabilities[index];
+            if (probability >= 0.0f) {
+                const unsigned long long key =
+                    ((unsigned long long)__float_as_uint(probability) << 32)
+                    | (unsigned long long)(0xffffffffu - (unsigned int)index);
+                best = key > best ? key : best;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned long long other =
+                __shfl_down_sync(0xffffffff, best, offset);
+            best = other > best ? other : best;
+        }
+        if (lane == 0) warp_best[warp] = best;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int other = 1; other < warps; ++other)
+                best = warp_best[other] > best ? warp_best[other] : best;
             int best_index = 0;
             float best_value = -1.0f;
-            for (int expert = 0; expert < experts; ++expert) {
-                if (probabilities[expert] > best_value) {
-                    best_value = probabilities[expert];
-                    best_index = expert;
-                }
+            if (best != 0ULL) {
+                best_index = (int)(0xffffffffu - (unsigned int)(best & 0xffffffffULL));
+                best_value = __uint_as_float((unsigned int)(best >> 32));
             }
             selected[rank] = best_index;
             routing_weights[rank] = best_value;
-            selected_total += best_value;
             probabilities[best_index] = -1.0f;
         }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float selected_total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank)
+            selected_total += routing_weights[rank];
         for (int rank = 0; rank < top_k; ++rank) {
             routing_weights[rank] /= selected_total;
         }
@@ -736,6 +767,38 @@ void bf16_matvec_warp(
     for (int offset = 16; offset > 0; offset >>= 1)
         partial += __shfl_down_sync(0xffffffff, partial, offset);
     if (lane == 0) output[row] = partial;
+}
+
+// A block per row for a projection with a handful of long rows: qwen4exp's
+// hyper-connection inject is 4 rows of 10240, which the warp form ran as one
+// block of four warps (~12 us, twice per layer). Same 128-bit loads as
+// bf16_matvec_warp, spread over the whole block.
+extern "C" __global__
+void bf16_matvec_long_rows(
+    const unsigned short* weights,
+    const float* vector,
+    float* output,
+    const int rows,
+    const int columns
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned short* row_weights =
+        weights + (long long)row * (long long)columns;
+    float partial = 0.0f;
+    if (bf16_vectorizable(row_weights, vector, columns)) {
+        const uint4* packed = (const uint4*)row_weights;
+        const int steps = columns >> 3;
+        for (int step = threadIdx.x; step < steps; step += blockDim.x)
+            partial += bf16_dot8(packed[step], vector + step * 8);
+    } else {
+        for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+            const unsigned int bits = ((unsigned int)row_weights[column]) << 16;
+            partial += __uint_as_float(bits) * vector[column];
+        }
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
 }
 
 extern "C" __global__
