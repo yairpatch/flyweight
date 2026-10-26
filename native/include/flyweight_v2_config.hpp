@@ -158,5 +158,11 @@ struct ModelConfig {
     std::uint32_t eot_token_id=0xffffffffu;
     std::uint32_t bos_token_id=0xffffffffu;
     std::uint32_t mask_token_id=0xffffffffu;
+    // Raon-1 (raon1) hyperparameters
+    float mhc_magnitude=2.0f;
+    float situ_beta=4.0f;
+    float situ_linear_beta=25.0f;
+    float kda_gate_lower_bound=-5.0f;
+    float latent_norm_rms_epsilon=1e-6f;
 };
 }

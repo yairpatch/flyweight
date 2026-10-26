@@ -84,6 +84,7 @@ typedef struct FlyweightV2ModelConfig {
 } FlyweightV2ModelConfig;
 
 typedef struct FlyweightV2BailingRuntime FlyweightV2BailingRuntime;
+typedef struct FlyweightV2RaonRuntime FlyweightV2RaonRuntime;
 
 typedef struct FlyweightV2GpuInfo {
     int32_t available;
@@ -169,6 +170,7 @@ typedef struct FlyweightV2QwenRuntimeOptions {
                             CPU. MoE models (hybrid placement only): the last N MoE layers hold their
                             whole expert set pinned and the others never page; an N that does not
                             fit whole falls back to the per-expert cache over every layer. */
+    const char* gpu_layer_selection; /* per-layer offloading selection (e.g. "1-10", "1,3,8,10", "1-5,8,10-12"); NULL = use gpu_layers count */
 } FlyweightV2QwenRuntimeOptions;
 
 /* Where a prepared runtime put its weights and arenas, read back after
@@ -212,6 +214,7 @@ typedef struct FlyweightV2PlacementPlan {
     uint64_t context_limit;
     int32_t cache_type_k;
     int32_t cache_type_v;
+    uint64_t host_kv_state_bytes;      /* KV and recurrent state kept in host RAM */
 } FlyweightV2PlacementPlan;
 
 typedef struct FlyweightV2QwenRuntimeInfo {
@@ -881,6 +884,30 @@ FLYWEIGHT_V2_API int flyweight_v2_bailing_reset_slot(FlyweightV2BailingRuntime* 
 FLYWEIGHT_V2_API int flyweight_v2_bailing_cache_save_slot(FlyweightV2BailingRuntime* runtime, uint32_t slot, void* buffer, uint64_t capacity, uint64_t* length);
 FLYWEIGHT_V2_API int flyweight_v2_bailing_cache_load_slot(FlyweightV2BailingRuntime* runtime, uint32_t slot, const void* buffer, uint64_t length);
 
+/* Execution for Raon-1 (raon1) checkpoints.
+   Supports Raon-mHC (4 parallel streams), hybrid recurrent RDA / NoPE MLA attention,
+   and SiTU-GLU dense & sparse MoE blocks. */
+FLYWEIGHT_V2_API int flyweight_v2_raon_create(const FlyweightV2Model* model, uint32_t capacity, FlyweightV2RaonRuntime** out);
+FLYWEIGHT_V2_API void flyweight_v2_raon_destroy(FlyweightV2RaonRuntime* runtime);
+FLYWEIGHT_V2_API int flyweight_v2_raon_reset(FlyweightV2RaonRuntime* runtime);
+FLYWEIGHT_V2_API int flyweight_v2_raon_eval(FlyweightV2RaonRuntime* runtime, const uint32_t* tokens, uint32_t count, float* logits);
+FLYWEIGHT_V2_API int flyweight_v2_raon_set_progress(FlyweightV2RaonRuntime* runtime, int (*callback)(void* user, uint32_t processed, uint32_t total), void* user);
+FLYWEIGHT_V2_API int flyweight_v2_raon_cache_save(FlyweightV2RaonRuntime* runtime, void* buffer, uint64_t capacity, uint64_t* length);
+FLYWEIGHT_V2_API int flyweight_v2_raon_cache_load(FlyweightV2RaonRuntime* runtime, const void* buffer, uint64_t length);
+FLYWEIGHT_V2_API int flyweight_v2_raon_create_slots(const FlyweightV2Model* model, uint32_t capacity, uint32_t slots, FlyweightV2RaonRuntime** out);
+FLYWEIGHT_V2_API int flyweight_v2_raon_slot_count(FlyweightV2RaonRuntime* runtime, uint32_t* out);
+FLYWEIGHT_V2_API int flyweight_v2_raon_eval_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot, const uint32_t* tokens, uint32_t count, float* logits);
+FLYWEIGHT_V2_API int flyweight_v2_raon_reset_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot);
+FLYWEIGHT_V2_API int flyweight_v2_raon_cache_save_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot, void* buffer, uint64_t capacity, uint64_t* length);
+FLYWEIGHT_V2_API int flyweight_v2_raon_cache_load_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot, const void* buffer, uint64_t length);
+FLYWEIGHT_V2_API int flyweight_v2_raon_uses_gpu(const FlyweightV2RaonRuntime* runtime, int* out);
+FLYWEIGHT_V2_API int flyweight_v2_raon_plan(FlyweightV2RaonRuntime* runtime, FlyweightV2PlacementPlan* out);
+FLYWEIGHT_V2_API int flyweight_v2_raon_create_with_options(const FlyweightV2Model* model, uint32_t capacity, uint32_t slots, int32_t expert_mode, int32_t gpu_layers, const char* gpu_layer_selection, FlyweightV2RaonRuntime** out);
+FLYWEIGHT_V2_API int flyweight_v2_raon_layer_on_gpu(const FlyweightV2RaonRuntime* runtime, uint32_t layer);
+/* As _create_with_options, plus the MLA cache type: 0 f32, 1 f16, 2 bf16
+   (the placement codes; one type, the latent is both key and value). */
+FLYWEIGHT_V2_API int flyweight_v2_raon_create_ex(const FlyweightV2Model* model, uint32_t capacity, uint32_t slots, int32_t expert_mode, int32_t gpu_layers, const char* gpu_layer_selection, int32_t cache_type, FlyweightV2RaonRuntime** out);
+
 FLYWEIGHT_V2_API int flyweight_v2_qwen_validate(const FlyweightV2Model* model);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_tensor_role(const FlyweightV2Model* model, const char* role, FlyweightV2TensorInfo* out);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_layer_tensor(const FlyweightV2Model* model, uint32_t layer, const char* role, FlyweightV2TensorInfo* out);
@@ -899,6 +926,7 @@ FLYWEIGHT_V2_API int flyweight_v2_tensor_view(const FlyweightV2Model* model, uin
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_create(FlyweightV2Model* model, const FlyweightV2QwenRuntimeOptions* options, FlyweightV2QwenRuntime** out);
 FLYWEIGHT_V2_API void flyweight_v2_qwen_runtime_destroy(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime* runtime, FlyweightV2QwenRuntimeInfo* out);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_layer_on_gpu(const FlyweightV2QwenRuntime* runtime, uint32_t layer);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime* runtime, FlyweightV2PlacementPlan* out);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime* runtime);

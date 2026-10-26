@@ -1974,7 +1974,28 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_values_indexed", "kv_attention_values_f16_indexed",
              "kv_attention_values_bf16_indexed", "kv_attention_values_q8_indexed",
              "kv_attention_scores_turbo3_indexed", "kv_attention_scores_turbo4_indexed",
-             "kv_attention_values_turbo3_indexed", "kv_attention_values_turbo4_indexed"
+             "kv_attention_values_turbo3_indexed", "kv_attention_values_turbo4_indexed",
+             // Raon-1: resolved here so a first launch never inserts into the
+             // table while another thread reads it.
+             "raon_cache_store",
+             "raon_combine_routes",
+             "raon_gather_rows",
+             "raon_head_gemm",
+             "raon_head_gemv",
+             "raon_long_rows_matvec",
+             "raon_mhc_post",
+             "raon_mhc_pre",
+             "raon_mla_attention",
+             "raon_mla_attention_mma",
+             "raon_mla_attention_mma_f16",
+             "raon_mla_combine",
+             "raon_mla_decode_attention",
+             "raon_mla_rope_queries",
+             "raon_rda_conv",
+             "raon_rda_recurrence",
+             "raon_sigmoid_mul",
+             "raon_situ_glu",
+             "raon_widen_half"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)
@@ -4011,9 +4032,24 @@ extern "C" int flyweight_gpu_launch_named(
 ) {
     if (name == nullptr || arguments == nullptr || grid_x == 0 || grid_y == 0
         || block_x == 0) return -1;
-    const auto found = g_functions.find(name);
-    if (found == g_functions.end()) return -2;
-    return launch(found->second, grid_x, grid_y, block_x, arguments,
+    CUfunction function = nullptr;
+    {
+        const auto found = g_functions.find(name);
+        if (found != g_functions.end()) {
+            function = found->second;
+        } else if (g_module != nullptr && g_api.cuModuleGetFunction != nullptr) {
+            static std::mutex lookup_mutex;
+            std::lock_guard<std::mutex> lock(lookup_mutex);
+            const auto retry = g_functions.find(name);
+            if (retry != g_functions.end()) {
+                function = retry->second;
+            } else if (g_api.cuModuleGetFunction(&function, g_module, name) == 0 && function != nullptr) {
+                g_functions[name] = function;
+            }
+        }
+    }
+    if (function == nullptr) return -2;
+    return launch(function, grid_x, grid_y, block_x, arguments,
                   shared_bytes, reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -3;
 }
@@ -4024,7 +4060,20 @@ extern "C" int flyweight_gpu_launch_named(
 // on this side would be a second copy of the same rule, free to drift from it.
 extern "C" int flyweight_gpu_kernel_available(const char* name) {
     if (name == nullptr) return 0;
-    return g_functions.find(name) != g_functions.end() ? 1 : 0;
+    const auto found = g_functions.find(name);
+    if (found != g_functions.end()) return 1;
+    if (g_module != nullptr && g_api.cuModuleGetFunction != nullptr) {
+        static std::mutex lookup_mutex;
+        std::lock_guard<std::mutex> lock(lookup_mutex);
+        const auto retry = g_functions.find(name);
+        if (retry != g_functions.end()) return 1;
+        CUfunction function = nullptr;
+        if (g_api.cuModuleGetFunction(&function, g_module, name) == 0 && function != nullptr) {
+            g_functions[name] = function;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 extern "C" int flyweight_gpu_attention_16bit_cublas(
