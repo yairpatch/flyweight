@@ -27,6 +27,7 @@
 #include "flyweight_v2_tool_grammar.hpp"
 #include "flyweight_v2_byte_alphabet.hpp"
 #include "flyweight_v2_vision.hpp"
+#include "flyweight_v2_ple_reader.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
 #include "qwen_kquant_pack_api.hpp"
@@ -985,8 +986,16 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t output_hc_down = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t output_hc_up = std::numeric_limits<std::uint64_t>::max();
     // The 320M-row n-gram table. Host-resident always: a token reads 16 rows
-    // of 160 elements, so it is served from the mapping like host embeddings.
+    // of 160 elements, through ple_reader in decode and the mapping elsewhere.
     std::uint64_t ple_table = std::numeric_limits<std::uint64_t>::max();
+    // Direct reads of that table (qwen4_ple_begin/finish). Opened on the first
+    // token; null when unavailable, which keeps the mapping path.
+    std::shared_ptr<flyweight::v2::PleReader> ple_reader;
+    bool ple_reader_tried = false;
+    // A decode token's rows are issued at the embedding and collected before
+    // the first PLE layer; this is the workspace they then upload to.
+    bool ple_pending = false;
+    std::uint64_t ple_pending_destination = 0;
     FlyweightV2QwenRuntimeOptions options{};
     std::string gpu_layer_selection_str;
     flyweight::v2::ExpertExecutionMode expert_mode =
@@ -7446,9 +7455,10 @@ std::uint64_t qwen4_ple_row_bytes(std::uint32_t type, std::uint64_t row_width) {
     return row_bytes;
 }
 
-void qwen4_stage_ple_embed(
-    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
-    const std::vector<std::uint32_t>& history, std::uint64_t destination
+// The table rows one token reads: (ngram-1) * heads_per_ngram of them.
+int qwen4_ple_token_rows(
+    const FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+    const std::vector<std::uint32_t>& history, std::uint64_t* rows
 ) {
     const auto& config = runtime.model->config;
     const std::uint64_t eos = config.ple_eos_token_id;
@@ -7459,54 +7469,165 @@ void qwen4_stage_ple_embed(
     const auto& multipliers = config.ple_multipliers;
     const std::uint32_t heads_per = config.ple_heads_per_ngram;
     const std::uint32_t head_count = (config.ple_ngram_size - 1) * heads_per;
+    if (head_count > static_cast<std::uint32_t>(flyweight::v2::PleReader::kMaxRows))
+        throw std::runtime_error("native qwen4exp PLE has too many heads");
     const auto& table = runtime.model->tensors[runtime.ple_table];
-    const std::uint64_t row_width = config.per_layer_embedding_size;
-    const std::uint64_t row_bytes = qwen4_ple_row_bytes(table.type, row_width);
-    const auto* source = tensor_data(*runtime.model, table);
     const std::uint64_t rows_total = table.shape[1];  // GGUF shape [width, rows]
-    // Pageable source is fine here: an async upload from pageable memory
-    // stages internally before returning, so the buffer can be reused.
-    static thread_local std::vector<float> gathered;
-    gathered.resize(static_cast<std::size_t>(head_count) * row_width);
     const std::uint64_t bigram = t0 * multipliers[0] ^ t1 * multipliers[1];
     const std::uint64_t trigram = bigram ^ t2 * multipliers[2];
     for (std::uint32_t head = 0; head < head_count; ++head) {
         const std::uint64_t mixed = head < heads_per ? bigram : trigram;
-        const std::uint64_t row = mixed % config.ple_head_vocab_sizes[head]
+        rows[head] = mixed % config.ple_head_vocab_sizes[head]
             + config.ple_head_offsets[head];
-        if (row >= rows_total)
+        if (rows[head] >= rows_total)
             throw std::runtime_error(
                 "native qwen4exp PLE row is out of range");
-        float* destination =
-            gathered.data() + static_cast<std::size_t>(head) * row_width;
-        const auto* row_data = source + row * row_bytes;
-        if (table.type == 20) {
-            for (std::uint64_t block = 0; block * kIq4nlBlockElements < row_width;
-                 ++block) {
-                const auto* base = row_data + block * kIq4nlBlockBytes;
-                std::uint16_t d_bits = 0;
-                std::memcpy(&d_bits, base, 2);
-                const float scale = qwen_half_value(d_bits);
-                float* out = destination + block * kIq4nlBlockElements;
-                for (int element = 0; element < 16; ++element) {
-                    const std::uint8_t byte = base[2 + element];
-                    out[element] = scale * kIq4nlValues[byte & 15];
-                    out[element + 16] = scale * kIq4nlValues[byte >> 4];
-                }
-            }
-        } else if (table.type == 0) {
-            std::memcpy(destination, row_data, row_width * sizeof(float));
-        } else {
-            // Any other row-decodable type (the K-quants and the IQ family)
-            // through the shared row dequant; the stride check above already
-            // guaranteed the width tiles the block.
-            qwen_dequant_row(source, table.type, static_cast<int>(row_width), row,
-                             destination);
-        }
     }
+    return static_cast<int>(head_count);
+}
+
+// One table row's raw bytes to `row_width` floats.
+void qwen4_ple_decode_row(
+    std::uint32_t type, std::uint64_t row_width, const std::uint8_t* row_data,
+    float* destination
+) {
+    if (type == 20) {
+        for (std::uint64_t block = 0; block * kIq4nlBlockElements < row_width;
+             ++block) {
+            const auto* base = row_data + block * kIq4nlBlockBytes;
+            std::uint16_t d_bits = 0;
+            std::memcpy(&d_bits, base, 2);
+            const float scale = qwen_half_value(d_bits);
+            float* out = destination + block * kIq4nlBlockElements;
+            for (int element = 0; element < 16; ++element) {
+                const std::uint8_t byte = base[2 + element];
+                out[element] = scale * kIq4nlValues[byte & 15];
+                out[element + 16] = scale * kIq4nlValues[byte >> 4];
+            }
+        }
+    } else if (type == 0) {
+        std::memcpy(destination, row_data, row_width * sizeof(float));
+    } else {
+        // Any other row-decodable type (the K-quants and the IQ family)
+        // through the shared row dequant; qwen4_ple_row_bytes already
+        // guaranteed the width tiles the block.
+        qwen_dequant_row(row_data, type, static_cast<int>(row_width), 0,
+                         destination);
+    }
+}
+
+// Whether decode will read the n-gram table through PleReader rather than
+// the mapping: Linux, and not turned off. (`open` can still fail; then the
+// mapping path runs beside whatever the experts have pinned.)
+bool qwen4_ple_direct_planned() {
+#if defined(__linux__)
+    const char* setting = std::getenv("FLYWEIGHT_PLE_DIRECT");
+    return !(setting && setting[0] == '0');
+#else
+    return false;
+#endif
+}
+
+// The direct reader, opened on first use. FLYWEIGHT_PLE_DIRECT=0 keeps the
+// mapping path for A/B; FLYWEIGHT_PLE_ROW_CACHE sets the row cache size in
+// rows (default 1M, ~90 MB for IQ4_NL rows; 0 disables it).
+flyweight::v2::PleReader* qwen4_ple_reader(FlyweightV2QwenRuntime& runtime) {
+    if (runtime.ple_reader_tried) return runtime.ple_reader.get();
+    runtime.ple_reader_tried = true;
+    const char* setting = std::getenv("FLYWEIGHT_PLE_DIRECT");
+    if (setting && setting[0] == '0') return nullptr;
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const auto* address = tensor_data(*runtime.model, table);
+    // The shard whose mapping holds the table; mappings start at file
+    // offset 0, so the table's file offset is its distance into it.
+    const FlyweightV2Model* owner = nullptr;
+    auto holds = [&](const FlyweightV2Model& model) {
+        return model.data && address >= model.data
+            && address + table.size <= model.data + model.size;
+    };
+    if (holds(*runtime.model)) owner = runtime.model;
+    for (const auto& shard : runtime.model->shards)
+        if (!owner && shard && holds(*shard)) owner = shard.get();
+    if (!owner || owner->path.empty()) return nullptr;
+    std::uint64_t cache_rows = 1ull << 20;
+    if (const char* rows = std::getenv("FLYWEIGHT_PLE_ROW_CACHE"))
+        cache_rows = std::strtoull(rows, nullptr, 10);
+    const std::uint64_t row_bytes = qwen4_ple_row_bytes(
+        table.type, runtime.model->config.per_layer_embedding_size);
+    auto reader = std::make_shared<flyweight::v2::PleReader>();
+    if (!reader->open(owner->path,
+            static_cast<std::uint64_t>(address - owner->data), row_bytes,
+            table.shape[1], cache_rows)) {
+        std::fprintf(stderr,
+            "[flyweight] n-gram table: direct reads unavailable, reading "
+            "through the mapping\n");
+        return nullptr;
+    }
+    runtime.ple_reader = std::move(reader);
+    return runtime.ple_reader.get();
+}
+
+// Upload the gathered rows of the pending token (no-op when none is pending).
+void qwen4_ple_finish(FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.ple_pending) return;
+    runtime.ple_pending = false;
+    auto* reader = runtime.ple_reader.get();
+    if (!reader->collect())
+        throw std::runtime_error("native qwen4exp PLE direct read failed");
+    const auto& config = runtime.model->config;
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const std::uint64_t row_width = config.per_layer_embedding_size;
+    const int head_count = static_cast<int>(
+        (config.ple_ngram_size - 1) * config.ple_heads_per_ngram);
+    static thread_local std::vector<float> gathered;
+    gathered.resize(static_cast<std::size_t>(head_count) * row_width);
+    for (int head = 0; head < head_count; ++head)
+        qwen4_ple_decode_row(table.type, row_width, reader->row(head),
+            gathered.data() + static_cast<std::size_t>(head) * row_width);
+    if (flyweight_gpu_upload(runtime.ple_pending_destination, gathered.data(),
+            gathered.size() * sizeof(float), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp PLE staging failed");
+}
+
+// Start gathering this token's n-gram embedding into `destination`. With the
+// direct reader the rows are only issued here, and qwen4_ple_finish (before
+// the first PLE layer) waits for them; without it the gather completes now.
+void qwen4_ple_begin(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+    const std::vector<std::uint32_t>& history, std::uint64_t destination
+) {
+    qwen4_ple_finish(runtime);
+    std::uint64_t rows[flyweight::v2::PleReader::kMaxRows];
+    const int head_count = qwen4_ple_token_rows(runtime, token, history, rows);
+    if (auto* reader = qwen4_ple_reader(runtime)) {
+        reader->issue(rows, head_count);
+        runtime.ple_pending = true;
+        runtime.ple_pending_destination = destination;
+        return;
+    }
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const std::uint64_t row_width = runtime.model->config.per_layer_embedding_size;
+    const std::uint64_t row_bytes = qwen4_ple_row_bytes(table.type, row_width);
+    const auto* source = tensor_data(*runtime.model, table);
+    // Pageable source is fine here: an async upload from pageable memory
+    // stages internally before returning, so the buffer can be reused.
+    static thread_local std::vector<float> gathered;
+    gathered.resize(static_cast<std::size_t>(head_count) * row_width);
+    for (int head = 0; head < head_count; ++head)
+        qwen4_ple_decode_row(table.type, row_width, source + rows[head] * row_bytes,
+            gathered.data() + static_cast<std::size_t>(head) * row_width);
     if (flyweight_gpu_upload(destination, gathered.data(),
             gathered.size() * sizeof(float), runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp PLE staging failed");
+}
+
+// The blocking form, for callers that read the embedding right away.
+void qwen4_stage_ple_embed(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+    const std::vector<std::uint32_t>& history, std::uint64_t destination
+) {
+    qwen4_ple_begin(runtime, token, history, destination);
+    qwen4_ple_finish(runtime);
 }
 
 // Rows form: the whole chunk's n-gram gathers, one upload. In-chunk history
@@ -22749,7 +22870,32 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whatever the pinning, so page pressure dominates either way. It stays
         // available for boxes where the numbers come out differently, but it does
         // not turn itself on to buy nothing and lock pages doing it.
-        const bool budgeted_direct=forced_direct&&!auto_direct&&
+        // The exception, measured since: qwen4exp with its n-gram table read
+        // through PleReader. The table no longer takes page cache, so every
+        // expert layer fits the budget (40 GiB of 48 layers for Flash-Next
+        // IQ3_XXS on the 60 GiB box), and pinned experts cannot be evicted by
+        // the table or the dense weights. Interleaved warm runs (2026-10-26):
+        // decode 21.7-22.9 ms a token pinned against 23.0-23.9 staged, and a
+        // staged run that follows anything else that churned the page cache
+        // is far worse. So auto pins when every expert layer fits, and only
+        // then -- partial coverage is still the no-win case above.
+        bool auto_full_direct=false;
+        if(runtime->options.expert_paging==0&&!ram_for_direct&&
+           runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid&&
+           runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+           qwen4_ple_direct_planned()&&
+           runtime->host_available_bytes>kRegisterReserveBytes){
+            std::uint64_t all_experts=0;
+            const int roles=runtime->nemotron?2:3;
+            for(const auto& layer:runtime->layers){
+                if(!qwen_layer_expert_count(*runtime,layer))continue;
+                for(int role=0;role<roles;++role)
+                    all_experts+=runtime->model->tensors[layer.expert_tensors[role]].size;
+            }
+            auto_full_direct=all_experts>0&&
+                all_experts<=runtime->host_available_bytes-kRegisterReserveBytes;
+        }
+        const bool budgeted_direct=(forced_direct||auto_full_direct)&&!auto_direct&&
             runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
@@ -22835,8 +22981,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // gathered on the host (16 rows a token), so pinning it would buy
             // nothing and cost 25.7 GiB. The embedding IS registerable, so it is
             // charged to the budget below rather than reserved from it.
+            // Not when decode reads the table through PleReader: that drops
+            // every page after copying its row out, so the table holds no
+            // page cache and the experts can have the RAM.
             std::uint64_t host_resident_bytes=0;
-            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max())
+            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+               !qwen4_ple_direct_planned())
                 host_resident_bytes+=
                     runtime->model->tensors[runtime->ple_table].size;
             const auto floor_bytes=kRegisterReserveBytes+host_resident_bytes;
@@ -27083,7 +27233,13 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             return;
         }
         // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
-        if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
+        if(type==30){
+            void*args[]={&matrix,&input,&output,&output_size,&input_size};
+            if(output_size<=16&&input_size>=2048)
+                launch_named("bf16_matvec_long_rows",output_size,1,256,args);
+            else launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);
+            return;
+        }
         const auto*format=flyweight::v2::qwen_format(type);
         if(format&&format->matvec_q8_warp&&
            q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size,
@@ -27110,6 +27266,41 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             const_cast<std::uint64_t*>(&hc_normed),
             const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
         launch_named("qwen4_group_rms",hc_count,1,256,norm_args);
+        // Three launches instead of six when the mixers are bf16 (every
+        // released qwen4exp GGUF): the down projection and inject logits in
+        // one, the silu, up projection and stream mix in the other. 38.5 ->
+        // 28.9 us per hc_pre standalone, two per layer. FLYWEIGHT_HC_FUSED=0
+        // keeps the chain below for A/B.
+        static const bool env_hc_fused=[]{
+            const char*s=std::getenv("FLYWEIGHT_HC_FUSED");return !s||s[0]!='0';}();
+        const bool has_inject=inject_index!=std::numeric_limits<std::uint64_t>::max();
+        if(env_hc_fused&&hc_low_rank%8==0&&
+           qwen_device_type(*runtime,down_index)==30&&
+           qwen_device_type(*runtime,up_index)==30&&
+           (!has_inject||qwen_device_type(*runtime,inject_index)==30)){
+            std::uint64_t down=runtime->device_tensors[down_index];
+            std::uint64_t up=runtime->device_tensors[up_index];
+            std::uint64_t inject=has_inject?runtime->device_tensors[inject_index]:0;
+            float divisor=static_cast<float>(hc_count);
+            void*down_args[]={const_cast<std::uint64_t*>(&hc_normed),&down,&inject,
+                const_cast<std::uint64_t*>(&hc_low),
+                const_cast<std::uint64_t*>(&hc_gates),
+                const_cast<int*>(&hc_low_rank),const_cast<int*>(&hc_count),
+                const_cast<int*>(&hc_wide_size)};
+            launch_named("qwen4_hc_down_inject",
+                static_cast<std::uint32_t>((hc_low_rank+(has_inject?hc_count:0)+1)/2),
+                1,256,down_args);
+            void*up_args[]={const_cast<std::uint64_t*>(&hc_low),&up,
+                const_cast<std::uint64_t*>(&hc_normed),
+                const_cast<std::uint64_t*>(&normalized),
+                const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size),
+                const_cast<int*>(&hc_low_rank),&divisor};
+            launch_named("qwen4_hc_up_mix",
+                static_cast<std::uint32_t>((hidden_size+7)/8),1,256,up_args,
+                static_cast<std::uint32_t>(hc_low_rank*sizeof(float)));
+            q8_cached_input=0;
+            return;
+        }
         dense_matvec(down_index,hc_normed,hc_low,hc_wide_size,hc_low_rank);
         float divisor=static_cast<float>(hc_count);
         void*silu_args[]={const_cast<std::uint64_t*>(&hc_low),
@@ -27221,8 +27412,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,init_args);
             if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
                !runtime->model->config.ple_layers.empty())
-                qwen4_stage_ple_embed(*runtime,input_token,
-                                      runtime->processed_tokens,ple_embed);
+                // Issued now, collected before the first PLE layer reads it.
+                qwen4_ple_begin(*runtime,input_token,
+                                runtime->processed_tokens,ple_embed);
         }
     }
     if(qwen_lm_diag_enabled()){
@@ -27297,8 +27489,10 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             &&!layer.dense_ffn&&graph_eligible;
         bool front_done=false;
         if(runtime->qwen4exp){
-            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                qwen4_ple_finish(*runtime);
                 ple_block(layer);
+            }
             if(!front_graph)
                 hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
                        layer.hc_attn_inject);
@@ -28379,6 +28573,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         if(env_wddm_flush&&flyweight_gpu_wddm())
             (void)flyweight_gpu_stream_query(runtime->stream);
     }
+    // No PLE layer ran (or none exists): do not leave reads in flight.
+    if(runtime->qwen4exp)qwen4_ple_finish(*runtime);
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_start);
     if(runtime->options.mtp_drafts){
         auto target_hidden=runtime->state+runtime->mtp_target_hidden_offset;

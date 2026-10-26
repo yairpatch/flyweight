@@ -477,22 +477,53 @@ void route_topk(
         probabilities[index] /= denominator;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float selected_total = 0.0f;
-        for (int rank = 0; rank < top_k; ++rank) {
+    // Selection is a block-wide argmax per rank. It used to be thread 0
+    // scanning all experts top_k times, which at 512 experts x 10 ranks was
+    // ~27 us of a single thread, once per routed layer per token. The key
+    // packs the probability above the inverted index, so the maximum is the
+    // largest probability and, on a tie, the lowest index -- the same pick the
+    // serial strict-greater scan made, so the routes are unchanged.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    __shared__ unsigned long long warp_best[32];
+    for (int rank = 0; rank < top_k; ++rank) {
+        unsigned long long best = 0ULL;
+        for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+            const float probability = probabilities[index];
+            if (probability >= 0.0f) {
+                const unsigned long long key =
+                    ((unsigned long long)__float_as_uint(probability) << 32)
+                    | (unsigned long long)(0xffffffffu - (unsigned int)index);
+                best = key > best ? key : best;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned long long other =
+                __shfl_down_sync(0xffffffff, best, offset);
+            best = other > best ? other : best;
+        }
+        if (lane == 0) warp_best[warp] = best;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int other = 1; other < warps; ++other)
+                best = warp_best[other] > best ? warp_best[other] : best;
             int best_index = 0;
             float best_value = -1.0f;
-            for (int expert = 0; expert < experts; ++expert) {
-                if (probabilities[expert] > best_value) {
-                    best_value = probabilities[expert];
-                    best_index = expert;
-                }
+            if (best != 0ULL) {
+                best_index = (int)(0xffffffffu - (unsigned int)(best & 0xffffffffULL));
+                best_value = __uint_as_float((unsigned int)(best >> 32));
             }
             selected[rank] = best_index;
             routing_weights[rank] = best_value;
-            selected_total += best_value;
             probabilities[best_index] = -1.0f;
         }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float selected_total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank)
+            selected_total += routing_weights[rank];
         for (int rank = 0; rank < top_k; ++rank) {
             routing_weights[rank] /= selected_total;
         }
@@ -736,6 +767,38 @@ void bf16_matvec_warp(
     for (int offset = 16; offset > 0; offset >>= 1)
         partial += __shfl_down_sync(0xffffffff, partial, offset);
     if (lane == 0) output[row] = partial;
+}
+
+// A block per row for a projection with a handful of long rows: qwen4exp's
+// hyper-connection inject is 4 rows of 10240, which the warp form ran as one
+// block of four warps (~12 us, twice per layer). Same 128-bit loads as
+// bf16_matvec_warp, spread over the whole block.
+extern "C" __global__
+void bf16_matvec_long_rows(
+    const unsigned short* weights,
+    const float* vector,
+    float* output,
+    const int rows,
+    const int columns
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned short* row_weights =
+        weights + (long long)row * (long long)columns;
+    float partial = 0.0f;
+    if (bf16_vectorizable(row_weights, vector, columns)) {
+        const uint4* packed = (const uint4*)row_weights;
+        const int steps = columns >> 3;
+        for (int step = threadIdx.x; step < steps; step += blockDim.x)
+            partial += bf16_dot8(packed[step], vector + step * 8);
+    } else {
+        for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+            const unsigned int bits = ((unsigned int)row_weights[column]) << 16;
+            partial += __uint_as_float(bits) * vector[column];
+        }
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
 }
 
 extern "C" __global__
@@ -14991,6 +15054,106 @@ void qwen4_silu_scale(float* values, const int count, const float divisor) {
     if (index >= count) return;
     const float x = values[index] / divisor;
     values[index] = x / (1.0f + expf(-x));
+}
+
+// hc_pre's low-rank down projection and inject logits in one launch, over
+// the normed streams qwen4_group_rms just wrote: low_rank rows of `down`, then
+// (when `inject` is set) hc rows of `inject`, all hc*hidden_size wide. The
+// down projection used to run warp-per-row, which is 40 blocks for its 320
+// rows and left most of the card idle (13.9 us for 6.5 MB). Here four warps
+// split each row's columns and a block does two rows, so it is ~160 blocks
+// and 11.7 us -- inject included, which was a launch of its own. The four
+// partial sums add in a fixed order, so results are deterministic; against
+// the warp form they differ only in fp32 summation order. 256 threads.
+extern "C" __global__
+void qwen4_hc_down_inject(
+    const float* normed, const unsigned short* down,
+    const unsigned short* inject, float* low, float* gates,
+    const int low_rank, const int hc, const int width
+) {
+    __shared__ float parts[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 2 + (warp >> 2);
+    const int part = warp & 3;
+    const int rows = low_rank + (inject ? hc : 0);
+    float partial = 0.0f;
+    if (row < rows) {
+        const unsigned short* row_weights = row < low_rank
+            ? down + (long long)row * width
+            : inject + (long long)(row - low_rank) * width;
+        if (bf16_vectorizable(row_weights, normed, width)) {
+            const uint4* packed = (const uint4*)row_weights;
+            const int steps = width >> 3;
+            for (int step = part * 32 + lane; step < steps; step += 128)
+                partial += bf16_dot8(packed[step], normed + step * 8);
+        } else {
+            for (int column = part * 32 + lane; column < width; column += 128) {
+                const unsigned int bits = ((unsigned int)row_weights[column]) << 16;
+                partial += __uint_as_float(bits) * normed[column];
+            }
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) parts[warp] = partial;
+    __syncthreads();
+    if ((threadIdx.x & 127) == 0 && row < rows) {
+        const int first = warp;  // 0 or 4: this row's four warps
+        const float value = parts[first] + parts[first + 1]
+            + parts[first + 2] + parts[first + 3];
+        if (row < low_rank) low[row] = value;
+        else gates[row - low_rank] = value;
+    }
+}
+
+// hc_pre's back half in one launch: silu(low / divisor), the up projection
+// back to hc*hidden_size, and the sigmoid-gated mean over the streams that
+// makes the block input -- formerly qwen4_silu_scale, bf16_matvec_warp and
+// qwen4_hc_mix. A warp owns one hidden index and computes its hc up rows
+// (s*hidden_size + i) with bf16_matvec_warp's dot, then lane 0 mixes them in
+// qwen4_hc_mix's order, so the result is bit-identical to that chain. `low`
+// is left as the down projection wrote it. 256 threads, eight hidden indices
+// per block, low_rank floats of dynamic shared memory.
+extern "C" __global__
+void qwen4_hc_up_mix(
+    const float* low, const unsigned short* up, const float* normed,
+    float* block_input, const int hc, const int hidden_size,
+    const int low_rank, const float divisor
+) {
+    extern __shared__ float activated[];
+    for (int j = threadIdx.x; j < low_rank; j += blockDim.x) {
+        const float x = low[j] / divisor;
+        activated[j] = x / (1.0f + expf(-x));
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (i >= hidden_size) return;
+    float total = 0.0f;
+    for (int s = 0; s < hc; ++s) {
+        const long long row = (long long)s * hidden_size + i;
+        const unsigned short* row_weights = up + row * low_rank;
+        float partial = 0.0f;
+        if (bf16_vectorizable(row_weights, activated, low_rank)) {
+            const uint4* packed = (const uint4*)row_weights;
+            const int steps = low_rank >> 3;
+            for (int step = lane; step < steps; step += 32)
+                partial += bf16_dot8(packed[step], activated + step * 8);
+        } else {
+            for (int column = lane; column < low_rank; column += 32) {
+                const unsigned int bits = ((unsigned int)row_weights[column]) << 16;
+                partial += __uint_as_float(bits) * activated[column];
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        if (lane == 0) {
+            const float gate = 1.0f / (1.0f + expf(-partial));
+            total += gate * normed[row];
+        }
+    }
+    if (lane == 0) block_input[i] = total / (float)hc;
 }
 
 // block_input = mean over streams of sigmoid(up_out) * normed.
