@@ -20,6 +20,7 @@
 #include "flyweight_v2_deepseek4_kernels.hpp"
 #include "flyweight_v2_diffusion_kernels.hpp"
 #include "flyweight_v2_bailing.hpp"
+#include "flyweight_v2_raon.hpp"
 #include "flyweight_v2_hf_quantize.hpp"
 #include "flyweight_v2_hf_cache.hpp"
 #include "flyweight_v2_workspace.hpp"
@@ -36,6 +37,7 @@
 #include "flyweight_cpu_topology.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -995,6 +997,7 @@ struct FlyweightV2QwenRuntime {
     bool ple_pending = false;
     std::uint64_t ple_pending_destination = 0;
     FlyweightV2QwenRuntimeOptions options{};
+    std::string gpu_layer_selection_str;
     flyweight::v2::ExpertExecutionMode expert_mode =
         flyweight::v2::ExpertExecutionMode::streamed_gpu;
     std::vector<QwenLayerPlan> layers;
@@ -2961,6 +2964,11 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=21 && key.compare(key.size()-21,21,".ple.head_vocab_sizes")==0 && type==9) m.config.ple_head_vocab_sizes=read_u64_array(type);
         else if (key.size()>=34 && key.compare(key.size()-34,34,".attention.compress_rope_freq_base")==0 && (type==6 || type==12)) m.config.compress_rope_freq_base=read_float(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".hyper_connection.epsilon")==0 && (type==6 || type==12)) m.config.sinkhorn_epsilon=read_float(type);
+        else if ((key.size()>=27 && key.compare(key.size()-27,27,".hyper_connection.magnitude")==0) && (type==6 || type==12)) m.config.mhc_magnitude=read_float(type);
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".activation.situ_beta")==0 && (type==6 || type==12)) m.config.situ_beta=read_float(type);
+        else if (key.size()>=28 && key.compare(key.size()-28,28,".activation.situ_linear_beta")==0 && (type==6 || type==12)) m.config.situ_linear_beta=read_float(type);
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".kda.gate_lower_bound")==0 && (type==6 || type==12)) m.config.kda_gate_lower_bound=read_float(type);
+        else if (key.size()>=34 && key.compare(key.size()-34,34,".attention.latent_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.latent_norm_rms_epsilon=read_float(type);
         else if (key.size()>=19 && key.compare(key.size()-19,19,".swiglu_clamp_shexp")==0 && type==9) m.config.swiglu_clamp_shexp=read_float_array(type);
         else if (key.size()>=17 && key.compare(key.size()-17,17,".swiglu_clamp_exp")==0 && type==9) m.config.swiglu_clamp_exp=read_float_array(type);
         else if (set_config(key,type)) {}
@@ -3057,6 +3065,18 @@ int parse(FlyweightV2Model& m) {
                     flyweight::v2::bailing::layer_is_full_attention(
                         layer,m.config.layer_count,
                         m.config.full_attention_interval)?0:1;
+        }
+    }
+    if(m.architecture=="raon1"){
+        if(!m.config.kv_lora_rank)m.config.kv_lora_rank=m.config.value_length;
+        if(!m.config.expert_shared_intermediate_size&&m.config.expert_shared_count)
+            m.config.expert_shared_intermediate_size=
+                m.config.expert_intermediate_size*m.config.expert_shared_count;
+        if(m.config.attention_kv_heads_by_layer.empty()&&m.config.layer_count){
+            m.config.attention_kv_heads_by_layer.assign(m.config.layer_count,0);
+            for(uint32_t l : {3u, 7u, 11u, 15u, 19u, 23u, 24u}){
+                if(l < m.config.layer_count) m.config.attention_kv_heads_by_layer[l] = 1;
+            }
         }
     }
     // qwen4exp: the novel blocks are driven entirely by metadata, and a
@@ -9033,7 +9053,7 @@ int plan_memory(FlyweightV2MemoryPlan& out, uint64_t budget, uint64_t static_wei
 }
 
 extern "C" {
-uint32_t flyweight_v2_version() { return 7; }
+uint32_t flyweight_v2_version() { return 8; }
 uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
 uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
 uint64_t flyweight_v2_placement_plan_size() { return sizeof(FlyweightV2PlacementPlan); }
@@ -9436,6 +9456,160 @@ void bailing_adapt_gguf(FlyweightV2Model& m) {
                         !=dropped.end();
                 }),
             m.tensors.end());
+}
+
+void raon_adapt_gguf(FlyweightV2Model& m) {
+    namespace raon = flyweight::v2::raon;
+    const auto& config = m.config;
+    if(!config.layer_count)return;
+
+    const auto find=[&m](const std::string& name)->Tensor*{
+        for(auto& tensor:m.tensors)if(tensor.name==name)return &tensor;
+        return nullptr;
+    };
+
+    struct Pending {
+        std::string name;
+        std::vector<std::uint64_t> shape;
+        std::uint64_t offset=0, size=0;
+    };
+    std::vector<Pending> pending;
+    std::vector<std::uint8_t> arena;
+    const auto reserve=[&arena](std::uint64_t bytes)->std::uint64_t{
+        const auto at=arena.size();
+        arena.resize(at+bytes);
+        return at;
+    };
+
+    std::vector<std::string> dropped;
+    for(std::uint32_t layer=0;layer<config.layer_count;++layer){
+        const std::string prefix="blk."+std::to_string(layer)+".";
+        const bool is_mla = layer < config.attention_kv_heads_by_layer.size() &&
+                            config.attention_kv_heads_by_layer[layer] == 1;
+        if(!is_mla) continue;
+        if(find(prefix+"attn_kv_b.weight")) continue;
+        auto* k_b=find(prefix+"attn_k_b.weight");
+        auto* v_b=find(prefix+"attn_v_b.weight");
+        if(!k_b||!v_b) continue;
+
+        const std::uint64_t heads = config.attention_heads ? config.attention_heads : 40;
+        const std::uint64_t rotary_dim = config.rotary_dimension ? config.rotary_dimension : 64;
+        const std::uint64_t qk_nope = config.key_length_mla > rotary_dim ? (config.key_length_mla - rotary_dim) : 128;
+        const std::uint64_t v_head = config.value_length_mla ? config.value_length_mla : 128;
+        const std::uint64_t kv_lora = config.kv_lora_rank ? config.kv_lora_rank : 512;
+
+        std::vector<float> keys(heads*kv_lora*qk_nope);
+        std::vector<float> values(heads*v_head*kv_lora);
+        raon::matrix_decode({tensor_data(m,*k_b),k_b->type},
+                            qk_nope,heads*kv_lora,keys.data());
+        raon::matrix_decode({tensor_data(m,*v_b),v_b->type},
+                            kv_lora,heads*v_head,values.data());
+        const std::uint64_t merged_rows=heads*(qk_nope+v_head);
+        const auto offset=reserve(merged_rows*kv_lora*sizeof(float));
+        auto* out=reinterpret_cast<float*>(arena.data()+offset);
+        for(std::uint64_t head=0;head<heads;++head){
+            float* block=out+head*(qk_nope+v_head)*kv_lora;
+            const float* k=keys.data()+head*kv_lora*qk_nope;
+            for(std::uint64_t row=0;row<qk_nope;++row)
+                for(std::uint64_t column=0;column<kv_lora;++column)
+                    block[row*kv_lora+column]=k[column*qk_nope+row];
+            std::memcpy(block+qk_nope*kv_lora,
+                        values.data()+head*v_head*kv_lora,
+                        v_head*kv_lora*sizeof(float));
+        }
+        pending.push_back({prefix+"attn_kv_b.weight",{kv_lora,merged_rows},
+                           offset,merged_rows*kv_lora*sizeof(float)});
+        dropped.push_back(k_b->name);
+        dropped.push_back(v_b->name);
+    }
+
+    if(!arena.empty()){
+        m.owned_arena=std::move(arena);
+        for(const auto& entry:pending){
+            Tensor tensor;
+            tensor.name=entry.name;
+            tensor.shape=entry.shape;
+            tensor.type=0;
+            tensor.offset=entry.offset;
+            tensor.size=entry.size;
+            tensor.source=m.owned_arena.data();
+            m.tensors.push_back(std::move(tensor));
+        }
+        if(!dropped.empty())
+            m.tensors.erase(
+                std::remove_if(m.tensors.begin(),m.tensors.end(),
+                    [&dropped](const Tensor& tensor){
+                        return std::find(dropped.begin(),dropped.end(),tensor.name)
+                            !=dropped.end();
+                    }),
+                m.tensors.end());
+    }
+}
+
+void raon_validate_plan(const FlyweightV2Model& m) {
+    const auto& config = m.config;
+    std::unordered_set<std::string> present;
+    for(const auto& tensor:m.tensors)present.insert(tensor.name);
+    const auto require=[&present](const std::string& name){
+        if(!present.count(name))
+            throw std::runtime_error("raon1 is missing required tensor: "+name);
+    };
+    require("token_embd.weight");
+    require("output_norm.weight");
+    require("output.weight");
+
+    for(std::uint32_t layer=0;layer<config.layer_count;++layer){
+        const std::string prefix="blk."+std::to_string(layer)+".";
+        require(prefix+"attn_norm.weight");
+        require(prefix+"ffn_norm.weight");
+        require(prefix+"hc_attn_fn.weight");
+        require(prefix+"hc_attn_base.weight");
+        require(prefix+"hc_attn_scale.weight");
+        require(prefix+"hc_ffn_fn.weight");
+        require(prefix+"hc_ffn_base.weight");
+        require(prefix+"hc_ffn_scale.weight");
+
+        const bool is_mla = layer < config.attention_kv_heads_by_layer.size() &&
+                            config.attention_kv_heads_by_layer[layer] == 1;
+        if(is_mla){
+            require(prefix+"attn_q_a.weight");
+            require(prefix+"attn_q_a_norm.weight");
+            require(prefix+"attn_q_b.weight");
+            require(prefix+"attn_kv_a_mqa.weight");
+            require(prefix+"attn_kv_a_norm.weight");
+            require(prefix+"attn_kv_b.weight");
+            require(prefix+"attn_gate.weight");
+            require(prefix+"attn_output.weight");
+        } else {
+            require(prefix+"attn_q.weight");
+            require(prefix+"attn_k.weight");
+            require(prefix+"attn_v.weight");
+            require(prefix+"ssm_conv1d_q.weight");
+            require(prefix+"ssm_conv1d_k.weight");
+            require(prefix+"ssm_conv1d_v.weight");
+            require(prefix+"ssm_f_a.weight");
+            require(prefix+"ssm_f_b.weight");
+            require(prefix+"ssm_beta.weight");
+            require(prefix+"ssm_rda.weight");
+            require(prefix+"ssm_a");
+            require(prefix+"ssm_dt.bias");
+            require(prefix+"ssm_g.weight");
+            if (!present.count(prefix+"ssm_norm.weight") && !present.count(prefix+"ssm_o_norm.weight"))
+                throw std::runtime_error("raon1 is missing required tensor: "+prefix+"ssm_norm.weight");
+            require(prefix+"attn_output.weight");
+        }
+
+        if(layer < config.leading_dense_block_count){
+            require(prefix+"ffn_gate.weight");
+            require(prefix+"ffn_up.weight");
+            require(prefix+"ffn_down.weight");
+        } else {
+            require(prefix+"ffn_gate_inp.weight");
+            require(prefix+"ffn_gate_exps.weight");
+            require(prefix+"ffn_up_exps.weight");
+            require(prefix+"ffn_down_exps.weight");
+        }
+    }
 }
 
 // An HF checkpoint is a directory: config.json plus one or more safetensors
@@ -12573,6 +12747,2851 @@ int flyweight_v2_bailing_cache_load(FlyweightV2BailingRuntime* runtime,
     return flyweight_v2_bailing_cache_load_slot(runtime, 0, buffer, length);
 }
 
+// ---------------------------------------------------------------------------
+// Raon-1 (raon1) runtime
+// ---------------------------------------------------------------------------
+
+struct RaonSlot {
+    std::size_t position = 0;
+    std::vector<flyweight::v2::raon::LayerCache> caches;
+    std::vector<float> streams; // [mhc_streams * hidden]
+    // Device decode (FlyweightV2RaonRuntime::device_decode): the RDA state
+    // and conv windows and the MLA cache rows live here instead of in
+    // `caches`, per layer, 0 where the layer has none.
+    std::vector<std::uint64_t> rda_state, rda_window, mla_latents, mla_rope;
+};
+
+// Device-resident decode weights of one layer: the small RDA tensors in
+// their GGUF types plus an f32 block [q_conv | k_conv | v_conv | dt_bias | a |
+// o_norm]; the MLA norms [q_a_norm | kv_a_norm] and kv_b as f16; the dense
+// FFN; the shared expert.
+struct RaonDecodeLayer {
+    std::uint64_t f_a = 0, f_b = 0, beta = 0, rda = 0, small = 0;
+    // f_a, beta and rda stacked [rank + 2 * heads][hidden] when they share a
+    // type: they read the same input, and beta/rda alone (40 rows) make a
+    // latency-bound five-block matvec each.
+    std::uint64_t f_a_beta_rda = 0;
+    std::uint64_t norms = 0, kv_b = 0;
+    std::uint64_t dense_gate = 0, dense_up = 0, dense_down = 0;
+    std::uint64_t shared_gate = 0, shared_up = 0, shared_down = 0;
+    // mHC on the device: fn ([17][4H], checkpoint type) and an f32 block
+    // [base 17 | scale 4 | norm gain H] per site (attention, FFN).
+    std::uint64_t mhc_fn[2] = {}, mhc_params[2] = {};
+};
+
+// Device decode's expert cache: VRAM slots each holding one routed expert
+// ([gate | up | down] in the layer's types) for any MoE layer, kept by LRU.
+// A decode token runs the experts it finds here on the GPU and the rest on
+// the CPU at the same time; up to admit_budget of those misses per token are
+// uploaded from the pinned host copy on `stream` and become usable once the
+// stream has drained (polled, never waited on). Replayed on real Raon routes,
+// this serves ~71% of expert reads from the GPU at the VRAM that pinned six
+// whole layers (25%).
+struct RaonExpertCache {
+    std::size_t slot_bytes = 0, slots = 0;
+    std::uint64_t pool = 0;
+    std::uint64_t stream = 0;
+    std::vector<std::int32_t> slot_of;     // [layer * experts + expert] -> slot, -1
+    std::vector<std::int32_t> owner;       // slot -> layer * experts + expert, -1
+    std::vector<std::uint8_t> ready;       // slot -> its upload has landed
+    std::vector<std::int32_t> newer, older;  // LRU links; head = most recent
+    std::int32_t head = -1, tail = -1, unused = 0;  // slots [unused, slots) never filled
+    std::vector<std::int32_t> pending;     // uploaded, not yet seen to land
+    std::uint32_t admit_budget = 16, admitted = 0;
+    std::uint64_t lookups = 0, hits = 0, admissions = 0;
+};
+
+// Scratch of the one-token device step, sub-buffers of one allocation.
+struct RaonDecodeScratch {
+    std::uint64_t x = 0, pack = 0, qkv = 0, fa = 0, fb = 0, beta = 0, delta = 0, att = 0;
+    std::uint64_t latent = 0, qn = 0, query = 0, queries = 0, ctx = 0, partial = 0, partial_ml = 0;
+    std::uint64_t mla_out = 0, hidden = 0, ffn_gate = 0, ffn_up = 0, ffn_act = 0, shared_out = 0;
+    std::uint64_t streams = 0, mixes = 0, coefficients = 0, routed = 0;
+    std::size_t max_splits = 0;
+};
+
+static const char* raon_cuda_source = R"(
+extern "C" __global__ void raon_situ_glu(
+    const float* gate, const float* val, float* output,
+    int size, float beta, float value_beta
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float g = gate[i];
+        float v = val[i];
+        float sig = 1.0f / (1.0f + expf(-g));
+        float g_act = beta * tanhf(g / beta) * sig;
+        float v_act = value_beta * tanhf(v / value_beta);
+        output[i] = g_act * v_act;
+    }
+}
+
+// C[r][head][n] = sum_k A[r][head][k] * B[head](k, n), every operand strided,
+// for the per-head MLA projections of the batched prefill (q_nope through
+// the key half of kv_b, the latent context through its value half). 64x64
+// output tile per block, 256 threads at 4x4 each, K in steps of 16.
+// grid = (ceil(N/64), ceil(rows/64) * heads). b_half: B is f16, else f32.
+extern "C" __global__ void raon_head_gemm(
+    const float* A, const void* B, float* C, int rows, int K, int N,
+    long long a_row, int a_head, long long b_head, int b_k, int b_n,
+    long long c_row, int c_head, int b_half
+) {
+    // Heads ride grid.y with the row tiles (the launch has no z).
+    const int row_tiles = (rows + 63) / 64;
+    const int head = blockIdx.y / row_tiles;
+    const int n0 = blockIdx.x * 64, r0 = (blockIdx.y % row_tiles) * 64;
+    __shared__ float a_tile[16][65];
+    __shared__ float b_tile[16][65];
+    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    const float* a = A + (long long)head * a_head;
+    const long long b_base = head * b_head;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int i = threadIdx.x; i < 16 * 64; i += 256) {
+            const int kk = i % 16, rr = i / 16, r = r0 + rr, k = k0 + kk;
+            a_tile[kk][rr] = (r < rows && k < K) ? a[(long long)r * a_row + k] : 0.0f;
+        }
+        for (int i = threadIdx.x; i < 16 * 64; i += 256) {
+            const int kk = b_k == 1 ? i % 16 : i / 64, nn = b_k == 1 ? i / 16 : i % 64;
+            const int n = n0 + nn, k = k0 + kk;
+            const long long at = b_base + (long long)k * b_k + (long long)n * b_n;
+            b_tile[kk][nn] = (n < N && k < K)
+                ? (b_half ? __half2float(((const __half*)B)[at]) : ((const float*)B)[at]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            float av[4], bv[4];
+            for (int i = 0; i < 4; ++i) av[i] = a_tile[kk][ty + 16 * i];
+            for (int j = 0; j < 4; ++j) bv[j] = b_tile[kk][tx + 16 * j];
+            for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] += av[i] * bv[j];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int r = r0 + ty + 16 * i;
+        if (r >= rows) continue;
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx + 16 * j;
+            if (n < N) C[(long long)r * c_row + (long long)head * c_head + n] = acc[i][j];
+        }
+    }
+}
+
+// queries[t][head][latent + i] = q[t][head * (nope + rope) + nope + i]: the
+// rope half of each query rides unrotated next to its absorbed latent half.
+extern "C" __global__ void raon_mla_rope_queries(
+    const float* q, float* queries, int tokens, int heads, int nope, int rope, int latent
+) {
+    const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)tokens * heads * rope;
+    if (index >= total) return;
+    const int i = (int)(index % rope);
+    const long long row = index / rope;   // t * heads + head
+    const int head = (int)(row % heads);
+    const long long t = row / heads;
+    queries[row * (latent + rope) + latent + i] =
+        q[t * heads * (nope + rope) + (long long)head * (nope + rope) + nope + i];
+}
+
+// Absorbed MLA attention for prefill: query row r = (token r / heads, head),
+// 576 wide [absorbed latent 512 | rope 64], against the shared cache of
+// normalized latents [P][512] and rope keys [P][64]; the value is the latent
+// itself. Causal: token t sees positions <= first + t. Online softmax over
+// 32-key chunks; the score dot runs in 64-wide slices of the 576, then the
+// chunk's probabilities weight the latent rows into a [32][512] accumulator,
+// eight threads per row holding 64 dims each. Writes ctx[r][512].
+// Dynamic shared: (32*65 + 32*65 + 32*33 + 32*512) floats.
+// Causal depthwise conv + SiLU over a chunk for one projection, one thread
+// per channel walking the tokens (bailing::short_conv_step, batched).
+// x[t * x_stride + c]; weights [channels][4]; window [channels][3] in/out.
+extern "C" __global__ void raon_rda_conv(
+    const float* x, long long x_stride, const float* weights, float* window, float* out,
+    int tokens, int channels
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float w0 = weights[c * 4], w1 = weights[c * 4 + 1], w2 = weights[c * 4 + 2],
+                w3 = weights[c * 4 + 3];
+    float p0 = window[c * 3], p1 = window[c * 3 + 1], p2 = window[c * 3 + 2];
+    for (int t = 0; t < tokens; ++t) {
+        const float input = x[(long long)t * x_stride + c];
+        const float total = p0 * w0 + p1 * w1 + p2 * w2 + input * w3;
+        out[(long long)t * channels + c] = total / (1.0f + expf(-total));
+        p0 = p1; p1 = p2; p2 = input;
+    }
+    window[c * 3] = p0; window[c * 3 + 1] = p1; window[c * 3 + 2] = p2;
+}
+
+__device__ __forceinline__ float raon_block_sum_128(float value, float* scratch) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value += __shfl_xor_sync(0xffffffff, value, offset);
+    if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = value;
+    __syncthreads();
+    const float total = scratch[0] + scratch[1] + scratch[2] + scratch[3];
+    __syncthreads();
+    return total;
+}
+
+// The RDA recurrence over a chunk (raon::rda_head_token, batched): one block
+// per head, thread v owns state column v of the head's [128 x 128] state,
+// kept in shared memory k-major (S[k * 128 + v]) so a thread's walk over k is
+// conflict-free. `state` is [head][v][k] (the host layout), or [head][k][v]
+// with state_kmajor (device decode). head_dim 128.
+// Dynamic shared: (128*128 + 3*128 + 4) floats.
+extern "C" __global__ void raon_rda_recurrence(
+    const float* q, const float* k, const float* v, const float* f_b,
+    const float* beta_raw, const float* delta, const float* gate, long long gate_stride,
+    const float* a, const float* dt_bias, const float* o_norm, float* state, float* out,
+    int tokens, int heads, float lower_bound, float epsilon, int state_kmajor
+) {
+    extern __shared__ float shared[];
+    const int D = 128;
+    float* S = shared;
+    float* qn = S + D * D;
+    float* kn = qn + D;
+    float* decay = kn + D;
+    float* scratch = decay + D;
+    const int h = blockIdx.x, i = threadIdx.x;
+    const int channels = heads * D;
+    float* head_state = state + (long long)h * D * D;
+    // k-major state (the device-decode layout) loads coalesced; the host
+    // layout [v][k] is transposed on the way in and out.
+    for (int j = 0; j < D; ++j) S[j * D + i] = state_kmajor ? head_state[j * D + i] : head_state[i * D + j];
+    const float a_exp = -a[h];
+    const float bias = dt_bias[h * D + i];
+    const float gain = o_norm[i];
+    const float q_scale0 = rsqrtf((float)D);
+    __syncthreads();
+    for (int t = 0; t < tokens; ++t) {
+        const long long base = (long long)t * channels + h * D;
+        const float qv = q[base + i], kv = k[base + i];
+        const float q_sq = raon_block_sum_128(qv * qv, scratch);
+        const float k_sq = raon_block_sum_128(kv * kv, scratch);
+        qn[i] = qv * (q_scale0 / sqrtf(q_sq + 1e-6f));
+        kn[i] = kv * (1.0f / sqrtf(k_sq + 1e-6f));
+        const float scaled = a_exp * (f_b[base + i] + bias);
+        decay[i] = expf(lower_bound * (1.0f / (1.0f + expf(-scaled))));
+        __syncthreads();
+        const float b = beta_raw[(long long)t * heads + h], d = delta[(long long)t * heads + h];
+        const float beta = 1.0f / (1.0f + expf(-b));
+        const float sp1 = -b > 20.0f ? -b : log1pf(expf(-b));
+        const float sp2 = -(b + d) > 20.0f ? -(b + d) : log1pf(expf(-(b + d)));
+        const float ratio = expf(sp1 - sp2);
+        float pred = 0.0f;
+        for (int j = 0; j < D; ++j) {
+            const float value = S[j * D + i] * decay[j];
+            S[j * D + i] = value;
+            pred += value * kn[j];
+        }
+        const float err = (v[base + i] * ratio - pred) * beta;
+        float o = 0.0f;
+        for (int j = 0; j < D; ++j) {
+            const float value = S[j * D + i] + err * kn[j];
+            S[j * D + i] = value;
+            o += value * qn[j];
+        }
+        const float o_sq = raon_block_sum_128(o * o, scratch);
+        o = o * (1.0f / sqrtf(o_sq / D + epsilon)) * gain;
+        const float g = gate[(long long)t * gate_stride + h * D + i];
+        out[base + i] = o * (1.0f / (1.0f + expf(-g)));
+    }
+    for (int j = 0; j < D; ++j) {
+        if (state_kmajor) head_state[j * D + i] = S[j * D + i];
+        else head_state[i * D + j] = S[j * D + i];
+    }
+}
+
+// rows[r] = source[token[r]]: the routes of a chunk laid out expert by expert.
+extern "C" __global__ void raon_gather_rows(
+    const float* source, const int* token, float* rows, int count, int width
+) {
+    const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long long)count * width) return;
+    const int r = (int)(index / width), i = (int)(index % width);
+    rows[index] = source[(long long)token[r] * width + i];
+}
+
+// out[t] = sum_k weight[t][k] * expert_out[route_row[t][k]] (+ shared[t]).
+extern "C" __global__ void raon_combine_routes(
+    const float* expert_out, const int* route_row, const float* weight, const float* shared,
+    float* out, int tokens, int used, int width
+) {
+    const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long long)tokens * width) return;
+    const int t = (int)(index / width), i = (int)(index % width);
+    float total = 0.0f;
+    for (int k = 0; k < used; ++k)
+        total += weight[t * used + k] * expert_out[(long long)route_row[t * used + k] * width + i];
+    if (shared) total += shared[index];
+    out[index] = total;
+}
+
+// f16 (bf16 = 0) or bf16 (bf16 = 1) cache rows widened to f32.
+extern "C" __global__ void raon_widen_half(
+    const unsigned short* source, float* target, long long count, int bf16
+) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const unsigned short bits = source[i];
+    target[i] = bf16 ? __uint_as_float(((unsigned int)bits) << 16)
+                     : __half2float(__ushort_as_half(bits));
+}
+
+#define RAON_NEG_INF __int_as_float(0xff800000)
+__device__ __forceinline__ float raon_cache_load(const void* base, long long index, int type) {
+    if (type == 0) return ((const float*)base)[index];
+    const unsigned short bits = ((const unsigned short*)base)[index];
+    return type == 1 ? __half2float(__ushort_as_half(bits)) : __uint_as_float(((unsigned int)bits) << 16);
+}
+
+// Absorbed MLA attention: query row r = (token r / heads, head), 576 wide
+// [absorbed latent 512 | rope 64], against the shared cache of normalized
+// latents [P][512] and rope keys [P][64] stored in `cache_type` (0 f32, 1 f16,
+// 2 bf16); the value is the latent itself. Causal: token t sees positions
+// <= first + t. Online softmax over 32-key chunks; the score dot runs in
+// 64-wide slices of the 576, then the chunk's probabilities weight the latent
+// rows into a [32][512] accumulator, eight threads per row holding 64 dims.
+//
+// grid.y splits the keys into runs of keys_per_split (split-K, for decode,
+// where 40 query rows alone would leave the card idle). With partial_ml null
+// there is one split and ctx[r][512] is the result; otherwise ctx is
+// [splits][rows][512] unnormalized and partial_ml [splits][rows] holds each
+// split's (max, sum) for raon_mla_combine.
+// Dynamic shared: (32*65 + 32*65 + 32*33 + 32*512) floats.
+extern "C" __global__ void raon_mla_attention(
+    const float* queries, const void* latents, const void* rope_keys, int cache_type,
+    float* ctx, float* partial_ml, int rows, int heads, int first, float scale,
+    int keys_per_split
+) {
+    extern __shared__ float shared[];
+    float* q_tile = shared;               // [32][65]
+    float* k_tile = q_tile + 32 * 65;     // [32][65]
+    float* p_tile = k_tile + 32 * 65;     // [32][33]
+    float* v_tile = p_tile + 32 * 33;     // [32][512]
+    const int r0 = blockIdx.x * 32;
+    const int row = threadIdx.x >> 3, lane = threadIdx.x & 7;
+    const int my_row = r0 + row;
+    const bool live = my_row < rows;
+    const int limit = live ? first + my_row / heads : -1;
+    const int last_row = min(rows, r0 + 32) - 1;
+    const int key_end = first + last_row / heads + 1;
+    const int key_begin = blockIdx.y * keys_per_split;
+    const int key_stop = min(key_end, key_begin + keys_per_split);
+    float acc[64];
+    for (int j = 0; j < 64; ++j) acc[j] = 0.0f;
+    float row_max = RAON_NEG_INF, row_sum = 0.0f;
+    for (int key0 = key_begin; key0 < key_stop; key0 += 32) {
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int d0 = 0; d0 < 576; d0 += 64) {
+            for (int i = threadIdx.x; i < 32 * 64; i += 256) {
+                const int rr = i / 64, d = i % 64, r = r0 + rr;
+                q_tile[rr * 65 + d] = r < rows ? queries[(long long)r * 576 + d0 + d] : 0.0f;
+                const int key = key0 + rr, dim = d0 + d;
+                float value = 0.0f;
+                if (key < key_stop)
+                    value = dim < 512 ? raon_cache_load(latents, (long long)key * 512 + dim, cache_type)
+                                      : raon_cache_load(rope_keys, (long long)key * 64 + dim - 512, cache_type);
+                k_tile[rr * 65 + d] = value;
+            }
+            __syncthreads();
+#pragma unroll 8
+            for (int d = 0; d < 64; ++d) {
+                const float qv = q_tile[row * 65 + d];
+                for (int j = 0; j < 4; ++j) s[j] += qv * k_tile[(lane * 4 + j) * 65 + d];
+            }
+            __syncthreads();
+        }
+        float chunk_max = RAON_NEG_INF;
+        for (int j = 0; j < 4; ++j) {
+            const int key = key0 + lane * 4 + j;
+            s[j] = (live && key <= limit && key < key_stop) ? s[j] * scale : RAON_NEG_INF;
+            chunk_max = fmaxf(chunk_max, s[j]);
+        }
+        for (int offset = 1; offset < 8; offset <<= 1)
+            chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffff, chunk_max, offset));
+        const float new_max = fmaxf(row_max, chunk_max);
+        const float rescale = new_max == RAON_NEG_INF ? 1.0f : __expf(row_max - new_max);
+        float chunk_sum = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            const float w = s[j] == RAON_NEG_INF ? 0.0f : __expf(s[j] - new_max);
+            p_tile[row * 33 + lane * 4 + j] = w;
+            chunk_sum += w;
+        }
+        for (int offset = 1; offset < 8; offset <<= 1)
+            chunk_sum += __shfl_xor_sync(0xffffffff, chunk_sum, offset);
+        row_sum = row_sum * rescale + chunk_sum;
+        row_max = new_max;
+        for (int j = 0; j < 64; ++j) acc[j] *= rescale;
+        for (int i = threadIdx.x; i < 32 * 512; i += 256) {
+            const int key = key0 + i / 512;
+            v_tile[i] = key < key_stop ? raon_cache_load(latents, (long long)key * 512 + i % 512, cache_type) : 0.0f;
+        }
+        __syncthreads();
+        for (int key = 0; key < 32; ++key) {
+            const float w = p_tile[row * 33 + key];
+            const float* v = v_tile + key * 512 + lane;
+#pragma unroll
+            for (int j = 0; j < 64; ++j) acc[j] += w * v[8 * j];
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    if (partial_ml) {
+        float* out = ctx + ((long long)blockIdx.y * rows + my_row) * 512;
+        for (int j = 0; j < 64; ++j) out[lane + 8 * j] = acc[j];
+        if (lane == 0) {
+            partial_ml[((long long)blockIdx.y * rows + my_row) * 2] = row_max;
+            partial_ml[((long long)blockIdx.y * rows + my_row) * 2 + 1] = row_sum;
+        }
+        return;
+    }
+    const float inverse = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    for (int j = 0; j < 64; ++j) ctx[(long long)my_row * 512 + lane + 8 * j] = acc[j] * inverse;
+}
+
+// Decode attention: one token's 40 query rows [heads][576] against
+// positions [0, positions). grid = (heads / 4, splits), 256 threads: a block
+// takes four heads and one run of keys_per_split keys, each warp every eighth
+// key. Lane j of a warp loads dims j, j+32, ... of the key row once -- 16
+// latent dims and 2 rope dims -- and uses them both for the four scores
+// (warp-reduced) and, through an online softmax, for its 16 dims of each
+// head's latent accumulator. The eight warps fold in shared memory and the
+// block writes raon_mla_combine's partials ([split][head][512], (max, sum)).
+// Dynamic shared: 8 * 4 * (512 + 2) floats.
+extern "C" __global__ void raon_mla_decode_attention(
+    const float* queries, const void* latents, const void* rope_keys, int cache_type,
+    float* partial, float* partial_ml, int heads, int positions, int keys_per_split, float scale
+) {
+    extern __shared__ float shared[];
+    const int h0 = blockIdx.x * 4, split = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int key_begin = split * keys_per_split;
+    const int key_end = min(positions, key_begin + keys_per_split);
+    float q[4][18];
+    for (int h = 0; h < 4; ++h)
+        for (int j = 0; j < 18; ++j)
+            q[h][j] = h0 + h < heads ? queries[(long long)(h0 + h) * 576 + lane + 32 * j] : 0.0f;
+    float m[4], l[4], acc[4][16];
+    for (int h = 0; h < 4; ++h) {
+        m[h] = RAON_NEG_INF; l[h] = 0.0f;
+        for (int j = 0; j < 16; ++j) acc[h][j] = 0.0f;
+    }
+    for (int p = key_begin + warp; p < key_end; p += 8) {
+        float key[18];
+        for (int j = 0; j < 16; ++j) key[j] = raon_cache_load(latents, (long long)p * 512 + lane + 32 * j, cache_type);
+        key[16] = raon_cache_load(rope_keys, (long long)p * 64 + lane, cache_type);
+        key[17] = raon_cache_load(rope_keys, (long long)p * 64 + lane + 32, cache_type);
+        for (int h = 0; h < 4; ++h) {
+            float s = 0.0f;
+            for (int j = 0; j < 18; ++j) s += q[h][j] * key[j];
+            for (int offset = 16; offset > 0; offset >>= 1) s += __shfl_xor_sync(0xffffffff, s, offset);
+            s *= scale;
+            const float new_m = fmaxf(m[h], s);
+            const float rescale = m[h] == RAON_NEG_INF ? 0.0f : __expf(m[h] - new_m);
+            const float w = __expf(s - new_m);
+            l[h] = l[h] * rescale + w;
+            for (int j = 0; j < 16; ++j) acc[h][j] = acc[h][j] * rescale + w * key[j];
+            m[h] = new_m;
+        }
+    }
+    float* warp_acc = shared;                       // [8][4][512]
+    float* warp_ml = shared + 8 * 4 * 512;          // [8][4][2]
+    for (int h = 0; h < 4; ++h) {
+        for (int j = 0; j < 16; ++j) warp_acc[(warp * 4 + h) * 512 + lane + 32 * j] = acc[h][j];
+        if (lane == 0) { warp_ml[(warp * 4 + h) * 2] = m[h]; warp_ml[(warp * 4 + h) * 2 + 1] = l[h]; }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 4 * 512; i += blockDim.x) {
+        const int h = i / 512, d = i % 512;
+        if (h0 + h >= heads) continue;
+        float best = RAON_NEG_INF;
+        for (int w = 0; w < 8; ++w) best = fmaxf(best, warp_ml[(w * 4 + h) * 2]);
+        float value = 0.0f, total = 0.0f;
+        for (int w = 0; w < 8; ++w) {
+            const float mw = warp_ml[(w * 4 + h) * 2];
+            if (mw == RAON_NEG_INF) continue;
+            const float factor = __expf(mw - best);
+            value += factor * warp_acc[(w * 4 + h) * 512 + d];
+            total += factor * warp_ml[(w * 4 + h) * 2 + 1];
+        }
+        const long long row = (long long)split * heads + h0 + h;
+        partial[row * 512 + d] = value;
+        if (d == 0) { partial_ml[row * 2] = best; partial_ml[row * 2 + 1] = total; }
+    }
+}
+
+// C[h * c_head + n] = sum_k A[h * a_head + k] * B[h * b_head + k * b_k + n * b_n],
+// one row per head (decode). grid.y = heads. With b_n == 1 each thread owns an
+// n and walks k (coalesced across n); otherwise each warp owns an n and its
+// lanes walk k (coalesced across k), warp-reduced. B is f16 when b_half.
+extern "C" __global__ void raon_head_gemv(
+    const float* A, const void* B, float* C, int K, int N, int a_head, long long b_head,
+    int b_k, int b_n, int c_head, int b_half
+) {
+    const int h = blockIdx.y;
+    const float* a = A + (long long)h * a_head;
+    const long long base = (long long)h * b_head;
+    const auto load = [&](long long index) {
+        return b_half ? __half2float(((const __half*)B)[index]) : ((const float*)B)[index];
+    };
+    if (b_n == 1) {
+        const int n = blockIdx.x * blockDim.x + threadIdx.x;
+        if (n >= N) return;
+        float total = 0.0f;
+        for (int k = 0; k < K; ++k) total += a[k] * load(base + (long long)k * b_k + n);
+        C[(long long)h * c_head + n] = total;
+        return;
+    }
+    const int warps = blockDim.x >> 5, lane = threadIdx.x & 31;
+    const int n = blockIdx.x * warps + (threadIdx.x >> 5);
+    if (n >= N) return;
+    float total = 0.0f;
+    for (int k = lane; k < K; k += 32) total += a[k] * load(base + (long long)k * b_k + (long long)n * b_n);
+    for (int offset = 16; offset > 0; offset >>= 1) total += __shfl_xor_sync(0xffffffff, total, offset);
+    if (lane == 0) C[(long long)h * c_head + n] = total;
+}
+
+// mHC pre-mixing on the device for one token (raon_mhc_pre + the branch
+// norm): `mixes` [17] is fn . streams (unscaled), `streams` [4][H]. One block
+// of 1024 threads: the streams' RMS, then thread 0 the coefficients exactly as
+// raon_mhc_coefficients (Helmert chart, rho, gamma), then the pre-weighted
+// branch and its RMSNorm into x. post [4] and comb [16] go to `coefficients`
+// for raon_mhc_post. hc is 4.
+extern "C" __global__ void raon_mhc_pre(
+    const float* streams, const float* mixes, const float* base, const float* scale, const float* gain,
+    float* x, float* coefficients, int H, float mhc_eps, float magnitude, float epsilon
+) {
+    __shared__ float reduce[32];
+    __shared__ float pre[4];
+    __shared__ float inv;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < 4 * H; i += blockDim.x) partial += streams[i] * streams[i];
+    for (int offset = 16; offset > 0; offset >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    if ((threadIdx.x & 31) == 0) reduce[threadIdx.x >> 5] = partial;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); ++w) total += reduce[w];
+        const float inv_rms = 1.0f / sqrtf(total / (4.0f * H) + mhc_eps);
+        float m[17];
+        for (int r = 0; r < 17; ++r) m[r] = mixes[r] * inv_rms;
+        for (int i = 0; i < 4; ++i) pre[i] = 1.0f / (1.0f + expf(-(m[i] * scale[0] + base[i])));
+        for (int i = 0; i < 4; ++i)
+            coefficients[i] = magnitude / (1.0f + expf(-(m[4 + i] * scale[1] + base[4 + i])));
+        float Z[3][3];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) Z[r][c] = m[8 + r * 3 + c] * scale[2] + base[8 + r * 3 + c];
+        const float Q[4][3] = {
+            { 1.0f / 1.4142135623730951f,  1.0f / 2.449489742783178f,  1.0f / 3.4641016151377544f},
+            {-1.0f / 1.4142135623730951f,  1.0f / 2.449489742783178f,  1.0f / 3.4641016151377544f},
+            { 0.0f,                       -2.0f / 2.449489742783178f,  1.0f / 3.4641016151377544f},
+            { 0.0f,                        0.0f,                      -3.0f / 3.4641016151377544f}};
+        float T[4][3], E[4][4];
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 3; ++c) T[r][c] = Q[r][0] * Z[0][c] + Q[r][1] * Z[1][c] + Q[r][2] * Z[2][c];
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) E[r][c] = T[r][0] * Q[c][0] + T[r][1] * Q[c][1] + T[r][2] * Q[c][2];
+        float max_neg = 0.0f;
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) max_neg = fmaxf(max_neg, -E[r][c] / (r == c ? 0.625f : 0.125f));
+        const float rho = 1.0f + max_neg, gamma = 1.0f / (1.0f + expf(-scale[3]));
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) {
+                const float identity = r == c ? 1.0f : 0.0f;
+                const float phi = (r == c ? 0.625f : 0.125f) + E[r][c] / rho;
+                coefficients[4 + r * 4 + c] = identity + gamma * (phi - identity);
+            }
+    }
+    __syncthreads();
+    partial = 0.0f;
+    for (int j = threadIdx.x; j < H; j += blockDim.x) {
+        const float b = pre[0] * streams[j] + pre[1] * streams[H + j] + pre[2] * streams[2 * H + j] +
+                        pre[3] * streams[3 * H + j];
+        x[j] = b;
+        partial += b * b;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) reduce[threadIdx.x >> 5] = partial;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); ++w) total += reduce[w];
+        inv = 1.0f / sqrtf(total / H + epsilon);
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < H; j += blockDim.x) x[j] = x[j] * inv * gain[j];
+}
+
+// out[r] = matrix[r] . x for a few long rows (mHC's 17 x 10240 fn): one block
+// per row, 256 threads striding it. A warp per row (the generic matvec)
+// put three blocks on the card and took ~170 us here. matrix is f16 when
+// half, else f32.
+extern "C" __global__ void raon_long_rows_matvec(const void* matrix, int half, const float* x, float* out,
+                                                 int columns) {
+    __shared__ float reduce[8];
+    const long long base = (long long)blockIdx.x * columns;
+    float total = 0.0f;
+    for (int i = threadIdx.x; i < columns; i += blockDim.x)
+        total += (half ? __half2float(((const __half*)matrix)[base + i]) : ((const float*)matrix)[base + i]) * x[i];
+    for (int offset = 16; offset > 0; offset >>= 1) total += __shfl_xor_sync(0xffffffff, total, offset);
+    if ((threadIdx.x & 31) == 0) reduce[threadIdx.x >> 5] = total;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); ++w) sum += reduce[w];
+        out[blockIdx.x] = sum;
+    }
+}
+
+// mHC post-mixing in place: streams[d][j] = sum_s comb[d][s] streams[s][j] +
+// post[d] * branch[j]; a thread owns column j of all four streams.
+extern "C" __global__ void raon_mhc_post(float* streams, const float* branch, const float* coefficients, int H) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= H) return;
+    const float s0 = streams[j], s1 = streams[H + j], s2 = streams[2 * H + j], s3 = streams[3 * H + j];
+    const float b = branch[j];
+    for (int d = 0; d < 4; ++d) {
+        const float* c = coefficients + 4 + d * 4;
+        streams[d * H + j] = c[0] * s0 + c[1] * s1 + c[2] * s2 + c[3] * s3 + coefficients[d] * b;
+    }
+}
+
+// raon_mla_attention on the tensor cores (sm_80+), for prefill. f16
+// m16n8k16 MMA with f32 accumulation and an online softmax. A block takes 32
+// query rows (576 wide, pre-scaled by `scale` before the f16 conversion so
+// the absorbed queries stay in range) and walks the keys 32 at a time; the
+// key tile in shared memory doubles as the value tile (the latent is the
+// first 512 dims of each key row). Eight warps: warp (g, q) computes the
+// scores of row group g (16 rows) against keys 8q..8q+7 over all 576 dims,
+// the block folds them into per-row maxima and sums, then warp (g, q)
+// accumulates rows g against output dims 128q..128q+127 -- a 16x128 f32
+// accumulator per warp, which is what the 512-wide value allows.
+// Causal per token as raon_mla_attention. Writes ctx[r][512].
+#define RAON_MMA_QS 584
+#define RAON_MMA_PS 40
+__device__ __forceinline__ __half raon_cache_half(const void* base, long long index, int type) {
+    if (type == 1) return ((const __half*)base)[index];
+    return __float2half(raon_cache_load(base, index, type));
+}
+__device__ __forceinline__ void raon_mma_f16(float* c, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ unsigned raon_pack_half2(__half low, __half high) {
+    return (unsigned)__half_as_ushort(low) | ((unsigned)__half_as_ushort(high) << 16);
+}
+__device__ __forceinline__ unsigned raon_smem_address(const void* pointer) {
+    return (unsigned)__cvta_generic_to_shared(pointer);
+}
+// A fragment (16x16, rows of `row_stride` halves) of m16n8k16.
+__device__ __forceinline__ void raon_ldmatrix_a(unsigned* a, const __half* tile, int row_stride, int lane) {
+    const __half* at = tile + (lane & 15) * row_stride + (lane >> 4) * 8;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(raon_smem_address(at)));
+}
+// B fragment (k 16 x n 8) from a tile stored n-major (rows = n, k contiguous).
+__device__ __forceinline__ void raon_ldmatrix_b(unsigned* b, const __half* tile, int row_stride, int lane) {
+    const __half* at = tile + (lane & 7) * row_stride + ((lane >> 3) & 1) * 8;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(raon_smem_address(at)));
+}
+// B fragment (k 16 x n 8) from a tile stored k-major (rows = k, n contiguous).
+__device__ __forceinline__ void raon_ldmatrix_b_trans(unsigned* b, const __half* tile, int row_stride, int lane) {
+    const __half* at = tile + (lane & 15) * row_stride;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(raon_smem_address(at)));
+}
+extern "C" __global__ void __launch_bounds__(256) raon_mla_attention_mma(
+    const float* queries, const void* latents, const void* rope_keys, int cache_type,
+    float* ctx, int rows, int heads, int first, float scale
+) {
+    extern __shared__ __align__(16) unsigned char raon_mma_shared[];
+    __half* q_s = (__half*)raon_mma_shared;               // [32][QS]
+    __half* k_s = q_s + 32 * RAON_MMA_QS;                  // [32][QS]
+    float* s_s = (float*)(k_s + 32 * RAON_MMA_QS);         // [32][33]
+    __half* p_s = (__half*)(s_s + 32 * 33);                // [32][PS]
+    float* row_scale = (float*)(p_s + 32 * RAON_MMA_PS);   // [32]
+    float* row_m = row_scale + 32;                         // [32]
+    float* row_l = row_m + 32;                             // [32]
+    const int r0 = blockIdx.x * 32;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int group = warp >> 2, quarter = warp & 3;
+    const int lr = lane >> 2, lc = (lane & 3) * 2;
+    for (int i = threadIdx.x; i < 32 * 144; i += blockDim.x) {
+        const int r = i / 144, d = (i % 144) * 4;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r0 + r < rows) v = *(const float4*)(queries + (long long)(r0 + r) * 576 + d);
+        __half* q = q_s + r * RAON_MMA_QS + d;
+        *(unsigned*)q = raon_pack_half2(__float2half(v.x * scale), __float2half(v.y * scale));
+        *(unsigned*)(q + 2) = raon_pack_half2(__float2half(v.z * scale), __float2half(v.w * scale));
+    }
+    if (threadIdx.x < 32) { row_m[threadIdx.x] = RAON_NEG_INF; row_l[threadIdx.x] = 0.0f; }
+    float o[16][4];
+    for (int t = 0; t < 16; ++t) for (int i = 0; i < 4; ++i) o[t][i] = 0.0f;
+    const int last_row = min(rows, r0 + 32) - 1;
+    const int key_end = first + last_row / heads + 1;
+    for (int key0 = 0; key0 < key_end; key0 += 32) {
+        __syncthreads();
+        if (cache_type == 1) {
+            // f16 rows as 16-byte vectors: 64 per latent row, 8 per rope row.
+            for (int i = threadIdx.x; i < 32 * 72; i += blockDim.x) {
+                const int kk = i / 72, part = i % 72, key = key0 + kk;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (key < key_end)
+                    v = part < 64 ? ((const uint4*)latents)[(long long)key * 64 + part]
+                                  : ((const uint4*)rope_keys)[(long long)key * 8 + part - 64];
+                *(uint4*)(k_s + kk * RAON_MMA_QS + part * 8) = v;
+            }
+        } else {
+            for (int i = threadIdx.x; i < 32 * 576; i += blockDim.x) {
+                const int kk = i / 576, d = i % 576, key = key0 + kk;
+                __half value = __float2half(0.0f);
+                if (key < key_end)
+                    value = d < 512 ? raon_cache_half(latents, (long long)key * 512 + d, cache_type)
+                                    : raon_cache_half(rope_keys, (long long)key * 64 + d - 512, cache_type);
+                k_s[kk * RAON_MMA_QS + d] = value;
+            }
+        }
+        __syncthreads();
+        {
+            float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const __half* qa = q_s + group * 16 * RAON_MMA_QS;
+            const __half* kb = k_s + quarter * 8 * RAON_MMA_QS;
+#pragma unroll 4
+            for (int k0 = 0; k0 < 576; k0 += 16) {
+                unsigned a[4], b[2];
+                raon_ldmatrix_a(a, qa + k0, RAON_MMA_QS, lane);
+                raon_ldmatrix_b(b, kb + k0, RAON_MMA_QS, lane);
+                raon_mma_f16(c, a, b);
+            }
+            float* s0 = s_s + (group * 16 + lr) * 33 + quarter * 8 + lc;
+            s0[0] = c[0]; s0[1] = c[1];
+            s0[8 * 33] = c[2]; s0[8 * 33 + 1] = c[3];
+        }
+        __syncthreads();
+        for (int rr = 0; rr < 4; ++rr) {
+            const int row = warp * 4 + rr, global_row = r0 + row, key = key0 + lane;
+            const bool valid = global_row < rows && key < key_end && key <= first + global_row / heads;
+            const float score = valid ? s_s[row * 33 + lane] : RAON_NEG_INF;
+            float tile_max = score;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, offset));
+            const float old_max = row_m[row];
+            const float new_max = fmaxf(old_max, tile_max);
+            const float p = score == RAON_NEG_INF ? 0.0f : __expf(score - new_max);
+            float tile_sum = p;
+            for (int offset = 16; offset > 0; offset >>= 1) tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, offset);
+            p_s[row * RAON_MMA_PS + lane] = __float2half(p);
+            __syncwarp();
+            if (lane == 0) {
+                const float factor = old_max == RAON_NEG_INF ? 0.0f : __expf(old_max - new_max);
+                row_scale[row] = factor;
+                row_l[row] = row_l[row] * factor + tile_sum;
+                row_m[row] = new_max;
+            }
+        }
+        __syncthreads();
+        {
+            const float f0 = row_scale[group * 16 + lr], f1 = row_scale[group * 16 + lr + 8];
+            for (int t = 0; t < 16; ++t) { o[t][0] *= f0; o[t][1] *= f0; o[t][2] *= f1; o[t][3] *= f1; }
+            const __half* pa = p_s + group * 16 * RAON_MMA_PS;
+            for (int k0 = 0; k0 < 32; k0 += 16) {
+                unsigned a[4];
+                raon_ldmatrix_a(a, pa + k0, RAON_MMA_PS, lane);
+                const __half* v0 = k_s + k0 * RAON_MMA_QS + quarter * 128;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    unsigned b[2];
+                    raon_ldmatrix_b_trans(b, v0 + t * 8, RAON_MMA_QS, lane);
+                    raon_mma_f16(o[t], a, b);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int ra = r0 + group * 16 + lr, rb = ra + 8;
+    const float la = row_l[group * 16 + lr], lb = row_l[group * 16 + lr + 8];
+    const float ia = la > 0.0f ? 1.0f / la : 0.0f, ib = lb > 0.0f ? 1.0f / lb : 0.0f;
+    for (int t = 0; t < 16; ++t) {
+        const int col = quarter * 128 + t * 8 + lc;
+        if (ra < rows) { ctx[(long long)ra * 512 + col] = o[t][0] * ia; ctx[(long long)ra * 512 + col + 1] = o[t][1] * ia; }
+        if (rb < rows) { ctx[(long long)rb * 512 + col] = o[t][2] * ib; ctx[(long long)rb * 512 + col + 1] = o[t][3] * ib; }
+    }
+}
+
+// raon_mla_attention_mma for an f16 cache, sized for two blocks per SM.
+// The queries live in registers instead of shared memory: warp (g, q) holds
+// rows 16g..16g+15 for dims 144q..144q+143 (nine k-steps of A fragments) and
+// computes their partial scores against the tile's 16 keys; the four
+// partials meet in shared memory where the softmax sums them. Key tiles are
+// 16 keys, double-buffered and streamed in with cp.async one tile ahead, so
+// the block needs ~47 KB of shared memory and (with __launch_bounds__) at
+// most 128 registers a thread: two blocks share an SM and hide each other's
+// syncs and loads, which a single 94 KB block of 32-key tiles could not. The
+// value pass is raon_mla_attention_mma's: warp (g, q) accumulates rows 16g..
+// against output dims 128q..128q+127.
+// Dynamic shared: 2 key tiles [16][QS] + [4][32][17] partials + P [32][24] + stats.
+#define RAON_MMA_BN 16
+#define RAON_MMA_PS16 24
+__device__ __forceinline__ void raon_cp_async16(void* shared, const void* global, bool valid) {
+    const unsigned address = raon_smem_address(shared);
+    const int bytes = valid ? 16 : 0;   // 0: the 16 bytes are zero-filled
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(address), "l"(global), "r"(bytes));
+}
+extern "C" __global__ void __launch_bounds__(256, 2) raon_mla_attention_mma_f16(
+    const float* queries, const __half* latents, const __half* rope_keys,
+    float* ctx, int rows, int heads, int first, float scale
+) {
+    extern __shared__ __align__(16) unsigned char raon_mma_shared[];
+    __half* k_buf = (__half*)raon_mma_shared;                         // [2][16][QS]
+    float* s_part = (float*)(k_buf + 2 * RAON_MMA_BN * RAON_MMA_QS);   // [4][32][17]
+    __half* p_s = (__half*)(s_part + 4 * 32 * 17);                     // [32][PS16]
+    float* row_scale = (float*)(p_s + 32 * RAON_MMA_PS16);             // [32]
+    float* row_m = row_scale + 32;
+    float* row_l = row_m + 32;
+    const int r0 = blockIdx.x * 32;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int group = warp >> 2, quarter = warp & 3;
+    const int lr = lane >> 2, lc = (lane & 3) * 2;
+    unsigned qa[9][4];
+    {
+        const int ra = r0 + group * 16 + lr, rb = ra + 8;
+        const float* qra = queries + (long long)ra * 576 + quarter * 144;
+        const float* qrb = queries + (long long)rb * 576 + quarter * 144;
+        for (int k = 0; k < 9; ++k) {
+            const int d = k * 16 + lc;
+            const auto pair = [&](const float* row, bool live, int at) {
+                return live ? raon_pack_half2(__float2half(row[at] * scale), __float2half(row[at + 1] * scale))
+                            : 0u;
+            };
+            qa[k][0] = pair(qra, ra < rows, d);
+            qa[k][1] = pair(qrb, rb < rows, d);
+            qa[k][2] = pair(qra, ra < rows, d + 8);
+            qa[k][3] = pair(qrb, rb < rows, d + 8);
+        }
+    }
+    if (threadIdx.x < 32) { row_m[threadIdx.x] = RAON_NEG_INF; row_l[threadIdx.x] = 0.0f; }
+    float o[16][4];
+    for (int t = 0; t < 16; ++t) for (int i = 0; i < 4; ++i) o[t][i] = 0.0f;
+    const int last_row = min(rows, r0 + 32) - 1;
+    const int key_end = first + last_row / heads + 1;
+    const int tiles = (key_end + RAON_MMA_BN - 1) / RAON_MMA_BN;
+    const auto issue = [&](int tile) {
+        __half* buffer = k_buf + (tile & 1) * RAON_MMA_BN * RAON_MMA_QS;
+        for (int i = threadIdx.x; i < RAON_MMA_BN * 72; i += blockDim.x) {
+            const int kk = i / 72, part = i % 72, key = tile * RAON_MMA_BN + kk;
+            const bool valid = key < key_end;
+            const int safe = valid ? key : 0;
+            const __half* source = part < 64 ? latents + (long long)safe * 512 + part * 8
+                                             : rope_keys + (long long)safe * 64 + (part - 64) * 8;
+            raon_cp_async16(buffer + kk * RAON_MMA_QS + part * 8, source, valid);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    if (tiles > 0) issue(0);
+    for (int tile = 0; tile < tiles; ++tile) {
+        if (tile + 1 < tiles) {
+            issue(tile + 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const __half* k_s = k_buf + (tile & 1) * RAON_MMA_BN * RAON_MMA_QS;
+        const int key0 = tile * RAON_MMA_BN;
+        {
+            float c[2][4];
+            for (int n = 0; n < 2; ++n) for (int i = 0; i < 4; ++i) c[n][i] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 9; ++k) {
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    unsigned b[2];
+                    raon_ldmatrix_b(b, k_s + n * 8 * RAON_MMA_QS + quarter * 144 + k * 16, RAON_MMA_QS, lane);
+                    raon_mma_f16(c[n], qa[k], b);
+                }
+            }
+            float* part = s_part + (quarter * 32 + group * 16 + lr) * 17 + lc;
+            for (int n = 0; n < 2; ++n) {
+                part[n * 8] = c[n][0]; part[n * 8 + 1] = c[n][1];
+                part[8 * 17 + n * 8] = c[n][2]; part[8 * 17 + n * 8 + 1] = c[n][3];
+            }
+        }
+        __syncthreads();
+        // Softmax: a warp takes four rows, two at a time, 16 lanes per row.
+        for (int rr = 0; rr < 4; rr += 2) {
+            const int row = warp * 4 + rr + (lane >> 4), global_row = r0 + row;
+            const int column = lane & 15, key = key0 + column;
+            const bool valid = global_row < rows && key < key_end && key <= first + global_row / heads;
+            float score = RAON_NEG_INF;
+            if (valid)
+                score = s_part[row * 17 + column] + s_part[(32 + row) * 17 + column] +
+                        s_part[(64 + row) * 17 + column] + s_part[(96 + row) * 17 + column];
+            float tile_max = score;
+            for (int offset = 8; offset > 0; offset >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, offset));
+            const float old_max = row_m[row];
+            const float new_max = fmaxf(old_max, tile_max);
+            const float p = score == RAON_NEG_INF ? 0.0f : __expf(score - new_max);
+            float tile_sum = p;
+            for (int offset = 8; offset > 0; offset >>= 1) tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, offset);
+            p_s[row * RAON_MMA_PS16 + column] = __float2half(p);
+            __syncwarp();
+            if (column == 0) {
+                const float factor = old_max == RAON_NEG_INF ? 0.0f : __expf(old_max - new_max);
+                row_scale[row] = factor;
+                row_l[row] = row_l[row] * factor + tile_sum;
+                row_m[row] = new_max;
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+        {
+            const float f0 = row_scale[group * 16 + lr], f1 = row_scale[group * 16 + lr + 8];
+            for (int t = 0; t < 16; ++t) { o[t][0] *= f0; o[t][1] *= f0; o[t][2] *= f1; o[t][3] *= f1; }
+            unsigned a[4];
+            raon_ldmatrix_a(a, p_s + group * 16 * RAON_MMA_PS16, RAON_MMA_PS16, lane);
+            const __half* v0 = k_s + quarter * 128;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                unsigned b[2];
+                raon_ldmatrix_b_trans(b, v0 + t * 8, RAON_MMA_QS, lane);
+                raon_mma_f16(o[t], a, b);
+            }
+        }
+        __syncthreads();   // the buffer this tile used is refilled two tiles on
+    }
+    const int ra = r0 + group * 16 + lr, rb = ra + 8;
+    const float la = row_l[group * 16 + lr], lb = row_l[group * 16 + lr + 8];
+    const float ia = la > 0.0f ? 1.0f / la : 0.0f, ib = lb > 0.0f ? 1.0f / lb : 0.0f;
+    for (int t = 0; t < 16; ++t) {
+        const int col = quarter * 128 + t * 8 + lc;
+        if (ra < rows) { ctx[(long long)ra * 512 + col] = o[t][0] * ia; ctx[(long long)ra * 512 + col + 1] = o[t][1] * ia; }
+        if (rb < rows) { ctx[(long long)rb * 512 + col] = o[t][2] * ib; ctx[(long long)rb * 512 + col + 1] = o[t][3] * ib; }
+    }
+}
+
+// Folds raon_mla_attention's split-K partials: grid = rows, 128 threads.
+extern "C" __global__ void raon_mla_combine(
+    const float* partial, const float* partial_ml, float* ctx, int rows, int splits
+) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    float best = RAON_NEG_INF;
+    for (int s = 0; s < splits; ++s) best = fmaxf(best, partial_ml[((long long)s * rows + r) * 2]);
+    float total = 0.0f;
+    for (int s = 0; s < splits; ++s) {
+        const float m = partial_ml[((long long)s * rows + r) * 2];
+        if (m != RAON_NEG_INF) total += __expf(m - best) * partial_ml[((long long)s * rows + r) * 2 + 1];
+    }
+    const float inverse = total > 0.0f ? 1.0f / total : 0.0f;
+    for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+        float value = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float m = partial_ml[((long long)s * rows + r) * 2];
+            if (m != RAON_NEG_INF)
+                value += __expf(m - best) * partial[((long long)s * rows + r) * 512 + i];
+        }
+        ctx[(long long)r * 512 + i] = value * inverse;
+    }
+}
+
+// target[offset + i] = source[i] in the cache type (0 f32, 1 f16, 2 bf16).
+extern "C" __global__ void raon_cache_store(
+    const float* source, void* target, long long offset, int count, int type
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float value = source[i];
+    if (type == 0) { ((float*)target)[offset + i] = value; return; }
+    unsigned short bits;
+    if (type == 1) {
+        bits = __half_as_ushort(__float2half_rn(value));
+    } else {
+        const unsigned int u = __float_as_uint(value);
+        bits = (u & 0x7fffffffu) > 0x7f800000u ? (unsigned short)((u >> 16) | 0x40u)
+                                               : (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+    ((unsigned short*)target)[offset + i] = bits;
+}
+
+// x[i] *= sigmoid(gate[i])
+extern "C" __global__ void raon_sigmoid_mul(float* x, const float* gate, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] *= 1.0f / (1.0f + __expf(-gate[i]));
+}
+)";
+
+struct FlyweightV2RaonRuntime {
+    const FlyweightV2Model* model = nullptr;
+    flyweight::v2::raon::Geometry geometry;
+    std::vector<flyweight::v2::raon::LayerWeights> layers;
+    flyweight::v2::raon::Matrix embedding_matrix;
+    const float* output_norm = nullptr;
+    flyweight::v2::raon::Matrix head;
+    std::uint32_t capacity = 0;
+    std::vector<RaonSlot> slots;
+    std::vector<std::vector<float>> decoded_kv_b;
+    int (*progress_callback)(void* user, uint32_t processed, uint32_t total) = nullptr;
+    void* progress_user = nullptr;
+
+    bool uses_gpu = false;
+    int expert_mode = 2; // 0=streamed_gpu, 1=cpu, 2=auto/hybrid
+    std::uint32_t gpu_expert_layers = 0;
+    std::uint64_t gpu_expert_cache_bytes = 0;
+    std::uint64_t gpu_attention_bytes = 0;
+    std::vector<flyweight::v2::raon::GpuLayerDispatch> gpu_layers;
+    flyweight::v2::raon::GpuScratchDispatch gpu_scratch;
+
+    std::uint64_t gpu_head = 0;
+    std::uint64_t gpu_normalized = 0;
+    std::uint64_t gpu_logits = 0;
+    std::uint64_t gpu_allocated_bytes = 0;
+    std::vector<std::uint64_t> gpu_owned;
+    bool int8_tensor_cores = false;
+
+    // Batched prefill (v2_raon_prefill.inc): tokens per chunk, and the device
+    // scratch its GEMMs run through, sized for one chunk at create time.
+    std::uint32_t prefill_chunk = 1024;
+    std::uint64_t prefill_in = 0;      // GEMM input rows (f32)
+    std::uint64_t prefill_q8 = 0;      // the same rows as Q8 blocks
+    std::uint64_t prefill_scales = 0;
+    std::uint64_t prefill_out = 0;     // GEMM output rows (f32)
+    std::uint64_t prefill_gate = 0;    // expert gate / up / activation rows
+    std::uint64_t prefill_up = 0;
+    std::uint64_t prefill_act = 0;
+    // The MLA cache rows (normalized latents, then rope keys) the device
+    // attention reads, and how many positions fit.
+    std::uint64_t prefill_latents = 0;
+    std::uint64_t prefill_rope_keys = 0;
+    std::uint32_t prefill_key_capacity = 0;
+    // RDA state and conv windows for the device recurrence, and per RDA layer
+    // an f32 pack of the small tensors it streams with (see rda_pack_layout).
+    std::uint64_t prefill_rda_state = 0;
+    std::uint64_t prefill_rda_window = 0;
+    std::vector<std::vector<float>> rda_pack;
+    // Pinned host staging for the prefill's activation transfers, and the
+    // device copies of a chunk's route tables (token per route, sorted row and
+    // weight per token slot).
+    void* transfer_host = nullptr;
+    std::size_t transfer_bytes = 0;
+    std::uint64_t transfer_events[2] = {};
+    std::uint64_t prefill_routes = 0;
+    // Routed-MMQ tables: block experts, sorted routes, slot of each route,
+    // route weights, and the three per-expert weight pointer tables.
+    std::uint64_t prefill_route_tables = 0;
+    // Element capacities of the scratch above, for tiling.
+    std::size_t prefill_in_elements = 0, prefill_out_elements = 0, prefill_expert_elements = 0;
+
+    // Weight streaming for the prefill (see v2_raon_prefill.inc): a ring of
+    // slots in device memory with pinned host twins, filled on copy_stream.
+    std::uint32_t stream_slots = 0;
+    std::uint32_t stream_min_rows = 64;
+    std::size_t stream_slot_bytes = 0;
+    std::uint64_t stream_device = 0;
+    void* stream_host = nullptr;
+    std::uint64_t copy_stream = 0;
+    std::vector<std::uint64_t> stream_uploaded, stream_consumed;
+    std::uint64_t stream_sequence = 0;
+    // Page-locked copy of the experts of every MoE layer not resident on the
+    // device (raon_pin_host_experts): the prefill DMAs straight from it and
+    // the CPU decode path reads it in place of the mapping.
+    void* pinned_experts = nullptr;
+    std::size_t pinned_expert_bytes = 0;
+
+    // Device decode (raon_device_decode_setup): every token's attention and
+    // the shared expert run on the device against the device-resident state
+    // in RaonSlot, one round trip per layer.
+    bool device_decode = false;
+    std::vector<RaonDecodeLayer> decode_layers;
+    RaonDecodeScratch decode;
+    std::uint64_t device_state_bytes = 0;
+    RaonExpertCache expert_cache;
+
+    ~FlyweightV2RaonRuntime() {
+        if (copy_stream) flyweight_gpu_stream_sync(copy_stream);
+        if (uses_gpu) flyweight_gpu_stream_sync(0);
+        for (auto event : stream_uploaded) flyweight_gpu_event_destroy(event);
+        for (auto event : stream_consumed) flyweight_gpu_event_destroy(event);
+        if (copy_stream) flyweight_gpu_stream_destroy(copy_stream);
+        if (expert_cache.stream) {
+            flyweight_gpu_stream_sync(expert_cache.stream);
+            flyweight_gpu_stream_destroy(expert_cache.stream);
+        }
+        if (flyweight::v2::raon::profiling() && expert_cache.lookups)
+            std::fprintf(stderr, "[flyweight] raon expert cache: %zu slots, %.1f%% of %llu decode expert reads hit, "
+                                 "%llu admissions\n",
+                         expert_cache.slots, 100.0 * expert_cache.hits / expert_cache.lookups,
+                         (unsigned long long)expert_cache.lookups, (unsigned long long)expert_cache.admissions);
+        if (stream_host) flyweight_gpu_host_free(stream_host);
+        for (auto event : transfer_events) if (event) flyweight_gpu_event_destroy(event);
+        if (transfer_host) flyweight_gpu_host_free(transfer_host);
+        if (pinned_experts) flyweight_gpu_host_free(pinned_experts);
+        for (auto ptr : gpu_owned) {
+            flyweight_gpu_free(ptr);
+        }
+    }
+
+    RaonSlot& slot(uint32_t index) {
+        if (index >= slots.size())
+            throw std::runtime_error("raon sequence slot " + std::to_string(index) +
+                                     " is out of range (runtime holds " +
+                                     std::to_string(slots.size()) + ")");
+        return slots[index];
+    }
+};
+
+// Defined after the Qwen corpus helpers (the MMQ shape) and the verifier
+// (the kQ8Mmq* constants), which the batched prefill launches through.
+static std::string qwen_cuda_corpus();
+static std::uint64_t raon_cache_payload_bytes(const FlyweightV2RaonRuntime& runtime, std::uint64_t position,
+                                              int cache_type);
+static void raon_prefill_run(FlyweightV2RaonRuntime& runtime, RaonSlot& slot,
+                             const std::uint32_t* tokens, std::uint32_t count,
+                             float* final_hidden);
+static void raon_decode_device(FlyweightV2RaonRuntime& runtime, RaonSlot& slot,
+                               const float* token_embd, float* final_hidden);
+
+static flyweight::v2::raon::Matrix raon_matrix(const FlyweightV2Model& m, const std::string& name, bool required=true) {
+    for (const auto& t : m.tensors) {
+        if (t.name == name) {
+            return {tensor_data(m, t), t.type};
+        }
+    }
+    if (required) throw std::runtime_error("raon1 model is missing required tensor: " + name);
+    return {};
+}
+
+static const float* raon_f32(const FlyweightV2Model& m, const std::string& name, bool required=true) {
+    for (const auto& t : m.tensors) {
+        if (t.name == name) {
+            if (t.type != 0) throw std::runtime_error("raon1 tensor " + name + " must be f32");
+            return reinterpret_cast<const float*>(tensor_data(m, t));
+        }
+    }
+    if (required) throw std::runtime_error("raon1 model is missing required tensor: " + name);
+    return nullptr;
+}
+
+static std::uint64_t raon_gpu_scratch(FlyweightV2RaonRuntime& runtime, std::size_t bytes) {
+    std::uint64_t pointer = 0;
+    if (flyweight_gpu_alloc(bytes, &pointer) != 0)
+        throw std::runtime_error("out of device memory for raon scratch buffer");
+    runtime.gpu_owned.push_back(pointer);
+    runtime.gpu_allocated_bytes += bytes;
+    if (flyweight_gpu_memset(pointer, 0, bytes, 0) != 0)
+        throw std::runtime_error("failed to clear raon scratch buffer");
+    return pointer;
+}
+
+static std::uint64_t raon_gpu_upload_tensor(FlyweightV2RaonRuntime& runtime, const FlyweightV2Model& m,
+                                            const std::string& name, bool required = true) {
+    for (const auto& tensor : m.tensors) {
+        if (tensor.name != name) continue;
+        std::uint64_t pointer = 0;
+        if (flyweight_gpu_alloc(tensor.size, &pointer) != 0)
+            throw std::runtime_error("out of device memory uploading " + name);
+        if (flyweight_gpu_upload_sync(pointer, tensor_data(m, tensor), tensor.size) != 0) {
+            flyweight_gpu_free(pointer);
+            throw std::runtime_error("failed to upload " + name);
+        }
+        runtime.gpu_owned.push_back(pointer);
+        runtime.gpu_allocated_bytes += tensor.size;
+        return pointer;
+    }
+    if (required) throw std::runtime_error("raon is missing " + name);
+    return 0;
+}
+
+// Device decode. A token through the per-layer host loop pays two blocking
+// host<->device round trips per RDA layer, runs the MLA attention on the
+// host over the host cache (reading every layer's ~21 MB f32 kv_b per token)
+// and the shared expert on the CPU: ~22 ms/token against llama.cpp's ~8.5
+// around the same routed-expert reads. Here the per-slot RDA state, conv
+// windows and MLA cache (in the cache type, sized for the context) live on
+// the device with the small RDA tensors, the MLA norms, kv_b (f16), the dense
+// FFN and the shared experts, so a layer's attention is one upload and one
+// download and the shared expert overlaps the CPU's routed experts.
+// Needs every attention layer resident (checked after pinning) and Raon-1's
+// geometry (the attention kernels are laid out for it). Allocated before the
+// MoE fit so the fit sees it; any failure backs it all out.
+// FLYWEIGHT_RAON_DEVICE_DECODE=0 keeps the host loop.
+// The prefill's f32 key scratch for the host-cache MLA path: the whole context
+// up to 64 MiB of keys; longer contexts (or a failed allocation) fall back to
+// the host attention core.
+static void raon_allocate_key_scratch(FlyweightV2RaonRuntime& rt) {
+    const auto& g = rt.geometry;
+    const auto capacity = std::min<std::size_t>(rt.capacity, (64u << 20) / ((g.kv_lora + g.qk_rope) * sizeof(float)));
+    try {
+        rt.prefill_latents = raon_gpu_scratch(rt, capacity * g.kv_lora * sizeof(float));
+        rt.prefill_rope_keys = raon_gpu_scratch(rt, capacity * g.qk_rope * sizeof(float));
+        rt.prefill_key_capacity = static_cast<std::uint32_t>(capacity);
+    } catch (const std::exception&) {
+        rt.prefill_key_capacity = 0;
+    }
+}
+
+// Whether device decode can apply at all: decided before the prefill scratch
+// is sized, because in device decode the prefill reads the device cache (no
+// key scratch) and streams only experts and the RDA pack (smaller slots).
+static bool raon_device_decode_eligible(const FlyweightV2RaonRuntime& rt) {
+    if (const char* env = std::getenv("FLYWEIGHT_RAON_DEVICE_DECODE"))
+        if (env[0] == '0') return false;
+    if (const char* env = std::getenv("FLYWEIGHT_RAON_ATTN_GPU"))
+        if (env[0] == '0') return false;
+    const auto& g = rt.geometry;
+    // The device mHC kernels are written for four streams.
+    return g.kv_lora == 512 && g.qk_rope == 64 && g.head_dim == 128 && g.conv_width == 4 &&
+           g.mhc_streams == 4;
+}
+
+static bool raon_device_decode_setup(FlyweightV2RaonRuntime& rt, const FlyweightV2Model& model) {
+    namespace raon = flyweight::v2::raon;
+    const auto& g = rt.geometry;
+    if (!raon_device_decode_eligible(rt) || rt.stream_slots < 2) return false;
+    const std::size_t owned_before = rt.gpu_owned.size();
+    const std::uint64_t allocated_before = rt.gpu_allocated_bytes;
+    const std::size_t ch = g.heads * g.head_dim, history = g.conv_width - 1;
+    const auto upload_host = [&](const void* data, std::size_t bytes) {
+        const std::uint64_t pointer = raon_gpu_scratch(rt, bytes);
+        if (flyweight_gpu_upload_sync(pointer, data, bytes) != 0)
+            throw std::runtime_error("device decode upload failed");
+        return pointer;
+    };
+    try {
+        rt.decode_layers.assign(g.layers, RaonDecodeLayer{});
+        for (std::size_t l = 0; l < g.layers; ++l) {
+            auto& d = rt.decode_layers[l];
+            const auto& layer = rt.layers[l];
+            const std::string prefix = "blk." + std::to_string(l) + ".";
+            const raon::RaonMhcWeights* sites[2] = {&layer.mhc_attn, &layer.mhc_ffn};
+            const float* gains[2] = {layer.attn_norm, layer.ffn_norm};
+            const char* fn_names[2] = {"hc_attn_fn.weight", "hc_ffn_fn.weight"};
+            for (int site = 0; site < 2; ++site) {
+                d.mhc_fn[site] = raon_gpu_upload_tensor(rt, model, prefix + fn_names[site]);
+                std::vector<float> params(17 + 4 + g.hidden);
+                std::memcpy(params.data(), sites[site]->base, 17 * sizeof(float));
+                std::memcpy(params.data() + 17, sites[site]->scale, 4 * sizeof(float));
+                std::memcpy(params.data() + 21, gains[site], g.hidden * sizeof(float));
+                d.mhc_params[site] = upload_host(params.data(), params.size() * sizeof(float));
+            }
+            if (layer.is_rda) {
+                d.f_b = raon_gpu_upload_tensor(rt, model, prefix + "ssm_f_b.weight");
+                const auto& rda = layer.rda;
+                if (rda.f_a.type == rda.beta.type && rda.f_a.type == rda.rda.type) {
+                    const std::size_t row = flyweight::v2::bailing::row_bytes(rda.f_a.type, g.hidden);
+                    std::vector<std::uint8_t> stacked((g.ssm_dt_rank + 2 * g.heads) * row);
+                    std::memcpy(stacked.data(), rda.f_a.data, g.ssm_dt_rank * row);
+                    std::memcpy(stacked.data() + g.ssm_dt_rank * row, rda.beta.data, g.heads * row);
+                    std::memcpy(stacked.data() + (g.ssm_dt_rank + g.heads) * row, rda.rda.data, g.heads * row);
+                    d.f_a_beta_rda = upload_host(stacked.data(), stacked.size());
+                } else {
+                    d.f_a = raon_gpu_upload_tensor(rt, model, prefix + "ssm_f_a.weight");
+                    d.beta = raon_gpu_upload_tensor(rt, model, prefix + "ssm_beta.weight");
+                    d.rda = raon_gpu_upload_tensor(rt, model, prefix + "ssm_rda.weight");
+                }
+                std::vector<float> small(3 * ch * g.conv_width + ch + g.heads + g.head_dim, 0.0f);
+                float* at = small.data();
+                for (const float* conv : {layer.rda.q_conv, layer.rda.k_conv, layer.rda.v_conv}) {
+                    std::memcpy(at, conv, ch * g.conv_width * sizeof(float));
+                    at += ch * g.conv_width;
+                }
+                if (layer.rda.dt_bias) std::memcpy(at, layer.rda.dt_bias, ch * sizeof(float));
+                at += ch;
+                std::memcpy(at, layer.rda.a, g.heads * sizeof(float));
+                at += g.heads;
+                std::memcpy(at, layer.rda.o_norm, g.head_dim * sizeof(float));
+                d.small = upload_host(small.data(), small.size() * sizeof(float));
+            } else {
+                std::vector<float> norms(g.q_lora + g.kv_lora);
+                std::memcpy(norms.data(), layer.mla.q_a_norm, g.q_lora * sizeof(float));
+                std::memcpy(norms.data() + g.q_lora, layer.mla.kv_a_norm, g.kv_lora * sizeof(float));
+                d.norms = upload_host(norms.data(), norms.size() * sizeof(float));
+                const std::size_t elements = g.heads * (g.qk_nope + g.v_head_dim) * g.kv_lora;
+                std::vector<std::uint16_t> half(elements);
+                for (std::size_t i = 0; i < elements; ++i)
+                    half[i] = flyweight::cpu::float_to_half_bits(layer.mla.kv_b[i]);
+                d.kv_b = upload_host(half.data(), half.size() * 2);
+            }
+            if (!layer.is_moe) {
+                d.dense_gate = raon_gpu_upload_tensor(rt, model, prefix + "ffn_gate.weight");
+                d.dense_up = raon_gpu_upload_tensor(rt, model, prefix + "ffn_up.weight");
+                d.dense_down = raon_gpu_upload_tensor(rt, model, prefix + "ffn_down.weight");
+            } else if (g.shared_experts > 0 && layer.ffn.shared_gate) {
+                d.shared_gate = raon_gpu_upload_tensor(rt, model, prefix + "ffn_gate_shexp.weight");
+                d.shared_up = raon_gpu_upload_tensor(rt, model, prefix + "ffn_up_shexp.weight");
+                d.shared_down = raon_gpu_upload_tensor(rt, model, prefix + "ffn_down_shexp.weight");
+            }
+        }
+        const std::size_t element = raon::cache_element_bytes(g.cache_type);
+        std::uint64_t state_bytes = 0;
+        for (auto& slot : rt.slots) {
+            slot.rda_state.assign(g.layers, 0);
+            slot.rda_window.assign(g.layers, 0);
+            slot.mla_latents.assign(g.layers, 0);
+            slot.mla_rope.assign(g.layers, 0);
+            for (std::size_t l = 0; l < g.layers; ++l) {
+                if (rt.layers[l].is_rda) {
+                    slot.rda_state[l] = raon_gpu_scratch(rt, g.heads * g.head_dim * g.head_dim * sizeof(float));
+                    slot.rda_window[l] = raon_gpu_scratch(rt, 3 * ch * history * sizeof(float));
+                    state_bytes += (g.heads * g.head_dim * g.head_dim + 3 * ch * history) * sizeof(float);
+                } else {
+                    slot.mla_latents[l] = raon_gpu_scratch(rt, rt.capacity * g.kv_lora * element);
+                    slot.mla_rope[l] = raon_gpu_scratch(rt, rt.capacity * g.qk_rope * element);
+                    state_bytes += rt.capacity * (g.kv_lora + g.qk_rope) * element;
+                }
+            }
+        }
+        // The one-token scratch, carved from one allocation.
+        auto& d = rt.decode;
+        d.max_splits = (rt.capacity + 255) / 256;
+        const std::size_t ffn = std::max(g.dense_size, g.shared_size);
+        const std::size_t sizes[] = {
+            g.hidden, 4 * ch, 3 * ch, g.ssm_dt_rank + 2 * g.heads, ch, g.heads, g.heads, ch,
+            g.kv_lora, g.q_lora, g.heads * (g.qk_nope + g.qk_rope), g.heads * (g.kv_lora + g.qk_rope),
+            g.heads * g.kv_lora, d.max_splits * g.heads * g.kv_lora, d.max_splits * g.heads * 2,
+            g.heads * g.v_head_dim, g.hidden, ffn, ffn, ffn, g.hidden,
+            g.mhc_streams * g.hidden, 32, 32, g.hidden};
+        std::uint64_t* fields[] = {
+            &d.x, &d.pack, &d.qkv, &d.fa, &d.fb, &d.beta, &d.delta, &d.att,
+            &d.latent, &d.qn, &d.query, &d.queries, &d.ctx, &d.partial, &d.partial_ml,
+            &d.mla_out, &d.hidden, &d.ffn_gate, &d.ffn_up, &d.ffn_act, &d.shared_out,
+            &d.streams, &d.mixes, &d.coefficients, &d.routed};
+        std::size_t total = 0;
+        for (auto elements : sizes) total += (elements * sizeof(float) + 255) & ~std::size_t(255);
+        std::uint64_t base = raon_gpu_scratch(rt, total);
+        for (std::size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+            *fields[i] = base;
+            base += (sizes[i] * sizeof(float) + 255) & ~std::size_t(255);
+        }
+        // [f_a | beta | delta] contiguous, the stacked matvec's output.
+        d.beta = d.fa + g.ssm_dt_rank * sizeof(float);
+        d.delta = d.beta + g.heads * sizeof(float);
+        rt.device_state_bytes = state_bytes;
+    } catch (const std::exception& e) {
+        for (std::size_t i = owned_before; i < rt.gpu_owned.size(); ++i) flyweight_gpu_free(rt.gpu_owned[i]);
+        rt.gpu_owned.resize(owned_before);
+        rt.gpu_allocated_bytes = allocated_before;
+        rt.decode_layers.clear();
+        rt.decode = RaonDecodeScratch{};
+        for (auto& slot : rt.slots) {
+            slot.rda_state.clear(); slot.rda_window.clear();
+            slot.mla_latents.clear(); slot.mla_rope.clear();
+        }
+        std::fprintf(stderr, "[flyweight] raon: device decode off (%s)\n", e.what());
+        return false;
+    }
+    std::fprintf(stderr, "[flyweight] raon: device decode: %.0f MiB of resident weights and scratch, "
+                         "%.0f MiB of state for %zu slot(s) at context %u\n",
+                 (rt.gpu_allocated_bytes - allocated_before - rt.device_state_bytes) / 1048576.0,
+                 rt.device_state_bytes / 1048576.0, rt.slots.size(), rt.capacity);
+    return true;
+}
+
+// Allocates the expert cache's slot pool out of `budget` bytes of VRAM.
+static bool raon_expert_cache_setup(FlyweightV2RaonRuntime& rt, std::uint64_t budget) {
+    const auto& g = rt.geometry;
+    auto& c = rt.expert_cache;
+    std::size_t slot_bytes = 0;
+    for (const auto& layer : rt.layers) {
+        if (!layer.is_moe) continue;
+        const std::size_t bytes =
+            2 * g.expert_size * flyweight::v2::bailing::row_bytes(layer.ffn.gate_experts.type, g.hidden) +
+            g.hidden * flyweight::v2::bailing::row_bytes(layer.ffn.down_experts.type, g.expert_size);
+        slot_bytes = std::max(slot_bytes, (bytes + 255) & ~std::size_t(255));
+    }
+    if (!slot_bytes) return false;
+    const std::size_t slots = std::min<std::size_t>(budget / slot_bytes, g.experts * rt.layers.size());
+    if (slots < 64) return false;
+    try {
+        c.pool = raon_gpu_scratch(rt, slots * slot_bytes);
+        if (flyweight_gpu_stream_create(&c.stream) != 0) throw std::runtime_error("stream");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[flyweight] raon: expert cache off (%s)\n", e.what());
+        c = RaonExpertCache{};
+        return false;
+    }
+    c.slot_bytes = slot_bytes;
+    c.slots = slots;
+    c.slot_of.assign(rt.layers.size() * g.experts, -1);
+    c.owner.assign(slots, -1);
+    c.ready.assign(slots, 0);
+    c.newer.assign(slots, -1);
+    c.older.assign(slots, -1);
+    if (const char* env = std::getenv("FLYWEIGHT_RAON_EXPERT_ADMIT"))
+        c.admit_budget = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+    std::fprintf(stderr, "[flyweight] raon: expert cache of %zu slots (%.0f MiB), %u admissions per token\n",
+                 slots, slots * slot_bytes / 1048576.0, c.admit_budget);
+    return true;
+}
+
+// Fills the expert cache at load with whole layers from the top of the stack,
+// the experts layer pinning would have held: a first prompt then streams no
+// more than it did with pinned layers, and decode's LRU replaces them with
+// the experts it actually uses. Uploads from the pinned host copy.
+static void raon_expert_cache_fill(FlyweightV2RaonRuntime& rt) {
+    auto& c = rt.expert_cache;
+    if (!c.slots) return;
+    const auto& g = rt.geometry;
+    for (std::size_t l = rt.layers.size(); l-- > 0 && c.unused < static_cast<std::int32_t>(c.slots);) {
+        const auto& layer = rt.layers[l];
+        if (!layer.is_moe) continue;
+        const auto& f = layer.ffn;
+        const std::size_t gate_bytes = g.expert_size * flyweight::v2::bailing::row_bytes(f.gate_experts.type, g.hidden);
+        const std::size_t up_bytes = g.expert_size * flyweight::v2::bailing::row_bytes(f.up_experts.type, g.hidden);
+        const std::size_t down_bytes = g.hidden * flyweight::v2::bailing::row_bytes(f.down_experts.type, g.expert_size);
+        for (std::size_t e = 0; e < g.experts && c.unused < static_cast<std::int32_t>(c.slots); ++e) {
+            const std::int32_t slot = c.unused++;
+            const std::uint64_t target = c.pool + static_cast<std::uint64_t>(slot) * c.slot_bytes;
+            if (flyweight_gpu_upload(target, static_cast<const std::uint8_t*>(f.gate_experts.data) + e * gate_bytes,
+                                     gate_bytes, c.stream) != 0 ||
+                flyweight_gpu_upload(target + gate_bytes, static_cast<const std::uint8_t*>(f.up_experts.data) + e * up_bytes,
+                                     up_bytes, c.stream) != 0 ||
+                flyweight_gpu_upload(target + gate_bytes + up_bytes,
+                                     static_cast<const std::uint8_t*>(f.down_experts.data) + e * down_bytes,
+                                     down_bytes, c.stream) != 0)
+                throw std::runtime_error("raon expert cache fill failed");
+            const auto key = static_cast<std::int32_t>(l * g.experts + e);
+            c.owner[slot] = key;
+            c.slot_of[static_cast<std::size_t>(key)] = slot;
+            c.ready[slot] = 1;
+            // Oldest first in LRU order, so the fill is what decode evicts first.
+            c.older[slot] = -1;
+            c.newer[slot] = c.tail;
+            if (c.tail >= 0) c.older[c.tail] = slot;
+            c.tail = slot;
+            if (c.head < 0) c.head = slot;
+        }
+    }
+    flyweight_gpu_stream_sync(c.stream);
+}
+
+// Copies the routed and shared experts of every MoE layer that is not
+// resident on the device into one page-locked block, points the layer weights
+// at it and drops the mapping's pages for the originals. A long prefill streams
+// these ~15 GB per prompt (Raon-1 mini on a 12 GB card); from the mapping that
+// is a memcpy into pinned staging plus the DMA, DRAM-bound at ~15 GB/s, while
+// from page-locked memory it is the DMA alone at ~28 GB/s. Net RAM stays about
+// the same -- the mapping's pages for those tensors are released and their
+// page cache becomes reclaimable -- but the copy is locked, so it is only made
+// when MemAvailable keeps 8 GiB of headroom over it. FLYWEIGHT_RAON_PIN_EXPERTS=0 disables it, =1 skips the headroom check.
+static void raon_pin_host_experts(FlyweightV2RaonRuntime& runtime, const FlyweightV2Model& model) {
+    const char* setting = std::getenv("FLYWEIGHT_RAON_PIN_EXPERTS");
+    if (setting && setting[0] == '0') return;
+    const bool forced = setting && setting[0] == '1';
+    if (!runtime.stream_slots) return;
+    const auto& g = runtime.geometry;
+
+    struct Entry { const Tensor* tensor; flyweight::v2::raon::Matrix* matrix; };
+    std::vector<Entry> entries;
+    std::size_t total = 0;
+    for (std::size_t l = 0; l < runtime.layers.size(); ++l) {
+        auto& layer = runtime.layers[l];
+        if (!layer.is_moe || (l < runtime.gpu_layers.size() && runtime.gpu_layers[l].pinned)) continue;
+        const std::string prefix = "blk." + std::to_string(l) + ".";
+        const std::pair<const char*, flyweight::v2::raon::Matrix*> names[] = {
+            {"ffn_gate_exps.weight", &layer.ffn.gate_experts},
+            {"ffn_up_exps.weight", &layer.ffn.up_experts},
+            {"ffn_down_exps.weight", &layer.ffn.down_experts},
+            {"ffn_gate_shexp.weight", &layer.ffn.shared_gate},
+            {"ffn_up_shexp.weight", &layer.ffn.shared_up},
+            {"ffn_down_shexp.weight", &layer.ffn.shared_down}};
+        for (const auto& [suffix, matrix] : names) {
+            if (!matrix->data) continue;
+            for (const auto& t : model.tensors)
+                if (t.name == prefix + suffix) {
+                    entries.push_back({&t, matrix});
+                    total += (t.size + 63) & ~std::size_t(63);
+                    break;
+                }
+        }
+    }
+    if (!total) return;
+    const std::uint64_t headroom = 8ull << 30;
+    const auto available = available_host_memory();
+    if (!forced && total + headroom > available) {
+        std::fprintf(stderr, "[flyweight] raon: host experts not pinned (%.1f GiB needs %.1f GiB available)\n",
+                     total / 1073741824.0, (total + headroom) / 1073741824.0);
+        return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    void* block = nullptr;
+    if (flyweight_gpu_host_alloc(total, &block) != 0) {
+        std::fprintf(stderr, "[flyweight] raon: host experts not pinned (allocation of %.1f GiB failed)\n",
+                     total / 1073741824.0);
+        return;
+    }
+    auto* cursor = static_cast<std::uint8_t*>(block);
+    for (const auto& entry : entries) {
+        const auto* source = tensor_data(model, *entry.tensor);
+        const std::size_t bytes = entry.tensor->size;
+        constexpr std::size_t piece = 4u << 20;
+        const auto pieces = static_cast<std::int64_t>((bytes + piece - 1) / piece);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (std::int64_t i = 0; i < pieces; ++i) {
+            const std::size_t begin = static_cast<std::size_t>(i) * piece;
+            std::memcpy(cursor + begin, source + begin, std::min(piece, bytes - begin));
+        }
+        entry.matrix->data = cursor;
+#if defined(__linux__)
+        // Unmap the originals from this process. Their page cache is left to
+        // the kernel: it is reclaimable under pressure, and evicting it here
+        // made the next load read the 15 GB from disk (3 s -> 14 s measured).
+        const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+        const auto begin = reinterpret_cast<std::uintptr_t>(source) & ~(page - 1);
+        const auto end = (reinterpret_cast<std::uintptr_t>(source) + bytes + page - 1) & ~(page - 1);
+        (void)madvise(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin), MADV_DONTNEED);
+#endif
+        cursor += (bytes + 63) & ~std::size_t(63);
+    }
+    runtime.pinned_experts = block;
+    runtime.pinned_expert_bytes = total;
+    std::fprintf(stderr, "[flyweight] raon: pinned %.1f GiB of host experts for prefill streaming (%.1f s)\n",
+                 total / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    (void)g;
+}
+
+int flyweight_v2_raon_create_with_options(
+    const FlyweightV2Model* model, uint32_t capacity, uint32_t slots,
+    int32_t expert_mode, int32_t gpu_layers, const char* gpu_layer_selection,
+    FlyweightV2RaonRuntime** out
+) {
+    return flyweight_v2_raon_create_ex(model, capacity, slots, expert_mode, gpu_layers,
+                                       gpu_layer_selection, 0, out);
+}
+
+int flyweight_v2_raon_create_ex(
+    const FlyweightV2Model* model, uint32_t capacity, uint32_t slots,
+    int32_t expert_mode, int32_t gpu_layers, const char* gpu_layer_selection,
+    int32_t cache_type, FlyweightV2RaonRuntime** out
+) {
+    return guarded([&]{
+        // The MLA cache stores one latent that serves as both key and value,
+        // so it takes a single type: f32, f16 or bf16 (placement codes 0-2).
+        if (cache_type < 0 || cache_type > 2)
+            throw std::runtime_error("raon1 supports an f32, f16 or bf16 cache only");
+        if (!model || !out) throw std::runtime_error("model and output pointer are required");
+        if (slots == 0) throw std::runtime_error("raon slots count must be at least 1");
+        if (capacity == 0) throw std::runtime_error("raon sequence capacity must be at least 1");
+
+        auto runtime = std::make_unique<FlyweightV2RaonRuntime>();
+        runtime->model = model;
+        runtime->capacity = capacity;
+        if (const char* env = std::getenv("FLYWEIGHT_RAON_PREFILL_CHUNK")) {
+            const auto chunk = std::strtoul(env, nullptr, 10);
+            if (chunk >= 1 && chunk <= 4096) runtime->prefill_chunk = static_cast<std::uint32_t>(chunk);
+        }
+        // Scratch is sized per chunk, so a short context does not pay for a
+        // chunk it can never fill.
+        runtime->prefill_chunk = std::min<std::uint32_t>(runtime->prefill_chunk, capacity);
+
+        auto& g = runtime->geometry;
+        const auto& c = model->config;
+        g.hidden = c.hidden_size ? c.hidden_size : 2560;
+        g.heads = c.attention_heads ? c.attention_heads : 40;
+        g.layers = c.layer_count ? c.layer_count : 25;
+        if (!c.attention_kv_heads_by_layer.empty()) {
+            g.head_count_kv = c.attention_kv_heads_by_layer;
+        } else {
+            g.head_count_kv.resize(g.layers);
+            for (std::size_t l = 0; l < g.layers; ++l) {
+                const std::string prefix = "blk." + std::to_string(l) + ".";
+                bool is_mla = has_tensor(*model, prefix + "attn_k_b.weight") || has_tensor(*model, prefix + "attn_kv_b.weight");
+                g.head_count_kv[l] = is_mla ? 1 : 0;
+            }
+        }
+        g.dense_size = c.dense_intermediate_size ? c.dense_intermediate_size : 12032;
+        g.expert_size = c.expert_intermediate_size ? c.expert_intermediate_size : 1088;
+        g.leading_dense_layers = c.leading_dense_block_count ? c.leading_dense_block_count : 1;
+        g.experts = c.expert_count;
+        g.experts_used = c.expert_used_count ? c.expert_used_count : 6;
+        g.shared_experts = c.expert_shared_count;
+        g.shared_size = c.expert_shared_intermediate_size ?
+            (c.expert_shared_intermediate_size / (c.expert_shared_count ? c.expert_shared_count : 1)) :
+            g.expert_size;
+        g.situ_beta = c.situ_beta > 0.0f ? c.situ_beta : 4.0f;
+        g.situ_linear_beta = c.situ_linear_beta > 0.0f ? c.situ_linear_beta : 25.0f;
+        g.mhc_magnitude = c.mhc_magnitude > 0.0f ? c.mhc_magnitude : 2.0f;
+        g.mhc_streams = c.hyper_connection_count ? c.hyper_connection_count : 4;
+        g.mhc_eps = c.sinkhorn_epsilon > 0.0f ? c.sinkhorn_epsilon : 1e-5f;
+        g.epsilon = c.rms_norm_epsilon > 0.0f ? c.rms_norm_epsilon : 1e-6f;
+        g.latent_epsilon = c.latent_norm_rms_epsilon > 0.0f ? c.latent_norm_rms_epsilon : 1e-6f;
+        g.head_dim = c.attention_head_dim ? c.attention_head_dim : 128;
+        g.conv_width = c.conv_kernel ? c.conv_kernel : 4;
+        g.ssm_dt_rank = c.ssm_time_step_rank ? c.ssm_time_step_rank : 128;
+        g.kda_gate_lower_bound = c.kda_gate_lower_bound;
+        g.q_lora = c.q_lora_rank ? c.q_lora_rank : 576;
+        g.kv_lora = c.kv_lora_rank ? c.kv_lora_rank : 512;
+        g.qk_rope = c.rotary_dimension ? c.rotary_dimension : 64;
+        g.qk_nope = c.key_length_mla > g.qk_rope ? (c.key_length_mla - g.qk_rope) : 128;
+        g.v_head_dim = c.value_length_mla ? c.value_length_mla : 128;
+        g.expert_weights_scale = c.expert_weights_scale;
+        g.expert_weights_norm = c.expert_weights_norm;
+        g.cache_type = cache_type;
+
+        runtime->embedding_matrix = raon_matrix(*model, "token_embd.weight");
+        runtime->output_norm = raon_f32(*model, "output_norm.weight");
+        runtime->head = raon_matrix(*model, "output.weight");
+
+        runtime->layers.resize(g.layers);
+        runtime->decoded_kv_b.resize(g.layers);
+        for (std::size_t l = 0; l < g.layers; ++l) {
+            auto& w = runtime->layers[l];
+            const std::string prefix = "blk." + std::to_string(l) + ".";
+
+            w.is_rda = g.is_rda(l);
+            w.is_moe = (l >= g.leading_dense_layers) && (g.experts > 0);
+
+            w.attn_norm = raon_f32(*model, prefix + "attn_norm.weight");
+            w.ffn_norm = raon_f32(*model, prefix + "ffn_norm.weight");
+
+            w.mhc_attn.fn = raon_matrix(*model, prefix + "hc_attn_fn.weight");
+            w.mhc_attn.base = raon_f32(*model, prefix + "hc_attn_base.weight");
+            w.mhc_attn.scale = raon_f32(*model, prefix + "hc_attn_scale.weight");
+
+            w.mhc_ffn.fn = raon_matrix(*model, prefix + "hc_ffn_fn.weight");
+            w.mhc_ffn.base = raon_f32(*model, prefix + "hc_ffn_base.weight");
+            w.mhc_ffn.scale = raon_f32(*model, prefix + "hc_ffn_scale.weight");
+
+            if (w.is_rda) {
+                w.rda.q = raon_matrix(*model, prefix + "attn_q.weight");
+                w.rda.k = raon_matrix(*model, prefix + "attn_k.weight");
+                w.rda.v = raon_matrix(*model, prefix + "attn_v.weight");
+                w.rda.q_conv = raon_f32(*model, prefix + "ssm_conv1d_q.weight");
+                w.rda.k_conv = raon_f32(*model, prefix + "ssm_conv1d_k.weight");
+                w.rda.v_conv = raon_f32(*model, prefix + "ssm_conv1d_v.weight");
+                w.rda.f_a = raon_matrix(*model, prefix + "ssm_f_a.weight");
+                w.rda.f_b = raon_matrix(*model, prefix + "ssm_f_b.weight");
+                w.rda.beta = raon_matrix(*model, prefix + "ssm_beta.weight");
+                w.rda.rda = raon_matrix(*model, prefix + "ssm_rda.weight");
+                w.rda.a = raon_f32(*model, prefix + "ssm_a");
+                w.rda.dt_bias = raon_f32(*model, prefix + "ssm_dt.bias");
+                w.rda.gate = raon_matrix(*model, prefix + "ssm_g.weight");
+                w.rda.o_norm = raon_f32(*model, prefix + "ssm_norm.weight", false);
+                if (!w.rda.o_norm) w.rda.o_norm = raon_f32(*model, prefix + "ssm_o_norm.weight", true);
+                w.rda.output = raon_matrix(*model, prefix + "attn_output.weight");
+            } else {
+                w.mla.q_a = raon_matrix(*model, prefix + "attn_q_a.weight");
+                w.mla.q_a_norm = raon_f32(*model, prefix + "attn_q_a_norm.weight");
+                w.mla.q_b = raon_matrix(*model, prefix + "attn_q_b.weight");
+                w.mla.kv_a_mqa = raon_matrix(*model, prefix + "attn_kv_a_mqa.weight");
+                w.mla.kv_a_norm = raon_f32(*model, prefix + "attn_kv_a_norm.weight");
+
+                if (has_tensor(*model, prefix + "attn_k_b.weight") && has_tensor(*model, prefix + "attn_v_b.weight")) {
+                    const auto kb = raon_matrix(*model, prefix + "attn_k_b.weight");
+                    const auto vb = raon_matrix(*model, prefix + "attn_v_b.weight");
+                    const std::size_t total_elements = g.heads * (g.qk_nope + g.v_head_dim) * g.kv_lora;
+                    runtime->decoded_kv_b[l].resize(total_elements);
+                    float* dst = runtime->decoded_kv_b[l].data();
+
+                    const auto* kb_bytes = reinterpret_cast<const std::uint8_t*>(kb.data);
+                    const auto* vb_bytes = reinterpret_cast<const std::uint8_t*>(vb.data);
+
+                    for (std::size_t h = 0; h < g.heads; ++h) {
+                        float* head_dst = dst + h * (g.qk_nope + g.v_head_dim) * g.kv_lora;
+                        // Key weights: kb is [40, 512, 128] in GGML -> transpose each head to [128, 512]
+                        const auto* kb_h = kb_bytes + h * g.kv_lora * g.qk_nope * 2;
+                        for (std::size_t row = 0; row < g.qk_nope; ++row) {
+                            for (std::size_t i = 0; i < g.kv_lora; ++i) {
+                                head_dst[row * g.kv_lora + i] = flyweight::v2::bailing::f16_element(kb_h, i * g.qk_nope + row);
+                            }
+                        }
+                        // Value weights: vb is [40, 128, 512] in GGML -> direct copy of [128, 512]
+                        const auto* vb_h = vb_bytes + h * g.v_head_dim * g.kv_lora * 2;
+                        for (std::size_t row = 0; row < g.v_head_dim; ++row) {
+                            for (std::size_t i = 0; i < g.kv_lora; ++i) {
+                                head_dst[(g.qk_nope + row) * g.kv_lora + i] = flyweight::v2::bailing::f16_element(vb_h, row * g.kv_lora + i);
+                            }
+                        }
+                    }
+                    w.mla.kv_b = dst;
+                } else {
+                    const auto packed_kv_b = raon_matrix(*model, prefix + "attn_kv_b.weight");
+                    const std::size_t rows = g.heads * (g.qk_nope + g.v_head_dim);
+                    runtime->decoded_kv_b[l].resize(rows * g.kv_lora);
+                    flyweight::v2::bailing::matrix_decode(
+                        packed_kv_b, g.kv_lora, rows, runtime->decoded_kv_b[l].data());
+                    w.mla.kv_b = runtime->decoded_kv_b[l].data();
+                }
+                w.mla.gate = raon_matrix(*model, prefix + "attn_gate.weight");
+                w.mla.output = raon_matrix(*model, prefix + "attn_output.weight");
+            }
+
+            if (w.is_moe) {
+                w.ffn.router = raon_matrix(*model, prefix + "ffn_gate_inp.weight");
+                w.ffn.router_bias = raon_f32(*model, prefix + "exp_probs_b.bias", false);
+                w.ffn.gate_experts = raon_matrix(*model, prefix + "ffn_gate_exps.weight");
+                w.ffn.up_experts = raon_matrix(*model, prefix + "ffn_up_exps.weight");
+                w.ffn.down_experts = raon_matrix(*model, prefix + "ffn_down_exps.weight");
+                w.ffn.shared_gate = raon_matrix(*model, prefix + "ffn_gate_shexp.weight", false);
+                w.ffn.shared_up = raon_matrix(*model, prefix + "ffn_up_shexp.weight", false);
+                w.ffn.shared_down = raon_matrix(*model, prefix + "ffn_down_shexp.weight", false);
+            } else {
+                w.ffn.gate = raon_matrix(*model, prefix + "ffn_gate.weight");
+                w.ffn.up = raon_matrix(*model, prefix + "ffn_up.weight");
+                w.ffn.down = raon_matrix(*model, prefix + "ffn_down.weight");
+            }
+        }
+
+        runtime->slots.resize(slots);
+        for (auto& s : runtime->slots) {
+            s.position = 0;
+            s.streams.assign(g.mhc_streams * g.hidden, 0.0f);
+            s.caches.resize(g.layers);
+            for (std::size_t l = 0; l < g.layers; ++l) {
+                flyweight::v2::raon::reset_cache(s.caches[l], runtime->layers[l], g, capacity);
+            }
+        }
+
+        if (expert_mode != 1 && flyweight_gpu_available() && flyweight_gpu_init(0) == 0) {
+            std::vector<std::string> option_storage;
+#if !defined(_WIN32)
+            for (const char* path : {"/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"})
+                if (access((std::string(path) + "/cuda_fp16.h").c_str(), R_OK) == 0) {
+                    option_storage.push_back(std::string("-I") + path);
+                    if (access((std::string(path) + "/cccl/cub/config.cuh").c_str(), R_OK) == 0)
+                        option_storage.push_back(std::string("-I") + path + "/cccl");
+                }
+#endif
+            std::vector<const char*> options;
+            for (const auto& option : option_storage) options.push_back(option.c_str());
+            std::array<char, 16384> log{};
+            // The shared Qwen corpus, MMQ shape defines included: the batched
+            // prefill launches the MMQ kernels with qwen_mmq_shape(), which
+            // must match what the module was compiled with.
+            const std::string source = qwen_cuda_corpus() + raon_cuda_source;
+            if (flyweight_gpu_compile(source.c_str(), options.data(),
+                                    static_cast<std::int32_t>(options.size()), 0,
+                                    log.data(), log.size()) == 0) {
+                std::uint64_t head_bytes = 0;
+                for (const auto& t : model->tensors) {
+                    if (t.name == "output.weight") {
+                        head_bytes = t.size;
+                        break;
+                    }
+                }
+                if (head_bytes > 0 &&
+                    flyweight_gpu_alloc(head_bytes, &runtime->gpu_head) == 0) {
+                    if (flyweight_gpu_upload_sync(runtime->gpu_head, runtime->head.data, head_bytes) == 0) {
+                        runtime->gpu_owned.push_back(runtime->gpu_head);
+                        runtime->gpu_allocated_bytes += head_bytes;
+                        runtime->gpu_normalized = raon_gpu_scratch(*runtime, g.hidden * sizeof(float));
+                        runtime->gpu_logits = raon_gpu_scratch(*runtime, c.vocabulary_size * sizeof(float));
+
+                        // Allocate MoE scratch buffers
+                        auto& gs = runtime->gpu_scratch;
+                        gs.input = raon_gpu_scratch(*runtime, g.hidden * sizeof(float));
+                        gs.router_logits = raon_gpu_scratch(*runtime, g.experts * sizeof(float));
+                        const std::size_t max_expert_dim = std::max(g.expert_size, g.shared_size);
+                        gs.expert_gate = raon_gpu_scratch(*runtime, max_expert_dim * sizeof(float));
+                        gs.expert_up = raon_gpu_scratch(*runtime, max_expert_dim * sizeof(float));
+                        gs.expert_act = raon_gpu_scratch(*runtime, max_expert_dim * sizeof(float));
+                        gs.expert_down = raon_gpu_scratch(*runtime, g.hidden * sizeof(float));
+                        gs.moe_accum = raon_gpu_scratch(*runtime, g.hidden * sizeof(float));
+                        // Attention-projection scratch (see GpuScratchDispatch):
+                        // one 4x-channels pack serves both the RDA q/k/v/gate
+                        // layout and the MLA [q_a | gate | kv] layout, which
+                        // together need 6272 of the 20480 pack floats.
+                        gs.proj_pack = raon_gpu_scratch(*runtime, g.heads * g.head_dim * 4 * sizeof(float));
+                        gs.proj_query = raon_gpu_scratch(*runtime, g.heads * (g.qk_nope + g.qk_rope) * sizeof(float));
+                        gs.attn_in = raon_gpu_scratch(*runtime, g.heads * g.head_dim * sizeof(float));
+                        gs.proj_hidden = raon_gpu_scratch(*runtime, g.hidden * sizeof(float));
+                        gs.matvec_fn = qwen_gpu_matvec_by_type;
+                        gs.launch_situ_glu = [](std::uint64_t gate, std::uint64_t val, std::uint64_t out, int size, float beta, float linear_beta) -> int {
+                            void* args[] = {&gate, &val, &out, &size, &beta, &linear_beta};
+                            return flyweight_gpu_launch_named("raon_situ_glu", static_cast<std::uint32_t>((size + 255) / 256), 1, 256, 0, 0, args);
+                        };
+
+                        runtime->uses_gpu = true;
+                        {
+                            FlyweightV2GpuInfo probe{};
+                            if (gpu_probe(probe, 0) == 0)
+                                runtime->int8_tensor_cores =
+                                    probe.compute_major * 10 + probe.compute_minor >= 80;
+                        }
+
+                        // Prefill scratch comes out of VRAM before the pinning
+                        // fit, so the fit sees what is really left. Widest
+                        // input: a chunk of expert routes (used * hidden per
+                        // token) or the RDA output projection (channels);
+                        // widest output: the fused RDA q/k/v/gate projection.
+                        {
+                            const std::size_t chunk = runtime->prefill_chunk;
+                            const std::size_t channels = g.heads * g.head_dim;
+                            const std::size_t routes = chunk * g.experts_used;
+                            // Streamed MoE layers keep the chunk's own rows (the
+                            // shared expert's input and output) after the routes.
+                            const std::size_t in_elements = std::max({(routes + chunk) * g.hidden,
+                                                                      chunk * channels,
+                                                                      chunk * g.dense_size});
+                            const std::size_t out_elements = std::max({chunk * 4 * channels,
+                                                                       (routes + chunk) * g.hidden,
+                                                                       chunk * g.dense_size,
+                                                                       chunk * g.heads * (g.qk_nope + g.qk_rope)});
+                            const std::size_t expert_elements = routes * g.expert_size +
+                                                                chunk * g.shared_size;
+                            runtime->prefill_in = raon_gpu_scratch(*runtime, in_elements * sizeof(float));
+                            runtime->prefill_q8 = raon_gpu_scratch(*runtime, in_elements);
+                            runtime->prefill_scales = raon_gpu_scratch(*runtime, (in_elements / 32 + 1) * sizeof(float));
+                            runtime->prefill_out = raon_gpu_scratch(*runtime, out_elements * sizeof(float));
+                            runtime->prefill_gate = raon_gpu_scratch(*runtime, expert_elements * sizeof(float));
+                            runtime->prefill_up = raon_gpu_scratch(*runtime, expert_elements * sizeof(float));
+                            runtime->prefill_act = raon_gpu_scratch(*runtime, expert_elements * sizeof(float));
+                            // Positions the device MLA attention can hold: the
+                            // whole context, up to 64 MiB of keys; longer
+                            // contexts fall back to the host attention core.
+                            // Device decode attends from the device cache and
+                            // needs none of it; if it does not come up, the
+                            // buffer is made after pinning.
+                            const bool device_eligible = raon_device_decode_eligible(*runtime);
+                            if (!device_eligible) raon_allocate_key_scratch(*runtime);
+                            // token, sorted row and weight for each route
+                            runtime->prefill_routes = raon_gpu_scratch(*runtime, 3 * routes * sizeof(float));
+                            runtime->prefill_in_elements = in_elements;
+                            runtime->prefill_out_elements = out_elements;
+                            runtime->prefill_expert_elements = expert_elements;
+                            {
+                                const std::size_t padded = routes + 32 * g.experts;
+                                // pointer tables: one per streamed item (at most
+                                // one per expert) plus the resident one
+                                const std::size_t bytes = 4 * (padded / 32 + g.experts) + 4 * padded +
+                                                          8 * routes + 8 + 8 * 3 * g.experts * (g.experts + 1);
+                                runtime->prefill_route_tables = raon_gpu_scratch(*runtime, bytes);
+                            }
+                            {
+                                const std::size_t bytes = 32u << 20;
+                                if (flyweight_gpu_host_alloc(bytes, &runtime->transfer_host) == 0 &&
+                                    flyweight_gpu_event_create(&runtime->transfer_events[0]) == 0 &&
+                                    flyweight_gpu_event_create(&runtime->transfer_events[1]) == 0)
+                                    runtime->transfer_bytes = bytes;
+                            }
+                            runtime->prefill_rda_state = raon_gpu_scratch(
+                                *runtime, g.heads * g.head_dim * g.head_dim * sizeof(float));
+                            runtime->prefill_rda_window = raon_gpu_scratch(
+                                *runtime, 3 * g.heads * g.head_dim * (g.conv_width - 1) * sizeof(float));
+
+                            // The streaming ring: a slot fits the largest single
+                            // matrix the prefill may stream (an attention or
+                            // dense FFN projection), and holds as many whole
+                            // experts as fit. FLYWEIGHT_RAON_STREAM=0 turns it
+                            // off (CPU batched for whatever is not resident).
+                            bool stream_requested = true;
+                            if (const char* env = std::getenv("FLYWEIGHT_RAON_STREAM"))
+                                stream_requested = env[0] != '0';
+                            if (const char* env = std::getenv("FLYWEIGHT_RAON_STREAM_MIN_ROWS"))
+                                runtime->stream_min_rows = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+                            std::size_t slot_bytes = 0;
+                            for (const auto& t : model->tensors) {
+                                // Device decode keeps attention, kv_b and the dense
+                                // FFN resident: only experts (two per slot), shared
+                                // experts and the f32 RDA pack still stream.
+                                if (device_eligible) {
+                                    const auto& n = t.name;
+                                    if (n.find("_exps.weight") != std::string::npos && g.experts)
+                                        slot_bytes = std::max<std::size_t>(slot_bytes, 2 * 3 * (t.size / g.experts));
+                                    else if (n.find("shexp") != std::string::npos)
+                                        slot_bytes = std::max<std::size_t>(slot_bytes, 3 * t.size);
+                                    continue;
+                                }
+                                const auto& n = t.name;
+                                const bool expert = n.find("_exps.weight") != std::string::npos;
+                                const bool streamable =
+                                    n.find("attn_") != std::string::npos || n.find("ssm_g.") != std::string::npos ||
+                                    n.find("ffn_gate.") != std::string::npos || n.find("ffn_up.") != std::string::npos ||
+                                    n.find("ffn_down.") != std::string::npos || n.find("shexp") != std::string::npos;
+                                if (expert && g.experts) slot_bytes = std::max<std::size_t>(slot_bytes, 3 * (t.size / g.experts));
+                                else if (streamable) slot_bytes = std::max<std::size_t>(slot_bytes, t.size);
+                            }
+                            if (device_eligible) {
+                                const std::size_t ch = g.heads * g.head_dim;
+                                const std::size_t pack = (g.ssm_dt_rank * g.hidden + ch * g.ssm_dt_rank +
+                                                          2 * g.heads * g.hidden + 3 * ch * g.conv_width + ch +
+                                                          g.heads + g.head_dim) * sizeof(float);
+                                slot_bytes = std::max(slot_bytes, pack);
+                            }
+                            slot_bytes = (slot_bytes + 4095) & ~std::size_t(4095);
+                            const std::uint32_t slots = 4;
+                            if (stream_requested && slot_bytes &&
+                                flyweight_gpu_host_alloc(slots * slot_bytes, &runtime->stream_host) == 0) {
+                                try {
+                                    runtime->stream_device = raon_gpu_scratch(*runtime, slots * slot_bytes);
+                                    if (flyweight_gpu_stream_create(&runtime->copy_stream) != 0)
+                                        throw std::runtime_error("copy stream");
+                                    runtime->stream_uploaded.assign(slots, 0);
+                                    runtime->stream_consumed.assign(slots, 0);
+                                    for (std::uint32_t i = 0; i < slots; ++i)
+                                        if (flyweight_gpu_event_create(&runtime->stream_uploaded[i]) != 0 ||
+                                            flyweight_gpu_event_create(&runtime->stream_consumed[i]) != 0)
+                                            throw std::runtime_error("stream events");
+                                    runtime->stream_slot_bytes = slot_bytes;
+                                    runtime->stream_slots = slots;
+                                } catch (const std::exception& e) {
+                                    std::fprintf(stderr, "[flyweight] raon: prefill weight streaming disabled (%s)\n", e.what());
+                                }
+                            }
+                        }
+
+                        runtime->device_decode = raon_device_decode_setup(*runtime, *model);
+
+                        // Layer pinning decision:
+                        std::vector<std::size_t> moe_layer_indices;
+                        for (std::size_t l = 0; l < g.layers; ++l) {
+                            if (runtime->layers[l].is_moe) moe_layer_indices.push_back(l);
+                        }
+
+                        FlyweightV2GpuInfo info{};
+                        gpu_probe(info, 0);
+                        const std::uint64_t safety_margin = 512ull * 1024 * 1024; // 512 MiB margin
+                        // Runtime still allocates lazily after load (JIT
+                        // module, cuBLAS workspaces, decode scratch), and the
+                        // display consumes variable board memory. Under
+                        // ~900 MiB of post-load free VRAM the device expert
+                        // path crawls ~35x (measured at 577 MiB free on a
+                        // fresh idle boot, vs stable runs at 905-950 MiB), so
+                        // both pinning phases must stop at this floor. The
+                        // RDA attention stack is reserved from the fit budget
+                        // explicitly: it is nearly as valuable per byte as a
+                        // MoE layer and much cheaper to fund.
+                        std::uint64_t vram_floor = 900ull * 1024 * 1024;
+                        if (const char* env = std::getenv("FLYWEIGHT_RAON_VRAM_FLOOR_MIB")) {
+                            vram_floor = static_cast<std::uint64_t>(std::strtoull(env, nullptr, 10)) * 1024 * 1024;
+                        }
+                        std::uint64_t available_budget = info.free_memory > safety_margin
+                            ? (info.free_memory - safety_margin) : 0;
+
+                        // -----------------------------------------------------
+                        // Attention-side pinning is decided *after* the MoE
+                        // auto-fit below, but the fit reserves floor room for
+                        // it (see the wiring notes there): a pinned MoE layer
+                        // (~956 MB) buys ~28 ms/token while the attention
+                        // stack buys ~13 ms/token over all 25 layers, yet
+                        // letting the fit consume the last layer's worth of
+                        // VRAM left the load with ~580 MiB free and made the
+                        // device expert path ~35x slower -- measured on a
+                        // fresh boot. Slots 0..3 share one branch-norm input,
+                        // slot 4 consumes the attention output; rda_step and
+                        // mla_step define the exact slot order.
+                        std::vector<std::uint64_t> attention_layer_bytes(g.layers, 0);
+                        std::uint64_t attention_min_bytes = 0; // RDA-only reservation
+                        {
+                            static const char* rda_attn_names[] = {
+                                "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                                "ssm_g.weight", "attn_output.weight"};
+                            static const char* mla_attn_names[] = {
+                                "attn_q_a.weight", "attn_q_b.weight",
+                                "attn_kv_a_mqa.weight", "attn_gate.weight",
+                                "attn_output.weight"};
+                            for (std::size_t l = 0; l < g.layers; ++l) {
+                                const std::string prefix = "blk." + std::to_string(l) + ".";
+                                const char* const (&names)[5] = runtime->layers[l].is_rda
+                                    ? rda_attn_names : mla_attn_names;
+                                for (const char* suffix : names) {
+                                    const std::string name = prefix + suffix;
+                                    for (const auto& t : model->tensors) {
+                                        if (t.name == name) {
+                                            attention_layer_bytes[l] += t.size;
+                                            if (runtime->layers[l].is_rda)
+                                                attention_min_bytes += t.size;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Calculate size of one MoE layer
+                        std::uint64_t layer_bytes = 0;
+                        if (!moe_layer_indices.empty()) {
+                            std::string p = "blk." + std::to_string(moe_layer_indices[0]) + ".";
+                            for (const auto& t : model->tensors) {
+                                if (t.name.rfind(p, 0) == 0 &&
+                                    (t.name.find("exps.weight") != std::string::npos ||
+                                     t.name.find("shexp.weight") != std::string::npos ||
+                                     t.name.find("ffn_gate_inp.weight") != std::string::npos)) {
+                                    layer_bytes += t.size;
+                                }
+                            }
+                        }
+
+                        std::unordered_set<std::uint32_t> selected_layers;
+                        const bool has_selection = (gpu_layer_selection != nullptr && gpu_layer_selection[0] != '\0');
+                        if (has_selection) {
+                            std::string sel = gpu_layer_selection;
+                            std::size_t pos = 0;
+                            while (pos < sel.size()) {
+                                auto next = sel.find(',', pos);
+                                if (next == std::string::npos) next = sel.size();
+                                std::string token = sel.substr(pos, next - pos);
+                                if (!token.empty()) {
+                                    try {
+                                        selected_layers.insert(static_cast<std::uint32_t>(std::stoul(token)));
+                                    } catch (...) {}
+                                }
+                                pos = next + 1;
+                            }
+                        }
+
+                        runtime->gpu_layers.resize(g.layers);
+                        for (auto l : moe_layer_indices) {
+                            runtime->gpu_layers[l].is_moe = true;
+                        }
+
+                        std::vector<std::size_t> pin_candidates;
+                        if (has_selection) {
+                            for (auto l : moe_layer_indices) {
+                                if (selected_layers.count(static_cast<std::uint32_t>(l))) {
+                                    pin_candidates.push_back(l);
+                                }
+                            }
+                        } else if (gpu_layers >= 0) {
+                            const std::size_t target = std::min<std::size_t>(static_cast<std::size_t>(gpu_layers), moe_layer_indices.size());
+                            for (std::size_t i = 0; i < target; ++i) {
+                                pin_candidates.push_back(moe_layer_indices[moe_layer_indices.size() - target + i]);
+                            }
+                        } else {
+                        // Auto fit: keep the floor out of the layer pinning
+                        // budget (see the vram_floor note above for why the
+                        // plain free-minus-margin fit crawled the expert
+                        // path). The floor absorbs the old safety margin: the
+                        // attention pass re-probes and pins anything left
+                        // above the floor.
+                        available_budget = available_budget > vram_floor
+                            ? (available_budget - vram_floor) : 0;
+                        // The whole attention stack comes out of the MoE budget
+                        // first: per byte of VRAM it is worth ~18x a MoE layer
+                        // at decode (an RDA layer's ~52 MB of projections are
+                        // read every token, while 927 MB of experts save only
+                        // the ~52 MB of experts a token routes to).
+                        // FLYWEIGHT_RAON_ATTN_FIRST=0 restores MoE-first.
+                        {
+                            bool attention_first = true;
+                            if (const char* env = std::getenv("FLYWEIGHT_RAON_ATTN_FIRST"))
+                                attention_first = env[0] != '0';
+                            if (const char* env = std::getenv("FLYWEIGHT_RAON_ATTN_GPU"))
+                                attention_first = attention_first && env[0] != '0';
+                            std::uint64_t attention_total = 0;
+                            for (auto bytes : attention_layer_bytes) attention_total += bytes;
+                            if (attention_first)
+                                available_budget = available_budget > attention_total
+                                    ? (available_budget - attention_total) : 0;
+                        }
+                        const std::size_t fit = layer_bytes > 0 ? static_cast<std::size_t>(available_budget / layer_bytes) : 0;
+                            // Device decode spends the expert budget on a
+                            // per-expert cache instead of whole layers.
+                            bool expert_cache = runtime->device_decode;
+                            if (const char* env = std::getenv("FLYWEIGHT_RAON_EXPERT_CACHE"))
+                                expert_cache = expert_cache && env[0] != '0';
+                            if (expert_cache && raon_expert_cache_setup(*runtime, available_budget)) {
+                                // no whole layers pinned
+                            } else {
+                            const std::size_t target = std::min<std::size_t>(fit, moe_layer_indices.size());
+                            for (std::size_t i = 0; i < target; ++i) {
+                                pin_candidates.push_back(moe_layer_indices[moe_layer_indices.size() - target + i]);
+                            }
+                            }
+                        }
+
+                        // Upload pinned layers
+                        for (auto l : pin_candidates) {
+                            const std::string prefix = "blk." + std::to_string(l) + ".";
+                            try {
+                                auto& gl = runtime->gpu_layers[l];
+                                gl.router = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_gate_inp.weight");
+                                gl.router_type = runtime->layers[l].ffn.router.type;
+                                gl.router_bias = runtime->layers[l].ffn.router_bias;
+                                gl.gate_exps = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_gate_exps.weight");
+                                gl.gate_type = runtime->layers[l].ffn.gate_experts.type;
+                                gl.up_exps = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_up_exps.weight");
+                                gl.up_type = runtime->layers[l].ffn.up_experts.type;
+                                gl.down_exps = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_down_exps.weight");
+                                gl.down_type = runtime->layers[l].ffn.down_experts.type;
+                                if (g.shared_experts > 0 && runtime->layers[l].ffn.shared_gate &&
+                                    l < runtime->decode_layers.size() && runtime->decode_layers[l].shared_gate) {
+                                    // Already resident for device decode.
+                                    const auto& d = runtime->decode_layers[l];
+                                    gl.shared_gate = d.shared_gate;
+                                    gl.shared_gate_type = runtime->layers[l].ffn.shared_gate.type;
+                                    gl.shared_up = d.shared_up;
+                                    gl.shared_up_type = runtime->layers[l].ffn.shared_up.type;
+                                    gl.shared_down = d.shared_down;
+                                    gl.shared_down_type = runtime->layers[l].ffn.shared_down.type;
+                                } else if (g.shared_experts > 0 && runtime->layers[l].ffn.shared_gate) {
+                                    gl.shared_gate = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_gate_shexp.weight", false);
+                                    gl.shared_gate_type = runtime->layers[l].ffn.shared_gate.type;
+                                    gl.shared_up = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_up_shexp.weight", false);
+                                    gl.shared_up_type = runtime->layers[l].ffn.shared_up.type;
+                                    gl.shared_down = raon_gpu_upload_tensor(*runtime, *model, prefix + "ffn_down_shexp.weight", false);
+                                    gl.shared_down_type = runtime->layers[l].ffn.shared_down.type;
+                                }
+                                gl.pinned = true;
+                                runtime->gpu_expert_layers++;
+                                runtime->gpu_expert_cache_bytes += layer_bytes;
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "[flyweight] raon: failed to pin layer %zu on GPU (%s)\n", l, e.what());
+                                break;
+                            }
+                        }
+
+                        runtime->expert_mode = runtime->gpu_expert_layers > 0 ? 2 : 1;
+                        {
+                            FlyweightV2GpuInfo fit_probe{};
+                            gpu_probe(fit_probe, 0);
+                            std::uint64_t attention_total = 0;
+                            for (auto bytes : attention_layer_bytes) attention_total += bytes;
+                            std::fprintf(stderr,
+                                "[flyweight] raon: moe fit: budget %llu MiB, layer %.0f MiB, pinned %u/%zu, free %llu MiB, attention total %.0f MiB\n",
+                                (unsigned long long)(available_budget / (1024 * 1024)),
+                                layer_bytes / 1048576.0, runtime->gpu_expert_layers,
+                                moe_layer_indices.size(),
+                                (unsigned long long)(fit_probe.free_memory / (1024 * 1024)),
+                                attention_total / 1048576.0);
+                        }
+
+                        // Attention projection offload: greedy over the budget
+                        // the MoE fit left behind, highest-value layers first.
+                        // RDA layers lead because their four channel-wide
+                        // projections dominate the per-token profile; MLA
+                        // layers follow. Fits as many whole layers as the
+                        // remaining VRAM allows -- a partially offloaded layer
+                        // would still stream its CPU-side half, so layers go
+                        // all-or-nothing, with a clean rollback if an upload
+                        // throws mid-way.
+                        std::vector<std::size_t> attention_order;
+                        for (std::size_t l = 0; l < g.layers; ++l)
+                            if (runtime->layers[l].is_rda) attention_order.push_back(l);
+                        for (std::size_t l = 0; l < g.layers; ++l)
+                            if (!runtime->layers[l].is_rda) attention_order.push_back(l);
+
+                        // Runtime still allocates lazily after load (JIT
+                        // module, cuBLAS workspaces, decode scratch), and the
+                        // display consumes variable board memory. Under
+                        // ~900 MiB of post-load free VRAM the device expert
+                        // path crawls ~35x (measured at 577 MiB free on a
+                        // fresh idle boot, vs stable runs at 905-950 MiB), so
+                        // both pinning phases must stop at this floor. The
+                        // RDA attention stack is reserved from the fit budget
+                        // explicitly: it is nearly as valuable per byte as a
+                        // MoE layer and much cheaper to fund.
+                        FlyweightV2GpuInfo attention_probe{};
+                        gpu_probe(attention_probe, 0);
+                        bool attention_requested = true;
+                        if (const char* env = std::getenv("FLYWEIGHT_RAON_ATTN_GPU")) {
+                            attention_requested = env[0] != '0';
+                        }
+                        const std::size_t attention_total_layers = attention_requested
+                            ? attention_order.size() : 0;
+                        std::uint64_t attention_pinned_bytes = 0;
+                        std::size_t attention_pinned_count = 0;
+
+                        if (attention_total_layers > 0) {
+                            const std::size_t owned_before = runtime->gpu_owned.size();
+                            const std::uint64_t allocated_before = runtime->gpu_allocated_bytes;
+                            FlyweightV2GpuInfo attention_probe_before = attention_probe;
+                            bool attention_ok = true;
+                            try {
+                                for (auto l : attention_order) {
+                                    const std::uint64_t bytes = attention_layer_bytes[l];
+                                    if (bytes == 0) continue;
+                                    // Re-probe per layer: pin bytes register a
+                                    // few percent above nominal (allocator
+                                    // granularity), and display memory drifts
+                                    // while the 25.8 GB upload runs. Checking
+                                    // the live ceiling per pin guarantees the
+                                    // load never ends below the floor.
+                                    FlyweightV2GpuInfo live_probe{};
+                                    gpu_probe(live_probe, 0);
+                                    const std::uint64_t headroom = live_probe.free_memory > vram_floor
+                                        ? (live_probe.free_memory - vram_floor)
+                                        : 0;
+                                    if (bytes > headroom)
+                                        continue;
+                                    const std::string prefix = "blk." + std::to_string(l) + ".";
+                                    auto& gl = runtime->gpu_layers[l];
+                                    const auto& layer = runtime->layers[l];
+                                    // Slot contract (mirrors rda_step/mla_step):
+                                    // RDA [q, k, v, gate, output] / MLA
+                                    // [q_a, q_b, kv_a_mqa, gate, output].
+                                    const flyweight::v2::raon::Matrix* mats[5];
+                                    const char* suffixes[5];
+                                    if (layer.is_rda) {
+                                        mats[0] = &layer.rda.q;       suffixes[0] = "attn_q.weight";
+                                        mats[1] = &layer.rda.k;       suffixes[1] = "attn_k.weight";
+                                        mats[2] = &layer.rda.v;       suffixes[2] = "attn_v.weight";
+                                        mats[3] = &layer.rda.gate;    suffixes[3] = "ssm_g.weight";
+                                    } else {
+                                        mats[0] = &layer.mla.q_a;     suffixes[0] = "attn_q_a.weight";
+                                        mats[1] = &layer.mla.q_b;     suffixes[1] = "attn_q_b.weight";
+                                        mats[2] = &layer.mla.kv_a_mqa; suffixes[2] = "attn_kv_a_mqa.weight";
+                                        mats[3] = &layer.mla.gate;    suffixes[3] = "attn_gate.weight";
+                                    }
+                                    mats[4] = layer.is_rda ? &layer.rda.output : &layer.mla.output;
+                                    suffixes[4] = "attn_output.weight";
+
+                                    // Slots 0..3 all read the branch norm, so
+                                    // those tensors can be packed into ONE
+                                    // fused matrix (rows concatenated in a
+                                    // layout matching the step-side pack
+                                    // offsets: RDA plain slot order, MLA
+                                    // [q_a | gate | kv_a]) when their quant
+                                    // types agree. One matvec launch then
+                                    // replaces the per-slot launches; slot 1
+                                    // (MLA q_b) and slot 4 always stay
+                                    // separate -- they consume later data.
+                                    bool fused_member[5] = {};
+                                    if (layer.is_rda) {
+                                        fused_member[0] = fused_member[1] = fused_member[2] = fused_member[3] = true;
+                                    } else {
+                                        fused_member[0] = fused_member[2] = fused_member[3] = true;
+                                    }
+                                    bool can_pack = true;
+                                    if (const char* env = std::getenv("FLYWEIGHT_RAON_FUSED_ATTN")) {
+                                        can_pack = can_pack && env[0] != '0';
+                                    }
+                                    // Fused row order follows the pack
+                                    // layout: RDA plain slot order, MLA
+                                    // [q_a | gate | kv_a].
+                                    std::size_t fused_order[4];
+                                    std::size_t fused_count = 0;
+                                    if (layer.is_rda) {
+                                        fused_order[0] = 0;
+                                        fused_order[1] = 1;
+                                        fused_order[2] = 2;
+                                        fused_order[3] = 3;
+                                        fused_count = 4;
+                                    } else {
+                                        fused_order[0] = 0;
+                                        fused_order[1] = 3;
+                                        fused_order[2] = 2;
+                                        fused_count = 3;
+                                    }
+                                    const auto tensor_size = [&](const std::string& name) -> std::uint64_t {
+                                        for (const auto& t : model->tensors)
+                                            if (t.name == name) return t.size;
+                                        return 0;
+                                    };
+                                    const std::uint32_t fused_type = mats[fused_order[0]]->type;
+                                    std::uint64_t packed_bytes = 0;
+                                    std::uint64_t packed_sizes[4] = {};
+                                    for (std::size_t s = 0; s < fused_count && can_pack; ++s) {
+                                        const std::size_t slot = fused_order[s];
+                                        can_pack = mats[slot]->type == fused_type;
+                                        packed_sizes[s] = can_pack
+                                            ? tensor_size(prefix + suffixes[slot]) : 0;
+                                        can_pack = can_pack && packed_sizes[s] > 0;
+                                        packed_bytes += packed_sizes[s];
+                                    }
+                                    bool packed = false;
+                                    std::uint64_t fused_ptr = 0;
+                                    if (can_pack) {
+                                        if (flyweight_gpu_alloc(packed_bytes, &fused_ptr) == 0) {
+                                            runtime->gpu_owned.push_back(fused_ptr);
+                                            runtime->gpu_allocated_bytes += packed_bytes;
+                                            std::uint64_t offset = 0;
+                                            for (std::size_t s = 0; s < fused_count; ++s) {
+                                                const std::string name = prefix + suffixes[fused_order[s]];
+                                                for (const auto& t : model->tensors) {
+                                                    if (t.name != name) continue;
+                                                    if (flyweight_gpu_upload_sync(fused_ptr + offset, tensor_data(*model, t), t.size) != 0)
+                                                        throw std::runtime_error("failed to upload fused attention pack " + name);
+                                                    offset += t.size;
+                                                    break;
+                                                }
+                                            }
+                                            gl.attn_weight[0] = fused_ptr;
+                                            gl.attn_type[0] = fused_type;
+                                            packed = true;
+                                        }
+                                    }
+                                    // Slot fills: fused participants point at
+                                    // the fused matrix (weight[0]); everything
+                                    // else uploads per the slot contract.
+                                    for (std::size_t slot = 0; slot < 5; ++slot) {
+                                        if (!fused_member[slot]) {
+                                            gl.attn_weight[slot] = raon_gpu_upload_tensor(*runtime, *model, prefix + suffixes[slot]);
+                                            gl.attn_type[slot] = mats[slot]->type;
+                                            continue;
+                                        }
+                                        if (packed) {
+                                            // slot 0 carries the fused matrix;
+                                            // participants 1..3 stay empty.
+                                            if (slot == 0) continue;
+                                            gl.attn_weight[slot] = 0;
+                                            gl.attn_type[slot] = 0;
+                                            continue;
+                                        }
+                                        gl.attn_weight[slot] = raon_gpu_upload_tensor(*runtime, *model, prefix + suffixes[slot]);
+                                        gl.attn_type[slot] = mats[slot]->type;
+                                    }
+                                    gl.attn_packed = packed;
+                                    gl.attn_gpu = true;
+                                    attention_pinned_bytes += bytes;
+                                    ++attention_pinned_count;
+                                }
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr,
+                                    "[flyweight] raon: attention offload disabled (%s)\n", e.what());
+                                attention_ok = false;
+                            }
+                            if (!attention_ok) {
+                                for (std::size_t i = owned_before; i < runtime->gpu_owned.size(); ++i)
+                                    flyweight_gpu_free(runtime->gpu_owned[i]);
+                                runtime->gpu_owned.resize(owned_before);
+                                runtime->gpu_allocated_bytes = allocated_before;
+                                for (auto& gl : runtime->gpu_layers) {
+                                    gl.attn_gpu = false;
+                                    for (auto& weight : gl.attn_weight) weight = 0;
+                                }
+                                attention_pinned_bytes = 0;
+                                attention_pinned_count = 0;
+                            }
+                            runtime->gpu_attention_bytes = attention_pinned_bytes;
+                            FlyweightV2GpuInfo attention_probe_after{};
+                            gpu_probe(attention_probe_after, 0);
+                            std::fprintf(stderr,
+                                "[flyweight] raon: attention offload %zu/%zu layers pinned (%.0f MiB), free before/after pinning %.0f/%.0f MiB\n",
+                                attention_pinned_count, g.layers,
+                                attention_pinned_bytes / 1048576.0,
+                                attention_probe_before.free_memory / 1048576.0,
+                                attention_probe_after.free_memory / 1048576.0);
+                        } else {
+                            std::fprintf(stderr,
+                                "[flyweight] raon: attention offload skipped, no VRAM budget after MoE fit\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Device decode needs every attention projection resident; once that
+        // holds, the device copies are the only ones and the host caches go.
+        if (runtime->device_decode) {
+            bool resident = true;
+            for (std::size_t l = 0; l < runtime->layers.size(); ++l)
+                resident = resident && l < runtime->gpu_layers.size() && runtime->gpu_layers[l].attn_gpu;
+            if (!resident) {
+                runtime->device_decode = false;
+                std::fprintf(stderr, "[flyweight] raon: device decode off (attention not fully on the GPU)\n");
+            } else {
+                runtime->geometry.host_cache = false;
+                for (auto& s : runtime->slots)
+                    for (std::size_t l = 0; l < runtime->layers.size(); ++l)
+                        flyweight::v2::raon::reset_cache(s.caches[l], runtime->layers[l], runtime->geometry,
+                                                         runtime->capacity);
+            }
+        }
+        if (runtime->uses_gpu && !runtime->device_decode && !runtime->prefill_latents)
+            raon_allocate_key_scratch(*runtime);
+        if (runtime->uses_gpu) raon_pin_host_experts(*runtime, *model);
+        if (runtime->device_decode) raon_expert_cache_fill(*runtime);
+        else if (runtime->expert_cache.slots) {
+            // Device decode did not come up: nothing uses the cache.
+            runtime->expert_cache.slots = 0;
+        }
+
+        *out = runtime.release();
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_create_slots(const FlyweightV2Model* model, uint32_t capacity, uint32_t slots, FlyweightV2RaonRuntime** out) {
+    return flyweight_v2_raon_create_with_options(model, capacity, slots, 2, -1, nullptr, out);
+}
+
+int flyweight_v2_raon_create(const FlyweightV2Model* model, uint32_t capacity, FlyweightV2RaonRuntime** out) {
+    return flyweight_v2_raon_create_slots(model, capacity, 1, out);
+}
+
+void flyweight_v2_raon_destroy(FlyweightV2RaonRuntime* runtime) {
+    try {
+        if (flyweight::v2::raon::profiling())
+            flyweight::v2::raon::profile().report(stderr);
+        delete runtime;
+    } catch (...) {}
+}
+
+int flyweight_v2_raon_slot_count(FlyweightV2RaonRuntime* runtime, uint32_t* out) {
+    return guarded([&]{
+        if (!runtime || !out) throw std::runtime_error("invalid raon slot count arguments");
+        *out = static_cast<std::uint32_t>(runtime->slots.size());
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_uses_gpu(const FlyweightV2RaonRuntime* runtime, int* out) {
+    return guarded([&]{
+        if (!runtime || !out) throw std::runtime_error("invalid raon runtime or output pointer");
+        *out = runtime->uses_gpu ? 1 : 0;
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_layer_on_gpu(const FlyweightV2RaonRuntime* runtime, uint32_t layer) {
+    return guarded([&]{
+        if (!runtime || layer >= runtime->layers.size()) return -1;
+        if (!runtime->uses_gpu) return 0;
+        if (layer < runtime->gpu_layers.size()) {
+            return runtime->gpu_layers[layer].pinned ? 1 : 0;
+        }
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_plan(FlyweightV2RaonRuntime* runtime, FlyweightV2PlacementPlan* out) {
+    return guarded([&]{
+        if (!runtime || !out) throw std::runtime_error("invalid arguments to raon plan");
+        *out = {};
+        const auto& g = runtime->geometry;
+        const auto& c = runtime->model->config;
+
+        out->layers = static_cast<std::uint32_t>(g.layers);
+        out->dense_ffn_layers = static_cast<std::uint32_t>(g.leading_dense_layers);
+        out->moe_layers = static_cast<std::uint32_t>(g.layers > g.leading_dense_layers ? (g.layers - g.leading_dense_layers) : 0);
+        out->parallel_sequences = static_cast<std::uint32_t>(runtime->slots.size());
+        out->context_limit = runtime->capacity;
+
+        std::uint64_t total_moe_bytes = 0;
+        for (const auto& t : runtime->model->tensors) {
+            if (t.name.find("exps.weight") != std::string::npos) {
+                total_moe_bytes += t.size;
+            }
+        }
+        out->expert_weight_bytes = total_moe_bytes;
+        out->expert_bundles = out->moe_layers * g.experts;
+        // Host-resident per slot: the full-context MLA cache in its type, and
+        // the RDA state and conv windows (f32). Nothing of it lives on the
+        // device between calls.
+        if (runtime->device_decode)
+            out->kv_state_bytes = runtime->device_state_bytes;
+        else
+            out->host_kv_state_bytes = runtime->slots.size() *
+                raon_cache_payload_bytes(*runtime, runtime->capacity, g.cache_type);
+        out->host_pinned_bytes = runtime->pinned_expert_bytes + runtime->transfer_bytes +
+            static_cast<std::uint64_t>(runtime->stream_slots) * runtime->stream_slot_bytes;
+        out->cache_type_k = g.cache_type;
+        out->cache_type_v = g.cache_type;
+
+        if (runtime->uses_gpu) {
+            FlyweightV2GpuInfo info{};
+            gpu_probe(info, 0);
+            out->gpu_total_bytes = info.total_memory;
+            out->gpu_free_bytes = info.free_memory;
+            out->gpu_budget_bytes = info.free_memory + runtime->gpu_allocated_bytes;
+            out->gpu_budget_auto = 1;
+            out->static_weights_bytes = runtime->gpu_allocated_bytes - runtime->gpu_expert_cache_bytes;
+            out->expert_cache_bytes = runtime->gpu_expert_cache_bytes;
+            out->expert_cache_slots = static_cast<std::uint64_t>(runtime->gpu_expert_layers) * g.experts;
+            out->workspace_bytes = g.hidden * sizeof(float) + c.vocabulary_size * sizeof(float);
+            out->expert_mode = runtime->gpu_expert_layers > 0 ? 2 : 1;
+            out->gpu_expert_layers = runtime->gpu_expert_layers;
+            out->host_ffn_layers = 0;
+        } else {
+            out->expert_mode = 1; // CPU
+            out->host_ffn_layers = out->dense_ffn_layers;
+            out->gpu_expert_layers = 0;
+        }
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_reset_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot_index) {
+    return guarded([&]{
+        if (!runtime) throw std::runtime_error("invalid raon runtime");
+        auto& s = runtime->slot(slot_index);
+        s.position = 0;
+        std::fill(s.streams.begin(), s.streams.end(), 0.0f);
+        for (std::size_t l = 0; l < runtime->layers.size(); ++l) {
+            flyweight::v2::raon::reset_cache(s.caches[l], runtime->layers[l], runtime->geometry, runtime->capacity);
+        }
+        if (runtime->device_decode) {
+            // The MLA rows need no clearing: position 0 reads none of them.
+            const auto& g = runtime->geometry;
+            const std::size_t ch = g.heads * g.head_dim;
+            for (std::size_t l = 0; l < runtime->layers.size(); ++l) {
+                if (!s.rda_state[l]) continue;
+                if (flyweight_gpu_memset(s.rda_state[l], 0, g.heads * g.head_dim * g.head_dim * sizeof(float), 0) != 0 ||
+                    flyweight_gpu_memset(s.rda_window[l], 0, 3 * ch * (g.conv_width - 1) * sizeof(float), 0) != 0)
+                    throw std::runtime_error("raon device state reset failed");
+            }
+            flyweight_gpu_stream_sync(0);
+        }
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_reset(FlyweightV2RaonRuntime* runtime) {
+    return flyweight_v2_raon_reset_slot(runtime, 0);
+}
+
+int flyweight_v2_raon_set_progress(FlyweightV2RaonRuntime* runtime, int (*callback)(void* user, uint32_t processed, uint32_t total), void* user) {
+    return guarded([&]{
+        if (!runtime) throw std::runtime_error("invalid raon runtime");
+        runtime->progress_callback = callback;
+        runtime->progress_user = user;
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_eval_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot_index, const uint32_t* tokens, uint32_t count, float* logits) {
+    return guarded([&]{
+        if (!runtime || !tokens || (count > 0 && !logits))
+            throw std::runtime_error("invalid raon eval arguments");
+        if (count == 0) return 0;
+
+        if (flyweight_gpu_available()) flyweight_gpu_init(0);
+
+        auto& s = runtime->slot(slot_index);
+        if (s.position + count > runtime->capacity)
+            throw std::runtime_error("raon sequence exceeds runtime capacity");
+
+        const auto& g = runtime->geometry;
+        const auto embd_stride = flyweight::v2::bailing::row_bytes(runtime->embedding_matrix.type, g.hidden);
+        const auto* embd_base = reinterpret_cast<const std::uint8_t*>(runtime->embedding_matrix.data);
+
+        std::vector<float> token_embd(g.hidden);
+        std::vector<float> final_hidden(g.hidden);
+
+        // Prompts go through the batched prefill; single tokens (decode) and
+        // short appends stay on the per-token step. FLYWEIGHT_RAON_PREFILL=0
+        // forces the per-token path everywhere, for A/B checks.
+        static const bool prefill_enabled = [] {
+            const char* setting = std::getenv("FLYWEIGHT_RAON_PREFILL");
+            return !setting || setting[0] != '0';
+        }();
+        const bool batched = prefill_enabled && count >= 8;
+        if (batched)
+            raon_prefill_run(*runtime, s, tokens, count, final_hidden.data());
+
+        for (uint32_t i = 0; i < (batched ? 0u : count); ++i) {
+            const uint32_t token = tokens[i];
+            flyweight::v2::bailing::row_decode(
+                embd_base + static_cast<std::size_t>(token) * embd_stride,
+                runtime->embedding_matrix.type, g.hidden, token_embd.data());
+
+            if (runtime->device_decode)
+                raon_decode_device(*runtime, s, token_embd.data(), final_hidden.data());
+            else
+                flyweight::v2::raon::decoder_step(
+                    token_embd.data(), runtime->layers, g, s.position,
+                    s.caches, s.streams.data(), final_hidden.data(),
+                    runtime->uses_gpu ? &runtime->gpu_layers : nullptr,
+                    runtime->uses_gpu ? &runtime->gpu_scratch : nullptr);
+
+            s.position++;
+            if (runtime->progress_callback && count > 1) {
+                if (runtime->progress_callback(runtime->progress_user, i + 1, count) != 0) {
+                    throw std::runtime_error("raon eval aborted by progress callback");
+                }
+            }
+        }
+
+        // Output normalization and logits for the last token
+        std::vector<float> normalized(g.hidden);
+        flyweight::v2::bailing::rms_norm(
+            final_hidden.data(), runtime->output_norm, g.hidden, g.epsilon, normalized.data());
+
+        if (runtime->gpu_head && runtime->gpu_normalized && runtime->gpu_logits) {
+            flyweight_gpu_upload_sync(runtime->gpu_normalized, normalized.data(), g.hidden * sizeof(float));
+            int status = qwen_gpu_matvec_by_type(runtime->head.type, runtime->gpu_head, runtime->gpu_normalized,
+                                                runtime->gpu_logits, static_cast<int>(g.hidden),
+                                                static_cast<int>(runtime->model->config.vocabulary_size), 0);
+            if (status != 0) {
+                throw std::runtime_error("raon GPU head matvec failed with status " + std::to_string(status));
+            }
+            flyweight_gpu_download(logits, runtime->gpu_logits,
+                                   runtime->model->config.vocabulary_size * sizeof(float), 0);
+            flyweight_gpu_stream_sync(0);
+        } else {
+            flyweight::v2::bailing::matvec(
+                runtime->head, normalized.data(), g.hidden, runtime->model->config.vocabulary_size, logits);
+        }
+
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_eval(FlyweightV2RaonRuntime* runtime, const uint32_t* tokens, uint32_t count, float* logits) {
+    return flyweight_v2_raon_eval_slot(runtime, 0, tokens, count, logits);
+}
+
+#pragma pack(push, 1)
+struct RaonCacheHeader {
+    std::uint32_t magic;      // 0x52414F4E "RAON"
+    std::uint32_t version;    // 1
+    std::uint64_t position;
+    std::uint32_t capacity;
+    std::uint32_t layers;
+    std::uint32_t hidden;
+    std::uint32_t heads;
+    std::uint64_t payload_bytes;
+    // version 2: the MLA rows' storage type (placement codes); version 1
+    // snapshots end before this field and are f32.
+    std::uint32_t cache_type;
+    std::uint32_t reserved;
+};
+#pragma pack(pop)
+static constexpr std::size_t kRaonCacheHeaderV1 = offsetof(RaonCacheHeader, cache_type);
+
+// The MLA rows are stored in `cache_type` (placement codes 0 f32, 1 f16,
+// 2 bf16); a snapshot keeps the type it was taken in.
+static std::uint64_t raon_cache_payload_bytes(const FlyweightV2RaonRuntime& runtime, std::uint64_t position,
+                                              int cache_type) {
+    const auto& g = runtime.geometry;
+    const std::uint64_t element = flyweight::v2::raon::cache_element_bytes(cache_type);
+    std::uint64_t total = g.mhc_streams * g.hidden * sizeof(float);
+    for (std::size_t l = 0; l < g.layers; ++l) {
+        if (g.is_rda(l)) {
+            const std::size_t channels = g.heads * g.head_dim;
+            const std::size_t history = g.conv_width > 1 ? g.conv_width - 1 : 0;
+            total += (g.heads * g.head_dim * g.head_dim) * sizeof(float);
+            total += 3 * (channels * history) * sizeof(float);
+        } else {
+            total += position * (g.kv_lora + g.qk_rope) * element;
+        }
+    }
+    return total;
+}
+
+int flyweight_v2_raon_cache_save_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot_index, void* buffer, uint64_t capacity, uint64_t* length) {
+    return guarded([&]{
+        if (!runtime || !length) throw std::runtime_error("invalid raon cache save arguments");
+        auto& s = runtime->slot(slot_index);
+        const int cache_type = runtime->geometry.cache_type;
+        const std::uint64_t payload = raon_cache_payload_bytes(*runtime, s.position, cache_type);
+        const std::uint64_t total = sizeof(RaonCacheHeader) + payload;
+        *length = total;
+        if (!buffer || capacity == 0) return 0;
+        if (capacity < total) throw std::runtime_error("raon cache save buffer too small");
+
+        RaonCacheHeader header{};
+        header.magic = 0x52414F4Eu;
+        header.version = 2;
+        header.cache_type = static_cast<std::uint32_t>(cache_type);
+        header.position = s.position;
+        header.capacity = runtime->capacity;
+        header.layers = static_cast<std::uint32_t>(runtime->geometry.layers);
+        header.hidden = static_cast<std::uint32_t>(runtime->geometry.hidden);
+        header.heads = static_cast<std::uint32_t>(runtime->geometry.heads);
+        header.payload_bytes = payload;
+
+        auto* cursor = reinterpret_cast<std::uint8_t*>(buffer);
+        std::memcpy(cursor, &header, sizeof(header));
+        cursor += sizeof(header);
+
+        const auto& g = runtime->geometry;
+        const auto streams_bytes = g.mhc_streams * g.hidden * sizeof(float);
+        std::memcpy(cursor, s.streams.data(), streams_bytes);
+        cursor += streams_bytes;
+
+        const auto fetch = [](std::uint8_t* target, std::uint64_t source, std::size_t bytes) {
+            if (bytes && (flyweight_gpu_download(target, source, bytes, 0) != 0 ||
+                          flyweight_gpu_stream_sync(0) != 0))
+                throw std::runtime_error("raon device state download failed");
+        };
+        for (std::size_t l = 0; runtime->device_decode && l < g.layers; ++l) {
+            // Same payload layout as the host form below.
+            const std::size_t ch = g.heads * g.head_dim, history = g.conv_width - 1;
+            if (g.is_rda(l)) {
+                // The device keeps each head k-major; the payload is [v][k].
+                const std::size_t D = g.head_dim, state_bytes = g.heads * D * D * sizeof(float);
+                std::vector<float> kmajor(g.heads * D * D);
+                fetch(reinterpret_cast<std::uint8_t*>(kmajor.data()), s.rda_state[l], state_bytes);
+                auto* state = reinterpret_cast<float*>(cursor);
+                for (std::size_t h = 0; h < g.heads; ++h)
+                    for (std::size_t k = 0; k < D; ++k)
+                        for (std::size_t v = 0; v < D; ++v)
+                            std::memcpy(&state[(h * D + v) * D + k], &kmajor[(h * D + k) * D + v], sizeof(float));
+                cursor += state_bytes;
+                fetch(cursor, s.rda_window[l], 3 * ch * history * sizeof(float));
+                cursor += 3 * ch * history * sizeof(float);
+            } else {
+                const auto element = flyweight::v2::raon::cache_element_bytes(cache_type);
+                fetch(cursor, s.mla_latents[l], s.position * g.kv_lora * element);
+                cursor += s.position * g.kv_lora * element;
+                fetch(cursor, s.mla_rope[l], s.position * g.qk_rope * element);
+                cursor += s.position * g.qk_rope * element;
+            }
+        }
+        for (std::size_t l = 0; !runtime->device_decode && l < g.layers; ++l) {
+            const auto& c = s.caches[l];
+            if (g.is_rda(l)) {
+                const auto state_bytes = c.rda_state.size() * sizeof(float);
+                std::memcpy(cursor, c.rda_state.data(), state_bytes);
+                cursor += state_bytes;
+                const auto q_bytes = c.q_window.size() * sizeof(float);
+                std::memcpy(cursor, c.q_window.data(), q_bytes);
+                cursor += q_bytes;
+                const auto k_bytes = c.k_window.size() * sizeof(float);
+                std::memcpy(cursor, c.k_window.data(), k_bytes);
+                cursor += k_bytes;
+                const auto v_bytes = c.v_window.size() * sizeof(float);
+                std::memcpy(cursor, c.v_window.data(), v_bytes);
+                cursor += v_bytes;
+            } else {
+                const auto element = flyweight::v2::raon::cache_element_bytes(cache_type);
+                const auto latents_bytes = s.position * g.kv_lora * element;
+                std::memcpy(cursor, cache_type ? static_cast<const void*>(c.latents16.data())
+                                               : static_cast<const void*>(c.latents.data()), latents_bytes);
+                cursor += latents_bytes;
+                const auto rope_bytes = s.position * g.qk_rope * element;
+                std::memcpy(cursor, cache_type ? static_cast<const void*>(c.rope16.data())
+                                               : static_cast<const void*>(c.rope_keys.data()), rope_bytes);
+                cursor += rope_bytes;
+            }
+        }
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_cache_save(FlyweightV2RaonRuntime* runtime, void* buffer, uint64_t capacity, uint64_t* length) {
+    return flyweight_v2_raon_cache_save_slot(runtime, 0, buffer, capacity, length);
+}
+
+int flyweight_v2_raon_cache_load_slot(FlyweightV2RaonRuntime* runtime, uint32_t slot_index, const void* buffer, uint64_t length) {
+    return guarded([&]{
+        if (!runtime || !buffer) throw std::runtime_error("invalid raon cache load arguments");
+        if (length < sizeof(RaonCacheHeader)) throw std::runtime_error("raon cache snapshot truncated");
+
+        RaonCacheHeader header{};
+        std::memcpy(&header, buffer, kRaonCacheHeaderV1);
+        if (header.magic != 0x52414F4Eu) throw std::runtime_error("not a raon cache snapshot");
+        if (header.version != 1 && header.version != 2) throw std::runtime_error("unsupported raon cache version");
+        std::size_t header_bytes = kRaonCacheHeaderV1;
+        if (header.version == 2) {
+            if (length < sizeof(RaonCacheHeader)) throw std::runtime_error("raon cache snapshot truncated");
+            std::memcpy(&header, buffer, sizeof(header));
+            header_bytes = sizeof(RaonCacheHeader);
+            if (header.cache_type > 2) throw std::runtime_error("raon cache snapshot has an unknown cache type");
+        }
+        const int saved_type = static_cast<int>(header.cache_type);
+
+        const auto& g = runtime->geometry;
+        if (header.layers != g.layers || header.hidden != g.hidden || header.heads != g.heads)
+            throw std::runtime_error("raon cache snapshot geometry mismatch");
+        if (header.position > runtime->capacity)
+            throw std::runtime_error("raon cache snapshot exceeds runtime capacity");
+
+        const std::uint64_t expected_payload = raon_cache_payload_bytes(*runtime, header.position, saved_type);
+        if (header.payload_bytes != expected_payload || length < header_bytes + expected_payload)
+            throw std::runtime_error("raon cache snapshot payload length mismatch");
+
+        auto& s = runtime->slot(slot_index);
+        s.position = static_cast<std::size_t>(header.position);
+
+        const auto* cursor = reinterpret_cast<const std::uint8_t*>(buffer) + header_bytes;
+        const auto streams_bytes = g.mhc_streams * g.hidden * sizeof(float);
+        std::memcpy(s.streams.data(), cursor, streams_bytes);
+        cursor += streams_bytes;
+
+        const auto put = [](std::uint64_t target, const void* source, std::size_t bytes) {
+            if (bytes && flyweight_gpu_upload_sync(target, source, bytes) != 0)
+                throw std::runtime_error("raon device state upload failed");
+        };
+        for (std::size_t l = 0; runtime->device_decode && l < g.layers; ++l) {
+            const std::size_t ch = g.heads * g.head_dim, history = g.conv_width - 1;
+            if (g.is_rda(l)) {
+                const std::size_t D = g.head_dim, state_bytes = g.heads * D * D * sizeof(float);
+                std::vector<float> kmajor(g.heads * D * D);
+                for (std::size_t h = 0; h < g.heads; ++h)
+                    for (std::size_t v = 0; v < D; ++v)
+                        for (std::size_t k = 0; k < D; ++k)
+                            std::memcpy(&kmajor[(h * D + k) * D + v], cursor + ((h * D + v) * D + k) * sizeof(float),
+                                        sizeof(float));
+                put(s.rda_state[l], kmajor.data(), state_bytes);
+                cursor += state_bytes;
+                put(s.rda_window[l], cursor, 3 * ch * history * sizeof(float));
+                cursor += 3 * ch * history * sizeof(float);
+                continue;
+            }
+            s.caches[l].positions = s.position;
+            const auto saved = flyweight::v2::raon::cache_element_bytes(saved_type);
+            const std::size_t counts[2] = {s.position * g.kv_lora, s.position * g.qk_rope};
+            const std::uint64_t targets[2] = {s.mla_latents[l], s.mla_rope[l]};
+            for (int part = 0; part < 2; ++part) {
+                if (saved_type == g.cache_type) {
+                    put(targets[part], cursor, counts[part] * saved);
+                } else {
+                    // Converted through f32 into the runtime's type.
+                    const auto element = flyweight::v2::raon::cache_element_bytes(g.cache_type);
+                    std::vector<std::uint8_t> converted(counts[part] * element);
+                    for (std::size_t i = 0; i < counts[part]; ++i) {
+                        float value;
+                        if (saved_type == 0) {
+                            std::memcpy(&value, cursor + i * 4, 4);
+                        } else {
+                            std::uint16_t bits;
+                            std::memcpy(&bits, cursor + i * 2, 2);
+                            value = flyweight::v2::raon::cache_decode(bits, saved_type);
+                        }
+                        if (g.cache_type == 0) {
+                            std::memcpy(converted.data() + i * 4, &value, 4);
+                        } else {
+                            const std::uint16_t bits = flyweight::v2::raon::cache_encode(value, g.cache_type);
+                            std::memcpy(converted.data() + i * 2, &bits, 2);
+                        }
+                    }
+                    put(targets[part], converted.data(), converted.size());
+                }
+                cursor += counts[part] * saved;
+            }
+        }
+        for (std::size_t l = 0; !runtime->device_decode && l < g.layers; ++l) {
+            auto& c = s.caches[l];
+            if (g.is_rda(l)) {
+                const auto state_bytes = c.rda_state.size() * sizeof(float);
+                std::memcpy(c.rda_state.data(), cursor, state_bytes);
+                cursor += state_bytes;
+                const auto q_bytes = c.q_window.size() * sizeof(float);
+                std::memcpy(c.q_window.data(), cursor, q_bytes);
+                cursor += q_bytes;
+                const auto k_bytes = c.k_window.size() * sizeof(float);
+                std::memcpy(c.k_window.data(), cursor, k_bytes);
+                cursor += k_bytes;
+                const auto v_bytes = c.v_window.size() * sizeof(float);
+                std::memcpy(c.v_window.data(), cursor, v_bytes);
+                cursor += v_bytes;
+            } else {
+                c.positions = s.position;
+                // Rows come back through f32 so a snapshot taken in one cache
+                // type loads into a runtime using another.
+                const auto element = flyweight::v2::raon::cache_element_bytes(saved_type);
+                const std::uint8_t* latents = cursor;
+                const std::uint8_t* rope = cursor + s.position * g.kv_lora * element;
+                cursor = rope + s.position * g.qk_rope * element;
+                std::vector<float> latent(g.kv_lora), rope_key(g.qk_rope);
+                const auto read = [&](const std::uint8_t* base, std::size_t index) {
+                    if (saved_type == 0) {
+                        float value;
+                        std::memcpy(&value, base + index * 4, 4);
+                        return value;
+                    }
+                    std::uint16_t bits;
+                    std::memcpy(&bits, base + index * 2, 2);
+                    return flyweight::v2::raon::cache_decode(bits, saved_type);
+                };
+                for (std::size_t p = 0; p < s.position; ++p) {
+                    for (std::size_t i = 0; i < g.kv_lora; ++i) latent[i] = read(latents, p * g.kv_lora + i);
+                    for (std::size_t i = 0; i < g.qk_rope; ++i) rope_key[i] = read(rope, p * g.qk_rope + i);
+                    flyweight::v2::raon::cache_store(c, g, p, latent.data(), rope_key.data());
+                }
+            }
+        }
+        return 0;
+    });
+}
+
+int flyweight_v2_raon_cache_load(FlyweightV2RaonRuntime* runtime, const void* buffer, uint64_t length) {
+    return flyweight_v2_raon_cache_load_slot(runtime, 0, buffer, length);
+}
+
 // The names offered, best-compression first, which is also the order a menu
 // wants. Q6_K is the loader's default and is marked as such by the caller, not
 // here.
@@ -12666,6 +15685,9 @@ int flyweight_v2_model_open(const char* path, FlyweightV2Model** out) { return g
         if(m->architecture=="bailingmoe3"){
             bailing_adapt_gguf(*m);
             bailing_validate_plan(*m);
+        } else if(m->architecture=="raon1"){
+            raon_adapt_gguf(*m);
+            raon_validate_plan(*m);
         }
     }
     *out=m.release(); return 0; }); }
@@ -16336,6 +19358,134 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
     }
 }
 
+// Raon-1 pre-tokenizer (`raon` in GGUF):
+//   ?[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+
+// | ?(?:(?:(?![\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff])\p{L})\p{M}*)+(?: (?:(?:(?![\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff])\p{L})\p{M}*)+)*
+// | \p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))
+// |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+std::vector<std::string> raon_pretokenize(const std::string& text) {
+    const auto decoded = gguf_utf8_decode(text);
+    const std::size_t count = decoded.code.size();
+    std::vector<std::string> pieces;
+    auto at_code = [&](std::size_t index) { return decoded.code[index]; };
+    auto slice = [&](std::size_t from, std::size_t to) {
+        return text.substr(decoded.offset[from], decoded.offset[to] - decoded.offset[from]);
+    };
+    auto is_space = [&](std::uint32_t c) { return gguf_codepoint_is_space(c); };
+    auto is_cjk = [&](std::uint32_t c) { return joyai_is_cjk(c); };
+    auto is_letter = [&](std::uint32_t c) { return joyai_is_letter(c); };
+    auto is_mark = [&](std::uint32_t c) { return joyai_is_accent_mark(c); };
+    auto is_number = [&](std::uint32_t c) { return joyai_is_number(c); };
+
+    for (std::size_t at = 0; at < count;) {
+        // Alternative 1: optional space + CJK ideographs / Kana run:
+        //  ?[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+
+        {
+            std::size_t probe = at;
+            if (at_code(probe) == ' ' && probe + 1 < count && is_cjk(at_code(probe + 1)))
+                ++probe;
+            if (probe < count && is_cjk(at_code(probe))) {
+                std::size_t end = probe;
+                while (end < count && is_cjk(at_code(end))) ++end;
+                pieces.push_back(slice(at, end));
+                at = end;
+                continue;
+            }
+        }
+
+        // Alternative 2: optional space + run of non-CJK letters/marks + spaces between words:
+        //  ?(?:(?:(?!CJK)\p{L})\p{M}*)+(?: (?:(?:(?!CJK)\p{L})\p{M}*)+)*
+        {
+            std::size_t probe = at;
+            if (at_code(probe) == ' ' && probe + 1 < count &&
+                is_letter(at_code(probe + 1)) && !is_cjk(at_code(probe + 1)))
+                ++probe;
+            if (probe < count && is_letter(at_code(probe)) && !is_cjk(at_code(probe))) {
+                std::size_t end = probe;
+                while (end < count) {
+                    std::size_t word_end = end;
+                    while (word_end < count &&
+                           ((is_letter(at_code(word_end)) && !is_cjk(at_code(word_end))) ||
+                            is_mark(at_code(word_end)))) {
+                        ++word_end;
+                    }
+                    if (word_end == end) break;
+                    end = word_end;
+                    if (end + 1 < count && at_code(end) == ' ' &&
+                        is_letter(at_code(end + 1)) && !is_cjk(at_code(end + 1))) {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                pieces.push_back(slice(at, end));
+                at = end;
+                continue;
+            }
+        }
+
+        // Alternative 3: digit runs with \p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))
+        if (is_number(at_code(at))) {
+            std::size_t run_len = 0;
+            while (at + run_len < count && is_number(at_code(at + run_len))) ++run_len;
+            std::size_t chunk = run_len % 3 == 0 ? 3 : (run_len % 3);
+            pieces.push_back(slice(at, at + chunk));
+            at += chunk;
+            continue;
+        }
+
+        // Alternative 4: optional space + punctuation run + trailing carriage returns / newlines / slashes:
+        //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+        {
+            auto is_punct = [&](std::uint32_t c) {
+                return !is_space(c) && !is_letter(c) && !is_number(c) && !is_mark(c);
+            };
+            std::size_t probe = at;
+            if (at_code(probe) == ' ' && probe + 1 < count && is_punct(at_code(probe + 1)))
+                ++probe;
+            if (probe < count && is_punct(at_code(probe))) {
+                std::size_t end = probe;
+                while (end < count && is_punct(at_code(end))) ++end;
+                while (end < count && (at_code(end) == '\r' || at_code(end) == '\n' || at_code(end) == '/')) ++end;
+                pieces.push_back(slice(at, end));
+                at = end;
+                continue;
+            }
+        }
+
+        // Alternative 5: \s*[\r\n]+
+        {
+            std::size_t end = at, last_break = count;
+            while (end < count && is_space(at_code(end))) {
+                if (at_code(end) == '\r' || at_code(end) == '\n') last_break = end;
+                ++end;
+            }
+            if (last_break != count) {
+                pieces.push_back(slice(at, last_break + 1));
+                at = last_break + 1;
+                continue;
+            }
+        }
+
+        // Alternative 6 & 7: \s+(?!\S) and \s+
+        if (is_space(at_code(at))) {
+            std::size_t end = at;
+            while (end < count && is_space(at_code(end))) ++end;
+            if (end < count && end > at + 1) --end;
+            pieces.push_back(slice(at, end));
+            at = end;
+            continue;
+        }
+
+        pieces.push_back(slice(at, at + 1));
+        at += 1;
+    }
+    return pieces;
+}
+
 // The pre-tokenizer a checkpoint asks for by name. Anything unlisted gets no
 // pre-tokenization at all -- the whole text is one piece, which is exactly
 // what flyweight_v2_tokenize does for it, so the diagnostic split and the
@@ -16343,6 +19493,7 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
 // every indented line (see qwen35_pretokenize).
 std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
+    if(m.tokenizer_pre=="raon")return raon_pretokenize(text);
     if(m.tokenizer_pre=="qwen35")return qwen35_pretokenize(text);
     if(m.tokenizer_pre=="k2-horizon")return k2_horizon_pretokenize(text);
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
@@ -16386,7 +19537,7 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
        m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
        m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
        m->tokenizer_pre=="bailingmoe3"||m->tokenizer_pre=="lfm2"||
-       m->tokenizer_pre=="pixtral"){
+       m->tokenizer_pre=="pixtral"||m->tokenizer_pre=="raon"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -16475,6 +19626,64 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
 int flyweight_v2_tensor_read(const FlyweightV2Model* m,uint64_t i,void* dst,uint64_t bytes){return guarded([&]{if(!m||m->read_tensor(i,dst,bytes)!=0)throw std::runtime_error("invalid tensor read");return 0;});}
 int flyweight_v2_tensor_read_slice(const FlyweightV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,tensor_data(*m,t)+offset,static_cast<size_t>(bytes));return 0;});}
 int flyweight_v2_tensor_view(const FlyweightV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=tensor_data(*m,t)+offset;return 0;});}
+static std::vector<std::uint32_t> parse_layer_selection_str(const std::string& spec, std::size_t max_layers) {
+    std::vector<std::uint32_t> result;
+    if(spec.empty()) return result;
+    std::stringstream ss(spec);
+    std::string token;
+    while(std::getline(ss, token, ',')){
+        auto start_pos = token.find_first_not_of(" \t\r\n");
+        if(start_pos == std::string::npos){
+            throw std::runtime_error("empty layer selection item in: " + spec);
+        }
+        auto end_pos = token.find_last_not_of(" \t\r\n");
+        std::string item = token.substr(start_pos, end_pos - start_pos + 1);
+        auto dash = item.find('-');
+        if(dash != std::string::npos){
+            std::string start_str = item.substr(0, dash);
+            std::string end_str = item.substr(dash + 1);
+            auto s_start = start_str.find_first_not_of(" \t\r\n");
+            auto s_end = start_str.find_last_not_of(" \t\r\n");
+            auto e_start = end_str.find_first_not_of(" \t\r\n");
+            auto e_end = end_str.find_last_not_of(" \t\r\n");
+            if(s_start == std::string::npos || e_start == std::string::npos){
+                throw std::runtime_error("invalid layer range in: " + item);
+            }
+            char* p1 = nullptr;
+            char* p2 = nullptr;
+            long r_start = std::strtol(start_str.c_str() + s_start, &p1, 10);
+            long r_end = std::strtol(end_str.c_str() + e_start, &p2, 10);
+            if(p1 == start_str.c_str() + s_start || p2 == end_str.c_str() + e_start ||
+               r_start < 0 || r_end < 0 || r_start > r_end){
+                throw std::runtime_error("invalid layer range: " + item);
+            }
+            if(static_cast<std::size_t>(r_end) >= max_layers){
+                throw std::runtime_error(
+                    "layer selection index " + std::to_string(r_end) +
+                    " exceeds model layer count (" + std::to_string(max_layers) + ")");
+            }
+            for(long i = r_start; i <= r_end; ++i){
+                result.push_back(static_cast<std::uint32_t>(i));
+            }
+        } else {
+            char* p = nullptr;
+            long val = std::strtol(item.c_str(), &p, 10);
+            if(p == item.c_str() || val < 0){
+                throw std::runtime_error("invalid layer index: " + item);
+            }
+            if(static_cast<std::size_t>(val) >= max_layers){
+                throw std::runtime_error(
+                    "layer selection index " + std::to_string(val) +
+                    " exceeds model layer count (" + std::to_string(max_layers) + ")");
+            }
+            result.push_back(static_cast<std::uint32_t>(val));
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRuntimeOptions*options,FlyweightV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
@@ -16503,6 +19712,12 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     auto runtime=std::make_unique<FlyweightV2QwenRuntime>();
     runtime->model=m;
     runtime->options=options?*options:FlyweightV2QwenRuntimeOptions{};
+    if(options&&options->gpu_layer_selection)
+        runtime->gpu_layer_selection_str=options->gpu_layer_selection;
+    else if(const char*env=std::getenv("FLYWEIGHT_GPU_LAYERS"))
+        runtime->gpu_layer_selection_str=env;
+    if(!runtime->gpu_layer_selection_str.empty())
+        runtime->options.gpu_layers_explicit=1;
     if(runtime->options.device<0)throw std::runtime_error("Qwen runtime device must be non-negative");
     if(!flyweight::v2::valid_expert_execution_mode(runtime->options.moe_device))
         throw std::runtime_error("Qwen runtime MoE device is invalid");
@@ -16631,6 +19846,9 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     else if(lfm2)build_lfm2_plan(*runtime);
     else if(nemotron)build_nemotron_plan(*runtime);
     else build_qwen_plan(*runtime);
+    if(!runtime->gpu_layer_selection_str.empty()){
+        parse_layer_selection_str(runtime->gpu_layer_selection_str, runtime->layers.size());
+    }
     qwen_load_nvfp4_weight_scales(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
@@ -16810,6 +20028,18 @@ int flyweight_v2_qwen_runtime_plan(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->cache_type_k=runtime->options.cache_type_k;
     out->cache_type_v=runtime->options.cache_type_v;
     return 0;
+});}
+int flyweight_v2_qwen_runtime_layer_on_gpu(const FlyweightV2QwenRuntime*runtime,uint32_t layer){return guarded([&]{
+    if(!runtime||layer>=runtime->layers.size())return -1;
+    const auto&l=runtime->layers[layer];
+    if(l.dense_ffn)return l.ffn_on_host?0:1;
+    if(runtime->model->config.expert_count){
+        if(!runtime->whole_expert_layer_slots.empty()&&
+           layer<runtime->whole_expert_layer_slots.size())
+            return runtime->whole_expert_layer_slots[layer]>=0?1:0;
+        return 0;
+    }
+    return 1;
 });}
 int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,FlyweightV2QwenRuntimeInfo*out){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid Qwen runtime info handle");
@@ -17625,7 +20855,8 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whose first block were dense would silently run a spilled block on
         // weights that were never uploaded. Excluded explicitly.
         const bool dense_spill_model=
-            !runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4;
+            !runtime->layers.empty()&&runtime->layers.front().dense_ffn&&
+            !runtime->gemma4&&!runtime->model->config.expert_count;
         if(runtime->options.gpu_layers_explicit&&!dense_spill_model&&
            !runtime->model->config.expert_count)
             throw std::runtime_error(
@@ -17881,56 +21112,81 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             const char* forced_env=std::getenv("FLYWEIGHT_HOST_FFN_BLOCKS");
             std::uint32_t dense_blocks=0;
             for(const auto&layer:runtime->layers)dense_blocks+=layer.dense_ffn?1u:0u;
-            const bool forced=forced_env||runtime->options.gpu_layers_explicit;
-            const std::uint32_t forced_blocks=forced_env
-                ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10))
-                :dense_blocks-std::min(dense_blocks,runtime->options.gpu_layers);
-            const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
-            const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
-            auto want_more=[&]{
-                return forced?runtime->host_ffn_layers<forced_blocks
-                                 :resident>weight_budget;
-            };
-            auto spill_pass=[&](bool simd_only){
-                for(auto layer=runtime->layers.rbegin();
-                    layer!=runtime->layers.rend()&&want_more();++layer){
-                    if(!layer->dense_ffn||layer->ffn_on_host)continue;
-                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
-                    bool all_simd=true;
-                    for(std::size_t role=1;role<=3;++role)
-                        all_simd=all_simd&&qwen_simd_quant_type(
-                            runtime->model->tensors[layer->static_tensors[ffn_base+role]].type);
-                    if(simd_only&&!all_simd)continue;
-                    std::uint64_t freed=0;
-                    for(std::size_t role=1;role<=3;++role)
-                        freed+=device_align(runtime->model->tensors[
-                            layer->static_tensors[ffn_base+role]].size);
-                    layer->ffn_on_host=true;
-                    resident-=freed;
-                    runtime->host_ffn_bytes+=freed;
-                    ++runtime->host_ffn_layers;
+            const bool has_layer_selection=!runtime->gpu_layer_selection_str.empty();
+            const bool forced=forced_env||runtime->options.gpu_layers_explicit||has_layer_selection;
+            if(has_layer_selection){
+                const auto selected=parse_layer_selection_str(
+                    runtime->gpu_layer_selection_str,runtime->layers.size());
+                std::unordered_set<std::uint32_t> selected_set(
+                    selected.begin(),selected.end());
+                for(std::size_t i=0;i<runtime->layers.size();++i){
+                    auto&layer=runtime->layers[i];
+                    if(!layer.dense_ffn)continue;
+                    if(selected_set.count(static_cast<std::uint32_t>(i))){
+                        layer.ffn_on_host=false;
+                    }else{
+                        layer.ffn_on_host=true;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer.static_tensors[ffn_base+role]].size);
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
                 }
-            };
-            auto spill_pass_naive=[&]{
-                for(auto layer=runtime->layers.begin();
-                    layer!=runtime->layers.end()&&want_more();++layer){
-                    if(!layer->dense_ffn||layer->ffn_on_host)continue;
-                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
-                    std::uint64_t freed=0;
-                    for(std::size_t role=1;role<=3;++role)
-                        freed+=device_align(runtime->model->tensors[
-                            layer->static_tensors[ffn_base+role]].size);
-                    layer->ffn_on_host=true;
-                    resident-=freed;
-                    runtime->host_ffn_bytes+=freed;
-                    ++runtime->host_ffn_layers;
-                }
-            };
-            if(naive_order){
-                spill_pass_naive();
             }else{
-                spill_pass(true);
-                spill_pass(false);
+                const std::uint32_t forced_blocks=forced_env
+                    ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10))
+                    :dense_blocks-std::min(dense_blocks,runtime->options.gpu_layers);
+                const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
+                const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
+                auto want_more=[&]{
+                    return forced?runtime->host_ffn_layers<forced_blocks
+                                     :resident>weight_budget;
+                };
+                auto spill_pass=[&](bool simd_only){
+                    for(auto layer=runtime->layers.rbegin();
+                        layer!=runtime->layers.rend()&&want_more();++layer){
+                        if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                        bool all_simd=true;
+                        for(std::size_t role=1;role<=3;++role)
+                            all_simd=all_simd&&qwen_simd_quant_type(
+                                runtime->model->tensors[layer->static_tensors[ffn_base+role]].type);
+                        if(simd_only&&!all_simd)continue;
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer->static_tensors[ffn_base+role]].size);
+                        layer->ffn_on_host=true;
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
+                };
+                auto spill_pass_naive=[&]{
+                    for(auto layer=runtime->layers.begin();
+                        layer!=runtime->layers.end()&&want_more();++layer){
+                        if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                        const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                        std::uint64_t freed=0;
+                        for(std::size_t role=1;role<=3;++role)
+                            freed+=device_align(runtime->model->tensors[
+                                layer->static_tensors[ffn_base+role]].size);
+                        layer->ffn_on_host=true;
+                        resident-=freed;
+                        runtime->host_ffn_bytes+=freed;
+                        ++runtime->host_ffn_layers;
+                    }
+                };
+                if(naive_order){
+                    spill_pass_naive();
+                }else{
+                    spill_pass(true);
+                    spill_pass(false);
+                }
             }
             // The spill above keeps every block the tight margin can hold.
             // The allocation check further down reserves max(2 GiB, VRAM/8)
@@ -18971,8 +22227,31 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 }
                 return count;
             };
-            bool explicit_layers=runtime->options.gpu_layers_explicit!=0;
-            if(explicit_layers){
+            const bool has_layer_selection=!runtime->gpu_layer_selection_str.empty();
+            bool explicit_layers=runtime->options.gpu_layers_explicit!=0||has_layer_selection;
+            std::vector<std::uint32_t> selected_layers;
+            if(has_layer_selection){
+                selected_layers=parse_layer_selection_str(
+                    runtime->gpu_layer_selection_str,runtime->layers.size());
+            }
+            if(has_layer_selection){
+                std::unordered_set<std::uint32_t> selected_set(
+                    selected_layers.begin(),selected_layers.end());
+                std::uint64_t needed_slots=0;
+                for(const auto layer:moe_layers){
+                    if(selected_set.count(layer))
+                        needed_slots+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                }
+                const auto max_slots=cache/runtime->expert_slot_bytes;
+                if(needed_slots>max_slots){
+                    std::fprintf(stderr,
+                        "[flyweight] --n-gpu-layers: selected MoE layers require %llu expert bundles, but only %llu "
+                        "fit whole; caching the hottest experts of every layer instead\n",
+                        static_cast<unsigned long long>(needed_slots),
+                        static_cast<unsigned long long>(max_slots));
+                    explicit_layers=false;
+                }
+            }else if(explicit_layers){
                 const std::size_t wanted=std::min<std::size_t>(
                     moe_layers.size(),runtime->options.gpu_layers);
                 const std::size_t fit=
@@ -18991,24 +22270,37 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                   (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
                  (!whole_layer_setting||whole_layer_setting[0]!='0'));
             if(whole_layer_enabled&&!runtime->options.strict_resident){
-                std::size_t layer_count=
-                    whole_layers_fitting(cache/runtime->expert_slot_bytes);
-                char*end=nullptr;
-                const auto requested=whole_layer_setting
-                    ?std::strtoul(whole_layer_setting,&end,10):0;
-                if(explicit_layers)
-                    layer_count=std::min<std::size_t>(
-                        layer_count,runtime->options.gpu_layers);
-                else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
-                    layer_count=std::min<std::size_t>(layer_count,requested);
                 runtime->whole_expert_layer_slots.assign(
                     runtime->layers.size(),-1);
                 std::size_t slot=0;
-                for(std::size_t index=0;index<layer_count;++index){
-                    const auto layer=moe_layers[moe_layers.size()-layer_count+index];
-                    runtime->whole_expert_layer_slots[layer]=
-                        static_cast<std::int32_t>(slot);
-                    slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                std::size_t layer_count=0;
+                if(has_layer_selection&&explicit_layers){
+                    std::unordered_set<std::uint32_t> selected_set(
+                        selected_layers.begin(),selected_layers.end());
+                    for(const auto layer:moe_layers){
+                        if(!selected_set.count(layer))continue;
+                        runtime->whole_expert_layer_slots[layer]=
+                            static_cast<std::int32_t>(slot);
+                        slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                        ++layer_count;
+                    }
+                }else{
+                    layer_count=
+                        whole_layers_fitting(cache/runtime->expert_slot_bytes);
+                    char*end=nullptr;
+                    const auto requested=whole_layer_setting
+                        ?std::strtoul(whole_layer_setting,&end,10):0;
+                    if(explicit_layers)
+                        layer_count=std::min<std::size_t>(
+                            layer_count,runtime->options.gpu_layers);
+                    else if(whole_layer_setting&&end!=whole_layer_setting&&requested)
+                        layer_count=std::min<std::size_t>(layer_count,requested);
+                    for(std::size_t index=0;index<layer_count;++index){
+                        const auto layer=moe_layers[moe_layers.size()-layer_count+index];
+                        runtime->whole_expert_layer_slots[layer]=
+                            static_cast<std::int32_t>(slot);
+                        slot+=qwen_layer_expert_count(*runtime,runtime->layers[layer]);
+                    }
                 }
                 cache=slot*runtime->expert_slot_bytes;
                 if(!layer_count)
@@ -22015,6 +25307,7 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
 }
 
 #include "v2_mtp_verifier.inc"
+#include "v2_raon_prefill.inc"
 #include "v2_vision.inc"
 #include "v2_diffusion.inc"
 #include "v2_qwenimage.inc"

@@ -165,24 +165,60 @@ def _prefill_cache_seed(value: str) -> int | str:
     return count
 
 
-def _gpu_layers(value: str) -> int | None:
+def _gpu_layers(value: str) -> int | str | None:
     # None is auto-fit. Any count at or past the model's dense blocks keeps
     # them all on the GPU, so `all` (and llama.cpp's habitual 999) need no
     # knowledge of the model here.
-    normalized = value.lower()
+    # Accepts an integer count (e.g. 10), ranges (e.g. 1-10), specific layers
+    # (e.g. 1,3,8,10), or mixed selections (e.g. 1-5,8,10-12).
+    normalized = value.strip().lower()
     if normalized == "auto":
         return None
     if normalized == "all":
         return 1 << 30
+    if "," in value or "-" in value:
+        for part in value.split(","):
+            p = part.strip()
+            if not p:
+                raise argparse.ArgumentTypeError(
+                    "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
+                )
+            if "-" in p:
+                range_parts = p.split("-")
+                if len(range_parts) != 2:
+                    raise argparse.ArgumentTypeError(f"invalid layer range: {p!r}")
+                try:
+                    start = int(range_parts[0].strip())
+                    end = int(range_parts[1].strip())
+                except ValueError as error:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer range indices in {p!r}"
+                    ) from error
+                if start < 0 or end < 0 or start > end:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer range {start}-{end}: indices must be non-negative and start <= end"
+                    )
+            else:
+                try:
+                    idx = int(p)
+                except ValueError as error:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer index in {p!r}"
+                    ) from error
+                if idx < 0:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid layer index {idx}: must be non-negative"
+                    )
+        return value.strip()
     try:
         count = int(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(
-            "expected auto, all, or a non-negative integer"
+            "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
         ) from error
     if count < 0:
         raise argparse.ArgumentTypeError(
-            "expected auto, all, or a non-negative integer"
+            "expected auto, all, a non-negative integer count, or a layer selection like '1-10', '1,3,8,10', or '1-5,8,10-12'"
         )
     return count
 
@@ -485,14 +521,13 @@ def _add_runtime_options(
         placement, "--n-gpu-layers", "-ngl", "--gpu-layers", dest="gpu_layers",
         type=_gpu_layers, default=None, metavar="N",
         help="layers kept on the GPU, the rest on the CPU (llama.cpp's -ngl; "
-             "attention and KV stay on the GPU either way). Dense models: "
-             "blocks whose feed-forward stays on the GPU. MoE models: the last "
-             "N layers hold their whole expert set pinned on the GPU and the "
-             "others' experts always run on the CPU; an N that does not fit "
-             "whole (or all) takes the hot-expert cache over every layer "
-             "instead, which keeps more routing on the GPU. auto, the default, "
-             "fits dense blocks to free VRAM and gives MoE models that cache; "
-             "all keeps as much on the GPU as fits",
+             "attention and KV stay on the GPU either way). Accepts a count (e.g. 10), "
+             "a range (e.g. 1-10), specific layers (e.g. 1,3,8,10), or a mix "
+             "(e.g. 1-5,8,10-12). Dense models: blocks whose feed-forward stays on "
+             "the GPU. MoE models: pinned whole expert layers on GPU, the rest on "
+             "CPU; an N that does not fit whole (or all) takes the hot-expert "
+             "cache over every layer instead. auto fits to free VRAM; all keeps "
+             "as much on the GPU as fits",
     )
     add(
         placement, "--cpu-threads", type=int, default=0, metavar="N",
@@ -1366,6 +1401,17 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise SystemExit("--next-layer-prefetch must be within [0, 64]")
 
 
+def _raon_cache_type(args: argparse.Namespace) -> str:
+    from .v2 import raon_cache_type
+
+    key = getattr(args, "kv_dtype", None) or getattr(args, "cache_type_k", "f16")
+    value = getattr(args, "kv_dtype", None) or getattr(args, "cache_type_v", key)
+    try:
+        return raon_cache_type(key, value)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+
+
 def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
     names = (
         "device", "expert_mode", "mtp_drafts", "cache_type_k", "cache_type_v",
@@ -1445,14 +1491,38 @@ def _plan(args: argparse.Namespace) -> int:
     _select_backend(args)
     mmproj = getattr(args, "mmproj", None)
     with V2Model(args.model, mtp_model=args.mtp_model, mmproj=mmproj) as model:
-        options = _runtime_options(args)
-        options["context_limit"] = args.context_window
-        options["context_explicit"] = getattr(args, "context_explicit", False)
-        if model.vision:
-            options["vision_max_tokens"] = getattr(args, "image_max_tokens", 1024)
-        with model.native_runtime(**options) as runtime:
-            runtime.prepare()
-            placement = runtime.placement
+        if str(model.config["architecture"]) == "raon1":
+            from .v2 import RaonRuntime
+
+            raon = RaonRuntime(
+                model,
+                capacity=args.context_window,
+                expert_mode=getattr(args, "expert_mode", "auto"),
+                gpu_layers=getattr(args, "gpu_layers", None),
+                gpu_cache_mib=getattr(args, "gpu_cache_mib", 0),
+                cache_type=_raon_cache_type(args),
+            )
+            try:
+                placement = raon.placement
+            finally:
+                raon.close()
+        elif str(model.config["architecture"]) == "bailingmoe3":
+            from .v2 import BailingRuntime
+
+            bailing = BailingRuntime(model, capacity=args.context_window)
+            try:
+                placement = bailing.placement
+            finally:
+                bailing.close()
+        else:
+            options = _runtime_options(args)
+            options["context_limit"] = args.context_window
+            options["context_explicit"] = getattr(args, "context_explicit", False)
+            if model.vision:
+                options["vision_max_tokens"] = getattr(args, "image_max_tokens", 1024)
+            with model.native_runtime(**options) as runtime:
+                runtime.prepare()
+                placement = runtime.placement
     if args.json:
         print(json.dumps(placement, indent=2))
     else:
@@ -1494,6 +1564,43 @@ def _benchmark(args: argparse.Namespace) -> int:
             finally:
                 bailing.close()
             info: dict[str, object] = {"expert_mode": "bailing-gpu-or-host"}
+            request_counters = None
+        elif str(model.config["architecture"]) == "raon1":
+            from .v2 import RaonRuntime
+
+            started = time.perf_counter()
+            raon = RaonRuntime(
+                model,
+                capacity=args.context,
+                expert_mode=getattr(args, "expert_mode", "auto"),
+                gpu_layers=getattr(args, "gpu_layers", None),
+                gpu_cache_mib=getattr(args, "gpu_cache_mib", 0),
+                cache_type=_raon_cache_type(args),
+            )
+            prepare_seconds = time.perf_counter() - started
+            uses_gpu = raon.uses_gpu
+            placement = raon.placement
+            try:
+                sampling = SimpleNamespace(
+                    temperature=args.temperature, top_k=args.top_k,
+                    top_p=args.top_p, seed=None,
+                )
+                all_generated, arrivals, total_seconds = _benchmark_bailing_generate(
+                    raon, prompt, 1 + args.warmup + args.iterations, sampling,
+                )
+            finally:
+                raon.close()
+            gpu_layers_count = placement.get("gpu_expert_layers", 0)
+            expert_mode_label = (
+                "hybrid" if placement.get("expert_mode") == 2
+                else ("gpu" if placement.get("expert_mode") == 0 else "cpu")
+            )
+            info: dict[str, object] = {
+                "expert_mode": expert_mode_label,
+                "moe_device": "hybrid" if gpu_layers_count > 0 else "cpu",
+                "head_device": "gpu" if uses_gpu else "cpu",
+                "gpu_layers": gpu_layers_count,
+            }
             request_counters = None
         else:
             options = _runtime_options(args)
@@ -1611,6 +1718,10 @@ def _architecture(model_path: Path) -> str | None:
             "BailingMoeV3ForCausalLM" in architectures
         ):
             return "bailingmoe3"
+        if model_type in {"raon1", "raon", "raon_mini", "raon1_mini"} or (
+            "Raon1ForCausalLM" in architectures or "RaonForCausalLM" in architectures
+        ):
+            return "raon1"
         return model_type if isinstance(model_type, str) else None
 
     from .v2 import V2Error
