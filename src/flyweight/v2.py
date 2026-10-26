@@ -341,6 +341,7 @@ class _PlacementPlan(ctypes.Structure):
         ("context_limit", ctypes.c_uint64),
         ("cache_type_k", ctypes.c_int32),
         ("cache_type_v", ctypes.c_int32),
+        ("host_kv_state_bytes", ctypes.c_uint64),
     ]
 
 
@@ -1472,6 +1473,101 @@ _BAILING_PROGRESS = ctypes.CFUNCTYPE(
 )
 
 
+def _sample_from_logits_buffer(
+    logits_buf: Any,
+    vocabulary: int,
+    config: Any = None,
+    generated: Sequence[int] | None = None,
+    generator: Any = None,
+) -> tuple[int, Any]:
+    temperature = float(getattr(config, "temperature", 0.0) or 0.0)
+    top_k = int(getattr(config, "top_k", 0) or 0)
+    top_p = float(getattr(config, "top_p", 0.0) or 0.0)
+    min_p = float(getattr(config, "min_p", 0.0) or 0.0)
+    presence_penalty = float(getattr(config, "presence_penalty", 0.0) or 0.0)
+    frequency_penalty = float(getattr(config, "frequency_penalty", 0.0) or 0.0)
+    repetition_penalty = float(getattr(config, "repetition_penalty", 1.0) or 1.0)
+    penalty_window = int(getattr(config, "penalty_window", 0) or 0)
+
+    if _numpy is None:
+        return max(range(vocabulary), key=logits_buf.__getitem__), generator
+
+    view = _numpy.frombuffer(logits_buf, dtype=_numpy.float32)
+
+    has_penalties = (
+        (presence_penalty != 0.0 or frequency_penalty != 0.0 or repetition_penalty != 1.0)
+        and bool(generated)
+    )
+    if has_penalties:
+        view = view.copy()
+        window = generated if penalty_window <= 0 else generated[-penalty_window:]
+        if repetition_penalty != 1.0:
+            for t in set(window):
+                if 0 <= t < view.size:
+                    val = view[t]
+                    view[t] = val / repetition_penalty if val > 0.0 else val * repetition_penalty
+        if presence_penalty != 0.0:
+            for t in set(window):
+                if 0 <= t < view.size:
+                    view[t] -= presence_penalty
+        if frequency_penalty != 0.0:
+            import collections
+            for t, count in collections.Counter(window).items():
+                if 0 <= t < view.size:
+                    view[t] -= frequency_penalty * count
+
+    if temperature <= 0.0:
+        return int(view.argmax()), generator
+
+    if top_k > 0 and top_k < view.size:
+        candidates = _numpy.argpartition(view, -top_k)[-top_k:]
+    else:
+        candidates = _numpy.arange(view.size)
+        if 0.0 < top_p < 1.0:
+            full = _numpy.exp((view - view.max()) / temperature)
+            mass = full.sum()
+            width = 256
+            while width < view.size:
+                prefix = _numpy.argpartition(view, -width)[-width:]
+                if full[prefix].sum() >= top_p * mass:
+                    candidates = prefix
+                    break
+                width *= 2
+
+    values = view[candidates].astype(_numpy.float32) / temperature
+    values -= values.max()
+    probabilities = _numpy.exp(values)
+    total = probabilities.sum()
+    if not _numpy.isfinite(total) or total <= 0.0:
+        return int(candidates[int(_numpy.argmax(values))]), generator
+    probabilities /= total
+
+    order = _numpy.argsort(probabilities)[::-1]
+    candidates = candidates[order]
+    probabilities = probabilities[order]
+    if 0.0 < top_p < 1.0:
+        cumulative = _numpy.cumsum(probabilities)
+        keep = int(_numpy.searchsorted(cumulative, top_p) + 1)
+        candidates = candidates[:keep]
+        probabilities = probabilities[:keep]
+        probabilities = probabilities / probabilities.sum()
+    if 0.0 < min_p <= 1.0 and probabilities.size > 1:
+        keep = max(1, int(_numpy.count_nonzero(probabilities >= min_p * probabilities[0])))
+        candidates = candidates[:keep]
+        probabilities = probabilities[:keep]
+        probabilities = probabilities / probabilities.sum()
+
+    seed = getattr(config, "seed", None)
+    if seed is not None:
+        rng = _numpy.random.default_rng(seed)
+    else:
+        rng = generator
+        if rng is None:
+            rng = _numpy.random.default_rng()
+        generator = rng
+    return int(candidates[rng.choice(probabilities.size, p=probabilities)]), generator
+
+
 class BailingRuntime:
     """Host execution for BailingMoE3 (Ling 3.0) checkpoints.
 
@@ -1750,92 +1846,24 @@ class BailingRuntime:
         """
         self._eval_into_buffer(tokens, slot)
 
-    def sample(self, config: Any = None) -> int:
+
+
+    def sample(
+        self, config: Any = None, generated: Sequence[int] | None = None
+    ) -> int:
         """Pick the next token from the logits currently in the buffer.
 
         Greedy when no temperature is set. Sampling runs on the ctypes buffer
         through numpy rather than a Python list, for the same reason as above.
         """
-        temperature = float(getattr(config, "temperature", 0.0) or 0.0)
-        top_k = int(getattr(config, "top_k", 0) or 0)
-        top_p = float(getattr(config, "top_p", 0.0) or 0.0)
-        min_p = float(getattr(config, "min_p", 0.0) or 0.0)
-        if _numpy is None or temperature <= 0.0:
-            if _numpy is not None:
-                view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
-                return int(view.argmax())
-            return max(range(self._vocabulary), key=self._logits.__getitem__)
-
-        # Everything below runs on the CANDIDATES, not on the vocabulary.
-        #
-        # This used to widen all 157k logits to float64, mask all but top_k of
-        # them to -inf, and then argsort, cumsum and `choice` over the whole
-        # array -- of which at most `top_k` entries could ever be drawn. It cost
-        # ~5 ms per token against a ~7 ms token, so asking for any temperature
-        # at all took decode from 146 to 88 tok/s while the GPU sat idle.
-        #
-        # Selecting first is exact, not an approximation: the discarded entries
-        # have probability zero, so they cannot enter the top_p prefix and
-        # cannot be drawn.
-        view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
-        if top_k > 0 and top_k < view.size:
-            candidates = _numpy.argpartition(view, -top_k)[-top_k:]
-        else:
-            # No top_k, so top_p has to consider the whole distribution. Take a
-            # generous prefix and widen it only if its mass has not reached
-            # top_p -- which keeps this exact while almost always touching a few
-            # hundred entries rather than the vocabulary. A top_p of 1.0 (or
-            # none) needs everything, and says so immediately.
-            candidates = _numpy.arange(view.size)
-            if 0.0 < top_p < 1.0:
-                full = _numpy.exp((view - view.max()) / temperature)
-                mass = full.sum()
-                width = 256
-                while width < view.size:
-                    prefix = _numpy.argpartition(view, -width)[-width:]
-                    if full[prefix].sum() >= top_p * mass:
-                        candidates = prefix
-                        break
-                    width *= 2
-
-        values = view[candidates].astype(_numpy.float32) / temperature
-        values -= values.max()
-        probabilities = _numpy.exp(values)
-        total = probabilities.sum()
-        if not _numpy.isfinite(total) or total <= 0.0:
-            return int(candidates[int(_numpy.argmax(values))])
-        probabilities /= total
-
-        order = _numpy.argsort(probabilities)[::-1]
-        candidates = candidates[order]
-        probabilities = probabilities[order]
-        if 0.0 < top_p < 1.0:
-            cumulative = _numpy.cumsum(probabilities)
-            # Keep the smallest prefix whose mass reaches top_p, always at
-            # least one token.
-            keep = int(_numpy.searchsorted(cumulative, top_p) + 1)
-            candidates = candidates[:keep]
-            probabilities = probabilities[:keep]
-            probabilities = probabilities / probabilities.sum()
-        if 0.0 < min_p <= 1.0 and probabilities.size > 1:
-            # llama.cpp's min-p, after top_p: relative to the best candidate,
-            # which is first because the order is descending.
-            keep = max(1, int(_numpy.count_nonzero(probabilities >= min_p * probabilities[0])))
-            candidates = candidates[:keep]
-            probabilities = probabilities[:keep]
-            probabilities = probabilities / probabilities.sum()
-
-        seed = getattr(config, "seed", None)
-        if seed is not None:
-            generator = _numpy.random.default_rng(seed)
-        else:
-            # One generator for the runtime rather than one per token:
-            # constructing a Generator seeds it from the OS entropy pool, which
-            # is not something to do 150 times a second.
-            generator = self._generator
-            if generator is None:
-                generator = self._generator = _numpy.random.default_rng()
-        return int(candidates[generator.choice(probabilities.size, p=probabilities)])
+        token, self._generator = _sample_from_logits_buffer(
+            self._logits,
+            self._vocabulary,
+            config,
+            generated=generated,
+            generator=self._generator,
+        )
+        return token
 
     def generate(
         self,
@@ -1872,6 +1900,279 @@ class BailingRuntime:
             self._handle = ctypes.c_void_p()
 
     def __enter__(self) -> "BailingRuntime":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+_RAON_PROGRESS = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+)
+
+
+# Raon-1's MLA cache holds one normalized latent per position that serves as
+# both key and value, so it takes a single storage type, and only the float
+# ones: the quantized KV types grade keys and values separately and have not
+# been measured on a shared latent. `auto` is f16, llama.cpp's default cache
+# type for this model.
+RAON_CACHE_TYPES = ("f32", "f16", "bf16")
+
+
+def raon_cache_type(cache_type_k: str | None = "f16", cache_type_v: str | None = None) -> str:
+    """The one cache type a Raon-1 runtime takes, from the --cache-type-k/v pair."""
+    key = cache_type_k or "f16"
+    value = cache_type_v or key
+    key = "f16" if key == "auto" else key
+    value = "f16" if value == "auto" else value
+    if key != value:
+        raise ValueError(
+            f"raon1 stores one latent as both key and value, so --cache-type-k ({key}) "
+            f"and --cache-type-v ({value}) must match")
+    if key not in RAON_CACHE_TYPES:
+        raise ValueError(
+            f"raon1 supports an f32, f16 or bf16 cache, not {key}")
+    return key
+
+
+class RaonRuntime:
+    """Execution for Raon-1 (raon1) checkpoints.
+
+    Features Raon-mHC (4 parallel streams with Helmert orthonormal combination),
+    hybrid attention cadence (RDA recurrent delta-rule linear attention and NoPE
+    multi-head latent attention), and SiTU-GLU dense and sparse MoE blocks.
+    """
+
+    def __init__(
+        self,
+        model: "V2Model",
+        capacity: int = 4096,
+        slots: int = 1,
+        expert_mode: str = "auto",
+        gpu_layers: int | str | Sequence[int] | set[int] | None = None,
+        gpu_cache_mib: int = 0,
+        cache_type: str = "f32",
+    ):
+        self._model = model
+        self._lib = model._lib
+        self._handle = ctypes.c_void_p()
+        self._vocabulary = int(str(model.config["vocabulary_size"]))
+        self.cache_type = raon_cache_type(cache_type)
+        mode_val = 1 if expert_mode == "cpu" else (0 if expert_mode in ("gpu", "streamed_gpu") else 2)
+        explicit, count, selection_bytes = parse_layer_selection(gpu_layers)
+        gpu_layers_arg = count if explicit else -1
+        selection_arg = selection_bytes if selection_bytes is not None else None
+
+        self._lib.flyweight_v2_raon_create_with_options.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p)
+        ]
+        self._lib.flyweight_v2_raon_eval.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_float)
+        ]
+        self._lib.flyweight_v2_raon_eval_slot.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)
+        ]
+        self._lib.flyweight_v2_raon_reset_slot.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32
+        ]
+        self._lib.flyweight_v2_raon_create_ex.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_void_p)
+        ]
+        self._check(
+            self._lib.flyweight_v2_raon_create_ex(
+                model._handle, ctypes.c_uint32(capacity), ctypes.c_uint32(slots),
+                ctypes.c_int32(mode_val), ctypes.c_int32(gpu_layers_arg),
+                selection_arg, ctypes.c_int32(CACHE_TYPE_CODES[self.cache_type]),
+                ctypes.byref(self._handle)
+            )
+        )
+        self._logits = (ctypes.c_float * self._vocabulary)()
+        self._generator: Any = None
+        self._progress: Any = None
+        self._slots = self._query_slot_count()
+
+    @property
+    def slot_count(self) -> int:
+        """How many independent sequences this runtime holds."""
+        return self._slots
+
+    @property
+    def uses_gpu(self) -> bool:
+        entry = self._lib.flyweight_v2_raon_uses_gpu
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        value = ctypes.c_int(0)
+        self._check(entry(self._handle, ctypes.byref(value)))
+        return bool(value.value)
+
+    def layer_on_gpu(self, layer: int) -> int:
+        entry = self._lib.flyweight_v2_raon_layer_on_gpu
+        entry.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        entry.restype = ctypes.c_int
+        return entry(self._handle, ctypes.c_uint32(layer))
+
+    @property
+    def placement(self) -> dict[str, int]:
+        """Where prepare put weights and arenas; see FlyweightV2PlacementPlan."""
+        value = _PlacementPlan()
+        entry = self._lib.flyweight_v2_raon_plan
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PlacementPlan)]
+        self._check(entry(self._handle, ctypes.byref(value)))
+        return {field: int(getattr(value, field)) for field, _ in _PlacementPlan._fields_}
+
+    def _query_slot_count(self) -> int:
+        entry = self._lib.flyweight_v2_raon_slot_count
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        value = ctypes.c_uint32(0)
+        self._check(entry(self._handle, ctypes.byref(value)))
+        return int(value.value)
+
+    def _check(self, status: int) -> None:
+        if status:
+            message = self._lib.flyweight_v2_last_error() or b"native v2 error"
+            raise V2Error(message.decode(errors="replace"))
+
+    def set_progress(self, callback: Any) -> None:
+        try:
+            entry = self._lib.flyweight_v2_raon_set_progress
+        except AttributeError:
+            self._progress = None
+            return
+        entry.argtypes = [ctypes.c_void_p, _RAON_PROGRESS, ctypes.c_void_p]
+        if callback is None:
+            self._progress = None
+            self._check(entry(self._handle, _RAON_PROGRESS(0), None))
+            return
+
+        def trampoline(_user, processed, total) -> int:
+            try:
+                return 0 if callback(int(processed), int(total)) is not False else 1
+            except Exception:
+                return 1
+
+        self._progress = _RAON_PROGRESS(trampoline)
+        self._check(entry(self._handle, self._progress, None))
+
+    def _eval_into_buffer(self, tokens: Sequence[int], slot: int = 0) -> None:
+        if not tokens:
+            raise ValueError("eval needs at least one token")
+        buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
+        if slot == 0:
+            self._check(
+                self._lib.flyweight_v2_raon_eval(
+                    self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+                )
+            )
+            return
+        self._check(
+            self._lib.flyweight_v2_raon_eval_slot(
+                self._handle, ctypes.c_uint32(slot), buffer,
+                ctypes.c_uint32(len(tokens)), self._logits
+            )
+        )
+
+    def eval(self, tokens: Sequence[int], slot: int = 0) -> Any:
+        self._eval_into_buffer(tokens, slot)
+        if _numpy is not None:
+            return _numpy.frombuffer(self._logits, dtype=_numpy.float32).copy()
+        return list(self._logits)
+
+    def eval_into(self, tokens: Sequence[int], slot: int = 0) -> None:
+        self._eval_into_buffer(tokens, slot)
+
+    def reset(self, slot: int = 0) -> None:
+        if slot == 0:
+            self._check(self._lib.flyweight_v2_raon_reset(self._handle))
+            return
+        self._check(
+            self._lib.flyweight_v2_raon_reset_slot(
+                self._handle, ctypes.c_uint32(slot)
+            )
+        )
+
+    def save_state(self, slot: int = 0) -> bytes:
+        if slot == 0:
+            save = self._lib.flyweight_v2_raon_cache_save
+            save.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            leading: tuple = (self._handle,)
+        else:
+            save = self._lib.flyweight_v2_raon_cache_save_slot
+            save.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+            ]
+            leading = (self._handle, ctypes.c_uint32(slot))
+        length = ctypes.c_uint64()
+        self._check(save(*leading, None, 0, ctypes.byref(length)))
+        buffer = ctypes.create_string_buffer(length.value)
+        self._check(save(*leading, buffer, length.value, ctypes.byref(length)))
+        return buffer.raw[: length.value]
+
+    def load_state(self, snapshot: bytes, slot: int = 0) -> None:
+        if slot == 0:
+            load = self._lib.flyweight_v2_raon_cache_load
+            load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+            self._check(load(self._handle, snapshot, len(snapshot)))
+            return
+        load = self._lib.flyweight_v2_raon_cache_load_slot
+        load.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint64
+        ]
+        self._check(
+            load(self._handle, ctypes.c_uint32(slot), snapshot, len(snapshot))
+        )
+
+    def sample(
+        self, config: Any = None, generated: Sequence[int] | None = None
+    ) -> int:
+        token, self._generator = _sample_from_logits_buffer(
+            self._logits,
+            self._vocabulary,
+            config,
+            generated=generated,
+            generator=self._generator,
+        )
+        return token
+
+    def generate(
+        self,
+        tokens: Sequence[int],
+        max_tokens: int = 32,
+        stop: Sequence[int] | None = None,
+        config: Any = None,
+    ) -> list[int]:
+        terminators = set(stop or ())
+        produced: list[int] = []
+        step = tokens
+        for _ in range(max_tokens):
+            self._eval_into_buffer(step)
+            best = self.sample(config, generated=produced)
+            produced.append(best)
+            if best in terminators:
+                break
+            step = [best]
+        return produced
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None) and self._handle:
+            self._lib.flyweight_v2_raon_destroy(self._handle)
+            self._handle = ctypes.c_void_p()
+
+    def __enter__(self) -> "RaonRuntime":
         return self
 
     def __exit__(self, *_: object) -> None:

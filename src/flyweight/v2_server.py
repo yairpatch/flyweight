@@ -49,6 +49,8 @@ from .v2 import (
     TASK_EVENT_TOKEN,
     V2Error,
     BailingRuntime,
+    RaonRuntime,
+    raon_cache_type,
     V2Model,
     V2QwenRuntime,
 )
@@ -2304,6 +2306,7 @@ class _BailingActive:
     stops: set
     sampling: object
     remaining: int
+    generated: list[int] = dataclasses.field(default_factory=list)
 
 
 class BailingEngine:
@@ -2374,13 +2377,18 @@ class BailingEngine:
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
         forbid_tool_calls: bool = False,
+        images: Sequence[PromptImage] | None = None,
+        anchor: int = 0,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         # As in the DeepSeek-V4 engine: BailingMoE3 runs its own runtime, whose
         # sampler has no constrained decoding -- the markup ban included -- so
         # its tool calls and a JSON response format stay with the tolerant
         # parser and the prompt. The arguments are accepted so the shared
-        # streaming path has one calling convention.
-        del tools, response_format, forbid_tool_calls
+        # streaming path has one calling convention. So are `images` (these
+        # runtimes take no pictures; the request is refused before here) and
+        # `anchor`, the opening a system prompt gives the native engine for its
+        # first prefill checkpoint: this engine snapshots whole prompts instead.
+        del tools, response_format, forbid_tool_calls, images, anchor
         task_queue: Queue[tuple[str, object]] = Queue(maxsize=self._MAX_BUFFERED_EVENTS)
         with self._lock:
             if self._closing:
@@ -2580,7 +2588,11 @@ class BailingEngine:
         """
         self.runtime.eval_into([task.pending], slot=task.slot)
         self._slot_tokens[task.slot].append(task.pending)
-        token = self.runtime.sample(task.sampling)
+        try:
+            token = self.runtime.sample(task.sampling, generated=task.generated)
+        except TypeError:
+            token = self.runtime.sample(task.sampling)
+        task.generated.append(token)
         if not self._emit(task.task_id, ("token", token)):
             return True
         task.remaining -= 1
@@ -2782,6 +2794,20 @@ class BailingGenerator(ChatGenerator):
         return self.engine.cache_stats()
 
 
+class RaonGenerator(ChatGenerator):
+    """Streaming generator backed by the Raon-1 runtime."""
+
+    def __init__(self, model: V2Model, runtime: "RaonRuntime",
+                 tokenizer: NativeV2Tokenizer,
+                 snapshot_budget_bytes: int | None = None):
+        super().__init__(model, BailingEngine(runtime, snapshot_budget_bytes),
+                         tokenizer)
+        self.runtime = runtime
+
+    def prefix_cache_stats(self) -> dict[str, int]:
+        return self.engine.cache_stats()
+
+
 def _report_placement(runtime: V2QwenRuntime) -> None:
     # A report, never a reason to fail a load that already succeeded.
     from .placement import format_placement
@@ -2903,6 +2929,7 @@ class NativeV2InferenceService(InferenceService):
         # so the options below that describe those features do not apply to it.
         self.architecture = str(self.v2_model.info["architecture"])
         self.bailing_runtime: BailingRuntime | None = None
+        self.raon_runtime: RaonRuntime | None = None
         if self.architecture == "bailingmoe3":
             try:
                 self._init_bailing(
@@ -2927,6 +2954,54 @@ class NativeV2InferenceService(InferenceService):
                 if runtime is not None:
                     runtime.close()
                     self.bailing_runtime = None
+                self.v2_model.close()
+                raise
+            self.generation_defaults_source = generation_defaults_source
+            self.gpu_cache_mib = gpu_cache_mib
+            self.mtp_drafts = 0
+            return
+        elif self.architecture == "raon1":
+            raon_defaults = {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "presence_penalty": 1.5,
+                "min_p": 0.0,
+            }
+            effective_defaults = dict(raon_defaults)
+            effective_defaults.update(generation_defaults)
+            generation_defaults = effective_defaults
+            if generation_defaults_source == "engine":
+                generation_defaults_source = "engine(raon-defaults)"
+            try:
+                self._init_raon(
+                    model_name=model_name or Path(model_path).stem,
+                    max_new_tokens=max_new_tokens,
+                    context_window=context_window,
+                    api_key=api_key,
+                    cors_origin=cors_origin,
+                    strict_model=strict_model,
+                    max_concurrent_requests=max_concurrent_requests,
+                    request_timeout_seconds=request_timeout_seconds,
+                    sse_keepalive_seconds=sse_keepalive_seconds,
+                    max_tool_call_tokens=max_tool_call_tokens,
+                    default_thinking_budget=default_thinking_budget,
+                    reasoning_effort=reasoning_effort,
+                    generation_defaults=generation_defaults,
+                    prompt_cache_mib=prompt_cache_mib,
+                    parallel_sequences=parallel_sequences,
+                    expert_mode=expert_mode,
+                    moe_device=moe_device,
+                    gpu_layers=gpu_layers,
+                    gpu_cache_mib=gpu_cache_mib,
+                    cache_type_k=cache_type_k,
+                    cache_type_v=cache_type_v,
+                )
+            except BaseException:
+                runtime = getattr(self, "raon_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                    self.raon_runtime = None
                 self.v2_model.close()
                 raise
             self.generation_defaults_source = generation_defaults_source
@@ -3072,6 +3147,62 @@ class NativeV2InferenceService(InferenceService):
         # One sequence of caches, so requests must not overlap.
         self._serialize_generation = True
 
+    def _init_raon(self, *, model_name, max_new_tokens, context_window, api_key,
+                   cors_origin, strict_model, max_concurrent_requests,
+                   request_timeout_seconds, sse_keepalive_seconds,
+                   max_tool_call_tokens, generation_defaults,
+                   default_thinking_budget=None,
+                   reasoning_effort=None, prompt_cache_mib=0,
+                   parallel_sequences=1, expert_mode="auto",
+                   moe_device=None, gpu_layers=None,
+                   gpu_cache_mib=0, cache_type_k="f16",
+                   cache_type_v="f16") -> None:
+        self.v2_runtime = None
+        tokenizer = NativeV2Tokenizer(
+            self.v2_model, image_max_tokens=self.image_max_tokens)
+        self.raon_runtime = RaonRuntime(
+            self.v2_model, capacity=context_window,
+            slots=max(1, int(parallel_sequences or 1)),
+            expert_mode=expert_mode or "auto",
+            gpu_layers=gpu_layers,
+            gpu_cache_mib=gpu_cache_mib,
+            cache_type=raon_cache_type(cache_type_k, cache_type_v),
+        )
+        snapshot_budget = (
+            None if prompt_cache_mib >= AUTO_PROMPT_CACHE_MIB
+            else prompt_cache_mib * 1024**2
+        )
+        super().__init__(
+            model_name,
+            RaonGenerator(self.v2_model, self.raon_runtime, tokenizer,
+                          snapshot_budget),
+            max_new_tokens=max_new_tokens,
+            context_window=context_window,
+            api_key=api_key,
+            cors_origin=cors_origin,
+            strict_model=strict_model,
+            max_concurrent_requests=max_concurrent_requests,
+            request_timeout_seconds=request_timeout_seconds,
+            sse_keepalive_seconds=sse_keepalive_seconds,
+            max_tool_call_tokens=max_tool_call_tokens,
+            default_thinking_budget=default_thinking_budget,
+            reasoning_effort=reasoning_effort,
+            generation_defaults=generation_defaults,
+        )
+        _report_placement(self.raon_runtime)
+        placement = self.raon_runtime.placement
+        self.requested_expert_mode = expert_mode or "auto"
+        if placement["expert_mode"] == 2:
+            self.expert_mode = "hybrid"
+        elif placement["expert_mode"] == 0:
+            self.expert_mode = "gpu"
+        else:
+            self.expert_mode = "cpu"
+        self.expert_fallback_reason = ""
+        self.moe_device = self.expert_mode
+        self.gpu_layers = placement["gpu_expert_layers"]
+        self._serialize_generation = True
+
     def _load_prompt_cache(
         self, root: str | Path | None, model_path: str | Path
     ) -> Path | None:
@@ -3141,6 +3272,10 @@ class NativeV2InferenceService(InferenceService):
         if bailing is not None:
             bailing.close()
             self.bailing_runtime = None
+        raon = getattr(self, "raon_runtime", None)
+        if raon is not None:
+            raon.close()
+            self.raon_runtime = None
         if self.v2_runtime is not None:
             self.v2_runtime.close()
             self.v2_runtime = None
@@ -3158,6 +3293,23 @@ class NativeV2InferenceService(InferenceService):
                 "device": "gpu" if bailing.uses_gpu else "cpu",
                 "parallel_sequences": int(
                     getattr(bailing, "slot_count", 1)
+                ),
+            }
+            return value
+        raon = getattr(self, "raon_runtime", None)
+        if raon is not None:
+            value = super().health()
+            value["execution"] = {
+                "backend": "native-v2-raon1",
+                "architecture": self.architecture,
+                "device": "gpu" if raon.uses_gpu else "cpu",
+                "expert_mode": self.expert_mode,
+                "requested_expert_mode": self.requested_expert_mode,
+                "moe_device": self.moe_device,
+                "expert_fallback_reason": self.expert_fallback_reason,
+                "gpu_layers": getattr(self, "gpu_layers", None),
+                "parallel_sequences": int(
+                    getattr(raon, "slot_count", 1)
                 ),
             }
             return value

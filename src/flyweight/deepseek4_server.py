@@ -31,7 +31,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -228,10 +228,14 @@ class Deepseek4Engine:
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
         forbid_tool_calls: bool = False,
+        images: Sequence[Any] | None = None,
+        anchor: int = 0,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         # As `tools` below: this runtime's sampler has none of the constraint
-        # machinery, the markup ban included.
-        del response_format, forbid_tool_calls
+        # machinery, the markup ban included. `images` and `anchor` (the opening
+        # a system prompt gives the native engine for its first prefill
+        # checkpoint) are taken for the shared calling convention and unused.
+        del response_format, forbid_tool_calls, images, anchor
         # Accepted and unused: constrained tool-call decoding lives in the Qwen
         # sampler, and this runtime has its own. A DeepSeek-V4 tool call is
         # still recovered by the tolerant parser in the server, which is where
