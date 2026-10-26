@@ -676,9 +676,11 @@ def _add_runtime_options(
         default="auto",
         help="how experts reach the GPU: staged copies through a pinned "
              "buffer, direct DMAs from registered (locked) host memory. auto "
-             "picks direct only when RAM holds the whole model with room to "
-             "spare and uploads are on the critical path: streamed GPU "
-             "experts, or MTP/lookup drafting",
+             "picks direct when RAM holds the whole model with room to spare "
+             "and uploads are on the critical path (streamed GPU experts, or "
+             "MTP/lookup drafting), and for qwen4exp hybrid decode when every "
+             "expert fits in RAM beside an 8 GiB reserve (the n-gram table is "
+             "read directly, so it takes none)",
     )
     add(
         tuning, "--routed-moe", action="store_true", default=None,

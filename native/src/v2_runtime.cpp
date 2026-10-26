@@ -7516,6 +7516,18 @@ void qwen4_ple_decode_row(
     }
 }
 
+// Whether decode will read the n-gram table through PleReader rather than
+// the mapping: Linux, and not turned off. (`open` can still fail; then the
+// mapping path runs beside whatever the experts have pinned.)
+bool qwen4_ple_direct_planned() {
+#if defined(__linux__)
+    const char* setting = std::getenv("FLYWEIGHT_PLE_DIRECT");
+    return !(setting && setting[0] == '0');
+#else
+    return false;
+#endif
+}
+
 // The direct reader, opened on first use. FLYWEIGHT_PLE_DIRECT=0 keeps the
 // mapping path for A/B; FLYWEIGHT_PLE_ROW_CACHE sets the row cache size in
 // rows (default 1M, ~90 MB for IQ4_NL rows; 0 disables it).
@@ -22858,7 +22870,32 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whatever the pinning, so page pressure dominates either way. It stays
         // available for boxes where the numbers come out differently, but it does
         // not turn itself on to buy nothing and lock pages doing it.
-        const bool budgeted_direct=forced_direct&&!auto_direct&&
+        // The exception, measured since: qwen4exp with its n-gram table read
+        // through PleReader. The table no longer takes page cache, so every
+        // expert layer fits the budget (40 GiB of 48 layers for Flash-Next
+        // IQ3_XXS on the 60 GiB box), and pinned experts cannot be evicted by
+        // the table or the dense weights. Interleaved warm runs (2026-10-26):
+        // decode 21.7-22.9 ms a token pinned against 23.0-23.9 staged, and a
+        // staged run that follows anything else that churned the page cache
+        // is far worse. So auto pins when every expert layer fits, and only
+        // then -- partial coverage is still the no-win case above.
+        bool auto_full_direct=false;
+        if(runtime->options.expert_paging==0&&!ram_for_direct&&
+           runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid&&
+           runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+           qwen4_ple_direct_planned()&&
+           runtime->host_available_bytes>kRegisterReserveBytes){
+            std::uint64_t all_experts=0;
+            const int roles=runtime->nemotron?2:3;
+            for(const auto& layer:runtime->layers){
+                if(!qwen_layer_expert_count(*runtime,layer))continue;
+                for(int role=0;role<roles;++role)
+                    all_experts+=runtime->model->tensors[layer.expert_tensors[role]].size;
+            }
+            auto_full_direct=all_experts>0&&
+                all_experts<=runtime->host_available_bytes-kRegisterReserveBytes;
+        }
+        const bool budgeted_direct=(forced_direct||auto_full_direct)&&!auto_direct&&
             runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
@@ -22944,8 +22981,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // gathered on the host (16 rows a token), so pinning it would buy
             // nothing and cost 25.7 GiB. The embedding IS registerable, so it is
             // charged to the budget below rather than reserved from it.
+            // Not when decode reads the table through PleReader: that drops
+            // every page after copying its row out, so the table holds no
+            // page cache and the experts can have the RAM.
             std::uint64_t host_resident_bytes=0;
-            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max())
+            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+               !qwen4_ple_direct_planned())
                 host_resident_bytes+=
                     runtime->model->tensors[runtime->ple_table].size;
             const auto floor_bytes=kRegisterReserveBytes+host_resident_bytes;
