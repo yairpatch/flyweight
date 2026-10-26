@@ -34,6 +34,7 @@ _DEVICE_ROWS = (
 )
 
 _HOST_ROWS = (
+    ("host_kv_state_bytes", "KV + recurrent state"),
     ("host_ffn_bytes", "spilled dense FFN (mapped)"),
     ("host_ffn_reencoded_bytes", "spilled FFN re-encode"),
     ("host_pinned_bytes", "pinned staging"),
