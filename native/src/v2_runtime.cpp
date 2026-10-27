@@ -22879,32 +22879,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whatever the pinning, so page pressure dominates either way. It stays
         // available for boxes where the numbers come out differently, but it does
         // not turn itself on to buy nothing and lock pages doing it.
-        // The exception, measured since: qwen4exp with its n-gram table read
-        // through PleReader. The table no longer takes page cache, so every
-        // expert layer fits the budget (40 GiB of 48 layers for Flash-Next
-        // IQ3_XXS on the 60 GiB box), and pinned experts cannot be evicted by
-        // the table or the dense weights. Interleaved warm runs (2026-10-26):
-        // decode 21.7-22.9 ms a token pinned against 23.0-23.9 staged, and a
-        // staged run that follows anything else that churned the page cache
-        // is far worse. So auto pins when every expert layer fits, and only
-        // then -- partial coverage is still the no-win case above.
-        bool auto_full_direct=false;
-        if(runtime->options.expert_paging==0&&!ram_for_direct&&
-           runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid&&
-           runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
-           qwen4_ple_direct_planned()&&
-           runtime->host_available_bytes>kRegisterReserveBytes){
-            std::uint64_t all_experts=0;
-            const int roles=runtime->nemotron?2:3;
-            for(const auto& layer:runtime->layers){
-                if(!qwen_layer_expert_count(*runtime,layer))continue;
-                for(int role=0;role<roles;++role)
-                    all_experts+=runtime->model->tensors[layer.expert_tensors[role]].size;
-            }
-            auto_full_direct=all_experts>0&&
-                all_experts<=runtime->host_available_bytes-kRegisterReserveBytes;
-        }
-        const bool budgeted_direct=(forced_direct||auto_full_direct)&&!auto_direct&&
+        // Measured again 2026-10-27 for qwen4exp, whose n-gram table no longer
+        // takes page cache so all 40 GiB of Flash-Next's experts fit: warm
+        // short-prompt decode was ~1.5 ms a token faster pinned, but a 40K-token
+        // prompt at an 86K context then swapped -- pinned pages leave ~10 GiB
+        // for the prompt cache, checkpoints and everything else, and a second
+        // 40K prompt ran for over ten minutes against 76 s staged. Staged keeps
+        // the experts in reclaimable page cache. Still opt-in.
+        const bool budgeted_direct=forced_direct&&!auto_direct&&
             runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
