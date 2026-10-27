@@ -859,6 +859,19 @@ void qwen_forward_rows(
         // bf16 takes the tiled GEMM once there are tokens to share each weight
         // tile across; bf16_matmul_rows re-reads the matrix per token.
         static const bool bf16_tiled=[]{const char*e=std::getenv("FLYWEIGHT_BF16_TILED");return !e||e[0]!='0';}();
+        // A handful of rows -- MTP verify -- reads each weight once for up to
+        // eight of them instead of once per token.
+        if(bf16_tiled&&type==30&&rows>=2&&rows<16){
+            for(int first=0;first<rows;first+=8){
+                int batch=std::min(8,rows-first);
+                auto batch_input=input+static_cast<std::uint64_t>(first)*input_size*sizeof(float);
+                auto batch_output=output+static_cast<std::uint64_t>(first)*output_size*sizeof(float);
+                void*args[]={&matrix,&batch_input,&batch_output,&output_size,&input_size,&batch};
+                launch("bf16_matvec_rows_warp",(output_size+7)/8,1,256,args);
+            }
+            dense_trace("bf16_matvec_rows_warp");
+            return;
+        }
         if(bf16_tiled&&type==30&&rows>=16){
             void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
             launch("bf16_matmul_tiled64",(output_size+63)/64,

@@ -769,6 +769,59 @@ void bf16_matvec_warp(
     if (lane == 0) output[row] = partial;
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(// bf16_matvec_warp over up to eight token rows at once: each weight load
+// serves every row, where the per-token rows kernel re-reads the matrix once
+// per token. MTP verify on qwen4exp runs its bf16 hyper-connection
+// projections (26 MB a layer) over 2-4 rows. Same per-row dot and warp
+// reduction as bf16_matvec_warp. Grid (output_size+7)/8, 256 threads.
+extern "C" __global__
+void bf16_matvec_rows_warp(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const unsigned short* row_weights =
+        weights + (long long)row * (long long)columns;
+    float partial[8] = {};
+    if (bf16_vectorizable(row_weights, vectors, columns)) {
+        const uint4* packed = (const uint4*)row_weights;
+        const int steps = columns >> 3;
+        for (int step = lane; step < steps; step += 32) {
+            const uint4 value = packed[step];
+            #pragma unroll
+            for (int token = 0; token < 8; ++token)
+                if (token < tokens)
+                    partial[token] += bf16_dot8(
+                        value, vectors + (long long)token * columns + step * 8);
+        }
+    } else {
+        for (int column = lane; column < columns; column += 32) {
+            const float weight =
+                __uint_as_float(((unsigned int)row_weights[column]) << 16);
+            #pragma unroll
+            for (int token = 0; token < 8; ++token)
+                if (token < tokens)
+                    partial[token] += weight * vectors[(long long)token * columns + column];
+        }
+    }
+    #pragma unroll
+    for (int token = 0; token < 8; ++token) {
+        if (token >= tokens) break;
+        float value = partial[token];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        if (lane == 0) output[(long long)token * rows + row] = value;
+    }
+}
+
 // A block per row for a projection with a handful of long rows: qwen4exp's
 // hyper-connection inject is 4 rows of 10240, which the warp form ran as one
 // block of four warps (~12 us, twice per layer). Same 128-bit loads as
