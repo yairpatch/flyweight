@@ -229,6 +229,70 @@ inline int qwen_host_ffn_batch_threshold(){
     return threshold;
 }
 
+// Staged MTP verify admission (no direct paging). The verify pass used to admit
+// only through DMA from registered memory, so with staged paging -- the default
+// -- the expert cache froze for as long as drafting ran: 9.5% of verify routes
+// hit it against ~33% in ordinary decode. Here a miss the cache policy admits
+// is copied into a pinned ring and uploaded on the prefetch stream; the slot is
+// live from the next pass on (qwen_verify_target_rows orders that pass behind
+// the uploads). The ring holds a pass's worth; once full, misses go unadmitted
+// until the next pass.
+static bool qwen_verify_stage_admission(
+    FlyweightV2QwenRuntime& runtime, QwenLayerPlan& layer,
+    std::uint32_t layer_number, int expert, int layer_experts
+) {
+    static const std::uint64_t ring_bytes=[]{
+        const char*setting=std::getenv("FLYWEIGHT_VERIFY_ADMIT_MIB");
+        const long value=setting?std::strtol(setting,nullptr,10):64;
+        return static_cast<std::uint64_t>(std::max(0L,value))<<20;
+    }();
+    if(!ring_bytes)return false;
+    std::uint64_t bundle=0;
+    for(int role=0;role<3;++role)
+        bundle+=runtime.model->tensors[layer.expert_tensors[role]].size/layer_experts;
+    if(!runtime.verify_admit_staging){
+        if(flyweight_gpu_host_alloc(ring_bytes,&runtime.verify_admit_staging)!=0){
+            runtime.verify_admit_staging=nullptr;return false;}
+        if(!runtime.verify_admit_event&&
+           flyweight_gpu_event_create(&runtime.verify_admit_event)!=0)return false;
+    }
+    // A new pass starts the ring over once the previous pass's uploads drained.
+    if(!runtime.verify_admit_pending){
+        if(runtime.verify_admit_bytes&&
+           flyweight_gpu_event_sync(runtime.verify_admit_event)!=0)return false;
+        runtime.verify_admit_bytes=0;
+    }
+    if(runtime.verify_admit_bytes+bundle>ring_bytes)return false;
+    const auto slot_index=select_expert_cache_slot(runtime,layer_number,expert,true);
+    if(slot_index==kNoExpertSlot)return false;
+    auto&slot=runtime.expert_slots[slot_index];
+    const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|
+        static_cast<std::uint32_t>(expert);
+    slot.key=cache_key;
+    slot.valid=true;
+    slot.native_valid=false;
+    slot.last_used=++runtime.expert_clock;
+    runtime.expert_residency[cache_key]=slot_index;
+    auto*ring=static_cast<std::uint8_t*>(runtime.verify_admit_staging)+runtime.verify_admit_bytes;
+    std::uint64_t offset=0;
+    for(int role=0;role<3;++role){
+        const auto&source=runtime.model->tensors[layer.expert_tensors[role]];
+        const auto bytes=source.size/layer_experts;
+        std::memcpy(ring+offset,tensor_data(*runtime.model,source)+
+            static_cast<std::uint64_t>(expert)*bytes,bytes);
+        offset+=bytes;
+    }
+    if(flyweight_gpu_upload(runtime.expert_cache+slot_index*runtime.expert_slot_bytes,
+           ring,bundle,runtime.prefetch_stream)!=0)
+        throw std::runtime_error("native MTP verify admission upload failed");
+    runtime.verify_admit_bytes+=bundle;
+    runtime.verify_admit_pending=true;
+    if(runtime.verify_admit_inflight.size()<runtime.expert_slots.size())
+        runtime.verify_admit_inflight.resize(runtime.expert_slots.size(),0);
+    runtime.verify_admit_inflight[slot_index]=1;
+    return true;
+}
+
 void qwen_forward_rows(
     FlyweightV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int total_rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
@@ -423,10 +487,15 @@ void qwen_forward_rows(
         !output_tokens&&runtime.options.mtp_drafts&&mtp_prompt_hidden;
     const bool had_mtp_target_hidden=runtime.mtp_has_target_hidden;
     if(preserve_mtp_prompt_hidden&&had_mtp_target_hidden){
+        // A whole hand-over row: on qwen4exp that is the streams
+        // (hc_count*hidden), and copying only `hidden` of it left 3/4 of the
+        // first pair's hidden stale.
         auto source=runtime.state+runtime.mtp_target_hidden_offset;
-        void*args[]={&source,const_cast<std::uint64_t*>(&mtp_prompt_hidden),
-                     const_cast<int*>(&hidden_size)};
-        launch("qwen_copy_vector",(hidden_size+255)/256,1,256,args);
+        int width=runtime.qwen4exp
+            ?static_cast<int>(runtime.model->config.hyper_connection_count)*hidden_size
+            :hidden_size;
+        void*args[]={&source,const_cast<std::uint64_t*>(&mtp_prompt_hidden),&width};
+        launch("qwen_copy_vector",(width+255)/256,1,256,args);
     }
     auto q8_rows=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
@@ -946,6 +1015,12 @@ void qwen_forward_rows(
         int channels=static_cast<int>(hc_wide_size);
         auto conv_weights=runtime.device_tensors[layer.ple_conv];
         std::uint64_t conv_state=runtime.state+layer.state_third;
+        // MTP fold capture: the conv's per-row inputs, so a rejected round can
+        // replay this ring over the accepted prefix (qwen_mtp_fold_delta_state).
+        if(runtime.mtp_fold_capture&&span_begin==0&&rows<=8&&layer.mtp_retain_ple&&
+           flyweight_gpu_copy_device(runtime.state+layer.mtp_retain_ple,normed,
+               static_cast<std::uint64_t>(rows)*channels*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native MTP PLE retention copy failed");
         void*conv_args[]={const_cast<std::uint64_t*>(&normed),&conv_weights,
             &conv_state,const_cast<std::uint64_t*>(&normed),&rows,&channels,
             &kernel_size,&dilation};
@@ -2546,6 +2621,12 @@ void qwen_forward_rows(
                 const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
                 const auto resident=runtime.expert_residency.find(cache_key);
                 std::size_t slot_index=kNoExpertSlot;
+                if(resident!=runtime.expert_residency.end()&&
+                   resident->second<runtime.verify_admit_inflight.size()&&
+                   runtime.verify_admit_inflight[resident->second]){
+                    // Admitted earlier in this pass; its upload has not landed.
+                    continue;
+                }
                 if(resident!=runtime.expert_residency.end()){
                     slot_index=resident->second;
                     record_expert_cache_hit(runtime,runtime.expert_slots[slot_index]);
@@ -2563,6 +2644,14 @@ void qwen_forward_rows(
                     if(rows_may_admit&&(layer.expert_dma||runtime.nemotron))
                         slot_index=select_expert_cache_slot(
                             runtime,layer_number,expert,true);
+                    else if(rows_may_admit&&output_tokens&&!runtime.nemotron&&
+                            qwen_verify_stage_admission(runtime,layer,layer_number,
+                                expert,layer_experts)){
+                        // Admitted for the next pass; this one computes the
+                        // route on the CPU like any other miss.
+                        if(verify_moe_profile)++qwen_verify_moe_profile().admitted;
+                        continue;
+                    }
                     if(slot_index==kNoExpertSlot){
                         if(verify_moe_profile)++qwen_verify_moe_profile().refused;
                         continue;
@@ -3753,7 +3842,18 @@ void qwen_verify_target_rows(
     int rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
 ) {
     if(rows>9)throw std::runtime_error("native MTP verifier batch is unsupported");
+    // Slots the previous pass admitted through the staging ring are read by
+    // this pass's kernels: order them behind those uploads.
+    if(runtime.verify_admit_pending){
+        if(flyweight_gpu_stream_wait_event(runtime.stream,runtime.verify_admit_event)!=0)
+            throw std::runtime_error("native MTP verify admission fence failed");
+        runtime.verify_admit_pending=false;
+        std::fill(runtime.verify_admit_inflight.begin(),runtime.verify_admit_inflight.end(),0);
+    }
     qwen_forward_rows(runtime,input_tokens,rows,output_tokens,final_hidden);
+    if(runtime.verify_admit_pending&&
+       flyweight_gpu_event_record(runtime.verify_admit_event,runtime.prefetch_stream)!=0)
+        throw std::runtime_error("native MTP verify admission event failed");
 }
 
 // Chunked prompt prefill: advance the recurrent/KV state over a whole chunk
@@ -3770,7 +3870,13 @@ void qwen_prefill_rows(
     if(runtime.options.mtp_drafts){
         const auto preserved=
             runtime.rows_workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
-        const int hidden=static_cast<int>(runtime.model->config.hidden_size);
+        // The preserved rows are hand-over rows: the streams on qwen4exp. They
+        // used to be indexed at `hidden` stride, so every prompt pair's draft
+        // K/V was built from the wrong slice of a stream row -- the draft
+        // attended over a garbled prompt, which costs acceptance and nothing
+        // else, so nothing failed.
+        const int hidden=static_cast<int>(runtime.model->config.hidden_size)*
+            (runtime.qwen4exp?static_cast<int>(runtime.model->config.hyper_connection_count):1);
         for(int row=had_mtp_target_hidden?0:1;row<rows;++row)
             qwen_mtp_append_pair(
                 runtime,tokens[row],preserved+

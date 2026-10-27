@@ -468,6 +468,12 @@ struct QwenLayerPlan {
     std::uint64_t hc_ffn_down = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t hc_ffn_up = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t hc_ffn_inject = std::numeric_limits<std::uint64_t>::max();
+    // qwen4exp's MTP block only: its own head mixer (nextn.hc_head_*, the
+    // checkpoint's mtp.hyper_connection_mixer), which collapses the draft's
+    // streams before the shared LM head.
+    std::uint64_t mtp_head_norm = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t mtp_head_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t mtp_head_up = std::numeric_limits<std::uint64_t>::max();
     // QSA indexer projections (full-attention layers). Loaded and resident from
     // phase 1 so residency accounting is stable, exercised only once the
     // sparse selection lands (plans/qwen4exp-flash-next.md phase 3).
@@ -548,6 +554,9 @@ struct QwenLayerPlan {
     // re-running the whole forward. Sized for the 8-row verifier maximum.
     std::uint64_t mtp_retain_qkv = 0;
     std::uint64_t mtp_retain_logits = 0;
+    // qwen4exp's PLE layer: the dilated conv's per-row inputs, retained the
+    // same way so the fold can replay that ring too.
+    std::uint64_t mtp_retain_ple = 0;
 };
 
 struct QwenExpertSlot {
@@ -741,7 +750,7 @@ struct QwenLayerOffsets {
     std::uint64_t state_first = 0, state_second = 0, state_third = 0;
     std::uint64_t snapshot_first = 0, snapshot_second = 0, snapshot_third = 0;
     std::uint64_t qsa_blocks = 0, qsa_ring = 0;
-    std::uint64_t mtp_retain_qkv = 0, mtp_retain_logits = 0;
+    std::uint64_t mtp_retain_qkv = 0, mtp_retain_logits = 0, mtp_retain_ple = 0;
 };
 
 struct QwenSlotGeometry {
@@ -1525,6 +1534,17 @@ struct FlyweightV2QwenRuntime {
     // slices fit; host block is one sequence's private host staging.
     std::vector<std::uint64_t> slot_events;
     std::uint64_t staging_event = 0;
+    // MTP verify admissions without direct paging: misses the cache policy
+    // admits are memcpy'd into this pinned ring and uploaded on the prefetch
+    // stream while the CPU computes them for the current pass; the next pass
+    // waits on verify_admit_event before its kernels read the slots.
+    void* verify_admit_staging = nullptr;
+    std::uint64_t verify_admit_bytes = 0;
+    std::uint64_t verify_admit_event = 0;
+    bool verify_admit_pending = false;
+    // Slots whose staged upload is still in flight: a later row of the same
+    // pass must not read them on the compute stream.
+    std::vector<std::uint8_t> verify_admit_inflight;
     std::uint64_t prefetch_stream = 0;
     std::uint64_t prefetch_event = 0;
     bool prefetch_pending = false;
@@ -1696,6 +1716,7 @@ static void qwen_apply_geometry(FlyweightV2QwenRuntime& runtime, std::size_t ind
         layer.qsa_ring = o.qsa_ring;
         layer.mtp_retain_qkv = o.mtp_retain_qkv;
         layer.mtp_retain_logits = o.mtp_retain_logits;
+        layer.mtp_retain_ple = o.mtp_retain_ple;
     };
     for (std::size_t i = 0; i < runtime.layers.size() && i < g.layers.size(); ++i)
         apply_layer(runtime.layers[i], g.layers[i]);
@@ -2602,6 +2623,15 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.cuda_graphs=false;
     runtime.cuda_graph_builds=runtime.cuda_graph_replays=runtime.cuda_graph_fallbacks=0;
     runtime.delta_host_ns=runtime.delta_host_calls=0;
+    if (runtime.verify_admit_staging) {
+        flyweight_gpu_stream_sync(runtime.prefetch_stream);
+        flyweight_gpu_host_free(runtime.verify_admit_staging);
+    }
+    runtime.verify_admit_staging = nullptr;
+    runtime.verify_admit_bytes = 0;
+    if (runtime.verify_admit_event) flyweight_gpu_event_destroy(runtime.verify_admit_event);
+    runtime.verify_admit_event = 0;
+    runtime.verify_admit_pending = false;
     flyweight_gpu_stream_destroy(runtime.prefetch_stream);
     runtime.prefetch_stream = 0;
     flyweight_gpu_stream_destroy(runtime.graph_stream);
@@ -3782,6 +3812,17 @@ void build_qwen4exp_plan(FlyweightV2QwenRuntime& runtime) {
         add_mtp_extra(prefix + "hc_ffn_down.weight", draft.hc_ffn_down);
         add_mtp_extra(prefix + "hc_ffn_up.weight", draft.hc_ffn_up);
         add_mtp_extra(prefix + "hc_ffn_inject.weight", draft.hc_ffn_inject);
+        // The block's own head mixer. Strata collapses the draft's streams
+        // with it (mtp.hyper_connection_mixer); llama.cpp's graph_mtp, which
+        // this first followed, reuses the target's output_hc_*, and the two
+        // differ (hc_head_norm mean 4.79 against output_hc_norm's 3.75).
+        if (has_tensor(model, prefix + "nextn.hc_head_norm.weight") &&
+            has_tensor(model, prefix + "nextn.hc_head_down.weight") &&
+            has_tensor(model, prefix + "nextn.hc_head_up.weight")) {
+            add_mtp_extra(prefix + "nextn.hc_head_norm.weight", draft.mtp_head_norm);
+            add_mtp_extra(prefix + "nextn.hc_head_down.weight", draft.mtp_head_down);
+            add_mtp_extra(prefix + "nextn.hc_head_up.weight", draft.mtp_head_up);
+        }
         draft.attention_heads = model.config.attention_heads;
         draft.kv_heads = model.config.attention_kv_heads;
         draft.head_dim = static_cast<std::uint32_t>(
@@ -20630,6 +20671,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // decay+beta logits (2 * value_heads each row). See QwenLayerPlan.
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
+                if(target.ple_conv!=std::numeric_limits<std::uint64_t>::max())
+                    target.mtp_retain_ple=reserve(
+                        9ULL*runtime->model->tensors[target.ple_conv].shape[1]*sizeof(float));
                 if(target.attention)continue;
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
@@ -20660,6 +20704,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 o.qsa_ring=layer.qsa_ring;
                 o.mtp_retain_qkv=layer.mtp_retain_qkv;
                 o.mtp_retain_logits=layer.mtp_retain_logits;
+                o.mtp_retain_ple=layer.mtp_retain_ple;
                 return o;
             };
             g.layers.reserve(runtime->layers.size());
@@ -24624,10 +24669,22 @@ std::uint32_t qwen4exp_mtp_draft(
         void* copy_args[] = {const_cast<std::uint64_t*>(&hc_streams), &draft_hidden, &count};
         launch("qwen_copy_vector", (hc_wide_size + 255) / 256, 1, copy_args);
     }
-    // No final norm on this arch: the inject-less collapse IS it.
-    hc_pre(runtime.device_tensors[runtime.output_hc_norm],
-           runtime.output_hc_down, runtime.output_hc_up,
-           std::numeric_limits<std::uint64_t>::max());
+    // No final norm on this arch: the inject-less collapse IS it -- through
+    // the block's own head mixer when the checkpoint carries one.
+    // FLYWEIGHT_MTP_OWN_HEAD=0 collapses with the target's output_hc_* (the
+    // llama.cpp reading) for A/B.
+    static const bool own_head = [] {
+        const char* setting = std::getenv("FLYWEIGHT_MTP_OWN_HEAD");
+        return !setting || setting[0] != '0';
+    }();
+    if (own_head && layer.mtp_head_norm != std::numeric_limits<std::uint64_t>::max())
+        hc_pre(runtime.device_tensors[layer.mtp_head_norm],
+               layer.mtp_head_down, layer.mtp_head_up,
+               std::numeric_limits<std::uint64_t>::max());
+    else
+        hc_pre(runtime.device_tensors[runtime.output_hc_norm],
+               runtime.output_hc_down, runtime.output_hc_up,
+               std::numeric_limits<std::uint64_t>::max());
     if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     int vocabulary = static_cast<int>(config.vocabulary_size);
@@ -24902,6 +24959,23 @@ void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
         if(flyweight_gpu_launch_named(name,gx,1,bx,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native MTP fold kernel failed: ")+name);
     };
+    // qwen4exp's PLE ring: replay the dilated conv over the retained inputs.
+    // The kernel writes its output over its input, so it runs on a copy.
+    for(auto&layer:runtime.layers){
+        if(layer.ple_conv==std::numeric_limits<std::uint64_t>::max()||!layer.mtp_retain_ple)continue;
+        const auto&conv=runtime.model->tensors[layer.ple_conv];
+        int channels=static_cast<int>(conv.shape[1]);
+        int kernel_size=static_cast<int>(conv.shape[0]);
+        int dilation=static_cast<int>(std::max<std::uint32_t>(runtime.model->config.ple_ngram_size,1));
+        auto scratch=convolved;
+        if(flyweight_gpu_copy_device(scratch,runtime.state+layer.mtp_retain_ple,
+               static_cast<std::uint64_t>(rows)*channels*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native MTP PLE fold copy failed");
+        auto weights=runtime.device_tensors[layer.ple_conv];
+        auto state=runtime.state+layer.state_third;
+        void*args[]={&scratch,&weights,&state,&scratch,&rows,&channels,&kernel_size,&dilation};
+        launch("qwen4_ple_conv_sequence",(static_cast<std::uint32_t>(channels)+255)/256,256,args);
+    }
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         auto&layer=runtime.layers[layer_number];
         if(layer.attention)continue;
@@ -24924,11 +24998,46 @@ void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
         if(kernel_size<=8)launch("delta_conv_chunk",(static_cast<std::uint32_t>(channels)+255)/256,256,conv_args);
         else launch("delta_conv_sequence",static_cast<std::uint32_t>(channels),1,conv_args);
         auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
-        // MTP fold replay is unreachable for qwen4exp (no draft block), so the
-        // gate stays the qwen3.5 silu form.
-        int gate_sigmoid=0;
+        // qwen4exp gates the recurrence output with a sigmoid, as its verify did.
+        int gate_sigmoid=runtime.qwen4exp?1:0;
         void*recurrent_args[]={const_cast<std::uint64_t*>(&convolved),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&output),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon),&gate_sigmoid};
-        if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
+        // Same kernel choice as the verify pass (qwen_forward_rows), so the
+        // rebuilt state is bitwise the replay's: the prologue form where the
+        // verifier takes it -- it does on qwen4exp -- else the plain chunk.
+        static const bool prologue_enabled=[]{
+            const char*setting=std::getenv("FLYWEIGHT_DELTA_PROLOGUE");
+            return !setting||setting[0]!='0';
+        }();
+        const bool prologue_ok=head_dim==128&&prologue_enabled&&
+            !flyweight_backend_is_cpu()&&
+            static_cast<std::uint64_t>(value_heads)==runtime.delta_value_heads&&
+            key_heads>0&&key_heads<=value_heads&&
+            layout.delta_w.size&&layout.delta_u.size&&
+            layout.delta_qinv.size&&layout.delta_kinv.size;
+        if(prologue_ok){
+            const auto norm_q=layout.delta_w.address(runtime.workspace);
+            const auto norm_k=layout.delta_u.address(runtime.workspace);
+            const auto beta_pre=layout.delta_qinv.address(runtime.workspace);
+            const auto decay_pre=layout.delta_kinv.address(runtime.workspace);
+            void*prologue_args[]={const_cast<std::uint64_t*>(&convolved),
+                const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),
+                &decay,&dt,
+                const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                &rows,&key_heads,&value_heads};
+            if(flyweight_gpu_launch_named("qwen_delta_scan_prologue",static_cast<std::uint32_t>(rows),
+                   static_cast<std::uint32_t>(key_heads),128,0,runtime.stream,prologue_args)!=0)
+                throw std::runtime_error("native MTP fold kernel failed: qwen_delta_scan_prologue");
+            void*pre_args[]={const_cast<std::uint64_t*>(&convolved),
+                const_cast<std::uint64_t*>(&gates),
+                const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                &norm,&recurrent_state,const_cast<std::uint64_t*>(&output),
+                &rows,&key_heads,&value_heads,&head_dim,
+                const_cast<float*>(&epsilon),&gate_sigmoid};
+            launch("qwen_delta_recurrent_chunk_pre",static_cast<std::uint32_t>(value_heads),128,pre_args);
+        }
+        else if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
         else launch("qwen_delta_recurrent_rows",static_cast<std::uint32_t>(value_heads),256,recurrent_args);
     }
 }
@@ -26964,6 +27073,14 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     if(runtime->cache_admission_enabled)
         qwen_freeze_expert_residency(*runtime);
     qwen_absorb_registration(*runtime);
+    // Slots an MTP verify pass admitted through the staging ring: their
+    // uploads ride the prefetch stream, so order this token's kernels after.
+    if(runtime->verify_admit_pending){
+        if(flyweight_gpu_stream_wait_event(runtime->stream,runtime->verify_admit_event)!=0)
+            throw std::runtime_error("native MTP verify admission fence failed");
+        runtime->verify_admit_pending=false;
+        std::fill(runtime->verify_admit_inflight.begin(),runtime->verify_admit_inflight.end(),0);
+    }
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     const auto expert_phase=runtime->cache_admission_enabled
         ?flyweight::v2::ExpertExecutionPhase::decode
@@ -31241,21 +31358,39 @@ static void qwen_mtp_fold_check(
     FlyweightV2QwenRuntime& runtime, const std::uint32_t* inputs,
     std::uint32_t valid
 ) {
-    struct Saved { std::vector<float> conv, recurrent; };
+    struct Saved { std::vector<float> conv, recurrent, ple; std::uint32_t layer=0; };
     auto capture=[&](std::vector<Saved>&stash){
         stash.clear();
         for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
             auto&layer=runtime.layers[layer_number];
-            if(layer.attention)continue;
+            if(layer.attention&&layer.ple_conv==std::numeric_limits<std::uint64_t>::max())continue;
+            if(layer.attention){
+                // A PLE ring on an attention layer: checked on its own.
+                Saved saved;
+                saved.layer=layer_number;
+                const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+                saved.ple.resize((ple_conv.shape[0]-1)*std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)*ple_conv.shape[1]);
+                if(flyweight_gpu_download(saved.ple.data(),runtime.state+layer.state_third,saved.ple.size()*sizeof(float),runtime.stream)!=0)
+                    throw std::runtime_error("native MTP fold check download failed");
+                stash.push_back(std::move(saved));
+                continue;
+            }
             const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
             const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
             const auto&norm=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
             Saved saved;
+            saved.layer=layer_number;
             saved.conv.resize(conv.shape[0]*conv.shape[1]);
             saved.recurrent.resize(a.shape[0]*norm.shape[0]*norm.shape[0]);
             if(flyweight_gpu_download(saved.conv.data(),runtime.state+layer.state_first,saved.conv.size()*sizeof(float),runtime.stream)!=0
                ||flyweight_gpu_download(saved.recurrent.data(),runtime.state+layer.state_second,saved.recurrent.size()*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native MTP fold check download failed");
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+                saved.ple.resize((ple_conv.shape[0]-1)*std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)*ple_conv.shape[1]);
+                if(flyweight_gpu_download(saved.ple.data(),runtime.state+layer.state_third,saved.ple.size()*sizeof(float),runtime.stream)!=0)
+                    throw std::runtime_error("native MTP fold check download failed");
+            }
             stash.push_back(std::move(saved));
         }
         if(flyweight_gpu_stream_sync(runtime.stream)!=0)
@@ -31284,15 +31419,16 @@ static void qwen_mtp_fold_check(
             // Where and on what machine: this has fired intermittently on CI
             // runners and never on a development box, so the message has to
             // carry what a rerun cannot reproduce.
-            std::fprintf(stderr,"mtp fold check failed: delta layer %zu %s state max_diff=%g rows=%u "
+            std::fprintf(stderr,"mtp fold check failed: layer %u %s state max_diff=%g rows=%u "
                 "differing=%zu/%zu first=%zu fold=%.9g replay=%.9g cpu_features=0x%x\n",
-                index,what,maximum,valid,differing,fold.size(),first,
+                folded[index].layer,what,maximum,valid,differing,fold.size(),first,
                 first<fold.size()?fold[first]:0.0f,first<fold.size()?replay[first]:0.0f,
                 flyweight_cpu_features());
             throw std::runtime_error("native MTP fold state diverged from replay");
         };
         compare(folded[index].conv,replayed[index].conv,"conv");
         compare(folded[index].recurrent,replayed[index].recurrent,"recurrent");
+        compare(folded[index].ple,replayed[index].ple,"ple ring");
     }
 }
 
@@ -31478,7 +31614,12 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     // the drift only reaches the output a few steps later (measured: token 3
     // on a dilation-3 fixture). A checkpoint with a PLE layer therefore takes
     // the full-replay rollback until the ring joins the retention arena.
-    const bool ple_blocks_fold=!runtime.model->config.ple_layers.empty();
+    // ...which it now has: the PLE layer's conv inputs ride the retention arena
+    // (mtp_retain_ple) and the fold replays that ring as well.
+    bool ple_blocks_fold=false;
+    for(const auto&layer:runtime.layers)
+        if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()&&!layer.mtp_retain_ple)
+            ple_blocks_fold=true;
     runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers&&!ple_blocks_fold;
     runtime.mtp_fold_valid=fold_enabled&&!ple_blocks_fold;
     runtime.mtp_fold_rows=rows;
