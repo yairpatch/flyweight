@@ -2777,7 +2777,44 @@ void qwen_forward_rows(
                 cursor+=stride;
                 runtime.prefill_streamed_bytes+=triple_bytes;
             }
-            if(cursor){
+            // Registered experts (direct paging) need no pack: each staged
+            // role DMAs straight from the pinned pages into the arena. The
+            // pack read and wrote every staged byte on the CPU (four worker
+            // threads beside the expert sweep) before the upload read it
+            // again. Flash-Next IQ3_XXS, 6K-token prompts, Gen5 link: 662-678
+            // tok/s packed, 707-712 direct. FLYWEIGHT_STREAM_DIRECT_DMA=0
+            // keeps the pack for A/B.
+            static const bool stream_direct_dma=[]{
+                const char*setting=std::getenv("FLYWEIGHT_STREAM_DIRECT_DMA");
+                return !setting||setting[0]!='0';
+            }();
+            if(cursor&&stream_direct_dma&&layer.expert_dma){
+                const double t_dma=moe_now();
+                std::uint64_t offset=0;
+                for(int slot=0;slot<static_cast<int>(staged.size());++slot){
+                    offset=0;
+                    for(int role=0;role<3;++role){
+                        const auto&tensor=runtime.model->tensors[layer.expert_tensors[role]];
+                        const auto bytes=stream_role_bytes[role];
+                        if(flyweight_gpu_upload(
+                               stream_slice_base+static_cast<std::uint64_t>(slot)*stride+offset,
+                               tensor_data(*runtime.model,tensor)+
+                                   static_cast<std::uint64_t>(staged[slot])*bytes,
+                               bytes,runtime.prefetch_stream)!=0)
+                            throw std::runtime_error(
+                                "native Qwen prefill expert stream DMA failed");
+                        offset+=bytes;
+                    }
+                }
+                if(flyweight_gpu_event_record(
+                       stream_upload_ready_event,runtime.prefetch_stream)!=0||
+                   flyweight_gpu_stream_wait_event(
+                       runtime.stream,stream_upload_ready_event)!=0)
+                    throw std::runtime_error(
+                        "native Qwen prefill expert stream fence failed");
+                if(moe_profile_enabled())
+                    qwen_moe_profile().stream_upload+=moe_now()-t_dma;
+            }else if(cursor){
                 // Pack the staged triples into this span's slice of the
                 // pinned mirror, then move the slice in one copy. The slice
                 // was the source of this span's previous layer upload; the
