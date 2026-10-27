@@ -1547,7 +1547,8 @@ extern "C" int flyweight_gpu_compile(
     }
     for (const char* name : {
              "qwen_q8_embedding", "qwen_f32_matvec",
-             "bf16_matvec_warp", "bf16_matvec_long_rows",
+             "bf16_matvec_warp", "bf16_matvec_long_rows", "bf16_matvec_rows_warp",
+             "route_topk_prior_rows",
              "qwen4_hc_down_inject", "qwen4_hc_up_mix",
              "qwen_f32_matvec_warp",
              "qwen_f16_matvec_warp", "qwen_f16_embedding",
@@ -1758,6 +1759,7 @@ extern "C" int flyweight_gpu_compile(
              "qwen_q8_matmul_rows", "qwen_q8_swiglu_rows",
               "qwen_shared_scale_rows", "qwen_q8_lm_head_argmax_rows",
               "qwen_shared_scale_rows_bf16", "bf16_matmul_rows",
+              "bf16_matmul_tiled64",
              "qwen_delta_recurrent_rows", "route_topk_rows", "rms_norm_rows",
               "q5k_grouped_swiglu_rows", "q5k_grouped_accumulate_rows", "q6k_grouped_swiglu",
               "q5k_grouped_relu2", "q5k_grouped_relu2_rows",

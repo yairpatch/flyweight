@@ -468,6 +468,12 @@ struct QwenLayerPlan {
     std::uint64_t hc_ffn_down = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t hc_ffn_up = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t hc_ffn_inject = std::numeric_limits<std::uint64_t>::max();
+    // qwen4exp's MTP block only: its own head mixer (nextn.hc_head_*, the
+    // checkpoint's mtp.hyper_connection_mixer), which collapses the draft's
+    // streams before the shared LM head.
+    std::uint64_t mtp_head_norm = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t mtp_head_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t mtp_head_up = std::numeric_limits<std::uint64_t>::max();
     // QSA indexer projections (full-attention layers). Loaded and resident from
     // phase 1 so residency accounting is stable, exercised only once the
     // sparse selection lands (plans/qwen4exp-flash-next.md phase 3).
@@ -548,6 +554,9 @@ struct QwenLayerPlan {
     // re-running the whole forward. Sized for the 8-row verifier maximum.
     std::uint64_t mtp_retain_qkv = 0;
     std::uint64_t mtp_retain_logits = 0;
+    // qwen4exp's PLE layer: the dilated conv's per-row inputs, retained the
+    // same way so the fold can replay that ring too.
+    std::uint64_t mtp_retain_ple = 0;
 };
 
 struct QwenExpertSlot {
@@ -741,7 +750,7 @@ struct QwenLayerOffsets {
     std::uint64_t state_first = 0, state_second = 0, state_third = 0;
     std::uint64_t snapshot_first = 0, snapshot_second = 0, snapshot_third = 0;
     std::uint64_t qsa_blocks = 0, qsa_ring = 0;
-    std::uint64_t mtp_retain_qkv = 0, mtp_retain_logits = 0;
+    std::uint64_t mtp_retain_qkv = 0, mtp_retain_logits = 0, mtp_retain_ple = 0;
 };
 
 struct QwenSlotGeometry {
@@ -1525,6 +1534,28 @@ struct FlyweightV2QwenRuntime {
     // slices fit; host block is one sequence's private host staging.
     std::vector<std::uint64_t> slot_events;
     std::uint64_t staging_event = 0;
+    // MTP verify admissions without direct paging: misses the cache policy
+    // admits are memcpy'd into this pinned ring and uploaded on the prefetch
+    // stream while the CPU computes them for the current pass; the next pass
+    // waits on verify_admit_event before its kernels read the slots.
+    void* verify_admit_staging = nullptr;
+    std::uint64_t verify_admit_bytes = 0;
+    std::uint64_t verify_admit_event = 0;
+    bool verify_admit_pending = false;
+    // qwen4exp's 2048-row prefill chunk, when its workspace would leave the
+    // hybrid expert cache nothing: prepare asks for a retry, and the retry
+    // caps the chunk here.
+    std::uint32_t prefill_rows_cap = 0;
+    bool prefill_rows_retry = false;
+    // Opt-in routing approximations (see qwen_route_prior_refresh and
+    // qwen_route_tail_skip): a device flag per (layer, expert) marking the
+    // experts the GPU cache holds, rebuilt before each decode token or verify
+    // pass when FLYWEIGHT_ROUTE_PRIOR is set.
+    std::uint64_t route_prior_mask = 0;
+    std::vector<std::uint8_t> route_prior_host;
+    // Slots whose staged upload is still in flight: a later row of the same
+    // pass must not read them on the compute stream.
+    std::vector<std::uint8_t> verify_admit_inflight;
     std::uint64_t prefetch_stream = 0;
     std::uint64_t prefetch_event = 0;
     bool prefetch_pending = false;
@@ -1696,6 +1727,7 @@ static void qwen_apply_geometry(FlyweightV2QwenRuntime& runtime, std::size_t ind
         layer.qsa_ring = o.qsa_ring;
         layer.mtp_retain_qkv = o.mtp_retain_qkv;
         layer.mtp_retain_logits = o.mtp_retain_logits;
+        layer.mtp_retain_ple = o.mtp_retain_ple;
     };
     for (std::size_t i = 0; i < runtime.layers.size() && i < g.layers.size(); ++i)
         apply_layer(runtime.layers[i], g.layers[i]);
@@ -2602,6 +2634,18 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.cuda_graphs=false;
     runtime.cuda_graph_builds=runtime.cuda_graph_replays=runtime.cuda_graph_fallbacks=0;
     runtime.delta_host_ns=runtime.delta_host_calls=0;
+    if (runtime.verify_admit_staging) {
+        flyweight_gpu_stream_sync(runtime.prefetch_stream);
+        flyweight_gpu_host_free(runtime.verify_admit_staging);
+    }
+    runtime.verify_admit_staging = nullptr;
+    runtime.verify_admit_bytes = 0;
+    if (runtime.route_prior_mask) flyweight_gpu_free(runtime.route_prior_mask);
+    runtime.route_prior_mask = 0;
+    runtime.route_prior_host.clear();
+    if (runtime.verify_admit_event) flyweight_gpu_event_destroy(runtime.verify_admit_event);
+    runtime.verify_admit_event = 0;
+    runtime.verify_admit_pending = false;
     flyweight_gpu_stream_destroy(runtime.prefetch_stream);
     runtime.prefetch_stream = 0;
     flyweight_gpu_stream_destroy(runtime.graph_stream);
@@ -3327,6 +3371,54 @@ int qwen_hybrid_gpu_miss_mode() {
     return mode;
 }
 
+// Opt-in routing approximations after Strata (both change the model's output
+// and are off unless asked for):
+//
+// FLYWEIGHT_ROUTE_PRIOR=<x>: routing picks the top-k on logit + x for experts
+// the GPU cache holds, so more routes hit it; the weights stay the router's
+// softmax over the picked set (Strata's STRATA_ROUTE_PRIOR, default 1.5 there
+// on small cards).
+//
+// FLYWEIGHT_ROUTE_TAIL_SKIP=<rank>: a routed expert that misses the cache and
+// sits at rank >= <rank> of the top-k (every verify row that routes it, for
+// an MTP pass) is neither computed nor admitted; its contribution is dropped
+// without renormalizing the others (Strata's route tail skip, rank 7 of 10).
+float qwen_route_prior() {
+    static const float prior = [] {
+        const char* setting = std::getenv("FLYWEIGHT_ROUTE_PRIOR");
+        return setting ? static_cast<float>(std::atof(setting)) : 0.0f;
+    }();
+    return prior;
+}
+int qwen_route_tail_skip() {
+    static const int rank = [] {
+        const char* setting = std::getenv("FLYWEIGHT_ROUTE_TAIL_SKIP");
+        return setting ? std::max(0, std::atoi(setting)) : 0;
+    }();
+    return rank;
+}
+// Rebuild the residency flags from the cache's slots and upload them ahead of
+// the work that routes against them. Cheap: a flag per (layer, expert).
+void qwen_route_prior_refresh(FlyweightV2QwenRuntime& runtime) {
+    if (qwen_route_prior() == 0.0f || runtime.expert_slots.empty()) return;
+    const std::uint64_t experts = runtime.model->config.expert_count;
+    const std::uint64_t bytes = runtime.layers.size() * experts;
+    if (!runtime.route_prior_mask &&
+        flyweight_gpu_alloc(bytes, &runtime.route_prior_mask) != 0)
+        throw std::runtime_error("native route prior mask allocation failed");
+    runtime.route_prior_host.assign(bytes, 0);
+    for (const auto& slot : runtime.expert_slots) {
+        if (!slot.valid) continue;
+        const auto layer = slot.key >> 32;
+        const auto expert = slot.key & 0xffffffffull;
+        if (layer < runtime.layers.size() && expert < experts)
+            runtime.route_prior_host[layer * experts + expert] = 1;
+    }
+    if (flyweight_gpu_upload(runtime.route_prior_mask, runtime.route_prior_host.data(),
+                             bytes, runtime.stream) != 0)
+        throw std::runtime_error("native route prior mask upload failed");
+}
+
 std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
     if(runtime.laguna)return 8;
     if(runtime.muse)return 9;
@@ -3782,6 +3874,17 @@ void build_qwen4exp_plan(FlyweightV2QwenRuntime& runtime) {
         add_mtp_extra(prefix + "hc_ffn_down.weight", draft.hc_ffn_down);
         add_mtp_extra(prefix + "hc_ffn_up.weight", draft.hc_ffn_up);
         add_mtp_extra(prefix + "hc_ffn_inject.weight", draft.hc_ffn_inject);
+        // The block's own head mixer. Strata collapses the draft's streams
+        // with it (mtp.hyper_connection_mixer); llama.cpp's graph_mtp, which
+        // this first followed, reuses the target's output_hc_*, and the two
+        // differ (hc_head_norm mean 4.79 against output_hc_norm's 3.75).
+        if (has_tensor(model, prefix + "nextn.hc_head_norm.weight") &&
+            has_tensor(model, prefix + "nextn.hc_head_down.weight") &&
+            has_tensor(model, prefix + "nextn.hc_head_up.weight")) {
+            add_mtp_extra(prefix + "nextn.hc_head_norm.weight", draft.mtp_head_norm);
+            add_mtp_extra(prefix + "nextn.hc_head_down.weight", draft.mtp_head_down);
+            add_mtp_extra(prefix + "nextn.hc_head_up.weight", draft.mtp_head_up);
+        }
         draft.attention_heads = model.config.attention_heads;
         draft.kv_heads = model.config.attention_kv_heads;
         draft.head_dim = static_cast<std::uint32_t>(
@@ -7667,44 +7770,44 @@ void qwen4_stage_ple_embed_rows(
         }
         return value;
     };
+    // Every row of the chunk first, then the reads: through PleReader in
+    // tickets of kCapacity rows (16 reader threads keep that many in flight),
+    // or straight from the mapping without it. Through the mapping a 5.5K
+    // token prompt spent 3-9.5 s of its ~30 s here, one page fault per row.
+    std::vector<std::uint64_t> rows(static_cast<std::size_t>(count) * head_count);
     for (int position = 0; position < count; ++position) {
         const std::uint64_t t0 = tokens[position];
         std::uint64_t t1 = back(position, 1);
         std::uint64_t t2 = t1 == eos ? eos : back(position, 2);
         const std::uint64_t bigram = t0 * multipliers[0] ^ t1 * multipliers[1];
         const std::uint64_t trigram = bigram ^ t2 * multipliers[2];
-        float* row_out = gathered.data()
-            + static_cast<std::size_t>(position) * head_count * row_width;
         for (std::uint32_t head = 0; head < head_count; ++head) {
             const std::uint64_t mixed = head < heads_per ? bigram : trigram;
             const std::uint64_t row = mixed % config.ple_head_vocab_sizes[head]
                 + config.ple_head_offsets[head];
             if (row >= rows_total)
                 throw std::runtime_error("native qwen4exp PLE row is out of range");
-            float* destination_row =
-                row_out + static_cast<std::size_t>(head) * row_width;
-            const auto* row_data = source + row * row_bytes;
-            if (table.type == 20) {
-                for (std::uint64_t block = 0;
-                     block * kIq4nlBlockElements < row_width; ++block) {
-                    const auto* base = row_data + block * kIq4nlBlockBytes;
-                    std::uint16_t d_bits = 0;
-                    std::memcpy(&d_bits, base, 2);
-                    const float scale = qwen_half_value(d_bits);
-                    float* out = destination_row + block * kIq4nlBlockElements;
-                    for (int element = 0; element < 16; ++element) {
-                        const std::uint8_t byte = base[2 + element];
-                        out[element] = scale * kIq4nlValues[byte & 15];
-                        out[element + 16] = scale * kIq4nlValues[byte >> 4];
-                    }
-                }
-            } else if (table.type == 0) {
-                std::memcpy(destination_row, row_data, row_width * sizeof(float));
-            } else {
-                qwen_dequant_row(source, table.type, static_cast<int>(row_width),
-                                 row, destination_row);
-            }
+            rows[static_cast<std::size_t>(position) * head_count + head] = row;
         }
+    }
+    qwen4_ple_finish(runtime);  // a decode ticket still in flight goes first
+    if (auto* reader = qwen4_ple_reader(runtime)) {
+        constexpr int kTicket = flyweight::v2::PleReader::kCapacity;
+        for (std::size_t first = 0; first < rows.size(); first += kTicket) {
+            const int batch = static_cast<int>(
+                std::min<std::size_t>(kTicket, rows.size() - first));
+            reader->issue(rows.data() + first, batch);
+            if (!reader->collect())
+                throw std::runtime_error("native qwen4exp PLE direct read failed");
+            for (int index = 0; index < batch; ++index)
+                qwen4_ple_decode_row(table.type, row_width, reader->row(index),
+                    gathered.data() + (first + index) * row_width);
+        }
+    } else {
+        for (std::size_t index = 0; index < rows.size(); ++index)
+            qwen4_ple_decode_row(table.type, row_width,
+                source + rows[index] * row_bytes,
+                gathered.data() + index * row_width);
     }
     if (flyweight_gpu_upload(destination, gathered.data(),
             gathered.size() * sizeof(float), runtime.stream) != 0)
@@ -8965,10 +9068,13 @@ static double qwen_probe_pinned_h2d_gbs() {
     }
     cleanup();
     if (samples.empty()) return 0.0;
-    const std::size_t take = std::min<std::size_t>(samples.size(), 5);
-    std::vector<double> tail(samples.end() - static_cast<std::ptrdiff_t>(take), samples.end());
-    std::sort(tail.begin(), tail.end());
-    return tail[tail.size() / 2];
+    // The fastest copy, not the median of the last few: a laptop link can sit
+    // in a low-power state for the whole probe and report a quarter of what
+    // it delivers under load (7.2 GB/s at startup against 26.7 measured with
+    // the server warm, same boot), and the budget below shrinks with it. A
+    // copy can only be as fast as the link allows, so the maximum is a rate
+    // the link has actually delivered.
+    return *std::max_element(samples.begin(), samples.end());
 }
 
 #if !defined(_WIN32)
@@ -19919,7 +20025,15 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
-    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:1024));
+    // qwen4exp takes 2048: once its bf16 hyper-connection projections run as
+    // a tiled GEMM, its prefill is the CPU expert phase, which reads each
+    // routed expert once per chunk. Flash-Next IQ3_XXS, 6K-token prompt:
+    // 1024 rows 520-536 tok/s, 2048 rows 570-676 (4096 adds nothing and
+    // halves the expert cache). The 2048-row workspace costs the expert cache
+    // ~19% of its slots, and decode speed is flat across that range.
+    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:(runtime->qwen4exp?2048:1024)));
+    if(runtime->prefill_rows_cap&&runtime->prefill_rows>runtime->prefill_rows_cap)
+        runtime->prefill_rows=runtime->prefill_rows_cap;
     if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -20368,7 +20482,7 @@ static std::string qwen_cuda_corpus(){
         std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source+
         flyweight::v2::diffusion_cuda_source;
 }
-int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return guarded([&]{
+static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     // Before anything reads weights in bulk: the hashed n-gram table is not
     // read the way the rest of the mapping is, and the kernel cannot know that.
@@ -20621,6 +20735,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // decay+beta logits (2 * value_heads each row). See QwenLayerPlan.
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
+                if(target.ple_conv!=std::numeric_limits<std::uint64_t>::max())
+                    target.mtp_retain_ple=reserve(
+                        9ULL*runtime->model->tensors[target.ple_conv].shape[1]*sizeof(float));
                 if(target.attention)continue;
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
@@ -20651,6 +20768,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 o.qsa_ring=layer.qsa_ring;
                 o.mtp_retain_qkv=layer.mtp_retain_qkv;
                 o.mtp_retain_logits=layer.mtp_retain_logits;
+                o.mtp_retain_ple=layer.mtp_retain_ple;
                 return o;
             };
             g.layers.reserve(runtime->layers.size());
@@ -20750,6 +20868,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
         // The batched rows forward (MTP verification and chunked prefill)
         // needs workspace and host staging proportional to its row capacity.
+        // A retried prepare (see flyweight_v2_qwen_runtime_prepare) caps the
+        // chunk; prefill_rows itself is set once, at create.
+        if(runtime->prefill_rows_cap&&runtime->prefill_rows>runtime->prefill_rows_cap)
+            runtime->prefill_rows=runtime->prefill_rows_cap;
         runtime->forward_rows_capacity=std::max<std::uint32_t>(runtime->prefill_rows,9);
         const std::uint64_t rows=runtime->forward_rows_capacity;
         const std::uint64_t hidden=runtime->model->config.hidden_size;
@@ -22124,6 +22246,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
         if(!runtime->options.strict_resident&&
            gpu_budget&&base_total_resolved>gpu_budget){
+            // qwen4exp's 2048-row workspace may be what does not fit; the
+            // caller retries with 1024-row chunks before reporting this.
+            if(runtime->qwen4exp&&runtime->prefill_rows>1024&&
+               !runtime->prefill_rows_cap&&!std::getenv("FLYWEIGHT_PREFILL_ROWS"))
+                runtime->prefill_rows_retry=true;
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
             // Every term base_total_resolved carries, so the sum reads back.
             const std::uint64_t snapshot_total=slot_count*
@@ -22561,6 +22688,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             }
         }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
+        // qwen4exp's 2048-row workspace is about twice the 1024-row one. When
+        // the expert cache came out smaller than that workspace, halving the
+        // chunk at least doubles the cache -- worth more to decode than the
+        // wider chunk is to prefill -- so ask for the retry.
+        if(runtime->qwen4exp&&runtime->prefill_rows>1024&&!runtime->prefill_rows_cap&&
+           !std::getenv("FLYWEIGHT_PREFILL_ROWS")&&runtime->expert_slot_bytes&&
+           runtime->expert_cache_bytes<runtime->workspace_bytes)
+            runtime->prefill_rows_retry=true;
         // Say how many expert slots this budget bought, and where the budget
         // came from. Slot count decides expert placement, placement decides
         // greedy output, and under auto-fit the count follows free VRAM at
@@ -22662,6 +22797,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             if(runtime->options.gpu_layers_explicit&&!runtime->options.gpu_layers)
                 std::fprintf(stderr,
                     "[flyweight] --n-gpu-layers 0: routed experts run on the CPU MoE\n");
+            else if(runtime->qwen4exp&&runtime->prefill_rows>1024&&
+                    !runtime->prefill_rows_cap&&!std::getenv("FLYWEIGHT_PREFILL_ROWS"))
+                // Finish this prepare as planned; the caller retries it with
+                // 1024-row chunks rather than run every expert on the CPU.
+                runtime->prefill_rows_retry=true;
             else
                 std::fprintf(stderr,
                     "[flyweight] hybrid expert cache does not fit; falling back to CPU MoE\n");
@@ -22870,32 +23010,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // whatever the pinning, so page pressure dominates either way. It stays
         // available for boxes where the numbers come out differently, but it does
         // not turn itself on to buy nothing and lock pages doing it.
-        // The exception, measured since: qwen4exp with its n-gram table read
-        // through PleReader. The table no longer takes page cache, so every
-        // expert layer fits the budget (40 GiB of 48 layers for Flash-Next
-        // IQ3_XXS on the 60 GiB box), and pinned experts cannot be evicted by
-        // the table or the dense weights. Interleaved warm runs (2026-10-26):
-        // decode 21.7-22.9 ms a token pinned against 23.0-23.9 staged, and a
-        // staged run that follows anything else that churned the page cache
-        // is far worse. So auto pins when every expert layer fits, and only
-        // then -- partial coverage is still the no-win case above.
-        bool auto_full_direct=false;
-        if(runtime->options.expert_paging==0&&!ram_for_direct&&
-           runtime->expert_mode==flyweight::v2::ExpertExecutionMode::hybrid&&
-           runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
-           qwen4_ple_direct_planned()&&
-           runtime->host_available_bytes>kRegisterReserveBytes){
-            std::uint64_t all_experts=0;
-            const int roles=runtime->nemotron?2:3;
-            for(const auto& layer:runtime->layers){
-                if(!qwen_layer_expert_count(*runtime,layer))continue;
-                for(int role=0;role<roles;++role)
-                    all_experts+=runtime->model->tensors[layer.expert_tensors[role]].size;
-            }
-            auto_full_direct=all_experts>0&&
-                all_experts<=runtime->host_available_bytes-kRegisterReserveBytes;
-        }
-        const bool budgeted_direct=(forced_direct||auto_full_direct)&&!auto_direct&&
+        // Measured again 2026-10-27 for qwen4exp, whose n-gram table no longer
+        // takes page cache so all 40 GiB of Flash-Next's experts fit: warm
+        // short-prompt decode was ~1.5 ms a token faster pinned, but a 40K-token
+        // prompt at an 86K context then swapped -- pinned pages leave ~10 GiB
+        // for the prompt cache, checkpoints and everything else, and a second
+        // 40K prompt ran for over ten minutes against 76 s staged. Staged keeps
+        // the experts in reclaimable page cache. Still opt-in.
+        const bool budgeted_direct=forced_direct&&!auto_direct&&
             runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
@@ -23140,6 +23262,28 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
     return 0;
 });}
+
+// qwen4exp prefills in 2048-row chunks, whose workspace (~0.95 GiB at a 64K
+// context) can leave no room for the hybrid expert cache on a 12 GiB card
+// sharing its memory with a desktop. Measured there: decode then ran every
+// expert on the CPU. That prepare asks for a retry, and this redoes it with
+// 1024-row chunks before anything has run.
+int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){
+    if(!runtime)return qwen_runtime_prepare_once(runtime);
+    const auto expert_mode=runtime->expert_mode;
+    const auto moe_device=runtime->options.moe_device;
+    const int status=qwen_runtime_prepare_once(runtime);
+    if(!runtime->prefill_rows_retry)return status;
+    runtime->prefill_rows_retry=false;
+    std::fprintf(stderr,
+        "[flyweight] 2048-row prefill chunks leave too little VRAM for the expert "
+        "cache; using 1024-row chunks\n");
+    release_qwen_device(*runtime);
+    runtime->prefill_rows_cap=1024;
+    runtime->expert_mode=expert_mode;
+    runtime->options.moe_device=moe_device;
+    return qwen_runtime_prepare_once(runtime);
+}
 
 // KV cache kernel selection by configured precision (0=f32, 1=f16, 2=bf16).
 // K and V are independent: append is one kv_store_<t> launch per cache; scores
@@ -24633,10 +24777,22 @@ std::uint32_t qwen4exp_mtp_draft(
         void* copy_args[] = {const_cast<std::uint64_t*>(&hc_streams), &draft_hidden, &count};
         launch("qwen_copy_vector", (hc_wide_size + 255) / 256, 1, copy_args);
     }
-    // No final norm on this arch: the inject-less collapse IS it.
-    hc_pre(runtime.device_tensors[runtime.output_hc_norm],
-           runtime.output_hc_down, runtime.output_hc_up,
-           std::numeric_limits<std::uint64_t>::max());
+    // No final norm on this arch: the inject-less collapse IS it -- through
+    // the block's own head mixer when the checkpoint carries one.
+    // FLYWEIGHT_MTP_OWN_HEAD=0 collapses with the target's output_hc_* (the
+    // llama.cpp reading) for A/B.
+    static const bool own_head = [] {
+        const char* setting = std::getenv("FLYWEIGHT_MTP_OWN_HEAD");
+        return !setting || setting[0] != '0';
+    }();
+    if (own_head && layer.mtp_head_norm != std::numeric_limits<std::uint64_t>::max())
+        hc_pre(runtime.device_tensors[layer.mtp_head_norm],
+               layer.mtp_head_down, layer.mtp_head_up,
+               std::numeric_limits<std::uint64_t>::max());
+    else
+        hc_pre(runtime.device_tensors[runtime.output_hc_norm],
+               runtime.output_hc_down, runtime.output_hc_up,
+               std::numeric_limits<std::uint64_t>::max());
     if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     int vocabulary = static_cast<int>(config.vocabulary_size);
@@ -24911,6 +25067,23 @@ void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
         if(flyweight_gpu_launch_named(name,gx,1,bx,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native MTP fold kernel failed: ")+name);
     };
+    // qwen4exp's PLE ring: replay the dilated conv over the retained inputs.
+    // The kernel writes its output over its input, so it runs on a copy.
+    for(auto&layer:runtime.layers){
+        if(layer.ple_conv==std::numeric_limits<std::uint64_t>::max()||!layer.mtp_retain_ple)continue;
+        const auto&conv=runtime.model->tensors[layer.ple_conv];
+        int channels=static_cast<int>(conv.shape[1]);
+        int kernel_size=static_cast<int>(conv.shape[0]);
+        int dilation=static_cast<int>(std::max<std::uint32_t>(runtime.model->config.ple_ngram_size,1));
+        auto scratch=convolved;
+        if(flyweight_gpu_copy_device(scratch,runtime.state+layer.mtp_retain_ple,
+               static_cast<std::uint64_t>(rows)*channels*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native MTP PLE fold copy failed");
+        auto weights=runtime.device_tensors[layer.ple_conv];
+        auto state=runtime.state+layer.state_third;
+        void*args[]={&scratch,&weights,&state,&scratch,&rows,&channels,&kernel_size,&dilation};
+        launch("qwen4_ple_conv_sequence",(static_cast<std::uint32_t>(channels)+255)/256,256,args);
+    }
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         auto&layer=runtime.layers[layer_number];
         if(layer.attention)continue;
@@ -24933,11 +25106,46 @@ void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
         if(kernel_size<=8)launch("delta_conv_chunk",(static_cast<std::uint32_t>(channels)+255)/256,256,conv_args);
         else launch("delta_conv_sequence",static_cast<std::uint32_t>(channels),1,conv_args);
         auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
-        // MTP fold replay is unreachable for qwen4exp (no draft block), so the
-        // gate stays the qwen3.5 silu form.
-        int gate_sigmoid=0;
+        // qwen4exp gates the recurrence output with a sigmoid, as its verify did.
+        int gate_sigmoid=runtime.qwen4exp?1:0;
         void*recurrent_args[]={const_cast<std::uint64_t*>(&convolved),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&output),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon),&gate_sigmoid};
-        if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
+        // Same kernel choice as the verify pass (qwen_forward_rows), so the
+        // rebuilt state is bitwise the replay's: the prologue form where the
+        // verifier takes it -- it does on qwen4exp -- else the plain chunk.
+        static const bool prologue_enabled=[]{
+            const char*setting=std::getenv("FLYWEIGHT_DELTA_PROLOGUE");
+            return !setting||setting[0]!='0';
+        }();
+        const bool prologue_ok=head_dim==128&&prologue_enabled&&
+            !flyweight_backend_is_cpu()&&
+            static_cast<std::uint64_t>(value_heads)==runtime.delta_value_heads&&
+            key_heads>0&&key_heads<=value_heads&&
+            layout.delta_w.size&&layout.delta_u.size&&
+            layout.delta_qinv.size&&layout.delta_kinv.size;
+        if(prologue_ok){
+            const auto norm_q=layout.delta_w.address(runtime.workspace);
+            const auto norm_k=layout.delta_u.address(runtime.workspace);
+            const auto beta_pre=layout.delta_qinv.address(runtime.workspace);
+            const auto decay_pre=layout.delta_kinv.address(runtime.workspace);
+            void*prologue_args[]={const_cast<std::uint64_t*>(&convolved),
+                const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),
+                &decay,&dt,
+                const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                &rows,&key_heads,&value_heads};
+            if(flyweight_gpu_launch_named("qwen_delta_scan_prologue",static_cast<std::uint32_t>(rows),
+                   static_cast<std::uint32_t>(key_heads),128,0,runtime.stream,prologue_args)!=0)
+                throw std::runtime_error("native MTP fold kernel failed: qwen_delta_scan_prologue");
+            void*pre_args[]={const_cast<std::uint64_t*>(&convolved),
+                const_cast<std::uint64_t*>(&gates),
+                const_cast<std::uint64_t*>(&beta_pre),const_cast<std::uint64_t*>(&decay_pre),
+                const_cast<std::uint64_t*>(&norm_q),const_cast<std::uint64_t*>(&norm_k),
+                &norm,&recurrent_state,const_cast<std::uint64_t*>(&output),
+                &rows,&key_heads,&value_heads,&head_dim,
+                const_cast<float*>(&epsilon),&gate_sigmoid};
+            launch("qwen_delta_recurrent_chunk_pre",static_cast<std::uint32_t>(value_heads),128,pre_args);
+        }
+        else if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
         else launch("qwen_delta_recurrent_rows",static_cast<std::uint32_t>(value_heads),256,recurrent_args);
     }
 }
@@ -26500,6 +26708,8 @@ static void qwen_run_hybrid_experts(
             continue;
         }
         ++runtime.expert_cache_misses;
+        // Opt-in route tail skip: a low-ranked miss is dropped outright.
+        if (qwen_route_tail_skip() > 0 && rank >= qwen_route_tail_skip()) continue;
         // Admit before choosing the device when misses may run on the GPU:
         // only a miss that actually received a slot has weights the grouped
         // kernels can read. The flag-off path keeps the previous order.
@@ -26973,6 +27183,15 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     if(runtime->cache_admission_enabled)
         qwen_freeze_expert_residency(*runtime);
     qwen_absorb_registration(*runtime);
+    // Slots an MTP verify pass admitted through the staging ring: their
+    // uploads ride the prefetch stream, so order this token's kernels after.
+    if(runtime->verify_admit_pending){
+        if(flyweight_gpu_stream_wait_event(runtime->stream,runtime->verify_admit_event)!=0)
+            throw std::runtime_error("native MTP verify admission fence failed");
+        runtime->verify_admit_pending=false;
+        std::fill(runtime->verify_admit_inflight.begin(),runtime->verify_admit_inflight.end(),0);
+    }
+    qwen_route_prior_refresh(*runtime);
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     const auto expert_phase=runtime->cache_admission_enabled
         ?flyweight::v2::ExpertExecutionPhase::decode
@@ -27474,6 +27693,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                                    const_cast<int*>(&experts),const_cast<int*>(&top_k),
                                    &normalize,&weight_scale};
                 launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                             static_cast<std::uint32_t>(2*experts*sizeof(float)));
+            }else if(qwen_route_prior()!=0.0f&&runtime->route_prior_mask){
+                std::uint64_t mask=runtime->route_prior_mask+
+                    static_cast<std::uint64_t>(layer_number)*experts;
+                float prior=qwen_route_prior();
+                int one=1;
+                void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&mask,&prior,
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&route_weights),&one,
+                                   const_cast<int*>(&experts),const_cast<int*>(&top_k)};
+                launch_named("route_topk_prior_rows",1,1,256,route_args,
                              static_cast<std::uint32_t>(2*experts*sizeof(float)));
             }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,launch_stream)!=0)throw std::runtime_error("native Qwen routing failed");
         };
@@ -31250,21 +31480,39 @@ static void qwen_mtp_fold_check(
     FlyweightV2QwenRuntime& runtime, const std::uint32_t* inputs,
     std::uint32_t valid
 ) {
-    struct Saved { std::vector<float> conv, recurrent; };
+    struct Saved { std::vector<float> conv, recurrent, ple; std::uint32_t layer=0; };
     auto capture=[&](std::vector<Saved>&stash){
         stash.clear();
         for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
             auto&layer=runtime.layers[layer_number];
-            if(layer.attention)continue;
+            if(layer.attention&&layer.ple_conv==std::numeric_limits<std::uint64_t>::max())continue;
+            if(layer.attention){
+                // A PLE ring on an attention layer: checked on its own.
+                Saved saved;
+                saved.layer=layer_number;
+                const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+                saved.ple.resize((ple_conv.shape[0]-1)*std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)*ple_conv.shape[1]);
+                if(flyweight_gpu_download(saved.ple.data(),runtime.state+layer.state_third,saved.ple.size()*sizeof(float),runtime.stream)!=0)
+                    throw std::runtime_error("native MTP fold check download failed");
+                stash.push_back(std::move(saved));
+                continue;
+            }
             const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
             const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
             const auto&norm=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
             Saved saved;
+            saved.layer=layer_number;
             saved.conv.resize(conv.shape[0]*conv.shape[1]);
             saved.recurrent.resize(a.shape[0]*norm.shape[0]*norm.shape[0]);
             if(flyweight_gpu_download(saved.conv.data(),runtime.state+layer.state_first,saved.conv.size()*sizeof(float),runtime.stream)!=0
                ||flyweight_gpu_download(saved.recurrent.data(),runtime.state+layer.state_second,saved.recurrent.size()*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native MTP fold check download failed");
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+                saved.ple.resize((ple_conv.shape[0]-1)*std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)*ple_conv.shape[1]);
+                if(flyweight_gpu_download(saved.ple.data(),runtime.state+layer.state_third,saved.ple.size()*sizeof(float),runtime.stream)!=0)
+                    throw std::runtime_error("native MTP fold check download failed");
+            }
             stash.push_back(std::move(saved));
         }
         if(flyweight_gpu_stream_sync(runtime.stream)!=0)
@@ -31293,15 +31541,16 @@ static void qwen_mtp_fold_check(
             // Where and on what machine: this has fired intermittently on CI
             // runners and never on a development box, so the message has to
             // carry what a rerun cannot reproduce.
-            std::fprintf(stderr,"mtp fold check failed: delta layer %zu %s state max_diff=%g rows=%u "
+            std::fprintf(stderr,"mtp fold check failed: layer %u %s state max_diff=%g rows=%u "
                 "differing=%zu/%zu first=%zu fold=%.9g replay=%.9g cpu_features=0x%x\n",
-                index,what,maximum,valid,differing,fold.size(),first,
+                folded[index].layer,what,maximum,valid,differing,fold.size(),first,
                 first<fold.size()?fold[first]:0.0f,first<fold.size()?replay[first]:0.0f,
                 flyweight_cpu_features());
             throw std::runtime_error("native MTP fold state diverged from replay");
         };
         compare(folded[index].conv,replayed[index].conv,"conv");
         compare(folded[index].recurrent,replayed[index].recurrent,"recurrent");
+        compare(folded[index].ple,replayed[index].ple,"ple ring");
     }
 }
 
@@ -31487,7 +31736,12 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     // the drift only reaches the output a few steps later (measured: token 3
     // on a dilation-3 fixture). A checkpoint with a PLE layer therefore takes
     // the full-replay rollback until the ring joins the retention arena.
-    const bool ple_blocks_fold=!runtime.model->config.ple_layers.empty();
+    // ...which it now has: the PLE layer's conv inputs ride the retention arena
+    // (mtp_retain_ple) and the fold replays that ring as well.
+    bool ple_blocks_fold=false;
+    for(const auto&layer:runtime.layers)
+        if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()&&!layer.mtp_retain_ple)
+            ple_blocks_fold=true;
     runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers&&!ple_blocks_fold;
     runtime.mtp_fold_valid=fold_enabled&&!ple_blocks_fold;
     runtime.mtp_fold_rows=rows;
