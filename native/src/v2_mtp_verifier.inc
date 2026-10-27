@@ -787,6 +787,16 @@ void qwen_forward_rows(
         // 48-block grid per projection per layer, pure launch latency, which
         // is what IQ1_M's ssm_alpha/ssm_beta measured as the bulk of the
         // prefill "proj" phase before it got its rows kernel.
+        // bf16 takes the tiled GEMM once there are tokens to share each weight
+        // tile across; bf16_matmul_rows re-reads the matrix per token.
+        static const bool bf16_tiled=[]{const char*e=std::getenv("FLYWEIGHT_BF16_TILED");return !e||e[0]!='0';}();
+        if(bf16_tiled&&type==30&&rows>=16){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
+            launch("bf16_matmul_tiled64",(output_size+63)/64,
+                   (static_cast<std::uint32_t>(rows)+63)/64,256,args);
+            dense_trace("bf16_matmul_tiled64");
+            return;
+        }
         if(format&&format->matmul_rows){
             void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
             using Grid=flyweight::v2::RowsMatmulGrid;

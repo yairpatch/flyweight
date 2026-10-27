@@ -7667,44 +7667,44 @@ void qwen4_stage_ple_embed_rows(
         }
         return value;
     };
+    // Every row of the chunk first, then the reads: through PleReader in
+    // tickets of kCapacity rows (16 reader threads keep that many in flight),
+    // or straight from the mapping without it. Through the mapping a 5.5K
+    // token prompt spent 3-9.5 s of its ~30 s here, one page fault per row.
+    std::vector<std::uint64_t> rows(static_cast<std::size_t>(count) * head_count);
     for (int position = 0; position < count; ++position) {
         const std::uint64_t t0 = tokens[position];
         std::uint64_t t1 = back(position, 1);
         std::uint64_t t2 = t1 == eos ? eos : back(position, 2);
         const std::uint64_t bigram = t0 * multipliers[0] ^ t1 * multipliers[1];
         const std::uint64_t trigram = bigram ^ t2 * multipliers[2];
-        float* row_out = gathered.data()
-            + static_cast<std::size_t>(position) * head_count * row_width;
         for (std::uint32_t head = 0; head < head_count; ++head) {
             const std::uint64_t mixed = head < heads_per ? bigram : trigram;
             const std::uint64_t row = mixed % config.ple_head_vocab_sizes[head]
                 + config.ple_head_offsets[head];
             if (row >= rows_total)
                 throw std::runtime_error("native qwen4exp PLE row is out of range");
-            float* destination_row =
-                row_out + static_cast<std::size_t>(head) * row_width;
-            const auto* row_data = source + row * row_bytes;
-            if (table.type == 20) {
-                for (std::uint64_t block = 0;
-                     block * kIq4nlBlockElements < row_width; ++block) {
-                    const auto* base = row_data + block * kIq4nlBlockBytes;
-                    std::uint16_t d_bits = 0;
-                    std::memcpy(&d_bits, base, 2);
-                    const float scale = qwen_half_value(d_bits);
-                    float* out = destination_row + block * kIq4nlBlockElements;
-                    for (int element = 0; element < 16; ++element) {
-                        const std::uint8_t byte = base[2 + element];
-                        out[element] = scale * kIq4nlValues[byte & 15];
-                        out[element + 16] = scale * kIq4nlValues[byte >> 4];
-                    }
-                }
-            } else if (table.type == 0) {
-                std::memcpy(destination_row, row_data, row_width * sizeof(float));
-            } else {
-                qwen_dequant_row(source, table.type, static_cast<int>(row_width),
-                                 row, destination_row);
-            }
+            rows[static_cast<std::size_t>(position) * head_count + head] = row;
         }
+    }
+    qwen4_ple_finish(runtime);  // a decode ticket still in flight goes first
+    if (auto* reader = qwen4_ple_reader(runtime)) {
+        constexpr int kTicket = flyweight::v2::PleReader::kCapacity;
+        for (std::size_t first = 0; first < rows.size(); first += kTicket) {
+            const int batch = static_cast<int>(
+                std::min<std::size_t>(kTicket, rows.size() - first));
+            reader->issue(rows.data() + first, batch);
+            if (!reader->collect())
+                throw std::runtime_error("native qwen4exp PLE direct read failed");
+            for (int index = 0; index < batch; ++index)
+                qwen4_ple_decode_row(table.type, row_width, reader->row(index),
+                    gathered.data() + (first + index) * row_width);
+        }
+    } else {
+        for (std::size_t index = 0; index < rows.size(); ++index)
+            qwen4_ple_decode_row(table.type, row_width,
+                source + rows[index] * row_bytes,
+                gathered.data() + index * row_width);
     }
     if (flyweight_gpu_upload(destination, gathered.data(),
             gathered.size() * sizeof(float), runtime.stream) != 0)
@@ -8965,10 +8965,13 @@ static double qwen_probe_pinned_h2d_gbs() {
     }
     cleanup();
     if (samples.empty()) return 0.0;
-    const std::size_t take = std::min<std::size_t>(samples.size(), 5);
-    std::vector<double> tail(samples.end() - static_cast<std::ptrdiff_t>(take), samples.end());
-    std::sort(tail.begin(), tail.end());
-    return tail[tail.size() / 2];
+    // The fastest copy, not the median of the last few: a laptop link can sit
+    // in a low-power state for the whole probe and report a quarter of what
+    // it delivers under load (7.2 GB/s at startup against 26.7 measured with
+    // the server warm, same boot), and the budget below shrinks with it. A
+    // copy can only be as fast as the link allows, so the maximum is a rate
+    // the link has actually delivered.
+    return *std::max_element(samples.begin(), samples.end());
 }
 
 #if !defined(_WIN32)
@@ -19919,7 +19922,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
-    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:1024));
+    // qwen4exp takes 2048: once its bf16 hyper-connection projections run as
+    // a tiled GEMM, its prefill is the CPU expert phase, which reads each
+    // routed expert once per chunk. Flash-Next IQ3_XXS, 6K-token prompt:
+    // 1024 rows 520-536 tok/s, 2048 rows 570-676 (4096 adds nothing and
+    // halves the expert cache). The 2048-row workspace costs the expert cache
+    // ~19% of its slots, and decode speed is flat across that range.
+    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:(runtime->qwen4exp?2048:1024)));
     if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));

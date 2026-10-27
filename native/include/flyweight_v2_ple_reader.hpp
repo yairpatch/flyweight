@@ -45,7 +45,8 @@ namespace flyweight::v2 {
 class PleReader {
 public:
     static constexpr std::uint64_t kPage = 4096;
-    static constexpr int kMaxRows = 64;
+    static constexpr int kMaxRows = 64;      // one decode token's rows, at most
+    static constexpr int kCapacity = 512;    // rows one ticket can carry
     static constexpr int kThreads = 16;
 
     PleReader() = default;
@@ -67,7 +68,7 @@ public:
         (void)posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
         // Two pages per row: a row may straddle a page boundary.
         if (posix_memalign(reinterpret_cast<void**>(&pages_), kPage,
-                           2 * kPage * kMaxRows) != 0) {
+                           2 * kPage * kCapacity) != 0) {
             pages_ = nullptr;
             close();
             return false;
@@ -79,7 +80,7 @@ public:
         cache_rows_ = cache_rows;
         tags_.assign(cache_rows, 0);
         cache_.assign(cache_rows * row_bytes, 0);
-        raw_.assign(kMaxRows * row_bytes, 0);
+        raw_.assign(kCapacity * row_bytes, 0);
         stop_ = false;
         for (int index = 0; index < kThreads; ++index)
             workers_.emplace_back([this] { work(); });
@@ -129,7 +130,7 @@ public:
     // is waited out first, since its buffers are about to be reused.
     void issue(const std::uint64_t* rows, int count) {
         drain();
-        if (count > kMaxRows) count = kMaxRows;
+        if (count > kCapacity) count = kCapacity;
         count_ = count;
         int blocks = 0;
         for (int index = 0; index < count; ++index) {
@@ -325,8 +326,8 @@ private:
 
     int fd_ = -1;
     std::uint8_t* pages_ = nullptr;
-    Want wants_[kMaxRows]{};
-    Block blocks_[kMaxRows]{};
+    Want wants_[kCapacity]{};
+    Block blocks_[kCapacity]{};
     int count_ = 0;
     std::uint64_t table_offset_ = 0, row_bytes_ = 0, rows_ = 0, cache_rows_ = 0;
     std::vector<std::uint64_t> tags_;
