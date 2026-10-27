@@ -1542,6 +1542,11 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t verify_admit_bytes = 0;
     std::uint64_t verify_admit_event = 0;
     bool verify_admit_pending = false;
+    // qwen4exp's 2048-row prefill chunk, when its workspace would leave the
+    // hybrid expert cache nothing: prepare asks for a retry, and the retry
+    // caps the chunk here.
+    std::uint32_t prefill_rows_cap = 0;
+    bool prefill_rows_retry = false;
     // Opt-in routing approximations (see qwen_route_prior_refresh and
     // qwen_route_tail_skip): a device flag per (layer, expert) marking the
     // experts the GPU cache holds, rebuilt before each decode token or verify
@@ -20027,6 +20032,8 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // halves the expert cache). The 2048-row workspace costs the expert cache
     // ~19% of its slots, and decode speed is flat across that range.
     runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:(runtime->qwen4exp?2048:1024)));
+    if(runtime->prefill_rows_cap&&runtime->prefill_rows>runtime->prefill_rows_cap)
+        runtime->prefill_rows=runtime->prefill_rows_cap;
     if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -20475,7 +20482,7 @@ static std::string qwen_cuda_corpus(){
         std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source+
         flyweight::v2::diffusion_cuda_source;
 }
-int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return guarded([&]{
+static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     // Before anything reads weights in bulk: the hashed n-gram table is not
     // read the way the rest of the mapping is, and the kernel cannot know that.
@@ -20861,6 +20868,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
         // The batched rows forward (MTP verification and chunked prefill)
         // needs workspace and host staging proportional to its row capacity.
+        // A retried prepare (see flyweight_v2_qwen_runtime_prepare) caps the
+        // chunk; prefill_rows itself is set once, at create.
+        if(runtime->prefill_rows_cap&&runtime->prefill_rows>runtime->prefill_rows_cap)
+            runtime->prefill_rows=runtime->prefill_rows_cap;
         runtime->forward_rows_capacity=std::max<std::uint32_t>(runtime->prefill_rows,9);
         const std::uint64_t rows=runtime->forward_rows_capacity;
         const std::uint64_t hidden=runtime->model->config.hidden_size;
@@ -22235,6 +22246,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
         if(!runtime->options.strict_resident&&
            gpu_budget&&base_total_resolved>gpu_budget){
+            // qwen4exp's 2048-row workspace may be what does not fit; the
+            // caller retries with 1024-row chunks before reporting this.
+            if(runtime->qwen4exp&&runtime->prefill_rows>1024&&
+               !runtime->prefill_rows_cap&&!std::getenv("FLYWEIGHT_PREFILL_ROWS"))
+                runtime->prefill_rows_retry=true;
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
             // Every term base_total_resolved carries, so the sum reads back.
             const std::uint64_t snapshot_total=slot_count*
@@ -22672,6 +22688,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             }
         }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
+        // qwen4exp's 2048-row workspace is about twice the 1024-row one. When
+        // the expert cache came out smaller than that workspace, halving the
+        // chunk at least doubles the cache -- worth more to decode than the
+        // wider chunk is to prefill -- so ask for the retry.
+        if(runtime->qwen4exp&&runtime->prefill_rows>1024&&!runtime->prefill_rows_cap&&
+           !std::getenv("FLYWEIGHT_PREFILL_ROWS")&&runtime->expert_slot_bytes&&
+           runtime->expert_cache_bytes<runtime->workspace_bytes)
+            runtime->prefill_rows_retry=true;
         // Say how many expert slots this budget bought, and where the budget
         // came from. Slot count decides expert placement, placement decides
         // greedy output, and under auto-fit the count follows free VRAM at
@@ -22773,6 +22797,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             if(runtime->options.gpu_layers_explicit&&!runtime->options.gpu_layers)
                 std::fprintf(stderr,
                     "[flyweight] --n-gpu-layers 0: routed experts run on the CPU MoE\n");
+            else if(runtime->qwen4exp&&runtime->prefill_rows>1024&&
+                    !runtime->prefill_rows_cap&&!std::getenv("FLYWEIGHT_PREFILL_ROWS"))
+                // Finish this prepare as planned; the caller retries it with
+                // 1024-row chunks rather than run every expert on the CPU.
+                runtime->prefill_rows_retry=true;
             else
                 std::fprintf(stderr,
                     "[flyweight] hybrid expert cache does not fit; falling back to CPU MoE\n");
@@ -23233,6 +23262,28 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
     return 0;
 });}
+
+// qwen4exp prefills in 2048-row chunks, whose workspace (~0.95 GiB at a 64K
+// context) can leave no room for the hybrid expert cache on a 12 GiB card
+// sharing its memory with a desktop. Measured there: decode then ran every
+// expert on the CPU. That prepare asks for a retry, and this redoes it with
+// 1024-row chunks before anything has run.
+int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){
+    if(!runtime)return qwen_runtime_prepare_once(runtime);
+    const auto expert_mode=runtime->expert_mode;
+    const auto moe_device=runtime->options.moe_device;
+    const int status=qwen_runtime_prepare_once(runtime);
+    if(!runtime->prefill_rows_retry)return status;
+    runtime->prefill_rows_retry=false;
+    std::fprintf(stderr,
+        "[flyweight] 2048-row prefill chunks leave too little VRAM for the expert "
+        "cache; using 1024-row chunks\n");
+    release_qwen_device(*runtime);
+    runtime->prefill_rows_cap=1024;
+    runtime->expert_mode=expert_mode;
+    runtime->options.moe_device=moe_device;
+    return qwen_runtime_prepare_once(runtime);
+}
 
 // KV cache kernel selection by configured precision (0=f32, 1=f16, 2=bf16).
 // K and V are independent: append is one kv_store_<t> launch per cache; scores
