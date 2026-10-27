@@ -683,6 +683,22 @@ def _add_runtime_options(
              "rest into swap",
     )
     add(
+        tuning, "--route-prior", type=float, default=None, metavar="X",
+        help="APPROXIMATE (changes outputs): pick each token's experts on "
+             "router logit + X for experts already in the GPU cache, so more "
+             "routes hit it; the weights stay the router's own. Hybrid "
+             "Flash-Next: 0.75 gives ~+15%% decode for ~1 pt of top-1 "
+             "agreement, 1.5 ~+30%% for ~4 pts (off by default)",
+    )
+    add(
+        tuning, "--route-tail-skip", type=int, default=None, metavar="RANK",
+        help="APPROXIMATE (changes outputs): drop a routed expert that misses "
+             "the GPU cache when it sits at rank >= RANK of the top-k, "
+             "instead of computing it on the CPU; the other weights are not "
+             "renormalized. Hybrid Flash-Next: 7 gives ~+25%% decode for "
+             "~1.7 pts of top-1 agreement (off by default)",
+    )
+    add(
         tuning, "--routed-moe", action="store_true", default=None,
         help="run prompt processing's routed experts through the block-table "
              "MMQ kernels, which is several times faster than the host expert "
@@ -2456,6 +2472,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # The routing approximations are read once by the native runtime, from the
+    # environment; an explicit flag wins over an inherited variable.
+    if getattr(args, "route_prior", None) is not None:
+        os.environ["FLYWEIGHT_ROUTE_PRIOR"] = repr(float(args.route_prior))
+    if getattr(args, "route_tail_skip", None) is not None:
+        os.environ["FLYWEIGHT_ROUTE_TAIL_SKIP"] = str(max(0, int(args.route_tail_skip)))
     if args.command == "doctor":
         return _doctor()
     _resolve_quant(args)

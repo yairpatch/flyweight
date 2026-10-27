@@ -626,6 +626,100 @@ void sampling_block_topk_pairs(
     }
 }
 
+// Softmax top-k over `rows` router rows with an optional residency prior: an
+// expert whose `resident` flag is set competes with `prior` added to its
+// logit (Strata's STRATA_ROUTE_PRIOR), so routing leans toward experts the
+// GPU already holds. The weights are always the router's own softmax,
+// renormalized over the picked set. With no mask (or prior 0) the picks are
+// the plain probabilities' -- route_topk_rows' selection, ties to the lowest
+// index -- made block-wide instead of by thread 0 alone. Grid `rows`, 256
+// threads, 2*experts floats of dynamic shared memory.
+extern "C" __global__
+void route_topk_prior_rows(
+    const float* logits,
+    const unsigned char* resident,
+    const float prior,
+    int* selected,
+    float* routing_weights,
+    const int rows,
+    const int experts,
+    const int top_k
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float route_shared[];
+    float* probabilities = route_shared;
+    float* scores = route_shared + experts;
+    const float* row_logits = logits + (long long)row * experts;
+    float local_maximum = -3.402823466e+38F;
+    for (int index = threadIdx.x; index < experts; index += blockDim.x)
+        local_maximum = fmaxf(local_maximum, row_logits[index]);
+    local_maximum = block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if (threadIdx.x == 0) maximum = local_maximum;
+    __syncthreads();
+    float local_sum = 0.0f;
+    for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+        const float probability = expf(row_logits[index] - maximum);
+        probabilities[index] = probability;
+        local_sum += probability;
+    }
+    local_sum = block_reduce_sum(local_sum);
+    __shared__ float denominator;
+    if (threadIdx.x == 0) denominator = local_sum;
+    __syncthreads();
+    const bool biased = resident != nullptr && prior != 0.0f;
+    for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+        probabilities[index] /= denominator;
+        scores[index] = biased
+            ? row_logits[index] + (resident[index] ? prior : 0.0f)
+            : probabilities[index];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    __shared__ unsigned long long warp_best[32];
+    __shared__ int picked[256];
+    for (int rank = 0; rank < top_k; ++rank) {
+        unsigned long long best = 0ULL;
+        for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+            const float score = scores[index];
+            if (isinf(score) && score < 0.0f) continue;   // already picked
+            const unsigned int bits = __float_as_uint(score);
+            const unsigned int ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+            const unsigned long long key = ((unsigned long long)ordered << 32)
+                | (unsigned long long)(0xffffffffu - (unsigned int)index);
+            best = key > best ? key : best;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned long long other = __shfl_down_sync(0xffffffff, best, offset);
+            best = other > best ? other : best;
+        }
+        if (lane == 0) warp_best[warp] = best;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int other = 1; other < warps; ++other)
+                best = warp_best[other] > best ? warp_best[other] : best;
+            const int index = best != 0ULL
+                ? (int)(0xffffffffu - (unsigned int)(best & 0xffffffffULL)) : 0;
+            picked[rank] = index;
+            scores[index] = __uint_as_float(0xff800000u);   // -inf: taken
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float selected_total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank)
+            selected_total += probabilities[picked[rank]];
+        for (int rank = 0; rank < top_k; ++rank) {
+            selected[row * top_k + rank] = picked[rank];
+            routing_weights[row * top_k + rank] =
+                probabilities[picked[rank]] / selected_total;
+        }
+    }
+}
+
 extern "C" __global__
 void route_topk_rows(
     const float* logits,

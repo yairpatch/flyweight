@@ -2419,6 +2419,17 @@ void qwen_forward_rows(
                                &normalize,&weight_scale};
             launch("route_topk_sigmoid_bias_rows",rows,1,256,route_args,
                    static_cast<std::uint32_t>(2*experts*sizeof(float)));
+        }else if(output_tokens&&qwen_route_prior()!=0.0f&&runtime.route_prior_mask){
+            // MTP verify under the opt-in residency prior (qwen_route_prior).
+            std::uint64_t mask=runtime.route_prior_mask+
+                static_cast<std::uint64_t>(layer_number)*experts;
+            float prior=qwen_route_prior();
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&mask,&prior,
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&route_weights),&rows,
+                               const_cast<int*>(&experts),const_cast<int*>(&top_k)};
+            launch("route_topk_prior_rows",rows,1,256,route_args,
+                   static_cast<std::uint32_t>(2*experts*sizeof(float)));
         }else{
             void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
             launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
@@ -2621,6 +2632,20 @@ void qwen_forward_rows(
             qwen_verify_moe_profile().distinct+=static_cast<std::uint64_t>(
                 std::unique(seen.begin(),seen.end())-seen.begin());
         }
+        // Opt-in route tail skip (qwen_route_tail_skip): the best rank any
+        // row of this pass gives each expert; a miss whose best rank is still
+        // at or past the threshold is dropped for every row.
+        const int tail_skip=output_tokens?qwen_route_tail_skip():0;
+        thread_local std::vector<std::uint8_t> best_rank;
+        if(tail_skip>0){
+            best_rank.assign(static_cast<std::size_t>(layer_experts),255);
+            for(int token=0;token<rows;++token)for(int rank=0;rank<layer_top_k;++rank){
+                const int route=token*layer_top_k+rank;
+                const int expert=selected_host[route];
+                if(weights_host[route]!=0.0f&&expert>=0&&expert<layer_experts)
+                    best_rank[expert]=static_cast<std::uint8_t>(std::min<int>(best_rank[expert],rank));
+            }
+        }
         if(gpu_rows_allowed){
             for(int token=0;token<rows;++token)for(int rank=0;rank<layer_top_k;++rank){
                 const int route=token*layer_top_k+rank;
@@ -2648,6 +2673,10 @@ void qwen_forward_rows(
                 }else{
                     ++runtime.expert_cache_misses;
                     if(verify_moe_profile)++qwen_verify_moe_profile().misses;
+                    if(tail_skip>0&&expert<layer_experts&&best_rank[expert]>=tail_skip){
+                        weights_host[route]=0.0f;   // dropped, not computed
+                        continue;
+                    }
                     // Under MTP this path *is* the decode path, so declining to
                     // admit here leaves the cache empty forever and runs every
                     // route on the CPU. Page in exactly as decode does. Only the
@@ -3863,6 +3892,7 @@ void qwen_verify_target_rows(
         runtime.verify_admit_pending=false;
         std::fill(runtime.verify_admit_inflight.begin(),runtime.verify_admit_inflight.end(),0);
     }
+    qwen_route_prior_refresh(runtime);
     qwen_forward_rows(runtime,input_tokens,rows,output_tokens,final_hidden);
     if(runtime.verify_admit_pending&&
        flyweight_gpu_event_record(runtime.verify_admit_event,runtime.prefetch_stream)!=0)

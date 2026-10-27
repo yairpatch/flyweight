@@ -1542,6 +1542,12 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t verify_admit_bytes = 0;
     std::uint64_t verify_admit_event = 0;
     bool verify_admit_pending = false;
+    // Opt-in routing approximations (see qwen_route_prior_refresh and
+    // qwen_route_tail_skip): a device flag per (layer, expert) marking the
+    // experts the GPU cache holds, rebuilt before each decode token or verify
+    // pass when FLYWEIGHT_ROUTE_PRIOR is set.
+    std::uint64_t route_prior_mask = 0;
+    std::vector<std::uint8_t> route_prior_host;
     // Slots whose staged upload is still in flight: a later row of the same
     // pass must not read them on the compute stream.
     std::vector<std::uint8_t> verify_admit_inflight;
@@ -2629,6 +2635,9 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     }
     runtime.verify_admit_staging = nullptr;
     runtime.verify_admit_bytes = 0;
+    if (runtime.route_prior_mask) flyweight_gpu_free(runtime.route_prior_mask);
+    runtime.route_prior_mask = 0;
+    runtime.route_prior_host.clear();
     if (runtime.verify_admit_event) flyweight_gpu_event_destroy(runtime.verify_admit_event);
     runtime.verify_admit_event = 0;
     runtime.verify_admit_pending = false;
@@ -3355,6 +3364,54 @@ int qwen_hybrid_gpu_miss_mode() {
         return value;
     }();
     return mode;
+}
+
+// Opt-in routing approximations after Strata (both change the model's output
+// and are off unless asked for):
+//
+// FLYWEIGHT_ROUTE_PRIOR=<x>: routing picks the top-k on logit + x for experts
+// the GPU cache holds, so more routes hit it; the weights stay the router's
+// softmax over the picked set (Strata's STRATA_ROUTE_PRIOR, default 1.5 there
+// on small cards).
+//
+// FLYWEIGHT_ROUTE_TAIL_SKIP=<rank>: a routed expert that misses the cache and
+// sits at rank >= <rank> of the top-k (every verify row that routes it, for
+// an MTP pass) is neither computed nor admitted; its contribution is dropped
+// without renormalizing the others (Strata's route tail skip, rank 7 of 10).
+float qwen_route_prior() {
+    static const float prior = [] {
+        const char* setting = std::getenv("FLYWEIGHT_ROUTE_PRIOR");
+        return setting ? static_cast<float>(std::atof(setting)) : 0.0f;
+    }();
+    return prior;
+}
+int qwen_route_tail_skip() {
+    static const int rank = [] {
+        const char* setting = std::getenv("FLYWEIGHT_ROUTE_TAIL_SKIP");
+        return setting ? std::max(0, std::atoi(setting)) : 0;
+    }();
+    return rank;
+}
+// Rebuild the residency flags from the cache's slots and upload them ahead of
+// the work that routes against them. Cheap: a flag per (layer, expert).
+void qwen_route_prior_refresh(FlyweightV2QwenRuntime& runtime) {
+    if (qwen_route_prior() == 0.0f || runtime.expert_slots.empty()) return;
+    const std::uint64_t experts = runtime.model->config.expert_count;
+    const std::uint64_t bytes = runtime.layers.size() * experts;
+    if (!runtime.route_prior_mask &&
+        flyweight_gpu_alloc(bytes, &runtime.route_prior_mask) != 0)
+        throw std::runtime_error("native route prior mask allocation failed");
+    runtime.route_prior_host.assign(bytes, 0);
+    for (const auto& slot : runtime.expert_slots) {
+        if (!slot.valid) continue;
+        const auto layer = slot.key >> 32;
+        const auto expert = slot.key & 0xffffffffull;
+        if (layer < runtime.layers.size() && expert < experts)
+            runtime.route_prior_host[layer * experts + expert] = 1;
+    }
+    if (flyweight_gpu_upload(runtime.route_prior_mask, runtime.route_prior_host.data(),
+                             bytes, runtime.stream) != 0)
+        throw std::runtime_error("native route prior mask upload failed");
 }
 
 std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
@@ -26600,6 +26657,8 @@ static void qwen_run_hybrid_experts(
             continue;
         }
         ++runtime.expert_cache_misses;
+        // Opt-in route tail skip: a low-ranked miss is dropped outright.
+        if (qwen_route_tail_skip() > 0 && rank >= qwen_route_tail_skip()) continue;
         // Admit before choosing the device when misses may run on the GPU:
         // only a miss that actually received a slot has weights the grouped
         // kernels can read. The flag-off path keeps the previous order.
@@ -27081,6 +27140,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         runtime->verify_admit_pending=false;
         std::fill(runtime->verify_admit_inflight.begin(),runtime->verify_admit_inflight.end(),0);
     }
+    qwen_route_prior_refresh(*runtime);
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     const auto expert_phase=runtime->cache_admission_enabled
         ?flyweight::v2::ExpertExecutionPhase::decode
@@ -27582,6 +27642,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                                    const_cast<int*>(&experts),const_cast<int*>(&top_k),
                                    &normalize,&weight_scale};
                 launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                             static_cast<std::uint32_t>(2*experts*sizeof(float)));
+            }else if(qwen_route_prior()!=0.0f&&runtime->route_prior_mask){
+                std::uint64_t mask=runtime->route_prior_mask+
+                    static_cast<std::uint64_t>(layer_number)*experts;
+                float prior=qwen_route_prior();
+                int one=1;
+                void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&mask,&prior,
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&route_weights),&one,
+                                   const_cast<int*>(&experts),const_cast<int*>(&top_k)};
+                launch_named("route_topk_prior_rows",1,1,256,route_args,
                              static_cast<std::uint32_t>(2*experts*sizeof(float)));
             }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,launch_stream)!=0)throw std::runtime_error("native Qwen routing failed");
         };
