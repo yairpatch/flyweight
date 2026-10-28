@@ -1045,6 +1045,10 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t plan_static_tensor_bytes = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_tensor_bytes = 0;
     std::uint64_t mtp_tensor_bytes = 0;
+    // qwen4exp: the draft block's routed experts are resident in the static
+    // arena and the draft's MoE runs on the GPU (FLYWEIGHT_MTP_GPU_EXPERTS=0
+    // keeps the host path).
+    bool mtp_gpu_experts = false;
     std::uint32_t scratch_elements = 0;
     std::uint32_t moe_intermediate = 0;
     std::vector<std::uint64_t> device_tensors;
@@ -21528,9 +21532,29 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
                 persistent[layer.static_tensors[slot]]=true;
             }
         }
+        runtime->mtp_gpu_experts=false;
         if(runtime->options.mtp_drafts){
             for(auto tensor:runtime->mtp_layer_plan.static_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
             for(auto tensor:runtime->mtp_special_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
+            // The draft runs once per drafted token and its routed experts
+            // were all host work: a route download, a sync, the CPU MoE and an
+            // upload, ~2-5 ms a draft. Strata keeps the block's 512 experts in
+            // VRAM (~0.7 GB at Q2_0) and drafts without leaving the GPU; so do
+            // we where the types have grouped kernels.
+            static const bool gpu_experts_enabled=[]{
+                const char*setting=std::getenv("FLYWEIGHT_MTP_GPU_EXPERTS");
+                return !setting||setting[0]!='0';
+            }();
+            const auto&draft=runtime->mtp_layer_plan;
+            if(gpu_experts_enabled&&runtime->qwen4exp&&runtime->mtp_available&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[0]].type)&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[1]].type)&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[2]].type)&&
+               runtime->model->tensors[draft.expert_tensors[0]].type==
+                   runtime->model->tensors[draft.expert_tensors[1]].type){
+                for(int role=0;role<3;++role)persistent[draft.expert_tensors[role]]=true;
+                runtime->mtp_gpu_experts=true;
+            }
         }
         // NVFP4 checkpoints quantize only the routed experts and ship every
         // dense weight as bf16, which costs ~1.9x Q8_0's bytes for the same
@@ -24564,7 +24588,6 @@ std::uint32_t qwen4exp_mtp_draft(
     const auto third = take(runtime.scratch_elements * sizeof(float));
     const auto fourth = take(runtime.scratch_elements * sizeof(float));
     const auto activated = take(top_k * runtime.moe_intermediate * sizeof(float));
-    (void)activated;
     const auto router_logits = take(experts * sizeof(float));
     const auto selected_device = take(top_k * sizeof(std::int32_t));
     const auto route_weights = take(top_k * sizeof(float));
@@ -24721,6 +24744,69 @@ std::uint32_t qwen4exp_mtp_draft(
     if (flyweight_gpu_route_topk(router_logits, selected_device, route_weights,
                                experts, top_k, runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP routing failed");
+    auto shared_expert = [&] {
+        auto up_half = first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
+        dense(9, normalized, first, hidden_size, intermediate);
+        dense(10, normalized, up_half, hidden_size, intermediate);
+        int count = intermediate;
+        void* silu_args[] = {const_cast<std::uint64_t*>(&first),
+                             const_cast<std::uint64_t*>(&second), &count};
+        launch("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, silu_args);
+        dense(11, second, third, intermediate, hidden_size);
+        auto shared_gate = tensor(12);
+        const auto sg_type = runtime.model->tensors[layer.static_tensors.at(12)].type;
+        void* shared_args[] = {const_cast<std::uint64_t*>(&normalized), &shared_gate,
+                               const_cast<std::uint64_t*>(&third),
+                               const_cast<int*>(&hidden_size)};
+        launch(sg_type == 30 ? "qwen_shared_scale_bf16" : "qwen_shared_scale", 1, 1, shared_args);
+    };
+    if (runtime.mtp_gpu_experts) {
+        // Resident experts: tables from the device routes, grouped SwiGLU,
+        // grouped down accumulated onto the shared expert's output. No host
+        // round trip until the drafted token itself.
+        shared_expert();
+        const auto tables = take(static_cast<std::uint64_t>(top_k) *
+                                 (3 * sizeof(std::uint64_t) + 2 * sizeof(float)));
+        std::uint64_t gate_table = tables;
+        std::uint64_t up_table = gate_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t down_table = up_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t gate_scales = down_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t up_scales = gate_scales + top_k * sizeof(float);
+        const auto& gate_t = runtime.model->tensors[layer.expert_tensors[0]];
+        const auto& up_t = runtime.model->tensors[layer.expert_tensors[1]];
+        const auto& down_t = runtime.model->tensors[layer.expert_tensors[2]];
+        unsigned long long gate_base = runtime.device_tensors[layer.expert_tensors[0]];
+        unsigned long long up_base = runtime.device_tensors[layer.expert_tensors[1]];
+        unsigned long long down_base = runtime.device_tensors[layer.expert_tensors[2]];
+        unsigned long long gate_stride = gate_t.size / experts;
+        unsigned long long up_stride = up_t.size / experts;
+        unsigned long long down_stride = down_t.size / experts;
+        int count = top_k;
+        void* table_args[] = {const_cast<std::uint64_t*>(&selected_device),
+                              &gate_base, &up_base, &down_base,
+                              &gate_stride, &up_stride, &down_stride,
+                              &gate_table, &up_table, &down_table,
+                              &gate_scales, &up_scales, &count};
+        if (flyweight_gpu_launch_named("expert_tables_from_routes", 1, 1, 32, 0,
+                                       runtime.stream, table_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP expert tables failed");
+        std::uint64_t activated_rows = activated;
+        void* gate_up_args[] = {&gate_table, &up_table,
+                                const_cast<std::uint64_t*>(&normalized), &activated_rows,
+                                const_cast<int*>(&hidden_size),
+                                const_cast<int*>(&intermediate), &count,
+                                &gate_scales, &up_scales};
+        if (flyweight_gpu_launch_named(
+                qwen_grouped_swiglu_name(gate_t.type, false, false).c_str(),
+                static_cast<std::uint32_t>(intermediate),
+                static_cast<std::uint32_t>(top_k), 256, 0, runtime.stream,
+                gate_up_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP grouped SwiGLU failed");
+        if (qwen_launch_grouped_accumulate(runtime.stream, down_t.type, down_table,
+                                           activated_rows, third, route_weights,
+                                           intermediate, hidden_size, top_k) != 0)
+            throw std::runtime_error("native qwen4exp MTP grouped down failed");
+    } else {
     auto* selected_host = reinterpret_cast<std::int32_t*>(staging);
     const auto weights_offset = device_align(top_k * sizeof(std::int32_t));
     const auto input_offset = weights_offset + device_align(top_k * sizeof(float));
@@ -24738,26 +24824,9 @@ std::uint32_t qwen4exp_mtp_draft(
         || flyweight_gpu_download(cpu_input, normalized, hidden_size * sizeof(float),
                                 runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP route transfer failed");
-    {
-        // Shared expert, then the routed experts on the host -- the same split
-        // the ordinary qwen4exp decode uses.
-        auto up_half = first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
-        dense(9, normalized, first, hidden_size, intermediate);
-        dense(10, normalized, up_half, hidden_size, intermediate);
-        int count = intermediate;
-        void* silu_args[] = {const_cast<std::uint64_t*>(&first),
-                             const_cast<std::uint64_t*>(&second), &count};
-        launch("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, silu_args);
-        dense(11, second, third, intermediate, hidden_size);
-    }
-    {
-        auto shared_gate = tensor(12);
-        const auto sg_type = runtime.model->tensors[layer.static_tensors.at(12)].type;
-        void* shared_args[] = {const_cast<std::uint64_t*>(&normalized), &shared_gate,
-                               const_cast<std::uint64_t*>(&third),
-                               const_cast<int*>(&hidden_size)};
-        launch(sg_type == 30 ? "qwen_shared_scale_bf16" : "qwen_shared_scale", 1, 1, shared_args);
-    }
+    // Shared expert, then the routed experts on the host -- the same split
+    // the ordinary qwen4exp decode uses.
+    shared_expert();
     if (flyweight_gpu_stream_sync(runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP route synchronization failed");
     for (int rank = 0; rank < top_k; ++rank) {
@@ -24777,6 +24846,7 @@ std::uint32_t qwen4exp_mtp_draft(
         void* add_args[] = {const_cast<std::uint64_t*>(&third),
                             const_cast<std::uint64_t*>(&fourth), &one, &count};
         launch("scaled_add", (hidden_size + 255) / 256, 1, add_args);
+    }
     }
     hc_post(third);
 

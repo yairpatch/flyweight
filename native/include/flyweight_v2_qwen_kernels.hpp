@@ -626,6 +626,30 @@ void sampling_block_topk_pairs(
     }
 }
 
+// Pointer and scale tables for the grouped expert kernels, straight from the
+// router's device output: rank r's gate/up/down rows live at
+// base + selected[r] * stride. Lets a fully resident expert set (qwen4exp's
+// MTP draft block) run its MoE without the routes ever visiting the host.
+extern "C" __global__
+void expert_tables_from_routes(
+    const int* selected,
+    const unsigned long long gate_base, const unsigned long long up_base,
+    const unsigned long long down_base, const unsigned long long gate_stride,
+    const unsigned long long up_stride, const unsigned long long down_stride,
+    unsigned long long* gate_table, unsigned long long* up_table,
+    unsigned long long* down_table, float* gate_scales, float* up_scales,
+    const int count
+) {
+    const int rank = threadIdx.x;
+    if (rank >= count) return;
+    const unsigned long long expert = (unsigned long long)selected[rank];
+    gate_table[rank] = gate_base + expert * gate_stride;
+    up_table[rank] = up_base + expert * up_stride;
+    down_table[rank] = down_base + expert * down_stride;
+    gate_scales[rank] = 1.0f;
+    up_scales[rank] = 1.0f;
+}
+
 // Softmax top-k over `rows` router rows with an optional residency prior: an
 // expert whose `resident` flag is set competes with `prior` added to its
 // logit (Strata's STRATA_ROUTE_PRIOR), so routing leans toward experts the
