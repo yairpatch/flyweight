@@ -9451,11 +9451,10 @@ R"FLYWEIGHT_CUDA(
         if (token >= rows || route - token * top_k >= counts[token]) return;   \
     } else if (route >= experts) return;                                        \
     if (row >= output_size) return;                                            \
-    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
-    const unsigned char* gate_row =                                             \
-        (const unsigned char*)gate_ptrs[route] + (long long)row * row_bytes;    \
-    const unsigned char* up_row =                                               \
-        (const unsigned char*)up_ptrs[route] + (long long)row * row_bytes;      \
+    const unsigned char* gate_row = q8_weight_row(                              \
+        (const unsigned char*)gate_ptrs[route], row, input_size, STRIDE);       \
+    const unsigned char* up_row = q8_weight_row(                                \
+        (const unsigned char*)up_ptrs[route], row, input_size, STRIDE);         \
     const signed char* act = vectors + (long long)token * input_size;           \
     const __half* act_scales = vector_scales + (long long)token * scale_stride; \
     const int groups = input_size >> 5;                                         \
@@ -9571,14 +9570,14 @@ extern "C" __global__ void name(                                                
     if (row >= output_size) return;                                            \
     const int base = counts ? token * top_k : 0;                                \
     const int count = counts ? counts[token] : experts;                         \
-    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
     const int groups = input_size >> 5;                                         \
     float partial = 0.0f;                                                       \
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {                    \
         for (int rank = 0; rank < count; ++rank) {                              \
             const int entry = base + rank;                                      \
-            const unsigned char* down_row = (const unsigned char*)              \
-                down_ptrs[entry] + (long long)row * row_bytes;                  \
+            const unsigned char* down_row = q8_weight_row(                      \
+                (const unsigned char*)down_ptrs[entry], row, input_size,        \
+                STRIDE);                                                        \
             const int4* av = (const int4*)(vectors                              \
                 + (long long)entry * input_size + (long long)g * 32);           \
             const int4 lo = av[0], hi = av[1];                                  \
@@ -9622,6 +9621,31 @@ FLYWEIGHT_Q8_GROUPED_DOWN_SIGNATURE(name) {                                     
 FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q4k_q8_grouped_down, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q5k_q8_grouped_down, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_GROUPED_DOWN(q6k_q8_grouped_down, q6k_q8_decode, 210)
+
+// The codebook and flat formats, whose float grouped kernels decode an octet
+// at a time and run compute-bound at ~90 GB/s (an IQ3_XXS 2560x640 gate+up
+// pair took ~13 us). Row bases go through q8_weight_row, so the flat formats'
+// 640-wide down rows (Q2_0, IQ4_NL) fit as well as the super-block ones.
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2xxs_q8_grouped_swiglu, iq2xxs_q8_decode, 66)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2xs_q8_grouped_swiglu, iq2xs_q8_decode, 74)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2s_q8_grouped_swiglu, iq2s_q8_decode, 82)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq3xxs_q8_grouped_swiglu, iq3xxs_q8_decode, 98)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq3s_q8_grouped_swiglu, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq4xs_q8_grouped_swiglu, iq4xs_q8_decode, 136)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq4nl_q8_grouped_swiglu, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq1s_q8_grouped_swiglu, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq1m_q8_grouped_swiglu, iq1m_q8_decode, 56)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(q20_q8_grouped_swiglu, q20_q8_decode, 72)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2xxs_q8_grouped_down, iq2xxs_q8_decode, 66)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2xs_q8_grouped_down, iq2xs_q8_decode, 74)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2s_q8_grouped_down, iq2s_q8_decode, 82)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq3xxs_q8_grouped_down, iq3xxs_q8_decode, 98)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq3s_q8_grouped_down, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq4xs_q8_grouped_down, iq4xs_q8_decode, 136)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq4nl_q8_grouped_down, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq1s_q8_grouped_down, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq1m_q8_grouped_down, iq1m_q8_decode, 56)
+FLYWEIGHT_Q8_GROUPED_DOWN(q20_q8_grouped_down, q20_q8_decode, 72)
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 

@@ -523,15 +523,15 @@ if __name__ == "__main__":
 class GroupedExpertQ8Tests(Q8KernelHarness, unittest.TestCase):
     """The Q8-activation grouped expert kernels must match the float ones.
 
-    ``<q4k|q5k|q6k>_q8_grouped_swiglu`` and ``_q8_grouped_down`` replaced the
-    float grouped kernels for K-quant expert stacks in decode and in the rows
+    ``<format>_q8_grouped_swiglu`` and ``_q8_grouped_down`` replaced the
+    float grouped kernels for K-quant and codebook expert stacks in decode and in the rows
     forward (MTP verify). Each serves both callers -- decode with no counts (one
     activation row shared by every expert) and the rows forward with per-token
     counts -- so both modes are checked, against an activation whose Q8 blocks
     are lossless: only summation order separates the two paths.
     """
 
-    EXPERT_FORMATS = ("Q4_K", "Q5_K", "Q6_K")
+    EXPERT_FORMATS = ("Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ3_XXS", "IQ2_S", "IQ2_XS")
     EXPERTS = 3
 
     def _expert_weights(self, label: str, seed: int) -> list:
@@ -705,3 +705,70 @@ class GroupedExpertQ8Tests(Q8KernelHarness, unittest.TestCase):
                 self._assert_close(self._download(actual, rows * ROWS),
                                    self._download(expected, rows * ROWS),
                                    f"{label} q8 down (rows)")
+
+
+
+class GroupedExpertQ8FlatDownTests(GroupedExpertQ8Tests):
+    """The 640-wide expert down rows of the flat formats (Q2_0, IQ4_NL): not a
+    whole number of 256-value super-blocks, so the Q8 grouped down has to find
+    its row bases the way q8_weight_row does rather than by super-blocks."""
+
+    # label -> (block bytes, prefix, values per block)
+    FLAT = {"IQ4_NL": (18, "iq4nl", 32), "Q2_0": (18, "q20", 64)}
+    WIDTH = 640
+
+    # Borrows the parent's helpers, not its K-quant/codebook cases.
+    test_q8_swiglu_matches_float_grouped_swiglu = None
+    test_q8_down_matches_float_grouped_accumulate = None
+
+    def _flat_weights(self, label: str, seed: int) -> int:
+        block, _, values = self.FLAT[label]
+        blocks = self.WIDTH // values * ROWS
+        rng = np.random.default_rng(seed)
+        packed = rng.integers(0, 256, size=blocks * block, dtype=np.uint8).reshape(blocks, block)
+        packed[:, :2] = rng.uniform(0.01, 0.2, size=blocks).astype(np.float16).view(
+            np.uint8).reshape(blocks, 2)
+        return self._upload(packed.reshape(-1))
+
+    def test_q8_down_matches_float_on_flat_640_rows(self):
+        width, top_k, rows = self.WIDTH, 3, 2
+        routes = rows * top_k
+        scale_stride = (width // 32) * 2
+        for index, (label, (_, prefix, _)) in enumerate(self.FLAT.items()):
+            with self.subTest(quantization=label):
+                experts = [self._flat_weights(label, 900 + 10 * index + e) for e in range(3)]
+                table = self._upload(np.array(
+                    [experts[r % 3] for r in range(routes)], dtype=np.uint64))
+                counts = self._upload(np.array([3, 2], dtype=np.int32))
+                weights = self._upload(np.array(
+                    [0.5, 0.3, 0.2, 0.6, 0.4, 0.0], dtype=np.float32))
+                activated = np.stack([self._exact_q8_activation(91 + index + r)[:width]
+                                      for r in range(routes)])
+                source = self._upload(activated.reshape(-1))
+                expected = self._alloc(rows * ROWS * 4)
+                actual = self._alloc(rows * ROWS * 4)
+                for buffer in (expected, actual):
+                    self.assertEqual(self._lib.flyweight_gpu_memset(
+                        buffer, 0, rows * ROWS * 4, 0), 0)
+                self._launch(f"{prefix}_grouped_accumulate_rows", ROWS, 256,
+                             [ctypes.c_uint64(table), ctypes.c_uint64(source),
+                              ctypes.c_uint64(expected), ctypes.c_uint64(weights),
+                              ctypes.c_uint64(counts), ctypes.c_int32(width),
+                              ctypes.c_int32(ROWS), ctypes.c_int32(top_k),
+                              ctypes.c_int32(rows)], grid_y=rows)
+                q8 = self._alloc(routes * width)
+                scales = self._alloc(routes * scale_stride * 2)
+                self._launch("quantize_q8_blocks_rows", (width + 255) // 256, 256,
+                             [ctypes.c_uint64(source), ctypes.c_uint64(q8),
+                              ctypes.c_uint64(scales), ctypes.c_int32(width),
+                              ctypes.c_int32(scale_stride)], grid_y=routes)
+                self._launch(f"{prefix}_q8_grouped_down", ROWS, 32,
+                             [ctypes.c_uint64(table), ctypes.c_uint64(q8),
+                              ctypes.c_uint64(scales), ctypes.c_uint64(actual),
+                              ctypes.c_uint64(weights), ctypes.c_uint64(counts),
+                              ctypes.c_int32(width), ctypes.c_int32(ROWS),
+                              ctypes.c_int32(top_k), ctypes.c_int32(0),
+                              ctypes.c_int32(scale_stride)], grid_y=rows)
+                self._assert_close(self._download(actual, rows * ROWS),
+                                   self._download(expected, rows * ROWS),
+                                   f"{label} q8 down (640-wide rows)")

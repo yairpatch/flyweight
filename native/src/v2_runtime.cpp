@@ -7325,6 +7325,32 @@ bool qwen_q8_head_enabled() {
     return !setting || setting[0] != '0';
 }
 
+// The codebook and flat formats' Q8 grouped kernels (swiglu or down), or null
+// for a type without one. Their float twins decode an octet at a time and run
+// compute-bound near 90 GB/s; these measured 4-5x faster on 2560x640 stacks.
+const char* qwen_q8_grouped_codebook(std::uint32_t type, bool swiglu) {
+    switch (type) {
+        case 16: return swiglu ? "iq2xxs_q8_grouped_swiglu" : "iq2xxs_q8_grouped_down";
+        case 17: return swiglu ? "iq2xs_q8_grouped_swiglu" : "iq2xs_q8_grouped_down";
+        case 18: return swiglu ? "iq3xxs_q8_grouped_swiglu" : "iq3xxs_q8_grouped_down";
+        case 19: return swiglu ? "iq1s_q8_grouped_swiglu" : "iq1s_q8_grouped_down";
+        case 20: return swiglu ? "iq4nl_q8_grouped_swiglu" : "iq4nl_q8_grouped_down";
+        case 21: return swiglu ? "iq3s_q8_grouped_swiglu" : "iq3s_q8_grouped_down";
+        case 22: return swiglu ? "iq2s_q8_grouped_swiglu" : "iq2s_q8_grouped_down";
+        case 23: return swiglu ? "iq4xs_q8_grouped_swiglu" : "iq4xs_q8_grouped_down";
+        case 29: return swiglu ? "iq1m_q8_grouped_swiglu" : "iq1m_q8_grouped_down";
+        case 42: return swiglu ? "q20_q8_grouped_swiglu" : "q20_q8_grouped_down";
+        default: return nullptr;
+    }
+}
+
+// Whether a row of `input_size` is whole blocks of the type: 32 for IQ4_NL's
+// flat blocks, 64 for Q2_0's, 256 for the super-block formats.
+bool qwen_q8_grouped_width_fits(std::uint32_t type, int input_size) {
+    const int unit = type == 20 ? 32 : type == 42 ? 64 : 256;
+    return input_size > 0 && input_size % unit == 0;
+}
+
 // The Q8-activation grouped SwiGLU for a K-quant expert stack, or null where
 // gate and up differ in type, the row is not super-block aligned, the kernel is
 // missing, or FLYWEIGHT_Q8_EXPERTS=0 (or the FLYWEIGHT_IQ2_Q8_DECODE kill
@@ -7337,22 +7363,25 @@ const char* qwen_q8_grouped_swiglu_kernel(
         return !setting || setting[0] != '0';
     }();
     if (!enabled || !qwen_q8_head_enabled() || gate_type != up_type ||
-        (input_size & 255))
+        !qwen_q8_grouped_width_fits(gate_type, input_size))
         return nullptr;
     const char* name = gate_type == 12 ? "q4k_q8_grouped_swiglu"
         : gate_type == 13 ? "q5k_q8_grouped_swiglu"
-        : gate_type == 14 ? "q6k_q8_grouped_swiglu" : nullptr;
+        : gate_type == 14 ? "q6k_q8_grouped_swiglu"
+        : qwen_q8_grouped_codebook(gate_type, true);
     return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
 }
 
 // The Q8-activation grouped down projection for a K-quant expert stack, under
 // the same switches as qwen_q8_grouped_swiglu_kernel.
 const char* qwen_q8_grouped_down_kernel(std::uint32_t down_type, int input_size) {
-    if (!qwen_q8_grouped_swiglu_kernel(12, 12, 256) || (input_size & 255))
+    if (!qwen_q8_grouped_swiglu_kernel(12, 12, 256) ||
+        !qwen_q8_grouped_width_fits(down_type, input_size))
         return nullptr;
     const char* name = down_type == 12 ? "q4k_q8_grouped_down"
         : down_type == 13 ? "q5k_q8_grouped_down"
-        : down_type == 14 ? "q6k_q8_grouped_down" : nullptr;
+        : down_type == 14 ? "q6k_q8_grouped_down"
+        : qwen_q8_grouped_codebook(down_type, false);
     return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
 }
 
