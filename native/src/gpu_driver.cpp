@@ -1547,7 +1547,7 @@ extern "C" int flyweight_gpu_compile(
     }
     for (const char* name : {
              "qwen_q8_embedding", "qwen_f32_matvec",
-             "bf16_matvec_warp", "bf16_matvec_long_rows", "bf16_matvec_rows_warp",
+             "bf16_matvec_warp", "bf16_matvec_long_rows", "bf16_matvec_rows_warp", "bf16_matvec_rows_split", "bf16_matvec_rows_short",
              "route_topk_prior_rows", "expert_tables_from_routes",
              "qwen4_hc_down_inject", "qwen4_hc_up_mix",
              "qwen_f32_matvec_warp",

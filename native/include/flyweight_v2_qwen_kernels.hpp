@@ -972,6 +972,93 @@ void bf16_matvec_long_rows(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Split-K twin of bf16_matvec_rows_warp for few, long output rows over 2-8
+// tokens: qwen4exp's hyper-connection inject (4 x 10240) ran as one block and
+// its down mix (320 x 10240) as 40, ~25 us each in MTP verify. grid (rows,
+// splits); a block covers `chunk` columns (a multiple of 8) of one row and,
+// with more than one split, adds into an output the host zeroed. The host
+// only launches it for 16-byte aligned rows with columns % 8 == 0.
+extern "C" __global__
+void bf16_matvec_rows_split(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens,
+    const int chunk
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int split = (int)blockIdx.y;
+    const int begin = (split * chunk) >> 3;
+    const int end = min(columns, (split + 1) * chunk) >> 3;
+    const uint4* packed = (const uint4*)(weights + (long long)row * (long long)columns);
+    float partial[8] = {};
+    for (int step = begin + threadIdx.x; step < end; step += blockDim.x) {
+        const uint4 value = packed[step];
+        #pragma unroll
+        for (int token = 0; token < 8; ++token)
+            if (token < tokens)
+                partial[token] += bf16_dot8(
+                    value, vectors + (long long)token * columns + step * 8);
+    }
+    __shared__ float sums[8][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int token = 0; token < 8; ++token) {
+        float value = partial[token];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        if (lane == 0) sums[warp][token] = value;
+    }
+    __syncthreads();
+    if ((int)threadIdx.x >= tokens) return;
+    float value = 0.0f;
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) value += sums[w][threadIdx.x];
+    float* target = output + (long long)threadIdx.x * rows + row;
+    if ((int)gridDim.y == 1) *target = value;
+    else atomicAdd(target, value);
+}
+
+// Short-row twin for many rows of a few hundred columns over 2-8 tokens:
+// qwen4exp's hyper-connection up mix (10240 x 320) is 40 16-byte steps a row,
+// which a warp per row covers in two passes, the second a quarter full. Here
+// eight lanes share a row (four rows a warp, 32 a 256-thread block). Same
+// alignment contract as bf16_matvec_rows_split.
+extern "C" __global__
+void bf16_matvec_rows_short(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens
+) {
+    const int sub = threadIdx.x & 7;
+    const int row = blockIdx.x * (int)(blockDim.x >> 3) + (int)(threadIdx.x >> 3);
+    const uint4* packed = (const uint4*)(weights + (long long)min(row, rows - 1) * (long long)columns);
+    const int steps = columns >> 3;
+    float partial[8] = {};
+    for (int step = sub; step < steps; step += 8) {
+        const uint4 value = packed[step];
+        #pragma unroll
+        for (int token = 0; token < 8; ++token)
+            if (token < tokens)
+                partial[token] += bf16_dot8(
+                    value, vectors + (long long)token * columns + step * 8);
+    }
+    #pragma unroll
+    for (int token = 0; token < 8; ++token) {
+        if (token >= tokens) break;
+        float value = partial[token];
+        for (int offset = 4; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset, 8);
+        if (sub == 0 && row < rows) output[(long long)token * rows + row] = value;
+    }
+}
+
 extern "C" __global__
 void bf16_matmul(
     const unsigned short* weights,

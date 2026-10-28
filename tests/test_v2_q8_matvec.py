@@ -772,3 +772,56 @@ class GroupedExpertQ8FlatDownTests(GroupedExpertQ8Tests):
                 self._assert_close(self._download(actual, rows * ROWS),
                                    self._download(expected, rows * ROWS),
                                    f"{label} q8 down (640-wide rows)")
+
+
+class Bf16RowsKernelTests(GroupedExpertQ8Tests):
+    """The MTP verify bf16 projections: the split-K (few long rows) and short-
+    row (many rows of a few hundred columns) kernels must match the warp form
+    they replace for qwen4exp's hyper-connection shapes."""
+
+    test_q8_swiglu_matches_float_grouped_swiglu = None
+    test_q8_down_matches_float_grouped_accumulate = None
+
+    def _bf16(self, count: int, seed: int) -> int:
+        values = np.random.default_rng(seed).standard_normal(count).astype(np.float32)
+        return self._upload((values.view(np.uint32) >> 16).astype(np.uint16))
+
+    def _warp(self, weights, vectors, rows, columns, tokens):
+        out = self._alloc(tokens * rows * 4)
+        self._launch("bf16_matvec_rows_warp", (rows + 7) // 8, 256,
+                     [ctypes.c_uint64(weights), ctypes.c_uint64(vectors), ctypes.c_uint64(out),
+                      ctypes.c_int32(rows), ctypes.c_int32(columns), ctypes.c_int32(tokens)])
+        return self._download(out, tokens * rows)
+
+    def test_split_and_short_match_warp(self):
+        for rows, columns, chunk in ((4, 10240, 1024), (320, 10240, 5120), (48, 2560, 2560)):
+            for tokens in (2, 3, 8):
+                with self.subTest(kernel="split", rows=rows, columns=columns, tokens=tokens):
+                    weights = self._bf16(rows * columns, rows)
+                    vectors = self._upload(np.random.default_rng(tokens).standard_normal(
+                        tokens * columns).astype(np.float32))
+                    splits = -(-columns // chunk)
+                    out = self._alloc(tokens * rows * 4)
+                    self.assertEqual(self._lib.flyweight_gpu_memset(out, 0, tokens * rows * 4, 0), 0)
+                    self._launch("bf16_matvec_rows_split", rows, 128,
+                                 [ctypes.c_uint64(weights), ctypes.c_uint64(vectors),
+                                  ctypes.c_uint64(out), ctypes.c_int32(rows),
+                                  ctypes.c_int32(columns), ctypes.c_int32(tokens),
+                                  ctypes.c_int32(chunk)], grid_y=splits)
+                    self._assert_close(self._download(out, tokens * rows),
+                                       self._warp(weights, vectors, rows, columns, tokens),
+                                       f"split {rows}x{columns} x{tokens}")
+        for rows, columns in ((10240, 320), (2050, 512)):
+            for tokens in (2, 3, 8):
+                with self.subTest(kernel="short", rows=rows, columns=columns, tokens=tokens):
+                    weights = self._bf16(rows * columns, rows)
+                    vectors = self._upload(np.random.default_rng(tokens).standard_normal(
+                        tokens * columns).astype(np.float32))
+                    out = self._alloc(tokens * rows * 4)
+                    self._launch("bf16_matvec_rows_short", (rows + 31) // 32, 256,
+                                 [ctypes.c_uint64(weights), ctypes.c_uint64(vectors),
+                                  ctypes.c_uint64(out), ctypes.c_int32(rows),
+                                  ctypes.c_int32(columns), ctypes.c_int32(tokens)])
+                    self._assert_close(self._download(out, tokens * rows),
+                                       self._warp(weights, vectors, rows, columns, tokens),
+                                       f"short {rows}x{columns} x{tokens}")
