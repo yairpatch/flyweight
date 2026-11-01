@@ -81,6 +81,7 @@ def bundle(package: Path, dist: Path, work: Path) -> Path:
         if not (package / directory).is_dir():
             raise SystemExit(f"{package / directory} is missing from this install")
         command += ["--add-data", f"{package / directory}{os.pathsep}flyweight/{directory}"]
+    command += ["--add-data", f"{package / 'model_catalog.json'}{os.pathsep}flyweight"]
     if importlib.util.find_spec("PIL") is not None:
         command += ["--collect-submodules", "PIL"]
     if sys.platform == "win32":

@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
-from . import gpu_setup
+from . import gpu_setup, models
 
 APP_NAME = "Flyweight"
 DEFAULT_PORT = 8000
@@ -67,6 +67,7 @@ class Settings:
     api_key: str = ""
     extra_args: str = ""
     recent_models: list[str] = field(default_factory=list)
+    models_dir: str = ""        # where "Get a model" downloads to; "" = ~/Flyweight Models
 
     @classmethod
     def from_dict(cls, data: object) -> "Settings":
@@ -630,6 +631,106 @@ class Controller:
         self.gpu: dict[str, object] | None = None    # gpu_setup.status(), cached
         self.gpu_installer = gpu_setup.Installer()
         self.update: dict[str, str] | None = None
+        self.machine: models.Machine | None = None
+        self.catalog: list[dict[str, object]] = []
+        self.catalog_loading = False
+        self.catalog_cache = (settings_path.parent if settings_path else config_dir()) \
+            / "model-catalog.json"
+        self.fetch_catalog = True
+        self.notice = ""                 # a one-off message for the page to toast
+        self._library: tuple[float, list[dict[str, object]]] = (0.0, [])
+        self.downloads = models.Downloads(self.models_dir, self._download_done)
+
+    # -- models ------------------------------------------------------------------
+
+    def models_dir(self) -> Path:
+        chosen = self.settings.models_dir.strip()
+        return Path(chosen).expanduser() if chosen else models.default_models_dir()
+
+    def refresh_catalog(self) -> None:
+        """Measure this computer and look the catalog's files up (slow: network)."""
+        with self.lock:
+            if self.catalog_loading:
+                return
+            self.catalog_loading = True
+        try:
+            machine = models.machine(self.models_dir())
+            entries = models.load_catalog(self.catalog_cache, fetch=self.fetch_catalog)
+            resolved = [models.resolve_entry(entry, machine) for entry in entries]
+            with self.lock:
+                self.machine, self.catalog = machine, resolved
+        finally:
+            with self.lock:
+                self.catalog_loading = False
+
+    def library(self) -> list[dict[str, object]]:
+        stamp, cached = self._library
+        if time.monotonic() - stamp < 3:
+            return cached
+        found = models.library(self.models_dir())
+        self._library = (time.monotonic(), found)
+        return found
+
+    def _download_done(self, job: "models.Job") -> None:
+        self._library = (0.0, [])
+        with self.lock:
+            self.log(f"Downloaded {job.name}.", "ok")
+            if self.engine is None:
+                self.settings.model = job.result
+                save_settings(self.settings, self.settings_path)
+                self.notice = f"{job.name} is ready. Press Start on Home."
+            else:
+                self.notice = f"{job.name} is downloaded. Stop the current model to switch."
+
+    def download(self, body: dict[str, object]) -> dict[str, object]:
+        entry_id = body.get("id")
+        if entry_id:
+            with self.lock:
+                entry = next((e for e in self.catalog if e.get("id") == entry_id), None)
+            if not entry or not entry.get("available"):
+                return {"ok": False, "error": "That model is not available right now."}
+            repo, name, files = str(entry["repo"]), str(entry["name"]), entry["files"]
+        else:
+            repo, name, files = str(body.get("repo", "")), str(body.get("name", "")), body.get("files")
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not isinstance(files, list) or not files:
+                return {"ok": False, "error": "Nothing to download."}
+        if not isinstance(files, list) or not all(isinstance(f, dict) for f in files):
+            return {"ok": False, "error": "Nothing to download."}
+        machine = self.machine or models.machine(self.models_dir())
+        total = sum(int(f.get("size") or 0) for f in files)
+        if machine.disk_free and total > machine.disk_free - 2**30:
+            return {"ok": False, "error": f"Not enough disk space: this needs "
+                                          f"{total / 2**30:.1f} GB in {self.models_dir()}."}
+        try:
+            job = self.downloads.add(repo, name or repo.split("/")[-1], files)  # type: ignore[arg-type]
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        self.log(f"Downloading {job.name} from Hugging Face ({total / 2**30:.1f} GB).", "note")
+        return {"ok": True, "job": job.id}
+
+    def use_model(self, path: str) -> dict[str, object]:
+        with self.lock:
+            if self.engine is not None:
+                return {"ok": False, "error": "Stop the running model first."}
+        self.update_settings({"model": path})
+        return {"ok": True}
+
+    def delete_model(self, folder: str) -> dict[str, object]:
+        with self.lock:
+            if self.engine is not None and self.settings.model.startswith(folder):
+                return {"ok": False, "error": "Stop the model before deleting it."}
+        try:
+            models.delete_model(self.models_dir(), folder)
+        except (OSError, ValueError) as error:
+            return {"ok": False, "error": str(error)}
+        self._library = (0.0, [])
+        with self.lock:
+            if self.settings.model.startswith(folder):
+                self.settings.model = ""
+            self.settings.recent_models = [m for m in self.settings.recent_models
+                                           if not m.startswith(folder)]
+            save_settings(self.settings, self.settings_path)
+        return {"ok": True}
 
     # -- background facts ----------------------------------------------------
 
@@ -865,7 +966,21 @@ class Controller:
                 "gpuSetup": self.gpu_installer.snapshot(),
                 "update": self.update,
                 "driverUrl": gpu_setup.DRIVER_DOWNLOAD_URL,
+                "notice": self._take_notice(),
+                "models": {
+                    "machine": asdict(self.machine) if self.machine else None,
+                    "summary": self.machine.summary() if self.machine else "",
+                    "catalog": self.catalog,
+                    "loading": self.catalog_loading,
+                    "downloads": self.downloads.snapshot(),
+                    "library": self.library(),
+                    "dir": str(self.models_dir()),
+                },
             }
+
+    def _take_notice(self) -> str:
+        notice, self.notice = self.notice, ""
+        return notice
 
     def shutdown(self) -> None:
         self.stop(wait=True)
@@ -1056,6 +1171,60 @@ def make_server(controller: Controller, token: str, picker=None):
             self._json(403, {"error": "forbidden"})
             return False
 
+        def _models(self, verb: str, body: dict) -> object:
+            """The Get-a-model page's verbs."""
+            if verb == "refresh":
+                threading.Thread(target=controller.refresh_catalog, daemon=True).start()
+                return {"ok": True}
+            if verb == "download":
+                return controller.download(body)
+            if verb in ("pause", "resume", "cancel"):
+                job = str(body.get("job", ""))
+                {"pause": controller.downloads.pause, "resume": controller.downloads.resume,
+                 "cancel": controller.downloads.remove}[verb](job)
+                return {"ok": True}
+            if verb == "search":
+                query = str(body.get("query", "")).strip()
+                if not query:
+                    return {"ok": True, "results": []}
+                try:
+                    return {"ok": True, "results": models.search(query)}
+                except models.HubError as error:
+                    return {"ok": False, "error": str(error)}
+            if verb == "repo":
+                repo = str(body.get("repo", ""))
+                if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+                    return {"ok": False, "error": "That is not a Hugging Face repository name."}
+                machine = controller.machine or models.machine(controller.models_dir())
+                try:
+                    return {"ok": True, "repo": models.repo_details(repo, machine)}
+                except models.HubError as error:
+                    return {"ok": False, "error": f"{repo}: {error}"}
+            if verb == "use":
+                return controller.use_model(str(body.get("path", "")))
+            if verb == "delete":
+                return controller.delete_model(str(body.get("folder", "")))
+            if verb == "reveal":
+                target = str(body.get("path") or "")
+                if not target:  # the downloads folder itself, created on first use
+                    controller.models_dir().mkdir(parents=True, exist_ok=True)
+                    target = str(controller.models_dir())
+                try:
+                    models.reveal(target)
+                except OSError as error:
+                    return {"ok": False, "error": str(error)}
+                return {"ok": True}
+            if verb == "folder":
+                try:
+                    chosen = picker("folder", str(controller.models_dir()))
+                except LookupError:
+                    return {"ok": False, "error": "No folder dialog is available here."}
+                if chosen:
+                    controller.update_settings({"models_dir": chosen})
+                    controller._library = (0.0, [])
+                return {"ok": True, "path": chosen}
+            return {"ok": False, "error": "unknown"}
+
         def do_POST(self) -> None:
             if not self._host_ok():
                 self._send(421, b"", "text/plain")
@@ -1112,6 +1281,8 @@ def make_server(controller: Controller, token: str, picker=None):
                     self._json(200, {"ok": True, "paths": [str(p) for p in written]})
                 except (OSError, subprocess.CalledProcessError) as error:
                     self._json(200, {"ok": False, "error": str(error)})
+            elif path.startswith("/api/models/"):
+                self._json(200, self._models(path[len("/api/models/"):], body))
             elif path == "/api/gpu/setup":
                 self._json(200, controller.setup_gpu())
             elif path == "/api/gpu/refresh":
@@ -1217,6 +1388,7 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
     if refresh_appimage_entry():
         controller.log("Added Flyweight to your applications menu.", "note")
     threading.Thread(target=controller.refresh_gpu, daemon=True).start()
+    threading.Thread(target=controller.refresh_catalog, daemon=True).start()
     threading.Thread(target=controller.check_for_update, daemon=True).start()
     if controller.first_run:
         controller.run_doctor()

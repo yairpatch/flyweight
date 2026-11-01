@@ -25,6 +25,12 @@ const ICONS = {
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
   gpu: '<rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="15" cy="12" r="2.5"/><path d="M7 10h3M7 14h3M6 18v2M10 18v2"/>',
   download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+  sparkle: '<path d="M12 3l1.8 4.6L18.5 9.5l-4.7 1.9L12 16l-1.8-4.6L5.5 9.5l4.7-1.9L12 3Z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  pause: '<rect x="6.5" y="5" width="3.5" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="3.5" height="14" rx="1" fill="currentColor"/>',
+  memory: '<rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 7v10M11 7v10M15 7v10M3 12h18"/>',
+  disk: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
 };
 
@@ -167,6 +173,8 @@ function render() {
   renderChat(s);
   renderDoctor(s);
   renderGpu(s);
+  renderModels(s);
+  if (s.notice) toast(s.notice);
   $("update").hidden = !s.update;
   if (s.update) $("update-text").textContent = `Update to ${s.update.version}`;
 
@@ -270,6 +278,7 @@ function renderChat(s) {
   $("chat-empty").hidden = Boolean(running);
   $("chat-bar").hidden = !running;
   frame.hidden = !running || !s.framed;
+  $("chat-unframed").hidden = !running || s.framed;
   if (running) {
     $("chat-model").textContent = s.model.name;
     $("chat-url").textContent = s.chatUrl;
@@ -341,6 +350,219 @@ function renderGpu(s) {
       <div class="notice-text"><div class="notice-title">${esc(card.title)}</div>
       <div class="notice-detail">${esc(card.detail)}</div>${card.extra || ""}</div>
       <div class="button-row">${card.buttons}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Get a model
+
+const gb = (bytes) => bytes >= 2 ** 30 ? `${(bytes / 2 ** 30).toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 2 ** 20))} MB`;
+const LEVEL_ORDER = { great: 0, good: 1, slow: 2, no: 3 };
+let searchResults = null;     // null: no search yet
+let searchBusy = false;
+let searchError = "";
+const repoDetails = {};       // repo -> details | {loading} | {error}
+const openRepos = new Set();
+
+function setHtml(id, html) {
+  const node = $(id);
+  if (node.dataset.html === html) return;
+  node.dataset.html = html;
+  node.innerHTML = html;
+}
+
+function eta(job) {
+  if (!job.speed) return "";
+  const seconds = (job.total - job.done) / job.speed;
+  if (seconds < 60) return "less than a minute left";
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min left`;
+  return `${(seconds / 3600).toFixed(1)} h left`;
+}
+
+function jobFor(s, repo) {
+  return s.models.downloads.find((j) => j.repo === repo && j.state !== "done");
+}
+
+function downloadedPath(s, entry) {
+  if (!entry.files) return null;
+  const file = entry.files[0].path.split("/").pop();
+  const hit = s.models.library.find((m) => m.repo === entry.repo && m.file === file);
+  return hit ? hit.path : null;
+}
+
+function renderModels(s) {
+  const m = s.models;
+  const active = m.downloads.filter((j) => ["queued", "downloading", "verifying"].includes(j.state));
+  $("nav-models-dot").classList.toggle("on", active.length > 0);
+  const locked = s.status !== "idle" && s.status !== "failed";
+
+  // this computer
+  const mc = m.machine;
+  setHtml("machine", mc ? [
+    `<span class="chip">${icon("memory")}${gb(mc.ram)} memory</span>`,
+    `<span class="chip">${icon("gpu")}${mc.gpu ? `${esc(mc.gpu)} · ${gb(mc.vram)}` : "No GPU — models run on the CPU"}</span>`,
+    `<span class="chip">${icon("disk")}${gb(mc.disk_free)} free</span>`,
+  ].join("") : `<span class="chip">Measuring this computer…</span>`);
+
+  // downloads in progress (and just finished)
+  setHtml("downloads", m.downloads.map((j) => {
+    const pct = j.total ? Math.min(100, Math.round((100 * j.done) / j.total)) : 0;
+    let sub = "", buttons = "", kind = "";
+    if (j.state === "done") {
+      kind = "done";
+      const inUse = s.settings.model === j.result;
+      sub = inUse ? "Downloaded · selected on Home" : "Downloaded";
+      buttons = inUse ? `<button class="button primary small" data-goto="home">${icon("play")}Go to Start</button>`
+        : `<button class="button small" data-use="${esc(j.result)}" ${locked ? "disabled" : ""}>Use</button>`;
+    } else if (j.state === "failed") {
+      kind = "failed";
+      sub = j.error;
+      buttons = `<button class="button ghost small" data-job="cancel" data-id="${j.id}">Remove</button>
+                 <button class="button primary small" data-job="resume" data-id="${j.id}">${icon("refresh")}Resume</button>`;
+    } else if (j.state === "paused") {
+      sub = `Paused · ${gb(j.done)} of ${gb(j.total)}`;
+      buttons = `<button class="button ghost small" data-job="cancel" data-id="${j.id}">Cancel</button>
+                 <button class="button primary small" data-job="resume" data-id="${j.id}">${icon("play")}Resume</button>`;
+    } else {
+      sub = j.state === "queued" ? "Waiting…" : j.state === "verifying" ? "Checking the file…"
+        : `${gb(j.done)} of ${gb(j.total)}${j.speed ? ` · ${gb(j.speed)}/s · ${eta(j)}` : ""}`;
+      buttons = `<button class="button ghost small" data-job="cancel" data-id="${j.id}">Cancel</button>
+                 <button class="button small" data-job="pause" data-id="${j.id}">${icon("pause")}Pause</button>`;
+    }
+    const meter = j.state === "done" || j.state === "failed" ? ""
+      : `<div class="meter"><i style="width:${pct}%"></i></div>`;
+    return `<div class="dl ${kind}">
+      <div class="notice-icon">${icon(kind === "done" ? "check" : kind === "failed" ? "alert" : "download")}</div>
+      <div class="dl-body"><div class="dl-title">${esc(j.name)}</div>${meter}<div class="dl-sub">${esc(sub)}</div></div>
+      <div class="button-row">${buttons}</div></div>`;
+  }).join(""));
+
+  // the catalog
+  if (m.loading && !m.catalog.length) {
+    setHtml("catalog", `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`);
+  } else if (!m.catalog.length) {
+    setHtml("catalog", `<div class="card empty-row">Could not load the list of models. Check the internet connection, then
+      <button class="button ghost small" data-models="refresh">${icon("refresh")}Try again</button></div>`);
+  } else {
+    const entries = [...m.catalog].sort((a, b) =>
+      (a.available === b.available ? 0 : a.available ? -1 : 1)
+      || LEVEL_ORDER[(a.fit || {}).level || "no"] - LEVEL_ORDER[(b.fit || {}).level || "no"]
+      || (b.rank || 0) - (a.rank || 0));
+    const fitting = entries.filter((e) => e.available && e.fit && (e.fit.level === "great" || e.fit.level === "good"));
+    const best = fitting.length ? fitting.reduce((x, y) => ((y.rank || 0) > (x.rank || 0) ? y : x)) : null;
+    if (best) entries.splice(entries.indexOf(best), 1), entries.unshift(best);
+    setHtml("catalog", entries.map((e) => {
+      const job = e.available && jobFor(s, e.repo);
+      const have = e.available && downloadedPath(s, e);
+      const tags = (e.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
+      let foot;
+      if (!e.available) {
+        foot = `<span class="size">Unavailable: ${esc(e.error || "")}</span>`;
+      } else if (job) {
+        const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
+        foot = `<div style="flex:1"><div class="meter"><i style="width:${pct}%"></i></div>
+                <div class="meter-label">${job.state === "paused" ? "Paused" : `${pct}%`}</div></div>`;
+      } else if (have) {
+        const inUse = s.settings.model === have;
+        foot = `<span class="size">${gb(e.size)} · downloaded</span>` + (inUse
+          ? `<span class="chip accent">${icon("check")}Selected</span>`
+          : `<button class="button small" data-use="${esc(have)}" ${locked ? "disabled" : ""}>Use</button>`);
+      } else {
+        foot = `<span class="size">${gb(e.size)} · ${esc(e.quant || "")}</span>
+                <button class="button ${e === best ? "primary" : ""} small" data-download="${esc(e.id)}" ${e.fit.level === "no" ? "disabled" : ""}>${icon("download")}Download</button>`;
+      }
+      const fitBadge = e.available && e.fit ? `<span class="fit ${e.fit.level}">${esc(e.fit.label)}</span>` : "";
+      return `<div class="mcard ${e === best ? "best" : ""} ${!e.available || (e.fit && e.fit.level === "no") ? "dim" : ""}">
+        ${e === best ? `<span class="ribbon">${icon("sparkle")}Best match</span>` : ""}
+        <div class="mcard-head"><div class="mcard-name">${esc(e.name)}</div>${fitBadge}</div>
+        <div class="mcard-desc">${esc(e.description || "")}</div>
+        <div class="chips">${tags}</div>
+        <div class="mcard-foot">${foot}</div></div>`;
+    }).join(""));
+  }
+
+  // the library
+  setHtml("library", m.library.length ? m.library.map((x) => {
+    const inUse = s.settings.model === x.path;
+    return `<div class="lib">
+      <div class="model-tile" style="width:38px;height:38px;border-radius:10px">${icon("cube")}</div>
+      <div class="lib-text"><div class="lib-name">${esc(x.name)}</div>
+        <div class="lib-sub">${esc(x.file)} · ${gb(x.size)}</div></div>
+      ${inUse ? `<span class="chip accent">Selected</span>` : `<button class="button small" data-use="${esc(x.path)}" ${locked ? "disabled" : ""}>Use</button>`}
+      <button class="icon-button" data-reveal="${esc(x.path)}" title="Show in folder" aria-label="Show in folder">${icon("folder")}</button>
+      <button class="icon-button" data-delete="${esc(x.folder)}" data-name="${esc(x.name)}" title="Delete" aria-label="Delete">${icon("trash")}</button>
+    </div>`;
+  }).join("") : `<div class="empty-row">Models you download appear here.</div>`);
+  setHtml("models-dir", `Saved in ${esc(m.dir)}`);
+
+  renderSearch(s);
+}
+
+function renderSearch(s) {
+  if (searchBusy) return setHtml("search-results", `<div class="card empty-row">Searching…</div>`);
+  if (searchError) return setHtml("search-results", `<div class="card empty-row">${esc(searchError)}</div>`);
+  if (searchResults === null) return setHtml("search-results", "");
+  if (!searchResults.length) return setHtml("search-results", `<div class="card empty-row">No GGUF models matched.</div>`);
+  const support = { yes: "Supported", no: "Not supported", unknown: "Unknown" };
+  setHtml("search-results", `<div class="card results">${searchResults.map((r) => {
+    const open = openRepos.has(r.repo);
+    const d = repoDetails[r.repo];
+    let body = "";
+    if (open) {
+      if (!d || d.loading) body = `<div class="result-note">Loading files…</div>`;
+      else if (d.error) body = `<div class="result-note">${esc(d.error)}</div>`;
+      else {
+        const sup = d.supported;
+        const note = d.gated ? "This model needs a Hugging Face login, which Flyweight does not do yet."
+          : sup === "no" ? `Flyweight cannot run the ${esc(d.architecture)} architecture.`
+          : sup === "unknown" ? "Hugging Face does not say which architecture this is; it may not load." : "";
+        body = (note ? `<div class="result-note">${note}</div>` : "") + `<div class="variants">${d.variants.map((v, i) => {
+          const files = v.files.concat(d.projector ? [d.projector] : []);
+          const job = s.models.downloads.find((j) => j.repo === d.repo && j.files[0].path === files[0].path && j.state !== "done");
+          const blocked = d.gated || sup === "no" || v.fit.level === "no";
+          return `<div class="variant"><span class="q">${esc(v.quant)}</span><span class="s">${gb(v.size)}</span>
+            <span class="fit ${v.fit.level}">${esc(v.fit.label)}</span>
+            ${job ? `<span class="s">${Math.round((100 * job.done) / (job.total || 1))}%</span>`
+              : `<button class="button small" data-hub="${esc(d.repo)}" data-variant="${i}" ${blocked ? "disabled" : ""}>${icon("download")}Download</button>`}</div>`;
+        }).join("") || `<div class="result-note">No complete GGUF files in this repository.</div>`}</div>`;
+      }
+    }
+    return `<div class="result"><div class="result-head" data-repo="${esc(r.repo)}">
+      <span class="result-name">${esc(r.repo)}</span>
+      <span class="result-meta">${r.downloads.toLocaleString()} downloads</span>
+      <span class="support ${r.supported}">${support[r.supported] || r.supported}</span>
+      ${icon("chevron")}</div>${body}</div>`;
+  }).join("")}</div>`);
+}
+
+async function searchHub(query) {
+  searchBusy = true; searchError = ""; render();
+  try {
+    const result = await api("/api/models/search", { query });
+    if (result.ok) searchResults = result.results; else searchError = result.error;
+  } catch (error) { searchError = error.message; }
+  searchBusy = false; render();
+}
+
+async function toggleRepo(repo) {
+  if (openRepos.has(repo)) { openRepos.delete(repo); return render(); }
+  openRepos.add(repo);
+  if (!repoDetails[repo] || repoDetails[repo].error) {
+    repoDetails[repo] = { loading: true }; render();
+    try {
+      const result = await api("/api/models/repo", { repo });
+      repoDetails[repo] = result.ok ? result.repo : { error: result.error };
+    } catch (error) { repoDetails[repo] = { error: error.message }; }
+  }
+  render();
+}
+
+async function modelsCall(verb, body = {}) {
+  try {
+    const result = await api(`/api/models/${verb}`, body);
+    if (result && result.ok === false) toast(result.error, "error");
+    await poll();
+    return result;
+  } catch (error) { toast(error.message, "error"); return null; }
 }
 
 function renderDoctor(s) {
@@ -473,7 +695,7 @@ async function copy(text) {
 }
 
 document.addEventListener("click", (event) => {
-  const target = event.target.closest("button, [data-copy], .recent-item, [data-goto]");
+  const target = event.target.closest("button, [data-copy], .recent-item, [data-goto], [data-repo]");
   if (!target) return;
   if (target.dataset.view) return show(target.dataset.view);
   if (target.dataset.goto) return show(target.dataset.goto);
@@ -489,6 +711,22 @@ document.addEventListener("click", (event) => {
   if (target.id === "update") {
     return state && state.update && api("/api/open", { url: state.update.url });
   }
+  if (target.dataset.models) return modelsCall(target.dataset.models);
+  if (target.dataset.download) return modelsCall("download", { id: target.dataset.download });
+  if (target.dataset.use) return modelsCall("use", { path: target.dataset.use }).then(() => toast("Selected. Press Start on Home."));
+  if (target.dataset.reveal) return modelsCall("reveal", { path: target.dataset.reveal });
+  if (target.dataset.job) return modelsCall(target.dataset.job, { job: target.dataset.id });
+  if (target.dataset.delete) {
+    if (!confirm(`Delete ${target.dataset.name} from this computer?`)) return;
+    return modelsCall("delete", { folder: target.dataset.delete });
+  }
+  if (target.dataset.hub) {
+    const d = repoDetails[target.dataset.hub];
+    const v = d.variants[Number(target.dataset.variant)];
+    const files = v.files.concat(d.projector ? [d.projector] : []);
+    return modelsCall("download", { repo: d.repo, name: `${d.repo.split("/").pop()} ${v.quant}`, files });
+  }
+  if (target.dataset.repo) return toggleRepo(target.dataset.repo);
   if (target.dataset.forget) {
     event.stopPropagation();
     return api("/api/forget", { path: target.dataset.forget }).then(poll);
@@ -530,6 +768,12 @@ document.addEventListener("input", (event) => {
   }
 });
 
+$("search-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const query = $("search-input").value.trim();
+  if (query) searchHub(query);
+});
+
 $("collapse").addEventListener("click", () => {
   const app = $("app");
   const collapsed = !app.classList.contains("collapsed");
@@ -537,6 +781,7 @@ $("collapse").addEventListener("click", () => {
   if (view === "chat") userExpanded = !collapsed; else userCollapsed = collapsed;
 });
 $("chat-external").addEventListener("click", () => state && api("/api/open", { url: state.chatUrl }));
+$("chat-open-browser").addEventListener("click", () => state && api("/api/open", { url: state.chatUrl }));
 $("log-copy").addEventListener("click", () => copy(logLines.join("\n")));
 $("log-clear").addEventListener("click", () => { $("log").innerHTML = ""; logLines = []; });
 $("doctor-run").addEventListener("click", () => api("/api/doctor", {}).then(poll));
@@ -567,7 +812,8 @@ async function poll() {
 async function loop() {
   await poll();
   const busy = state && (state.status === "loading" || state.status === "stopping"
-    || state.doctor.running || state.gpuSetup.running || !state.gpu);
+    || state.doctor.running || state.gpuSetup.running || !state.gpu || state.models.loading
+    || state.models.downloads.some((j) => j.state === "downloading" || j.state === "verifying"));
   setTimeout(loop, busy ? 500 : 1000);
 }
 

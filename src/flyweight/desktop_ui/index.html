@@ -18,6 +18,7 @@
       </div>
       <nav class="nav" aria-label="Sections">
         <button class="nav-item" data-view="home"><svg data-icon="home"></svg><span>Home</span></button>
+        <button class="nav-item" data-view="models"><svg data-icon="sparkle"></svg><span>Get a model</span><i class="nav-dot busy" id="nav-models-dot"></i></button>
         <button class="nav-item" data-view="chat"><svg data-icon="chat"></svg><span>Chat</span><i class="nav-dot" id="nav-chat-dot"></i></button>
         <button class="nav-item" data-view="activity"><svg data-icon="activity"></svg><span>Activity</span></button>
         <button class="nav-item" data-view="system"><svg data-icon="shield"></svg><span>System check</span><b class="nav-badge" id="nav-system-badge" hidden></b></button>
@@ -52,11 +53,12 @@
                 <div class="model-empty-icon"><svg data-icon="cube"></svg></div>
                 <div class="model-empty-text">
                   <div class="title">Choose a model</div>
-                  <div class="muted">A <code>.gguf</code> file, or a folder holding a safetensors checkpoint.</div>
+                  <div class="muted">New here? Get one picked for this computer. Already have a <code>.gguf</code>? Choose it.</div>
                 </div>
                 <div class="button-row">
-                  <button class="button primary" data-browse="file"><svg data-icon="file"></svg>Choose file</button>
-                  <button class="button" data-browse="folder"><svg data-icon="folder"></svg>Folder</button>
+                  <button class="button primary" data-goto="models"><svg data-icon="sparkle"></svg>Get a model</button>
+                  <button class="button" data-browse="file"><svg data-icon="file"></svg>Choose file</button>
+                  <button class="icon-button" data-browse="folder" title="Choose a safetensors folder" aria-label="Choose a safetensors folder"><svg data-icon="folder"></svg></button>
                 </div>
               </div>
               <div class="model-chosen" id="model-chosen" hidden>
@@ -170,6 +172,43 @@
         </footer>
       </section>
 
+      <!-- Get a model ----------------------------------------------------- -->
+      <section class="view" id="view-models" hidden>
+        <div class="scroll">
+          <div class="page wide">
+            <div class="view-head flat">
+              <div>
+                <h2>Get a model</h2>
+                <p class="muted">Pick one that suits this computer. Models download from Hugging Face and stay on this computer.</p>
+              </div>
+            </div>
+            <div class="machine" id="machine"></div>
+            <div id="downloads"></div>
+
+            <div class="section-label">Recommended for this computer</div>
+            <div class="catalog" id="catalog"></div>
+
+            <div class="section-row">
+              <div class="section-label">Your models</div>
+              <div class="button-row">
+                <button class="button ghost small" data-models="reveal"><svg data-icon="folder"></svg>Open folder</button>
+                <button class="button ghost small" data-models="folder"><svg data-icon="edit"></svg>Change folder</button>
+              </div>
+            </div>
+            <div class="card library" id="library"></div>
+            <p class="dir-note muted" id="models-dir"></p>
+
+            <div class="section-label">Search Hugging Face</div>
+            <form class="search" id="search-form">
+              <svg data-icon="search"></svg>
+              <input id="search-input" placeholder="Search GGUF models, e.g. qwen3 coder" autocomplete="off" spellcheck="false">
+              <button class="button" type="submit">Search</button>
+            </form>
+            <div id="search-results"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- Chat ------------------------------------------------------------ -->
       <section class="view" id="view-chat" hidden>
         <div class="chat-bar" id="chat-bar">
@@ -180,6 +219,12 @@
           <button class="button ghost small" id="chat-external"><svg data-icon="external"></svg>Open in browser</button>
         </div>
         <iframe class="chat-frame" id="chat-frame" title="Chat" hidden></iframe>
+        <div class="empty" id="chat-unframed" hidden>
+          <div class="empty-icon"><svg data-icon="chat"></svg></div>
+          <h2>Your model is ready</h2>
+          <p class="muted">The chat opens in your web browser.</p>
+          <button class="button primary" id="chat-open-browser"><svg data-icon="external"></svg>Open the chat</button>
+        </div>
         <div class="empty" id="chat-empty">
           <div class="empty-icon"><svg data-icon="chat"></svg></div>
           <h2>No model is running</h2>

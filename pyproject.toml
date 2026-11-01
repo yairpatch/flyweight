@@ -48,6 +48,7 @@ flyweight = [
   "ui/*.svg",
   "ui/assets/*",
   "desktop_ui/*",
+  "model_catalog.json",
 ]
 
 [tool.ruff.lint]

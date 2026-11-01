@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -374,6 +375,36 @@ class LocalApiTests(unittest.TestCase):
         self.assertEqual(start.call_args.args[0], 12)
         _, state = self.call("/api/state")
         self.assertIn("gpuSetup", state)  # type: ignore[operator]
+
+    def test_a_catalog_download_ends_selected_on_home(self) -> None:
+        from tests.hf_stub import HubStub, StubFile
+        from flyweight import models
+
+        hub = HubStub()
+        hub.add("org/Tiny-GGUF", [StubFile("Tiny-Q8_0.gguf", b"GGUF" + b"\0" * 4096)])
+        hub.start()
+        try:
+            with patch.dict(os.environ, {"HF_ENDPOINT": hub.url}):
+                self.controller.update_settings({"models_dir": str(self.root / "models")})
+                machine = models.Machine(ram=16 * 2**30, vram=0, gpu="", disk_free=100 * 2**30)
+                self.controller.machine = machine
+                self.controller.catalog = [models.resolve_entry(
+                    {"id": "tiny", "name": "Tiny", "repo": "org/Tiny-GGUF", "quants": ["Q8_0"]},
+                    machine)]
+                _, result = self.call("/api/models/download", {"id": "tiny"})
+                self.assertTrue(result["ok"])  # type: ignore[index]
+                deadline = time.monotonic() + 20
+                while not self.controller.settings.model and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            expected = self.root / "models" / "org__Tiny-GGUF" / "Tiny-Q8_0.gguf"
+            self.assertEqual(self.controller.settings.model, str(expected))
+            self.assertTrue(desktop.check_model(str(expected)).ok)
+            _, state = self.call("/api/state")
+            self.assertEqual(state["models"]["library"][0]["name"], "Tiny")  # type: ignore[index]
+            _, refused = self.call("/api/models/download", {"repo": "../x", "files": []})
+            self.assertFalse(refused["ok"])  # type: ignore[index]
+        finally:
+            hub.stop()
 
     def test_the_doctor_report_reaches_the_page(self) -> None:
         self.controller.put(("doctor-line", "[FAIL] native runtime: not built"))

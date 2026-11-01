@@ -35,6 +35,11 @@ No terminal, no Python, no CUDA toolkit.
 | **Windows 10/11** | [Flyweight-Setup-windows-x86_64.exe](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-Setup-windows-x86_64.exe) | Open it and click through. No administrator rights needed. Flyweight lands in the Start menu (and on the desktop). |
 | **Linux** (x86-64) | [Flyweight-linux-x86_64.AppImage](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-linux-x86_64.AppImage) | Double-click it. If your file manager only offers to open it as a file, right-click → *Properties* → *Allow executing as a program* first. It adds itself to your applications menu. |
 
+No model yet? **Get a model** in the app recommends ones that fit this
+computer's memory and graphics card, downloads the right file from Hugging
+Face (resumable, checksum-verified) and selects it, so the next step is
+pressing Start.
+
 The first launch checks the computer. With an NVIDIA card, the app offers
 **Set up GPU**: one click downloads NVIDIA's runtime compiler and headers
 (about 95 MB, once) into Flyweight's own folder, so the CUDA toolkit is never
@@ -155,8 +160,8 @@ flyweight app --install-shortcut   # add it to the applications / Start menu
 
 Pick a model (a `.gguf` file, or a safetensors folder), press **Start**, and
 the chat appears in the same window once the model has loaded. A sidebar
-holds four pages: **Home** (model and settings), **Chat**, **Activity** (the
-engine's live log) and **System check**. The app handles the usual first-run
+holds five pages: **Home** (model and settings), **Get a model**, **Chat**,
+**Activity** (the engine's live log) and **System check**. The app handles the usual first-run
 problems for you:
 
 - **Checks the computer first.** The first launch runs `flyweight doctor`;
@@ -172,6 +177,16 @@ problems for you:
 - **No port clashes.** A busy port is skipped for the next free one.
 - **Failures in words.** When the engine stops, a one-line diagnosis names the
   fix: out of memory, port taken, CUDA toolkit missing, damaged file.
+- **Gets you a model.** *Get a model* measures memory, GPU and disk, then
+  lists recommended models with a plain verdict for each ("Runs fast on your
+  GPU", "Runs well (GPU + memory)", "Too big for this computer") and a
+  *Best match*. Downloads pause and resume, are verified against Hugging
+  Face's SHA-256, land in `~/Flyweight Models` (changeable), and are selected
+  on Home when done. A search box finds any GGUF on Hugging Face and marks
+  architectures Flyweight cannot run. The recommended list is
+  `src/flyweight/model_catalog.json`; the app reads it from the main branch,
+  so edits reach installed apps without a release. `HF_ENDPOINT` points at a
+  mirror and `HF_TOKEN` is sent when set.
 - **Sets up the GPU.** An NVIDIA card with only the driver installed gets
   NVRTC and the CUDA headers in one click; a missing driver is pointed out
   with a link to it.
