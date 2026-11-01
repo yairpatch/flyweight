@@ -26,6 +26,27 @@ runs on the same engine beside a chat model (`--image-model`).
 
 ## Install
 
+### The easy way: download the app
+
+No terminal, no Python, no CUDA toolkit.
+
+| | Download | Then |
+| --- | --- | --- |
+| **Windows 10/11** | [Flyweight-Setup-windows-x86_64.exe](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-Setup-windows-x86_64.exe) | Open it and click through. No administrator rights needed. Flyweight lands in the Start menu (and on the desktop). |
+| **Linux** (x86-64) | [Flyweight-linux-x86_64.AppImage](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-linux-x86_64.AppImage) | Double-click it. If your file manager only offers to open it as a file, right-click → *Properties* → *Allow executing as a program* first. It adds itself to your applications menu. |
+
+The first launch checks the computer. With an NVIDIA card, the app offers
+**Set up GPU**: one click downloads NVIDIA's runtime compiler and headers
+(about 95 MB, once) into Flyweight's own folder, so the CUDA toolkit is never
+needed. If the card's driver is missing, it says so and links to NVIDIA's
+download page. Without an NVIDIA GPU, models run on the CPU.
+
+The installer is not code-signed yet, so Windows may show *"Windows protected
+your PC"*: click **More info**, then **Run anyway**. Uninstall from
+*Settings → Apps* like any other program.
+
+### With pip (developers and servers)
+
 Wheels are on PyPI as `flyweight-llm` for Linux x86-64 (manylinux 2.28) and
 Windows x64. The import package and the command are `flyweight`:
 
@@ -151,8 +172,11 @@ problems for you:
 - **No port clashes.** A busy port is skipped for the next free one.
 - **Failures in words.** When the engine stops, a one-line diagnosis names the
   fix: out of memory, port taken, CUDA toolkit missing, damaged file.
-- **Remembers** your settings and recent models. Closing the window stops the
-  model.
+- **Sets up the GPU.** An NVIDIA card with only the driver installed gets
+  NVRTC and the CUDA headers in one click; a missing driver is pointed out
+  with a link to it.
+- **Remembers** your settings and recent models, says when a new version is
+  out, and stops the model when the window closes.
 
 The interface is a local web page in its own window. With `pip install
 "flyweight-llm[desktop]"` it uses a native webview (WebView2 on Windows).
@@ -163,10 +187,13 @@ Windows' picker, zenity or kdialog on Linux. The engine is the ordinary
 `flyweight serve`, run as a child process, so everything in this README
 applies to it.
 
-For a machine without Python, `python tools/build_desktop.py` freezes an
-installed wheel into a standalone bundle (`Flyweight-<version>-windows-x86_64.zip`
-or `...-linux-x86_64.tar.gz`): unpack it and run `Flyweight`. The GPU driver
-and CUDA toolkit are still needed as described above.
+The downloads at the top of this README are this app, frozen with its own
+Python. `python tools/build_desktop.py --installer` builds them from an
+installed wheel: the Inno Setup installer on Windows and the AppImage on Linux
+(`packaging/` holds the installer script, icons and the release workflow).
+
+From a pip install, `python -m flyweight.gpu_setup install` does what the
+app's **Set up GPU** button does, and `flyweight serve` uses the result.
 
 ## Serving
 

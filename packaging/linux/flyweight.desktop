@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Flyweight
+GenericName=Local AI chat
+Comment=Run AI models on this computer
+Exec=Flyweight
+Icon=flyweight
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=Flyweight

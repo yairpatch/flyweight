@@ -210,6 +210,24 @@ class ShortcutTests(unittest.TestCase):
                 self.assertEqual(desktop.uninstall_shortcut(), written)
                 self.assertFalse(written[0].exists())
 
+    @unittest.skipIf(os.name == "nt", "AppImages are Linux")
+    def test_an_appimage_keeps_a_menu_entry_pointing_at_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "Downloads", "Flyweight.AppImage")
+            with patch.dict(os.environ, {"XDG_DATA_HOME": directory, "APPIMAGE": first}):
+                self.assertTrue(desktop.refresh_appimage_entry())
+                entry = Path(directory, "applications", "flyweight.desktop").read_text()
+                self.assertIn(f"Exec={first}", entry)
+                self.assertTrue(Path(directory, "icons/hicolor/scalable/apps/flyweight.svg").is_file())
+                self.assertFalse(desktop.refresh_appimage_entry())  # unchanged: left alone
+            moved = os.path.join(directory, "Apps", "Flyweight.AppImage")
+            with patch.dict(os.environ, {"XDG_DATA_HOME": directory, "APPIMAGE": moved}):
+                self.assertTrue(desktop.refresh_appimage_entry())
+                self.assertIn(f"Exec={moved}", Path(directory, "applications", "flyweight.desktop").read_text())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("APPIMAGE", None)
+            self.assertFalse(desktop.refresh_appimage_entry())
+
     def test_the_cli_exposes_the_app(self) -> None:
         args = _parser().parse_args(["app", "--install-shortcut"])
         self.assertTrue(args.install_shortcut)
@@ -344,6 +362,18 @@ class LocalApiTests(unittest.TestCase):
         self.assertIn("does not fit", self.controller.hint)
         _, state = self.call("/api/state?since=0")
         self.assertTrue(any("OUT_OF_MEMORY" in line["text"] for line in state["logs"]))  # type: ignore[index]
+
+    def test_gpu_setup_is_offered_only_when_needed(self) -> None:
+        self.controller.gpu = {"state": "ready"}
+        _, result = self.call("/api/gpu/setup", {})
+        self.assertFalse(result["ok"])  # type: ignore[index]
+        self.controller.gpu = {"state": "needs-setup", "major": 12}
+        with patch.object(self.controller.gpu_installer, "start") as start:
+            _, result = self.call("/api/gpu/setup", {})
+        self.assertTrue(result["ok"])  # type: ignore[index]
+        self.assertEqual(start.call_args.args[0], 12)
+        _, state = self.call("/api/state")
+        self.assertIn("gpuSetup", state)  # type: ignore[operator]
 
     def test_the_doctor_report_reaches_the_page(self) -> None:
         self.controller.put(("doctor-line", "[FAIL] native runtime: not built"))

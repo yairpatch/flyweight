@@ -36,8 +36,12 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
+from . import gpu_setup
+
 APP_NAME = "Flyweight"
 DEFAULT_PORT = 8000
+RELEASES_PAGE = "https://github.com/yairpatch/flyweight/releases/latest"
+RELEASES_API = "https://api.github.com/repos/yairpatch/flyweight/releases/latest"
 READY_TIMEOUT_SECONDS = 60 * 60  # a 200 GB MoE off a spinning disk is slow
 _SPLIT_PART = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 
@@ -458,6 +462,10 @@ class Engine:
 
 def _launch_target() -> tuple[str, list[str]]:
     """Executable and arguments a menu entry should run (no console window)."""
+    if os.environ.get("APPIMAGE"):
+        # Inside an AppImage sys.executable is in a temporary mount; the
+        # AppImage file itself is what stays.
+        return os.environ["APPIMAGE"], []
     if getattr(sys, "frozen", False):
         return sys.executable, []
     interpreter = Path(sys.executable)
@@ -480,9 +488,9 @@ def linux_desktop_entry() -> str:
         "Type=Application\n"
         f"Name={APP_NAME}\n"
         "GenericName=Local AI chat\n"
-        "Comment=Run a local language model and chat with it\n"
+        "Comment=Run AI models on this computer\n"
         f"Exec={exec_line}\n"
-        f"Icon={_icon_path()}\n"
+        "Icon=flyweight\n"
         "Terminal=false\n"
         "Categories=Utility;Development;\n"
         "StartupWMClass=Flyweight\n"
@@ -521,10 +529,38 @@ def install_shortcut() -> list[Path]:
         return written
     path = _shortcut_paths()[0]
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The icon is copied out of the package: an AppImage's own copy lives in
+    # a mount that disappears when the app quits.
+    icon = path.parent.parent / "icons" / "hicolor" / "scalable" / "apps" / "flyweight.svg"
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    icon.write_bytes(_icon_path().read_bytes())
     path.write_text(linux_desktop_entry(), encoding="utf-8")
     path.chmod(0o755)
     written.append(path)
     return written
+
+
+def refresh_appimage_entry() -> bool:
+    """Running as an AppImage: keep a menu entry that opens this file.
+
+    Downloaded AppImages are double-clicked from the Downloads folder and
+    then never found again; the entry fixes that, and is rewritten if the
+    file moved. Returns True when it wrote one.
+    """
+    if os.name == "nt" or not os.environ.get("APPIMAGE"):
+        return False
+    path = _shortcut_paths()[0]
+    wanted = linux_desktop_entry()
+    try:
+        if path.read_text(encoding="utf-8") == wanted:
+            return False
+    except OSError:
+        pass
+    try:
+        install_shortcut()
+    except OSError:
+        return False
+    return True
 
 
 def uninstall_shortcut() -> list[Path]:
@@ -591,6 +627,58 @@ class Controller:
         self.last_poll = 0.0
         self.quit_requested = threading.Event()
         self.first_run = not (settings_path or config_dir() / "desktop.json").exists()
+        self.gpu: dict[str, object] | None = None    # gpu_setup.status(), cached
+        self.gpu_installer = gpu_setup.Installer()
+        self.update: dict[str, str] | None = None
+
+    # -- background facts ----------------------------------------------------
+
+    def refresh_gpu(self) -> None:
+        """Detect NVIDIA support (slow on Windows, so off the request path)."""
+        try:
+            found = gpu_setup.status_dict()
+        except Exception as error:  # noqa: BLE001 - detection must never break the app
+            found = {"state": "none", "title": "GPU check failed", "detail": str(error)}
+        with self.lock:
+            self.gpu = found
+
+    def setup_gpu(self) -> dict[str, object]:
+        with self.lock:
+            gpu = self.gpu or {}
+        if gpu.get("state") != "needs-setup":
+            return {"ok": False, "error": "GPU setup is not needed here."}
+
+        def done() -> None:
+            self.refresh_gpu()
+            snapshot = self.gpu_installer.snapshot()
+            if snapshot["error"]:
+                self.log(str(snapshot["error"]), "error")
+            else:
+                self.log("GPU support installed. New starts use the GPU.", "ok")
+                self.doctor_ran = False  # the old report is stale now
+
+        self.log(f"Setting up GPU support (CUDA {gpu.get('major')})…", "note")
+        self.gpu_installer.start(int(gpu.get("major") or 12), done)  # type: ignore[call-overload]
+        return {"ok": True}
+
+    def check_for_update(self) -> None:
+        """Note a newer release, so the page can offer it. Silent on failure."""
+        current = _version()
+        if not re.fullmatch(r"\d+(\.\d+)*", current):
+            return
+        try:
+            request = urllib.request.Request(RELEASES_API, headers={
+                "Accept": "application/vnd.github+json", "User-Agent": "flyweight-desktop"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                release = json.load(response)
+        except (OSError, ValueError):
+            return
+        tag = str(release.get("tag_name", "")).lstrip("v")
+        if not re.fullmatch(r"\d+(\.\d+)*", tag):
+            return
+        if tuple(map(int, tag.split("."))) > tuple(map(int, current.split("."))):
+            with self.lock:
+                self.update = {"version": tag, "url": str(release.get("html_url") or RELEASES_PAGE)}
 
     # -- log ---------------------------------------------------------------
 
@@ -682,7 +770,9 @@ class Controller:
                              for a in arguments)
             self.log("", "")
             self.log(f"$ flyweight {shown}", "note")
-            env = {"FLYWEIGHT_UI_FRAME_ANCESTOR": self.frame_origin} if self.frame_origin else {}
+            env = gpu_setup.engine_environment()
+            if self.frame_origin:
+                env["FLYWEIGHT_UI_FRAME_ANCESTOR"] = self.frame_origin
             self.engine_log = []
             try:
                 self.engine = Engine(arguments, self, env=env)
@@ -733,7 +823,7 @@ class Controller:
             self.log("", "")
             self.log("Checking this computer…", "note")
             try:
-                Engine(["doctor"], self, prefix="doctor-")
+                Engine(["doctor"], self, prefix="doctor-", env=gpu_setup.engine_environment())
             except OSError as error:
                 self.doctor_running = False
                 self.doctor = [DoctorLine("fail", "check", f"could not run: {error}")]
@@ -771,6 +861,10 @@ class Controller:
                 "version": _version(),
                 "platform": sys.platform,
                 "framed": bool(self.frame_origin),
+                "gpu": self.gpu,
+                "gpuSetup": self.gpu_installer.snapshot(),
+                "update": self.update,
+                "driverUrl": gpu_setup.DRIVER_DOWNLOAD_URL,
             }
 
     def shutdown(self) -> None:
@@ -1006,7 +1100,10 @@ def make_server(controller: Controller, token: str, picker=None):
                 self._json(200, {"ok": True, "path": chosen})
             elif path == "/api/open":
                 url = str(body.get("url", ""))
-                if re.fullmatch(r"http://(127\.0\.0\.1|[0-9.]+):\d+/", url):
+                allowed = {gpu_setup.DRIVER_DOWNLOAD_URL, RELEASES_PAGE}
+                if controller.update:
+                    allowed.add(controller.update["url"])
+                if url in allowed or re.fullmatch(r"http://(127\.0\.0\.1|[0-9.]+):\d+/", url):
                     webbrowser.open(url)
                 self._json(200, {"ok": True})
             elif path == "/api/shortcut":
@@ -1015,6 +1112,11 @@ def make_server(controller: Controller, token: str, picker=None):
                     self._json(200, {"ok": True, "paths": [str(p) for p in written]})
                 except (OSError, subprocess.CalledProcessError) as error:
                     self._json(200, {"ok": False, "error": str(error)})
+            elif path == "/api/gpu/setup":
+                self._json(200, controller.setup_gpu())
+            elif path == "/api/gpu/refresh":
+                controller.refresh_gpu()
+                self._json(200, {"ok": True})
             elif path == "/api/quit":
                 self._json(200, {"ok": True})
                 controller.quit_requested.set()
@@ -1112,6 +1214,10 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
     controller.frame_origin = f"http://127.0.0.1:{port}"
     url = f"http://127.0.0.1:{port}/#t={token}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    if refresh_appimage_entry():
+        controller.log("Added Flyweight to your applications menu.", "note")
+    threading.Thread(target=controller.refresh_gpu, daemon=True).start()
+    threading.Thread(target=controller.check_for_update, daemon=True).start()
     if controller.first_run:
         controller.run_doctor()
 

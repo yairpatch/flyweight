@@ -23,6 +23,8 @@ const ICONS = {
   alert: '<path d="M12 8v5M12 16.5v.01"/><circle cx="12" cy="12" r="9"/>',
   bang: '<path d="M12 6v8M12 18v.01"/>',
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
+  gpu: '<rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="15" cy="12" r="2.5"/><path d="M7 10h3M7 14h3M6 18v2M10 18v2"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
 };
 
@@ -164,6 +166,9 @@ function render() {
   renderActionBar(s);
   renderChat(s);
   renderDoctor(s);
+  renderGpu(s);
+  $("update").hidden = !s.update;
+  if (s.update) $("update-text").textContent = `Update to ${s.update.version}`;
 
   // transitions
   if (lastStatus && lastStatus !== s.status) {
@@ -285,6 +290,58 @@ const CHECK_NAMES = {
   "amd gpu": "AMD GPU", "cuda headers": "CUDA headers", check: "System check",
 };
 const checkName = (name) => CHECK_NAMES[name.toLowerCase()] || name.charAt(0).toUpperCase() + name.slice(1);
+
+// What the GPU needs, and the one button that provides it.
+function gpuView(s) {
+  const g = s.gpu;
+  const job = s.gpuSetup;
+  if (!g) return null;
+  if (job.running) {
+    const percent = Math.round(job.fraction * 100);
+    return { kind: "", title: "Setting up GPU support…", detail: "Downloading NVIDIA's compiler and headers. You can keep using the app.",
+      extra: `<div class="meter"><i style="width:${percent}%"></i></div><div class="meter-label">${esc(job.message)}</div>`, buttons: "" };
+  }
+  if (job.error) {
+    return { kind: "error", title: "GPU setup did not finish", detail: job.error,
+      buttons: `<button class="button primary" data-gpu="setup">${icon("refresh")}Try again</button>` };
+  }
+  if (g.state === "needs-setup") {
+    return { kind: "", title: g.title, detail: `${g.detail} About ${g.download_mb} MB, once.`,
+      buttons: `<button class="button primary" data-gpu="setup">${icon("download")}Set up GPU</button>` };
+  }
+  if (g.state === "needs-driver" || g.state === "old-driver") {
+    return { kind: "warn", title: g.title, detail: `${g.detail} Install it from NVIDIA, restart if asked, then press "Check again".`,
+      buttons: `<button class="button" data-gpu="refresh">${icon("refresh")}Check again</button>
+                <button class="button primary" data-gpu="driver">${icon("external")}Get the driver</button>` };
+  }
+  return null;
+}
+
+function renderGpu(s) {
+  const view = gpuView(s);
+  const notice = $("gpu-notice");
+  const key = JSON.stringify([view, s.status]);
+  if (renderGpu.key === key) return;
+  renderGpu.key = key;
+  const busy = s.status !== "idle" && s.status !== "failed";
+  // Home shows it only while something needs doing.
+  notice.hidden = !view;
+  if (view) {
+    notice.className = `notice ${view.kind}`;
+    notice.innerHTML = `<div class="notice-icon">${icon("gpu")}</div>
+      <div class="notice-text"><div class="notice-title">${esc(view.title)}</div>
+      <div class="notice-detail">${esc(view.detail)}</div>${view.extra || ""}</div>
+      <div class="button-row">${view.buttons}</div>`;
+  }
+  const g = s.gpu || { title: "Checking graphics…", detail: "", state: "none" };
+  const card = view || { kind: g.state === "ready" ? "" : "", title: g.title, detail: g.detail, buttons:
+    `<button class="button ghost small" data-gpu="refresh">${icon("refresh")}Check again</button>` };
+  $("gpu-card").className = `card gpu-card ${view ? view.kind : g.state === "ready" ? "ok" : ""}`;
+  $("gpu-card").innerHTML = `<div class="notice-icon">${icon(g.state === "ready" ? "check" : "gpu")}</div>
+      <div class="notice-text"><div class="notice-title">${esc(card.title)}</div>
+      <div class="notice-detail">${esc(card.detail)}</div>${card.extra || ""}</div>
+      <div class="button-row">${card.buttons}</div>`;
+}
 
 function renderDoctor(s) {
   const d = s.doctor;
@@ -423,6 +480,15 @@ document.addEventListener("click", (event) => {
   if (target.dataset.act) return act(target.dataset.act);
   if (target.dataset.browse) return browse(target.dataset.browse);
   if (target.dataset.copy) return copy(target.dataset.copy);
+  if (target.dataset.gpu) {
+    const what = target.dataset.gpu;
+    if (what === "driver") return api("/api/open", { url: state.driverUrl });
+    target.disabled = true;
+    return api(`/api/gpu/${what}`, {}).then((r) => { if (r && r.ok === false) toast(r.error, "error"); return poll(); });
+  }
+  if (target.id === "update") {
+    return state && state.update && api("/api/open", { url: state.update.url });
+  }
   if (target.dataset.forget) {
     event.stopPropagation();
     return api("/api/forget", { path: target.dataset.forget }).then(poll);
@@ -500,7 +566,8 @@ async function poll() {
 
 async function loop() {
   await poll();
-  const busy = state && (state.status === "loading" || state.status === "stopping" || state.doctor.running);
+  const busy = state && (state.status === "loading" || state.status === "stopping"
+    || state.doctor.running || state.gpuSetup.running || !state.gpu);
   setTimeout(loop, busy ? 500 : 1000);
 }
 

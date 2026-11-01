@@ -2423,8 +2423,9 @@ def _doctor() -> int:
                     report("cuda headers", True, str(headers))
                 else:
                     report("cuda headers", None, "cuda_fp16.h not found",
-                           "install the CUDA toolkit headers, or point CUDA_HOME "
-                           "at a toolkit; until then serve with --backend cpu")
+                           "python -m flyweight.gpu_setup install (fetches the "
+                           "headers and NVRTC, no toolkit needed), or install the "
+                           "CUDA toolkit; until then serve with --backend cpu")
             else:
                 # The probe says only "no"; the two libraries it needs fail
                 # for different reasons with different fixes, so look at each.
@@ -2435,8 +2436,9 @@ def _doctor() -> int:
                 elif not nvrtc:
                     report("nvidia gpu", None,
                            "driver found, but the NVRTC library is missing",
-                           "install the CUDA toolkit (it provides libnvrtc), or "
-                           "serve with --backend cpu")
+                           "python -m flyweight.gpu_setup install (fetches NVRTC "
+                           "and the headers, no toolkit needed), install the CUDA "
+                           "toolkit, or serve with --backend cpu")
                 else:
                     report("nvidia gpu", None, "no usable device",
                            "serve with --backend cpu, or install an NVIDIA driver")
@@ -2505,8 +2507,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"flyweight: {error}") from None
 
 
+def _use_private_cuda() -> None:
+    """Point the runtime at GPU support the desktop app installed, if any.
+
+    Only when nothing names a toolkit already: a CUDA_PATH someone set is
+    theirs. The runtime falls back to CUDA_PATH/lib64 for NVRTC, whose
+    $ORIGIN runpath then finds its companion library, so the variables are
+    enough even though the loader path is fixed by now.
+    """
+    if os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"):
+        return
+    try:
+        from . import gpu_setup
+
+        found = gpu_setup.engine_environment()
+    except Exception:  # noqa: BLE001 - a missing driver is not this function's business
+        return
+    for name in ("CUDA_PATH", "CUDA_HOME"):
+        if name in found:
+            os.environ[name] = found[name]
+
+
 def _run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _use_private_cuda()
     # The routing approximations are read once by the native runtime, from the
     # environment; an explicit flag wins over an inherited variable.
     if getattr(args, "route_prior", None) is not None:

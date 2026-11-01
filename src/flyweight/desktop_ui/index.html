@@ -30,6 +30,7 @@
             <div class="engine-model" id="engine-model">No model loaded</div>
           </div>
         </div>
+        <button class="update" id="update" hidden><svg data-icon="download"></svg><span id="update-text"></span></button>
         <div class="version" id="version"></div>
       </div>
     </aside>
@@ -43,6 +44,8 @@
               <h1 class="display" id="greeting">Good evening</h1>
               <p class="lede" id="lede">Choose a model and press Start. Everything runs on this computer.</p>
             </header>
+
+            <div class="notice" id="gpu-notice" hidden></div>
 
             <div class="card model-card" id="model-card">
               <div class="model-empty" id="model-empty">
@@ -213,6 +216,9 @@
             </div>
             <div class="summary" id="doctor-summary"></div>
             <div class="card checks" id="doctor-list"></div>
+
+            <div class="section-label">Graphics</div>
+            <div class="card gpu-card" id="gpu-card"></div>
 
             <div class="section-label">Desktop</div>
             <div class="card settings">
