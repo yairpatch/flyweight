@@ -770,6 +770,9 @@ examples:
   flyweight inspect model.gguf
       metadata, config and tensor list as JSON
 
+  flyweight app
+      the desktop app: choose a model in a window and press Start
+
 Run `flyweight COMMAND --help` for one command's full options; each groups
 its flags by what they do. The older serve-v2 / generate-text-v2 /
 benchmark-v2 / inspect-gguf / probe-native-v2 spellings are still accepted.\
@@ -1340,6 +1343,33 @@ behind it, and the NVIDIA driver. Exits non-zero if anything that blocks
 serving is missing; a missing driver is reported but does not fail the check,
 because --backend cpu serves without one.\
 """,
+    )
+
+    app = _add_command(
+        commands, "app", aliases=("desktop",),
+        help="open the desktop app: pick a model, press Start",
+        description="Open Flyweight Desktop, a window that checks this "
+                    "computer, serves the model you pick and opens the chat "
+                    "-- no flags to learn. Linux and Windows; needs Tk.",
+        usage="app [--install-shortcut | --uninstall-shortcut]",
+        epilog="""\
+examples:
+  flyweight app
+      open the window
+
+  flyweight app --install-shortcut
+      add Flyweight to the applications menu (Start menu and desktop on
+      Windows), so it opens without a terminal from then on\
+""",
+    )
+    shortcut = app.add_mutually_exclusive_group()
+    shortcut.add_argument(
+        "--install-shortcut", action="store_true",
+        help="add a menu entry that opens the app, then exit",
+    )
+    shortcut.add_argument(
+        "--uninstall-shortcut", action="store_true",
+        help="remove the menu entry again, then exit",
     )
 
     audit = _add_command(
@@ -2480,6 +2510,14 @@ def _run(argv: list[str] | None = None) -> int:
         os.environ["FLYWEIGHT_ROUTE_TAIL_SKIP"] = str(max(0, int(args.route_tail_skip)))
     if args.command == "doctor":
         return _doctor()
+    if args.command in {"app", "desktop"}:
+        from . import desktop
+
+        if args.install_shortcut:
+            return desktop.main(["--install-shortcut"])
+        if args.uninstall_shortcut:
+            return desktop.main(["--uninstall-shortcut"])
+        return desktop.main([])
     _resolve_quant(args)
     if args.command in {"inspect", "inspect-gguf-v2", "inspect-gguf"}:
         with V2Model(args.model) as model:

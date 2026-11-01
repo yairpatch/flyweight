@@ -123,6 +123,46 @@ safetensors checkpoint directory. The defaults choose the backend and memory
 layout from what the machine has; the flags below are the ones worth
 knowing. `flyweight serve --help` lists everything, grouped.
 
+## Desktop app
+
+Prefer a window to a terminal? Flyweight Desktop runs on Linux and Windows:
+
+~~~bash
+flyweight app                      # open it
+flyweight app --install-shortcut   # add it to the applications / Start menu
+~~~
+
+Pick a model (a `.gguf` file, or a safetensors folder), press **Start**, and
+the chat opens in your browser once the model is loaded. The app takes care
+of the usual stumbling blocks:
+
+- **Checks the computer first.** The first launch runs `flyweight doctor` and
+  colours each line; **Check this computer** re-runs it at any time.
+- **Catches the wrong file.** Picking the vision projector (`mmproj-*.gguf`),
+  part 2 of a split GGUF, the folder around a single GGUF, a half-downloaded
+  file or a file inside a safetensors folder is either corrected or explained.
+  A projector found beside the model is offered as image input.
+- **Plain choices.** Device (automatic, NVIDIA, AMD, CPU only), context length,
+  and "let other devices on my network use it"; MoE expert placement, the
+  safetensors quantization, CPU threads, an API key and any extra `serve` flag
+  sit under *Show advanced options*.
+- **No port clashes.** A busy port is skipped for the next free one.
+- **Failures in words.** When the engine stops, the log stays on screen and a
+  one-line diagnosis names the fix: out of memory, port taken, CUDA toolkit
+  missing, unsupported model.
+- **Remembers** the last settings and recent models.
+
+The engine is the ordinary `flyweight serve`, run as a child process, so
+everything in this README applies to it. The window needs Tk: it ships with
+the python.org Windows installer; on Linux install `python3-tk` (Debian,
+Ubuntu), `python3-tkinter` (Fedora) or `tk` (Arch). On Windows the
+`flyweight-desktop` command opens the app with no console window.
+
+For a machine without Python, `python tools/build_desktop.py` freezes an
+installed wheel into a standalone bundle (`Flyweight-<version>-windows-x86_64.zip`
+or `...-linux-x86_64.tar.gz`): unpack it and run `Flyweight`. The GPU driver
+and CUDA toolkit are still needed as described above.
+
 ## Serving
 
 ### Context and memory
