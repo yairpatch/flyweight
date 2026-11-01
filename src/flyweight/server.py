@@ -126,6 +126,21 @@ UI_CSP = (
     "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
     "form-action 'self'"
 )
+
+
+def _ui_csp() -> str:
+    """UI_CSP, letting Flyweight Desktop's own page frame the chat.
+
+    The desktop app shows the chat inside its window, and names its exact
+    loopback origin in FLYWEIGHT_UI_FRAME_ANCESTOR when it starts the server.
+    Anything else in that variable is ignored: framing stays refused.
+    """
+    origin = os.environ.get("FLYWEIGHT_UI_FRAME_ANCESTOR", "")
+    if re.fullmatch(r"http://(127\.0\.0\.1|localhost):\d{1,5}", origin):
+        return UI_CSP.replace("frame-ancestors 'none'", f"frame-ancestors {origin}")
+    return UI_CSP
+
+
 # The preview shell runs model-generated code. The sandbox directive gives it
 # an opaque origin with no access to the app origin, its storage, or the API,
 # while inline scripts and styles stay allowed inside the sandbox.
@@ -4578,7 +4593,7 @@ def create_handler(
             self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header(
                 "Content-Security-Policy",
-                PREVIEW_CSP if asset.name == "preview.html" else UI_CSP,
+                PREVIEW_CSP if asset.name == "preview.html" else _ui_csp(),
             )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

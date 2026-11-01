@@ -8,10 +8,12 @@ choices and a log that explains its own failures. The engine itself is the
 same `flyweight serve`, run as a child process, so the window never holds the
 GPU and a crash in the runtime cannot take the window down with it.
 
-Linux and Windows are supported. The window is Tk, which ships with the
-python.org Windows installer and is one package away on Linux
-(`python3-tk`, `tk`); nothing else is required. The module is importable
-without Tk so the planning logic below can be tested headless.
+Linux and Windows are supported. The interface is a web page (desktop_ui/)
+served on loopback and shown in a native window: pywebview when it is
+installed (WebView2 on Windows), otherwise a Chromium-family browser in app
+mode (Edge ships with every Windows; Chrome, Chromium, Brave or Edge on
+Linux), otherwise an ordinary browser tab. Nothing beyond the standard
+library is required.
 
     flyweight app                      open the window
     flyweight app --install-shortcut   add Flyweight to the applications menu
@@ -20,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import re
 import shlex
 import socket
@@ -33,35 +34,9 @@ import urllib.request
 import webbrowser
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Protocol
 
 APP_NAME = "Flyweight"
-# What the user sees, mapped to what `serve` takes. Kept as pairs so the
-# combobox shows words while the command line gets the flag value.
-BACKENDS = (
-    ("Automatic (recommended)", "auto"),
-    ("NVIDIA GPU (CUDA)", "cuda"),
-    ("AMD GPU (ROCm, Linux)", "rocm"),
-    ("CPU only (no GPU)", "cpu"),
-)
-CONTEXTS = (
-    ("Automatic (recommended)", 0),
-    ("8K tokens", 8192),
-    ("16K tokens", 16384),
-    ("32K tokens", 32768),
-    ("64K tokens", 65536),
-    ("128K tokens", 131072),
-)
-EXPERT_MODES = (
-    ("Automatic (recommended)", "auto"),
-    ("Keep experts on the CPU (big MoE models)", "cpu"),
-    ("All experts on the GPU", "resident"),
-)
-QUANTS = (
-    ("Q6_K (recommended)", "Q6_K"),
-    ("Q4_K (smaller)", "Q4_K"),
-    ("Q8_0 (larger, closest to original)", "Q8_0"),
-    ("IQ4_XS (smallest usable)", "IQ4_XS"),
-)
 DEFAULT_PORT = 8000
 READY_TIMEOUT_SECONDS = 60 * 60  # a 200 GB MoE off a spinning disk is slow
 _SPLIT_PART = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
@@ -255,6 +230,11 @@ def check_model(raw: str) -> ModelCheck:
 
 def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if os.name != "nt":
+            # As the server binds: a port a stopped server left in TIME_WAIT
+            # is free to it, and must not be reported busy. (On Windows the
+            # option means "share a live port", so it is left off there.)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((host, port))
         except OSError:
@@ -426,11 +406,15 @@ def _popen_flags() -> dict[str, object]:
     return {"start_new_session": True}
 
 
-class Engine:
-    """One `flyweight` child process whose output arrives on a queue."""
+class _Sink(Protocol):
+    def put(self, item: tuple[str, object]) -> None: ...
 
-    def __init__(self, arguments: list[str], output: "queue.Queue[tuple[str, object]]",
-                 prefix: str = "") -> None:
+
+class Engine:
+    """One `flyweight` child process whose output arrives on a sink."""
+
+    def __init__(self, arguments: list[str], output: _Sink, prefix: str = "",
+                 env: dict[str, str] | None = None) -> None:
         self.command = engine_command() + arguments
         self.output = output
         self.prefix = prefix
@@ -438,7 +422,8 @@ class Engine:
         self.was_ready = False
         self.process = subprocess.Popen(
             self.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, env=_child_environment(), **_popen_flags(),
+            stderr=subprocess.STDOUT, env={**_child_environment(), **(env or {})},
+            **_popen_flags(),  # type: ignore[arg-type]
         )
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -552,437 +537,611 @@ def uninstall_shortcut() -> list[Path]:
 
 
 # --------------------------------------------------------------------------
-# The window
+# The app: state, a local API, and a window that shows it
 
 
-_TK_MISSING = """\
-Flyweight Desktop needs Tk, the GUI toolkit that ships with Python.
-Install it and run `flyweight app` again:
+def _version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
 
-  Debian / Ubuntu:   sudo apt install python3-tk
-  Fedora:            sudo dnf install python3-tkinter
-  Arch:              sudo pacman -S tk
-  Windows:           re-run the python.org installer and tick "tcl/tk and IDLE"
-
-The engine itself works without it: `flyweight serve MODEL` in a terminal."""
-
-
-def _label(pairs: tuple[tuple[str, object], ...], value: object) -> str:
-    for label, candidate in pairs:
-        if candidate == value:
-            return label
-    return pairs[0][0]
-
-
-def _value(pairs: tuple[tuple[str, object], ...], label: str) -> object:
-    for candidate_label, value in pairs:
-        if candidate_label == label:
-            return value
-    return pairs[0][1]
-
-
-def run_window() -> int:  # pragma: no cover - exercised by hand and under Xvfb
-    try:
-        import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
-    except ImportError:
-        print(_TK_MISSING, file=sys.stderr)
-        return 1
-    try:
-        root = tk.Tk(className="Flyweight")
-    except tk.TclError as error:
-        print(f"flyweight: cannot open a window ({error}). Is a display "
-              "available? Use `flyweight serve MODEL` in a terminal instead.",
-              file=sys.stderr)
-        return 1
-
-    settings = load_settings()
-    events: "queue.Queue[tuple[str, object]]" = queue.Queue()
-    state: dict[str, object] = {"engine": None, "port": None, "ready": False,
-                                "log": [], "doctor": None}
-
-    root.title(f"{APP_NAME} Desktop")
-    root.minsize(720, 560)
-    try:
-        root.tk.call("tk", "scaling")  # touch Tk so a broken install fails here
-    except tk.TclError:
-        pass
-    style = ttk.Style(root)
-    if "clam" in style.theme_names() and os.name != "nt":
-        style.theme_use("clam")
-    style.configure("Status.TLabel", font=("TkDefaultFont", 11, "bold"))
-    style.configure("Big.TButton", padding=(18, 8))
-
-    outer = ttk.Frame(root, padding=14)
-    outer.pack(fill="both", expand=True)
-    outer.columnconfigure(1, weight=1)
-
-    # --- Step 1: model
-    ttk.Label(outer, text="1. Model", font=("TkDefaultFont", 11, "bold")).grid(
-        row=0, column=0, columnspan=3, sticky="w")
-    model_var = tk.StringVar(value=settings.model)
-    model_box = ttk.Combobox(outer, textvariable=model_var,
-                             values=settings.recent_models)
-    model_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-    pick = ttk.Frame(outer)
-    pick.grid(row=1, column=2, sticky="e", padx=(6, 0), pady=(4, 0))
-    model_note = ttk.Label(outer, text="", wraplength=660)
-    model_note.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 8))
-
-    def choose_file() -> None:
-        path = filedialog.askopenfilename(
-            title="Choose a GGUF model",
-            filetypes=[("GGUF models", "*.gguf"), ("All files", "*")])
-        if path:
-            model_var.set(path)
-
-    def choose_folder() -> None:
-        path = filedialog.askdirectory(title="Choose a safetensors model folder")
-        if path:
-            model_var.set(path)
-
-    ttk.Button(pick, text="Choose file…", command=choose_file).pack(side="left")
-    ttk.Button(pick, text="Folder…", command=choose_folder).pack(side="left", padx=(4, 0))
-
-    # --- Step 2: options
-    ttk.Label(outer, text="2. Options", font=("TkDefaultFont", 11, "bold")).grid(
-        row=3, column=0, columnspan=3, sticky="w")
-    options = ttk.Frame(outer)
-    options.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
-    options.columnconfigure(1, weight=1)
-    options.columnconfigure(3, weight=1)
-
-    backend_var = tk.StringVar(value=_label(BACKENDS, settings.backend))
-    context_var = tk.StringVar(value=_label(CONTEXTS, settings.context))
-    port_var = tk.StringVar(value=str(settings.port))
-    share_var = tk.BooleanVar(value=settings.share_on_network)
-    open_var = tk.BooleanVar(value=settings.open_chat)
-    mmproj_var = tk.BooleanVar(value=settings.use_mmproj)
-
-    ttk.Label(options, text="Run on").grid(row=0, column=0, sticky="w")
-    ttk.Combobox(options, textvariable=backend_var, state="readonly",
-                 values=[label for label, _ in BACKENDS]).grid(
-        row=0, column=1, sticky="ew", padx=(6, 16))
-    ttk.Label(options, text="Context length").grid(row=0, column=2, sticky="w")
-    ttk.Combobox(options, textvariable=context_var, state="readonly",
-                 values=[label for label, _ in CONTEXTS]).grid(
-        row=0, column=3, sticky="ew", padx=(6, 0))
-    ttk.Label(options, text="Port").grid(row=1, column=0, sticky="w", pady=(6, 0))
-    ttk.Spinbox(options, from_=1024, to=65535, textvariable=port_var, width=8).grid(
-        row=1, column=1, sticky="w", padx=(6, 16), pady=(6, 0))
-    ttk.Checkbutton(options, text="Open the chat when ready", variable=open_var).grid(
-        row=1, column=2, columnspan=2, sticky="w", pady=(6, 0))
-    ttk.Checkbutton(options, text="Let other devices on my network use it",
-                    variable=share_var).grid(row=2, column=0, columnspan=2,
-                                             sticky="w", pady=(6, 0))
-    mmproj_check = ttk.Checkbutton(options, text="Image input (projector found)",
-                                   variable=mmproj_var)
-
-    # Advanced, folded away.
-    advanced_shown = tk.BooleanVar(value=False)
-    advanced = ttk.Frame(outer)
-    advanced.columnconfigure(1, weight=1)
-    advanced.columnconfigure(3, weight=1)
-    expert_var = tk.StringVar(value=_label(EXPERT_MODES, settings.expert_mode))
-    quant_var = tk.StringVar(value=_label(QUANTS, settings.quant))
-    threads_var = tk.StringVar(value=str(settings.cpu_threads))
-    key_var = tk.StringVar(value=settings.api_key)
-    extra_var = tk.StringVar(value=settings.extra_args)
-    ttk.Label(advanced, text="MoE experts").grid(row=0, column=0, sticky="w")
-    ttk.Combobox(advanced, textvariable=expert_var, state="readonly",
-                 values=[label for label, _ in EXPERT_MODES]).grid(
-        row=0, column=1, sticky="ew", padx=(6, 16))
-    ttk.Label(advanced, text="Safetensors quant").grid(row=0, column=2, sticky="w")
-    ttk.Combobox(advanced, textvariable=quant_var, state="readonly",
-                 values=[label for label, _ in QUANTS]).grid(
-        row=0, column=3, sticky="ew", padx=(6, 0))
-    ttk.Label(advanced, text="CPU threads (0 = auto)").grid(row=1, column=0, sticky="w", pady=(6, 0))
-    ttk.Spinbox(advanced, from_=0, to=512, textvariable=threads_var, width=8).grid(
-        row=1, column=1, sticky="w", padx=(6, 16), pady=(6, 0))
-    ttk.Label(advanced, text="API key (optional)").grid(row=1, column=2, sticky="w", pady=(6, 0))
-    ttk.Entry(advanced, textvariable=key_var, show="•").grid(
-        row=1, column=3, sticky="ew", padx=(6, 0), pady=(6, 0))
-    ttk.Label(advanced, text="Extra serve flags").grid(row=2, column=0, sticky="w", pady=(6, 0))
-    ttk.Entry(advanced, textvariable=extra_var).grid(
-        row=2, column=1, columnspan=3, sticky="ew", padx=(6, 0), pady=(6, 0))
-
-    def toggle_advanced() -> None:
-        if advanced_shown.get():
-            advanced.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        else:
-            advanced.grid_remove()
-
-    ttk.Checkbutton(outer, text="Show advanced options", variable=advanced_shown,
-                    command=toggle_advanced).grid(row=5, column=0, columnspan=3,
-                                                  sticky="w", pady=(8, 0))
-
-    # --- Step 3: start
-    ttk.Label(outer, text="3. Start", font=("TkDefaultFont", 11, "bold")).grid(
-        row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
-    controls = ttk.Frame(outer)
-    controls.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(4, 0))
-    start_button = ttk.Button(controls, text="Start", style="Big.TButton")
-    start_button.pack(side="left")
-    chat_button = ttk.Button(controls, text="Open chat", state="disabled")
-    chat_button.pack(side="left", padx=(6, 0))
-    doctor_button = ttk.Button(controls, text="Check this computer")
-    doctor_button.pack(side="right")
-    status_var = tk.StringVar(value="Stopped")
-    ttk.Label(outer, textvariable=status_var, style="Status.TLabel",
-              wraplength=680).grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 4))
-
-    log_frame = ttk.Frame(outer)
-    log_frame.grid(row=10, column=0, columnspan=3, sticky="nsew")
-    outer.rowconfigure(10, weight=1)
-    log = tk.Text(log_frame, height=12, wrap="word", state="disabled",
-                  font=("TkFixedFont", 9))
-    scroll = ttk.Scrollbar(log_frame, command=log.yview)
-    log.configure(yscrollcommand=scroll.set)
-    log.pack(side="left", fill="both", expand=True)
-    scroll.pack(side="right", fill="y")
-    log.tag_configure("fail", foreground="#c62828")
-    log.tag_configure("warn", foreground="#b26a00")
-    log.tag_configure("ok", foreground="#2e7d32")
-    log.tag_configure("note", foreground="#1565c0")
-
-    def write(text: str, tag: str = "") -> None:
-        log.configure(state="normal")
-        log.insert("end", text + "\n", tag)
-        # Bound the widget: a long session's per-request lines add up.
-        if int(log.index("end-1c").split(".")[0]) > 5000:
-            log.delete("1.0", "1000.0")
-        log.see("end")
-        log.configure(state="disabled")
-
-    current: dict[str, ModelCheck] = {}
-    doctor_text: list[str] = []
-
-    def refresh_model(*_: object) -> None:
-        check = check_model(model_var.get())
-        current["model"] = check
-        if check.ok:
-            model_note.configure(text="✓ " + check.message, foreground="#2e7d32")
-        else:
-            model_note.configure(text=check.message if model_var.get().strip() else
-                                 "Choose a model file (.gguf) or a safetensors folder.",
-                                 foreground="#c62828" if model_var.get().strip() else "")
-        if check.ok and check.mmproj:
-            mmproj_check.configure(text=f"Image input ({Path(check.mmproj).name})")
-            mmproj_check.grid(row=2, column=2, columnspan=2, sticky="w", pady=(6, 0))
-        else:
-            mmproj_check.grid_remove()
-
-    model_var.trace_add("write", refresh_model)
-    refresh_model()
-
-    def collect() -> Settings | None:
+    for distribution in ("flyweight-llm", "flyweight"):
         try:
-            port = int(port_var.get())
-            threads = int(threads_var.get() or 0)
-        except ValueError:
-            messagebox.showerror(APP_NAME, "Port and CPU threads must be whole numbers.")
-            return None
-        if not 1024 <= port <= 65535:
-            messagebox.showerror(APP_NAME, "Choose a port between 1024 and 65535.")
-            return None
-        settings.model = model_var.get().strip()
-        settings.backend = str(_value(BACKENDS, backend_var.get()))
-        settings.context = int(_value(CONTEXTS, context_var.get()))  # type: ignore[call-overload]
-        settings.port = port
-        settings.share_on_network = share_var.get()
-        settings.open_chat = open_var.get()
-        settings.use_mmproj = mmproj_var.get()
-        settings.expert_mode = str(_value(EXPERT_MODES, expert_var.get()))
-        settings.quant = str(_value(QUANTS, quant_var.get()))
-        settings.cpu_threads = max(0, threads)
-        settings.api_key = key_var.get()
-        settings.extra_args = extra_var.get()
-        return settings
+            return version(distribution)
+        except PackageNotFoundError:
+            continue
+    return "dev"
 
-    def set_running(running: bool) -> None:
-        start_button.configure(text="Stop" if running else "Start")
-        # ttk's state flags, not configure(state=...): the latter would turn a
-        # readonly combobox into a free-text one on the way back.
-        flag = ["disabled"] if running else ["!disabled"]
-        for widget in (model_box, *pick.winfo_children(), *options.winfo_children(),
-                       *advanced.winfo_children()):
-            set_state = getattr(widget, "state", None)
-            if callable(set_state):
-                try:
-                    set_state(flag)
-                except tk.TclError:
-                    pass
-        if not running:
-            chat_button.configure(state="disabled")
 
-    def start() -> None:
-        if state["engine"] is not None:
-            stop()
-            return
-        chosen = collect()
-        if chosen is None:
-            return
-        check = check_model(chosen.model)
-        if not check.ok:
-            messagebox.showwarning(APP_NAME, check.message)
-            return
-        try:
-            serve_arguments(chosen, check, chosen.port)
-        except ValueError as error:
-            messagebox.showerror(APP_NAME, f"The extra flags could not be read: {error}")
-            return
-        bind = "0.0.0.0" if chosen.share_on_network else "127.0.0.1"
-        port = pick_port(chosen.port, bind)
-        if port != chosen.port:
-            write(f"Port {chosen.port} is busy; using {port} instead.", "note")
-        remember_model(chosen, check.path)
-        model_box.configure(values=chosen.recent_models)
-        save_settings(chosen)
-        arguments = serve_arguments(chosen, check, port)
-        write("")
-        write("$ flyweight " + " ".join(shlex.quote(a) if a != chosen.api_key.strip()
-                                        else "****" for a in arguments), "note")
-        try:
-            state["engine"] = Engine(arguments, events)
-        except OSError as error:
-            messagebox.showerror(APP_NAME, f"Could not start the engine: {error}")
-            return
-        state["port"] = port
-        state["ready"] = False
-        state["log"] = []
-        state["started"] = time.monotonic()
-        status_var.set("Loading the model… (large models can take several minutes)")
-        set_running(True)
-        threading.Thread(target=wait_ready, args=(state["engine"], port), daemon=True).start()
+def _check_dict(check: ModelCheck) -> dict[str, object]:
+    data: dict[str, object] = asdict(check)
+    path = Path(check.path) if check.path else None
+    data["name"] = path.name if path else ""
+    data["folder"] = str(path.parent) if path else ""
+    data["mmprojName"] = Path(check.mmproj).name if check.mmproj else ""
+    return data
 
-    def wait_ready(engine: Engine, port: int) -> None:
+
+class Controller:
+    """Everything the window shows, owned in one place and safe across threads.
+
+    The page polls `snapshot()`; buttons call the verbs. The engine and the
+    system check are child processes whose lines land here through `put`.
+    """
+
+    LOG_LIMIT = 4000
+
+    def __init__(self, settings: Settings | None = None,
+                 settings_path: Path | None = None) -> None:
+        self.lock = threading.RLock()
+        self.settings_path = settings_path
+        self.settings = settings or load_settings(settings_path)
+        self.status = "idle"            # idle, loading, running, stopping, failed
+        self.engine: Engine | None = None
+        self.port: int | None = None
+        self.hint = ""
+        self.started_at = 0.0
+        self.ready_at = 0.0
+        self.logs: list[tuple[int, str, str]] = []
+        self.seq = 0
+        self.engine_log: list[str] = []
+        self.doctor_running = False
+        self.doctor_raw: list[str] = []
+        self.doctor: list[DoctorLine] = []
+        self.doctor_ran = False
+        self.frame_origin = ""          # the page's origin, allowed to frame the chat
+        self.last_poll = 0.0
+        self.quit_requested = threading.Event()
+        self.first_run = not (settings_path or config_dir() / "desktop.json").exists()
+
+    # -- log ---------------------------------------------------------------
+
+    def log(self, text: str, kind: str = "") -> None:
+        with self.lock:
+            self.seq += 1
+            self.logs.append((self.seq, text, kind))
+            del self.logs[:-self.LOG_LIMIT]
+
+    def put(self, item: tuple[str, object]) -> None:
+        """Engine and doctor output (see Engine)."""
+        kind, payload = item
+        with self.lock:
+            if kind == "line":
+                text = str(payload)
+                self.engine_log.append(text)
+                del self.engine_log[:-400]
+                lowered = text.lower()
+                tag = "error" if ("error" in lowered or "traceback" in lowered
+                                  or text.startswith("flyweight:")) else ""
+                self.log(text, tag)
+            elif kind == "exit":
+                self._engine_exited(int(payload))  # type: ignore[call-overload]
+            elif kind == "doctor-line":
+                text = str(payload)
+                self.doctor_raw.append(text)
+                stripped = text.strip()
+                tag = ("error" if stripped.startswith("[FAIL") else
+                       "warn" if stripped.startswith("[warn") else
+                       "ok" if stripped.startswith("[ok") else "")
+                self.log(text, tag)
+            elif kind == "doctor-exit":
+                self.doctor = parse_doctor("\n".join(self.doctor_raw))
+                if not self.doctor and self.doctor_raw:
+                    # doctor itself crashed: show its last words as a failure
+                    self.doctor = [DoctorLine("fail", "check", last_error(
+                        "\n".join(self.doctor_raw)) or "the check could not run")]
+                self.doctor_running = False
+                self.doctor_ran = True
+
+    def _engine_exited(self, code: int) -> None:
+        engine = self.engine
+        self.engine = None
+        if code == 0 or (engine is not None and engine.stopping):
+            self.status = "idle"
+            self.hint = ""
+            self.log("Stopped.", "note")
+            return
+        self.status = "failed"
+        self.hint = explain_failure("\n".join(self.engine_log))
+        self.log(f"Engine exited with code {code}. {self.hint}", "error")
+
+    # -- settings ----------------------------------------------------------
+
+    def update_settings(self, changes: dict[str, object]) -> None:
+        with self.lock:
+            merged = {**asdict(self.settings), **changes}
+            merged["recent_models"] = self.settings.recent_models  # not the page's to set
+            self.settings = Settings.from_dict(merged)
+            save_settings(self.settings, self.settings_path)
+
+    def forget_model(self, model: str) -> None:
+        with self.lock:
+            self.settings.recent_models = [m for m in self.settings.recent_models if m != model]
+            save_settings(self.settings, self.settings_path)
+
+    # -- verbs -------------------------------------------------------------
+
+    def start(self) -> dict[str, object]:
+        with self.lock:
+            if self.engine is not None:
+                return {"ok": False, "error": "Already running."}
+            check = check_model(self.settings.model)
+            if not check.ok:
+                return {"ok": False, "error": check.message}
+            try:
+                serve_arguments(self.settings, check, self.settings.port)
+            except ValueError as error:
+                return {"ok": False, "error": f"The extra flags could not be read: {error}"}
+            bind = "0.0.0.0" if self.settings.share_on_network else "127.0.0.1"
+            port = pick_port(self.settings.port, bind)
+            if port != self.settings.port:
+                self.log(f"Port {self.settings.port} is busy; using {port} instead.", "note")
+            remember_model(self.settings, check.path)
+            save_settings(self.settings, self.settings_path)
+            arguments = serve_arguments(self.settings, check, port)
+            secret = self.settings.api_key.strip()
+            shown = " ".join("****" if secret and a == secret else shlex.quote(a)
+                             for a in arguments)
+            self.log("", "")
+            self.log(f"$ flyweight {shown}", "note")
+            env = {"FLYWEIGHT_UI_FRAME_ANCESTOR": self.frame_origin} if self.frame_origin else {}
+            self.engine_log = []
+            try:
+                self.engine = Engine(arguments, self, env=env)
+            except OSError as error:
+                self.status = "failed"
+                self.hint = f"Could not start the engine: {error}"
+                return {"ok": False, "error": self.hint}
+            self.port = port
+            self.status = "loading"
+            self.hint = ""
+            self.started_at = time.time()
+            self.ready_at = 0.0
+            engine = self.engine
+        threading.Thread(target=self._wait_ready, args=(engine, port), daemon=True).start()
+        return {"ok": True}
+
+    def _wait_ready(self, engine: Engine, port: int) -> None:
         deadline = time.monotonic() + READY_TIMEOUT_SECONDS
         while engine.running() and time.monotonic() < deadline:
             if server_answers(port):
-                events.put(("ready", port))
+                with self.lock:
+                    if self.engine is engine:
+                        engine.was_ready = True
+                        self.status = "running"
+                        self.ready_at = time.time()
+                        self.log(f"Ready at {chat_url(port)} "
+                                 f"(loaded in {self.ready_at - self.started_at:.0f} s)", "ok")
                 return
-            time.sleep(0.5)
+            time.sleep(0.4)
 
-    def stop() -> None:
-        engine = state["engine"]
-        if isinstance(engine, Engine) and engine.running():
-            status_var.set("Stopping…")
-            start_button.state(["disabled"])
-            # Off the Tk thread: a clean shutdown can take seconds, and the
-            # exit event re-enables the button.
+    def stop(self, wait: bool = False) -> None:
+        with self.lock:
+            engine = self.engine
+            if engine is None:
+                return
+            self.status = "stopping"
+        if wait:
+            engine.stop()
+        else:
             threading.Thread(target=engine.stop, daemon=True).start()
 
-    def open_chat() -> None:
-        port = state.get("port")
-        if isinstance(port, int):
-            webbrowser.open(chat_url(port))
+    def run_doctor(self) -> None:
+        with self.lock:
+            if self.doctor_running:
+                return
+            self.doctor_running = True
+            self.doctor_raw = []
+            self.log("", "")
+            self.log("Checking this computer…", "note")
+            try:
+                Engine(["doctor"], self, prefix="doctor-")
+            except OSError as error:
+                self.doctor_running = False
+                self.doctor = [DoctorLine("fail", "check", f"could not run: {error}")]
+                self.doctor_ran = True
 
-    def run_doctor() -> None:
-        doctor_button.configure(state="disabled")
-        write("")
-        write("Checking this computer…", "note")
-        doctor_text.clear()
-        try:
-            Engine(["doctor"], events, prefix="doctor-")
-        except OSError as error:
-            write(f"Could not run the check: {error}", "fail")
-            doctor_button.configure(state="normal")
+    # -- what the page sees --------------------------------------------------
 
-    def handle(kind: str, payload: object) -> None:
-        if kind == "line":
-            text = str(payload)
-            log_lines = state["log"]
-            assert isinstance(log_lines, list)
-            log_lines.append(text)
-            del log_lines[:-400]
-            lowered = text.lower()
-            tag = "fail" if ("error" in lowered or "traceback" in lowered
-                             or text.startswith("flyweight:")) else ""
-            write(text, tag)
-        elif kind == "ready":
-            state["ready"] = True
-            if isinstance(state["engine"], Engine):
-                state["engine"].was_ready = True
-            port = int(payload)  # type: ignore[call-overload]
-            seconds = time.monotonic() - float(state.get("started", time.monotonic()))  # type: ignore[arg-type]
-            message = f"Running — chat at {chat_url(port)}  (loaded in {seconds:.0f} s)"
-            if settings.share_on_network:
+    def snapshot(self, since: int = 0) -> dict[str, object]:
+        with self.lock:
+            self.last_poll = time.monotonic()
+            check = check_model(self.settings.model) if self.settings.model else \
+                ModelCheck(False, message="")
+            lan = None
+            if self.status == "running" and self.settings.share_on_network and self.port:
                 address = lan_address()
-                if address:
-                    message += f"\nOther devices: http://{address}:{port}/"
-            status_var.set(message)
-            write(message, "ok")
-            chat_button.configure(state="normal")
-            if settings.open_chat:
-                open_chat()
-        elif kind == "exit":
-            code = payload
-            engine = state["engine"]
-            state["engine"] = None
-            state["ready"] = False
-            set_running(False)
-            start_button.state(["!disabled"])
-            if code == 0 or (isinstance(engine, Engine) and engine.stopping):
-                status_var.set("Stopped")
-                write("Stopped.", "note")
-                return
-            log_lines = state["log"]
-            hint = explain_failure("\n".join(log_lines))  # type: ignore[arg-type]
-            served = isinstance(engine, Engine) and engine.was_ready
-            status_var.set(("The engine stopped: " if served else "Could not start: ") + hint)
-            write(f"Engine exited with code {code}. {hint}", "fail")
-        elif kind == "doctor-line":
-            text = str(payload)
-            stripped = text.strip()
-            tag = ("fail" if stripped.startswith("[FAIL") else
-                   "warn" if stripped.startswith("[warn") else
-                   "ok" if stripped.startswith("[ok") else
-                   "note" if stripped.startswith("->") else "")
-            doctor_text.append(text)
-            # A missing package or library makes doctor itself crash.
-            if "traceback" in text.lower() or "error" in text.lower():
-                tag = tag or "fail"
-            write(text, tag)
-        elif kind == "doctor-exit":
-            doctor_button.configure(state="normal")
-            report = parse_doctor("\n".join(doctor_text))
-            failures = [line for line in report if line.status == "fail"]
-            if failures:
-                status_var.set(f"{len(failures)} problem(s) found — the red lines "
-                               "in the log say how to fix each.")
-            elif state["engine"] is None:
-                status_var.set("This computer can run Flyweight. Choose a model and press Start.")
+                lan = f"http://{address}:{self.port}/" if address else None
+            now = time.time()
+            return {
+                "status": self.status,
+                "hint": self.hint,
+                "port": self.port,
+                "chatUrl": chat_url(self.port) if self.port and self.status == "running" else None,
+                "lanUrl": lan,
+                "elapsed": (now - self.started_at) if self.status == "loading" else
+                           (self.ready_at - self.started_at if self.ready_at else 0),
+                "settings": asdict(self.settings),
+                "model": _check_dict(check),
+                "recent": [{"path": m, "name": Path(m).name, "folder": str(Path(m).parent),
+                            "exists": Path(m).exists()} for m in self.settings.recent_models],
+                "logs": [{"seq": n, "text": t, "kind": k} for n, t, k in self.logs if n > since],
+                "lastSeq": self.seq,
+                "lastLine": next((t for _, t, _k in reversed(self.logs) if t.strip()), ""),
+                "doctor": {"running": self.doctor_running, "ran": self.doctor_ran,
+                           "lines": [asdict(line) for line in self.doctor]},
+                "version": _version(),
+                "platform": sys.platform,
+                "framed": bool(self.frame_origin),
+            }
 
-    def pump() -> None:
+    def shutdown(self) -> None:
+        self.stop(wait=True)
+        with self.lock:
+            save_settings(self.settings, self.settings_path)
+
+
+# -- native file dialogs ------------------------------------------------------
+
+_WINDOWS_PICKER = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form -Property @{TopMost=$true}
+if ($env:FW_KIND -eq 'folder') {
+  $d = New-Object System.Windows.Forms.FolderBrowserDialog
+  $d.Description = 'Choose a safetensors model folder'
+  $d.UseDescriptionForTitle = $true
+  if ($d.ShowDialog($owner) -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }
+} else {
+  $d = New-Object System.Windows.Forms.OpenFileDialog
+  $d.Title = 'Choose a model'
+  $d.Filter = 'GGUF models (*.gguf)|*.gguf|All files (*.*)|*.*'
+  if ($env:FW_START) { $d.InitialDirectory = $env:FW_START }
+  if ($d.ShowDialog($owner) -eq 'OK') { [Console]::Out.Write($d.FileName) }
+}
+"""
+
+
+def _picker_commands(kind: str, start: str) -> list[tuple[list[str], dict[str, str]]]:
+    """Dialog programs to try, best looking first."""
+    import shutil
+
+    folder = kind == "folder"
+    commands: list[tuple[list[str], dict[str, str]]] = []
+    if os.name == "nt":
+        commands.append((["powershell", "-NoProfile", "-NonInteractive", "-STA",
+                          "-Command", _WINDOWS_PICKER], {"FW_KIND": kind, "FW_START": start}))
+    else:
+        desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        zenity = shutil.which("zenity")
+        kdialog = shutil.which("kdialog")
+        zenity_cmd = [zenity, "--file-selection", "--title",
+                      "Choose a model folder" if folder else "Choose a model"] if zenity else []
+        if zenity_cmd:
+            zenity_cmd += ["--directory"] if folder else \
+                ["--file-filter=GGUF models | *.gguf", "--file-filter=All files | *"]
+            if start:
+                zenity_cmd += ["--filename", start.rstrip("/") + "/"]
+        kdialog_cmd = ([kdialog, "--getexistingdirectory", start or str(Path.home())] if folder
+                       else [kdialog, "--getopenfilename", start or str(Path.home()),
+                             "GGUF models (*.gguf)"]) if kdialog else []
+        ordered = [kdialog_cmd, zenity_cmd] if "kde" in desktop_env else [zenity_cmd, kdialog_cmd]
+        commands += [(c, {}) for c in ordered if c]
+    own = ([sys.executable, "--pick", kind] if getattr(sys, "frozen", False)
+           else [sys.executable, "-m", "flyweight.desktop", "--pick", kind])
+    commands.append((own, {"FW_START": start}))
+    return commands
+
+
+def pick_path(kind: str, start: str = "") -> str | None:
+    """Show a native open dialog; the chosen path, None if cancelled.
+
+    Raises LookupError when no dialog program could run at all, so the page
+    can say "paste the path" instead of silently doing nothing.
+    """
+    for command, extra in _picker_commands(kind, start):
         try:
-            while True:
-                kind, payload = events.get_nowait()
-                handle(kind, payload)
-        except queue.Empty:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    env={**os.environ, **extra}, timeout=3600)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        chosen = result.stdout.strip().splitlines()
+        if result.returncode == 0 and chosen:
+            return chosen[-1]
+        if result.returncode in (0, 1) and "Traceback" not in result.stderr \
+                and "No module named" not in result.stderr:
+            return None  # the dialog ran and was cancelled
+    raise LookupError("no file dialog is available")
+
+
+def _tk_pick(kind: str) -> int:  # pragma: no cover - needs a display
+    """`--pick file|folder`: the last-resort dialog, in its own process."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return 2
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    start = os.environ.get("FW_START") or str(Path.home())
+    if kind == "folder":
+        path = filedialog.askdirectory(title="Choose a model folder", initialdir=start)
+    else:
+        path = filedialog.askopenfilename(
+            title="Choose a model", initialdir=start,
+            filetypes=[("GGUF models", "*.gguf"), ("All files", "*")])
+    root.destroy()
+    if path:
+        print(path)
+    return 0
+
+
+# -- the local API --------------------------------------------------------------
+
+UI_DIRECTORY = Path(__file__).resolve().parent / "desktop_ui"
+_UI_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
+_UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data:; connect-src 'self'; "
+           "frame-src http://127.0.0.1:* http://localhost:*; "
+           "object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+
+
+def make_server(controller: Controller, token: str, picker=None):
+    """The page's backend, on a free loopback port.
+
+    Every /api call carries the per-run token in a header. A custom header
+    cannot be sent cross-origin without a CORS preflight this server never
+    answers, so another web page open in the browser cannot drive it; the
+    Host check closes DNS rebinding.
+    """
+    import hmac
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    picker = picker or pick_path
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "FlyweightDesktop"
+
+        def log_message(self, *_: object) -> None:
             pass
-        root.after(100, pump)
 
-    def on_close() -> None:
-        engine = state["engine"]
-        if isinstance(engine, Engine) and engine.running():
-            if not messagebox.askokcancel(APP_NAME, "Stop the model and quit?"):
+        def _host_ok(self) -> bool:
+            host = self.headers.get("Host", "")
+            port = self.server.server_address[1]  # type: ignore[index]
+            return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+        def _send(self, status: int, body: bytes, content_type: str,
+                  extra: dict[str, str] | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, status: int, data: object) -> None:
+            self._send(status, json.dumps(data).encode("utf-8"),
+                       "application/json; charset=utf-8")
+
+        def do_GET(self) -> None:
+            if not self._host_ok():
+                self._send(421, b"", "text/plain")
                 return
-            engine.stop()  # wait for it: quitting must not orphan the server
-        collect()
-        save_settings(settings)
-        root.destroy()
+            path, _, query = self.path.partition("?")
+            if path in _UI_FILES:
+                name, content_type = _UI_FILES[path]
+                self._send(200, (UI_DIRECTORY / name).read_bytes(), content_type,
+                           {"Content-Security-Policy": _UI_CSP} if name.endswith(".html") else None)
+                return
+            if path == "/icon.svg":
+                self._send(200, _icon_path().read_bytes(), "image/svg+xml")
+                return
+            if path == "/api/state" and self._authorized():
+                since = 0
+                for part in query.split("&"):
+                    if part.startswith("since="):
+                        try:
+                            since = int(part[6:])
+                        except ValueError:
+                            pass
+                self._json(200, controller.snapshot(since))
+                return
+            if path.startswith("/api/"):
+                return
+            self._send(404, b"not found", "text/plain")
 
-    start_button.configure(command=start)
-    chat_button.configure(command=open_chat)
-    doctor_button.configure(command=run_doctor)
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.after(100, pump)
+        def _authorized(self) -> bool:
+            sent = self.headers.get("X-Flyweight-Token", "")
+            if hmac.compare_digest(sent, token):
+                return True
+            self._json(403, {"error": "forbidden"})
+            return False
 
-    write(f"{APP_NAME} Desktop. Choose a model, press Start, and the chat opens "
-          "in your browser when the model is loaded.", "note")
-    if not (config_dir() / "desktop.json").exists():
-        run_doctor()  # first run: say up front whether this machine can serve
-    root.mainloop()
+        def do_POST(self) -> None:
+            if not self._host_ok():
+                self._send(421, b"", "text/plain")
+                return
+            if not self._authorized():
+                return
+            length = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            path = self.path.partition("?")[0]
+            if path == "/api/settings":
+                controller.update_settings(body)
+                self._json(200, controller.snapshot(controller.seq))
+            elif path == "/api/forget":
+                controller.forget_model(str(body.get("path", "")))
+                self._json(200, {"ok": True})
+            elif path == "/api/start":
+                self._json(200, controller.start())
+            elif path == "/api/stop":
+                controller.stop()
+                self._json(200, {"ok": True})
+            elif path == "/api/doctor":
+                controller.run_doctor()
+                self._json(200, {"ok": True})
+            elif path == "/api/browse":
+                kind = "folder" if body.get("kind") == "folder" else "file"
+                current = controller.settings.model
+                start = str(Path(current).parent) if current else ""
+                try:
+                    chosen = picker(kind, start)
+                except LookupError:
+                    self._json(200, {"ok": False, "error":
+                                     "No file dialog is available here. Paste the "
+                                     "model's path into the box instead."})
+                    return
+                if chosen:
+                    controller.update_settings({"model": chosen})
+                self._json(200, {"ok": True, "path": chosen})
+            elif path == "/api/open":
+                url = str(body.get("url", ""))
+                if re.fullmatch(r"http://(127\.0\.0\.1|[0-9.]+):\d+/", url):
+                    webbrowser.open(url)
+                self._json(200, {"ok": True})
+            elif path == "/api/shortcut":
+                try:
+                    written = install_shortcut()
+                    self._json(200, {"ok": True, "paths": [str(p) for p in written]})
+                except (OSError, subprocess.CalledProcessError) as error:
+                    self._json(200, {"ok": False, "error": str(error)})
+            elif path == "/api/quit":
+                self._json(200, {"ok": True})
+                controller.quit_requested.set()
+            else:
+                self._json(404, {"error": "unknown"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    return server
+
+
+# -- the window ---------------------------------------------------------------
+
+
+def _app_browsers() -> list[str]:
+    """Chromium-family browsers that can open a page as a bare app window."""
+    import shutil
+
+    found: list[str] = []
+    if os.name == "nt":
+        roots = [os.environ.get(name, "") for name in
+                 ("ProgramFiles(x86)", "ProgramFiles", "LocalAppData")]
+        relative = (r"Microsoft\Edge\Application\msedge.exe",
+                    r"Google\Chrome\Application\chrome.exe",
+                    r"BraveSoftware\Brave-Browser\Application\brave.exe")
+        for rel in relative:
+            for root in roots:
+                candidate = Path(root) / rel if root else None
+                if candidate and candidate.is_file():
+                    found.append(str(candidate))
+                    break
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "chromium",
+                     "chromium-browser", "microsoft-edge", "microsoft-edge-stable",
+                     "brave-browser", "brave", "vivaldi"):
+            path = shutil.which(name)
+            if path:
+                found.append(path)
+    return found
+
+
+def _open_app_window(url: str) -> bool:  # pragma: no cover - needs a display
+    """Show the page in a browser app window and wait for it to close."""
+    for browser in _app_browsers():
+        profile = config_dir() / "window"
+        profile.mkdir(parents=True, exist_ok=True)
+        command = [browser, f"--app={url}", f"--user-data-dir={profile}",
+                   "--no-first-run", "--no-default-browser-check",
+                   "--window-size=1200,820", "--class=Flyweight",
+                   "--disable-features=Translate"]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            command.append("--no-sandbox")  # Chromium refuses to run as root otherwise
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        started = time.monotonic()
+        code = process.wait()
+        if code == 0 or time.monotonic() - started > 5:
+            return True
+    return False
+
+
+def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a display
+    """Serve the page and show it: pywebview, else a browser app window,
+    else an ordinary browser tab kept alive by the page's polling."""
+    import secrets
+
+    mode = mode or os.environ.get("FLYWEIGHT_DESKTOP_WINDOW", "")
+    controller = Controller()
+    token = secrets.token_urlsafe(24)
+    webview_window: list[object] = []
+
+    def webview_picker(kind: str, start: str) -> str | None:
+        import webview  # type: ignore[import-not-found]
+
+        window = webview_window[0]
+        dialog = webview.FOLDER_DIALOG if kind == "folder" else webview.OPEN_DIALOG
+        kwargs = {} if kind == "folder" else {
+            "file_types": ("GGUF models (*.gguf)", "All files (*.*)")}
+        result = window.create_file_dialog(dialog, directory=start, **kwargs)  # type: ignore[attr-defined]
+        return result[0] if result else None
+
+    use_webview = False
+    if mode in ("", "webview"):
+        try:
+            import webview  # type: ignore[import-not-found]  # noqa: F401
+            use_webview = True
+        except ImportError:
+            use_webview = False
+
+    server = make_server(controller, token, webview_picker if use_webview else None)
+    port = server.server_address[1]
+    controller.frame_origin = f"http://127.0.0.1:{port}"
+    url = f"http://127.0.0.1:{port}/#t={token}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    if controller.first_run:
+        controller.run_doctor()
+
+    try:
+        if use_webview:
+            import webview  # type: ignore[import-not-found]
+
+            window = webview.create_window(f"{APP_NAME}", url, width=1200, height=820,
+                                           min_size=(860, 600), background_color="#0f1115")
+            webview_window.append(window)
+            webview.start()
+        elif mode != "browser" and _open_app_window(url):
+            pass
+        else:
+            webbrowser.open(url)
+            print(f"{APP_NAME} is open in your browser: {url}\n"
+                  "Close the tab or press Ctrl-C here to quit.", file=sys.stderr)
+            # The page polls every second (once a minute when hidden). No
+            # poll for three minutes means the tab is gone.
+            opened = time.monotonic()
+            while not controller.quit_requested.wait(2):
+                # Never connected (no browser came up), or stopped polling.
+                since = controller.last_poll or opened
+                if time.monotonic() - since > (180 if controller.last_poll else 120):
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        controller.shutdown()
+        server.shutdown()
     return 0
 
 
@@ -1023,11 +1182,17 @@ def main(argv: list[str] | None = None) -> int:
         for path in install_shortcut():
             print(f"added {path}")
         return 0
+    if argv[:1] == ["--pick"]:
+        return _tk_pick(argv[1] if len(argv) > 1 else "file")
     if "--uninstall-shortcut" in argv:
         for path in uninstall_shortcut():
             print(f"removed {path}")
         return 0
-    return run_window()
+    mode = None
+    for flag in ("--webview", "--app-window", "--browser"):
+        if flag in argv:
+            mode = {"--webview": "webview", "--app-window": "app", "--browser": "browser"}[flag]
+    return run_window(mode)
 
 
 if __name__ == "__main__":

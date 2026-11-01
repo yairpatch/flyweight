@@ -1349,9 +1349,9 @@ because --backend cpu serves without one.\
         commands, "app", aliases=("desktop",),
         help="open the desktop app: pick a model, press Start",
         description="Open Flyweight Desktop, a window that checks this "
-                    "computer, serves the model you pick and opens the chat "
-                    "-- no flags to learn. Linux and Windows; needs Tk.",
-        usage="app [--install-shortcut | --uninstall-shortcut]",
+                    "computer, serves the model you pick and shows the chat "
+                    "-- no flags to learn. Linux and Windows.",
+        usage="app [--window MODE] [--install-shortcut | --uninstall-shortcut]",
         epilog="""\
 examples:
   flyweight app
@@ -1370,6 +1370,11 @@ examples:
     shortcut.add_argument(
         "--uninstall-shortcut", action="store_true",
         help="remove the menu entry again, then exit",
+    )
+    app.add_argument(
+        "--window", choices=("auto", "webview", "app", "browser"), default="auto",
+        help="how to show the app: auto tries pywebview, then an Edge/Chrome "
+             "app window, then a browser tab",
     )
 
     audit = _add_command(
@@ -2517,7 +2522,9 @@ def _run(argv: list[str] | None = None) -> int:
             return desktop.main(["--install-shortcut"])
         if args.uninstall_shortcut:
             return desktop.main(["--uninstall-shortcut"])
-        return desktop.main([])
+        flag = {"webview": ["--webview"], "app": ["--app-window"],
+                "browser": ["--browser"]}.get(args.window, [])
+        return desktop.main(flag)
     _resolve_quant(args)
     if args.command in {"inspect", "inspect-gguf-v2", "inspect-gguf"}:
         with V2Model(args.model) as model:

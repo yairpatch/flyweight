@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Flyweight</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="/icon.svg" alt="" width="26" height="26">
+        <span class="brand-name">Flyweight</span>
+        <button class="icon-button collapse" id="collapse" title="Collapse sidebar" aria-label="Collapse sidebar"><svg data-icon="sidebar"></svg></button>
+      </div>
+      <nav class="nav" aria-label="Sections">
+        <button class="nav-item" data-view="home"><svg data-icon="home"></svg><span>Home</span></button>
+        <button class="nav-item" data-view="chat"><svg data-icon="chat"></svg><span>Chat</span><i class="nav-dot" id="nav-chat-dot"></i></button>
+        <button class="nav-item" data-view="activity"><svg data-icon="activity"></svg><span>Activity</span></button>
+        <button class="nav-item" data-view="system"><svg data-icon="shield"></svg><span>System check</span><b class="nav-badge" id="nav-system-badge" hidden></b></button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="engine" id="engine-card">
+          <i class="status-dot" id="engine-dot"></i>
+          <div class="engine-text">
+            <div class="engine-status" id="engine-status">Stopped</div>
+            <div class="engine-model" id="engine-model">No model loaded</div>
+          </div>
+        </div>
+        <div class="version" id="version"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- Home ------------------------------------------------------------ -->
+      <section class="view" id="view-home">
+        <div class="scroll">
+          <div class="page">
+            <header class="hero">
+              <h1 class="display" id="greeting">Good evening</h1>
+              <p class="lede" id="lede">Choose a model and press Start. Everything runs on this computer.</p>
+            </header>
+
+            <div class="card model-card" id="model-card">
+              <div class="model-empty" id="model-empty">
+                <div class="model-empty-icon"><svg data-icon="cube"></svg></div>
+                <div class="model-empty-text">
+                  <div class="title">Choose a model</div>
+                  <div class="muted">A <code>.gguf</code> file, or a folder holding a safetensors checkpoint.</div>
+                </div>
+                <div class="button-row">
+                  <button class="button primary" data-browse="file"><svg data-icon="file"></svg>Choose file</button>
+                  <button class="button" data-browse="folder"><svg data-icon="folder"></svg>Folder</button>
+                </div>
+              </div>
+              <div class="model-chosen" id="model-chosen" hidden>
+                <div class="model-tile"><svg data-icon="cube"></svg></div>
+                <div class="model-info">
+                  <div class="model-name" id="model-name"></div>
+                  <div class="model-meta" id="model-meta"></div>
+                </div>
+                <div class="button-row">
+                  <button class="button ghost" data-browse="file"><svg data-icon="file"></svg>Change</button>
+                  <button class="icon-button" data-browse="folder" title="Choose a folder" aria-label="Choose a folder"><svg data-icon="folder"></svg></button>
+                </div>
+              </div>
+              <div class="path-row">
+                <input class="path-input" id="path-input" spellcheck="false" autocomplete="off"
+                       placeholder="…or paste a path to a model">
+              </div>
+              <div class="model-message" id="model-message" hidden></div>
+            </div>
+
+            <div class="recent" id="recent" hidden>
+              <div class="section-label">Recent</div>
+              <div class="recent-list" id="recent-list"></div>
+            </div>
+
+            <div class="section-label">Settings</div>
+            <fieldset class="card settings" id="settings">
+              <div class="row">
+                <div class="row-text"><div class="row-title">Run on</div><div class="row-sub">Automatic picks your GPU when there is one.</div></div>
+                <div class="segmented" data-setting="backend">
+                  <button data-value="auto">Automatic</button>
+                  <button data-value="cuda">NVIDIA</button>
+                  <button data-value="rocm" data-linux>AMD</button>
+                  <button data-value="cpu">CPU only</button>
+                </div>
+              </div>
+              <div class="row">
+                <div class="row-text"><div class="row-title">Context length</div><div class="row-sub">How much text the model can keep in mind. Longer uses more memory.</div></div>
+                <div class="segmented" data-setting="context" data-number>
+                  <button data-value="0">Auto</button>
+                  <button data-value="8192">8K</button>
+                  <button data-value="16384">16K</button>
+                  <button data-value="32768">32K</button>
+                  <button data-value="65536">64K</button>
+                  <button data-value="131072">128K</button>
+                </div>
+              </div>
+              <div class="row" id="row-mmproj" hidden>
+                <div class="row-text"><div class="row-title">Image input</div><div class="row-sub" id="mmproj-sub">Use the vision projector found beside the model.</div></div>
+                <label class="switch"><input type="checkbox" data-setting="use_mmproj"><span></span></label>
+              </div>
+              <div class="row">
+                <div class="row-text"><div class="row-title">Open chat when ready</div><div class="row-sub">Switch to the chat as soon as the model has loaded.</div></div>
+                <label class="switch"><input type="checkbox" data-setting="open_chat"><span></span></label>
+              </div>
+              <div class="row">
+                <div class="row-text"><div class="row-title">Share on my network</div><div class="row-sub">Let phones and other computers on this network use it.</div></div>
+                <label class="switch"><input type="checkbox" data-setting="share_on_network"><span></span></label>
+              </div>
+
+              <details class="advanced" id="advanced">
+                <summary><svg data-icon="chevron"></svg>Advanced</summary>
+                <div class="row">
+                  <div class="row-text"><div class="row-title">Mixture-of-experts placement</div><div class="row-sub">For big MoE models that do not fit on the GPU.</div></div>
+                  <select class="select" data-setting="expert_mode">
+                    <option value="auto">Automatic</option>
+                    <option value="cpu">Experts on the CPU</option>
+                    <option value="resident">All experts on the GPU</option>
+                  </select>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-title">Safetensors quantization</div><div class="row-sub">Applied when a safetensors folder is converted on first start.</div></div>
+                  <select class="select" data-setting="quant">
+                    <option value="Q6_K">Q6_K — recommended</option>
+                    <option value="Q4_K">Q4_K — smaller</option>
+                    <option value="Q8_0">Q8_0 — closest to original</option>
+                    <option value="IQ4_XS">IQ4_XS — smallest usable</option>
+                  </select>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-title">Port</div><div class="row-sub">A busy port is skipped automatically.</div></div>
+                  <input class="input narrow" type="number" min="1024" max="65535" data-setting="port" data-number>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-title">CPU threads</div><div class="row-sub">0 lets Flyweight choose.</div></div>
+                  <input class="input narrow" type="number" min="0" max="512" data-setting="cpu_threads" data-number>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-title">API key</div><div class="row-sub">Require this key from every client. Empty means none.</div></div>
+                  <input class="input" type="password" autocomplete="off" data-setting="api_key" placeholder="Optional">
+                </div>
+                <div class="row stacked">
+                  <div class="row-text"><div class="row-title">Extra serve flags</div><div class="row-sub">Passed to <code>flyweight serve</code> as typed.</div></div>
+                  <input class="input mono" spellcheck="false" data-setting="extra_args" placeholder="--parallel 2 --temperature 0.7">
+                </div>
+              </details>
+            </fieldset>
+            <p class="locked-note" id="locked-note" hidden>Stop the model to change its settings.</p>
+          </div>
+        </div>
+
+        <footer class="actionbar" id="actionbar">
+          <div class="progress" id="progress"></div>
+          <div class="actionbar-inner">
+            <div class="action-text">
+              <div class="action-title" id="action-title"></div>
+              <div class="action-sub" id="action-sub"></div>
+            </div>
+            <div class="button-row" id="action-buttons"></div>
+          </div>
+        </footer>
+      </section>
+
+      <!-- Chat ------------------------------------------------------------ -->
+      <section class="view" id="view-chat" hidden>
+        <div class="chat-bar" id="chat-bar">
+          <i class="status-dot running"></i>
+          <span class="chat-model" id="chat-model"></span>
+          <span class="chat-url" id="chat-url"></span>
+          <span class="spacer"></span>
+          <button class="button ghost small" id="chat-external"><svg data-icon="external"></svg>Open in browser</button>
+        </div>
+        <iframe class="chat-frame" id="chat-frame" title="Chat" hidden></iframe>
+        <div class="empty" id="chat-empty">
+          <div class="empty-icon"><svg data-icon="chat"></svg></div>
+          <h2>No model is running</h2>
+          <p class="muted">Start a model on the Home page and the chat appears here.</p>
+          <button class="button primary" data-goto="home">Go to Home</button>
+        </div>
+      </section>
+
+      <!-- Activity -------------------------------------------------------- -->
+      <section class="view" id="view-activity" hidden>
+        <div class="view-head">
+          <div>
+            <h2>Activity</h2>
+            <p class="muted">What the engine is doing, line by line.</p>
+          </div>
+          <div class="button-row">
+            <button class="button ghost small" id="log-copy"><svg data-icon="copy"></svg>Copy</button>
+            <button class="button ghost small" id="log-clear"><svg data-icon="trash"></svg>Clear</button>
+          </div>
+        </div>
+        <div class="log" id="log" tabindex="0"></div>
+      </section>
+
+      <!-- System check ---------------------------------------------------- -->
+      <section class="view" id="view-system" hidden>
+        <div class="scroll">
+          <div class="page">
+            <div class="view-head flat">
+              <div>
+                <h2>System check</h2>
+                <p class="muted">Whether this computer can run models, and how to fix what is missing.</p>
+              </div>
+              <button class="button" id="doctor-run"><svg data-icon="refresh"></svg>Run check</button>
+            </div>
+            <div class="summary" id="doctor-summary"></div>
+            <div class="card checks" id="doctor-list"></div>
+
+            <div class="section-label">Desktop</div>
+            <div class="card settings">
+              <div class="row">
+                <div class="row-text"><div class="row-title">Add to the app menu</div><div class="row-sub" id="shortcut-sub">Open Flyweight from your applications menu without a terminal.</div></div>
+                <button class="button" id="shortcut"><svg data-icon="plus"></svg>Add shortcut</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -218,5 +218,153 @@ class ShortcutTests(unittest.TestCase):
             install.assert_called_once()
 
 
+class LocalApiTests(unittest.TestCase):
+    """The page's backend: who may call it, and what the verbs do."""
+
+    def setUp(self) -> None:
+        import threading
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.model = _gguf(self.root / "m.gguf")
+        self.controller = desktop.Controller(settings_path=self.root / "desktop.json")
+        self.picked: list[tuple[str, str]] = []
+
+        def picker(kind: str, start: str) -> str | None:
+            self.picked.append((kind, start))
+            return str(self.model)
+
+        self.server = desktop.make_server(self.controller, "secret-token", picker)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self._dir.cleanup()
+
+    def call(self, path: str, body: dict | None = None, token: str = "secret-token",
+             host: str | None = None) -> tuple[int, object]:
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"X-Flyweight-Token": token, "Content-Type": "application/json"}
+        if host:
+            headers["Host"] = host
+        payload = None if body is None else json.dumps(body)
+        connection.request("GET" if body is None else "POST", path, payload, headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        try:
+            return response.status, json.loads(raw)
+        except ValueError:
+            return response.status, raw
+
+    def test_the_page_is_served_with_a_strict_policy(self) -> None:
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        html = response.read().decode()
+        self.assertEqual(response.status, 200)
+        self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+        self.assertIn('src="/app.js"', html)
+        self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)")
+        for asset in ("/app.js", "/app.css", "/icon.svg"):
+            self.assertEqual(self.call(asset)[0], 200, asset)
+
+    def test_the_api_needs_the_token_and_a_loopback_host(self) -> None:
+        self.assertEqual(self.call("/api/state", token="wrong")[0], 403)
+        self.assertEqual(self.call("/api/start", {}, token="")[0], 403)
+        self.assertEqual(self.call("/api/state", host="evil.example:80")[0], 421)
+        status, state = self.call("/api/state")
+        self.assertEqual(status, 200)
+        assert isinstance(state, dict)
+        self.assertEqual(state["status"], "idle")
+
+    def test_settings_are_validated_saved_and_reflected(self) -> None:
+        status, state = self.call("/api/settings", {
+            "model": str(self.model), "backend": "cpu", "port": "not a port",
+            "recent_models": ["/injected"]})
+        self.assertEqual(status, 200)
+        assert isinstance(state, dict)
+        self.assertEqual(state["settings"]["backend"], "cpu")
+        self.assertEqual(state["settings"]["port"], desktop.DEFAULT_PORT)
+        self.assertEqual(state["settings"]["recent_models"], [])
+        self.assertTrue(state["model"]["ok"])
+        saved = json.loads((self.root / "desktop.json").read_text())
+        self.assertEqual(saved["model"], str(self.model))
+
+    def test_browse_sets_the_model_and_a_missing_dialog_is_explained(self) -> None:
+        status, result = self.call("/api/browse", {"kind": "folder"})
+        self.assertEqual((status, result["path"]), (200, str(self.model)))  # type: ignore[index]
+        self.assertEqual(self.picked[0][0], "folder")
+        self.assertEqual(self.controller.settings.model, str(self.model))
+
+        def no_dialog(kind: str, start: str) -> str | None:
+            raise LookupError
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = desktop.make_server(self.controller, "secret-token", no_dialog)
+        self.port = self.server.server_address[1]
+        import threading
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        _, result = self.call("/api/browse", {"kind": "file"})
+        self.assertFalse(result["ok"])  # type: ignore[index]
+        self.assertIn("Paste", result["error"])  # type: ignore[index]
+
+    def test_start_refuses_a_bad_model_without_spawning(self) -> None:
+        self.controller.update_settings({"model": str(self.root / "missing.gguf")})
+        with patch.object(desktop, "Engine") as engine:
+            _, result = self.call("/api/start", {})
+        engine.assert_not_called()
+        self.assertFalse(result["ok"])  # type: ignore[index]
+        self.assertIn("moved", result["error"])  # type: ignore[index]
+
+    def test_start_runs_serve_and_an_exit_is_explained(self) -> None:
+        self.controller.update_settings({"model": str(self.model), "backend": "cpu"})
+        self.controller.frame_origin = "http://127.0.0.1:1234"
+        with patch.object(desktop, "Engine") as engine, \
+                patch.object(desktop.Controller, "_wait_ready"):
+            _, result = self.call("/api/start", {})
+        self.assertTrue(result["ok"])  # type: ignore[index]
+        arguments = engine.call_args.args[0]
+        self.assertEqual(arguments[:2], ["serve", str(self.model)])
+        self.assertEqual(engine.call_args.kwargs["env"],
+                         {"FLYWEIGHT_UI_FRAME_ANCESTOR": "http://127.0.0.1:1234"})
+        self.assertEqual(self.controller.status, "loading")
+        self.assertEqual(self.controller.settings.recent_models, [str(self.model)])
+        engine.return_value.stopping = False
+        self.controller.put(("line", "flyweight: CUDA_ERROR_OUT_OF_MEMORY"))
+        self.controller.put(("exit", 1))
+        self.assertEqual(self.controller.status, "failed")
+        self.assertIn("does not fit", self.controller.hint)
+        _, state = self.call("/api/state?since=0")
+        self.assertTrue(any("OUT_OF_MEMORY" in line["text"] for line in state["logs"]))  # type: ignore[index]
+
+    def test_the_doctor_report_reaches_the_page(self) -> None:
+        self.controller.put(("doctor-line", "[FAIL] native runtime: not built"))
+        self.controller.put(("doctor-line", "       -> python -m flyweight.native_build"))
+        self.controller.put(("doctor-exit", 1))
+        _, state = self.call("/api/state")
+        doctor = state["doctor"]  # type: ignore[index]
+        self.assertTrue(doctor["ran"])
+        self.assertEqual(doctor["lines"][0]["fix"], "python -m flyweight.native_build")
+
+
+class FramingTests(unittest.TestCase):
+    def test_only_an_exact_loopback_origin_may_frame_the_chat(self) -> None:
+        from flyweight import server
+
+        with patch.dict(os.environ, {"FLYWEIGHT_UI_FRAME_ANCESTOR": "http://127.0.0.1:4321"}):
+            self.assertIn("frame-ancestors http://127.0.0.1:4321", server._ui_csp())
+        for hostile in ("*", "https://evil.example", "http://127.0.0.1:1; script-src *", ""):
+            with patch.dict(os.environ, {"FLYWEIGHT_UI_FRAME_ANCESTOR": hostile}):
+                self.assertEqual(server._ui_csp(), server.UI_CSP)
+
+
 if __name__ == "__main__":
     unittest.main()

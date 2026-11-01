@@ -60,6 +60,7 @@ def main() -> int:
         # servers, the UI bundle and the native library), so name all of it.
         "--collect-all", "flyweight",
         "--collect-all", "jinja2",
+        # The last-resort file dialog (`--pick`) when no zenity/kdialog exists.
         "--hidden-import", "tkinter",
     ]
     # `_native` is not a Python package, and --collect-all skips the library
@@ -67,6 +68,12 @@ def main() -> int:
     for library in sorted((package / "_native").iterdir()):
         if library.is_file():
             command += ["--add-binary", f"{library}{os.pathsep}flyweight/_native"]
+    # The chat UI and the desktop page are plain directories too. Named
+    # explicitly: a bundle without them starts and then shows nothing.
+    for directory in ("ui", "desktop_ui"):
+        if not (package / directory).is_dir():
+            raise SystemExit(f"{package / directory} is missing from this install")
+        command += ["--add-data", f"{package / directory}{os.pathsep}flyweight/{directory}"]
     if importlib.util.find_spec("PIL") is not None:
         command += ["--collect-submodules", "PIL"]
     if sys.platform == "win32":

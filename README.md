@@ -133,30 +133,35 @@ flyweight app --install-shortcut   # add it to the applications / Start menu
 ~~~
 
 Pick a model (a `.gguf` file, or a safetensors folder), press **Start**, and
-the chat opens in your browser once the model is loaded. The app takes care
-of the usual stumbling blocks:
+the chat appears in the same window once the model has loaded. A sidebar
+holds four pages: **Home** (model and settings), **Chat**, **Activity** (the
+engine's live log) and **System check**. The app handles the usual first-run
+problems for you:
 
-- **Checks the computer first.** The first launch runs `flyweight doctor` and
-  colours each line; **Check this computer** re-runs it at any time.
+- **Checks the computer first.** The first launch runs `flyweight doctor`;
+  each problem comes with its fix and a copy button.
 - **Catches the wrong file.** Picking the vision projector (`mmproj-*.gguf`),
   part 2 of a split GGUF, the folder around a single GGUF, a half-downloaded
   file or a file inside a safetensors folder is either corrected or explained.
   A projector found beside the model is offered as image input.
 - **Plain choices.** Device (automatic, NVIDIA, AMD, CPU only), context length,
-  and "let other devices on my network use it"; MoE expert placement, the
-  safetensors quantization, CPU threads, an API key and any extra `serve` flag
-  sit under *Show advanced options*.
+  and "share on my network". MoE expert placement, the safetensors
+  quantization, port, CPU threads, an API key and any extra `serve` flag sit
+  under *Advanced*.
 - **No port clashes.** A busy port is skipped for the next free one.
-- **Failures in words.** When the engine stops, the log stays on screen and a
-  one-line diagnosis names the fix: out of memory, port taken, CUDA toolkit
-  missing, unsupported model.
-- **Remembers** the last settings and recent models.
+- **Failures in words.** When the engine stops, a one-line diagnosis names the
+  fix: out of memory, port taken, CUDA toolkit missing, damaged file.
+- **Remembers** your settings and recent models. Closing the window stops the
+  model.
 
-The engine is the ordinary `flyweight serve`, run as a child process, so
-everything in this README applies to it. The window needs Tk: it ships with
-the python.org Windows installer; on Linux install `python3-tk` (Debian,
-Ubuntu), `python3-tkinter` (Fedora) or `tk` (Arch). On Windows the
-`flyweight-desktop` command opens the app with no console window.
+The interface is a local web page in its own window. With `pip install
+"flyweight-llm[desktop]"` it uses a native webview (WebView2 on Windows).
+Without it, Flyweight opens the page as an app window of Edge, Chrome,
+Chromium or Brave (Edge ships with Windows), and as a last resort in a
+browser tab (`--window` picks one). File dialogs are the system's own:
+Windows' picker, zenity or kdialog on Linux. The engine is the ordinary
+`flyweight serve`, run as a child process, so everything in this README
+applies to it.
 
 For a machine without Python, `python tools/build_desktop.py` freezes an
 installed wheel into a standalone bundle (`Flyweight-<version>-windows-x86_64.zip`
