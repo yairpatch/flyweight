@@ -205,7 +205,9 @@ applies to it.
 The downloads at the top of this README are this app, frozen with its own
 Python. `python tools/build_desktop.py --installer` builds them from an
 installed wheel: the Inno Setup installer on Windows and the AppImage on Linux
-(`packaging/` holds the installer script, icons and the release workflow).
+(`packaging/` holds the installer script and icons). On each release,
+`.github/workflows/desktop.yml` builds both from the released wheels and
+attaches them to the release page.
 
 From a pip install, `python -m flyweight.gpu_setup install` does what the
 app's **Set up GPU** button does, and `flyweight serve` uses the result.
