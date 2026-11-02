@@ -1,8 +1,5 @@
 # Flyweight Desktop downloads: the Windows installer and the Linux AppImage.
 #
-# TO ENABLE: copy this file to .github/workflows/desktop.yml. (It lives here
-# because the bot that wrote it is not allowed to create workflow files.)
-#
 # Runs after the Release workflow has built and verified the wheels, freezes
 # those exact wheels into the two downloads, smoke-tests them, and attaches
 # them to the release page under stable names, so these links always point at
