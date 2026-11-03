@@ -32,6 +32,16 @@ class UIBundleTests(unittest.TestCase):
         self.assertTrue(any(asset.endswith(".js") for asset in assets))
         self.assertTrue(any(asset.endswith(".css") for asset in assets))
 
+    def test_the_desktop_app_bundle_is_present_and_self_consistent(self) -> None:
+        desktop = UI.parent / "desktop_ui"
+        html = (desktop / "desktop.html").read_text(encoding="utf-8")
+        self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)")
+        assets = re.findall(r'(?:src|href)="/assets/([^"]+)"', html)
+        self.assertTrue(assets, "desktop.html names no assets; run `pnpm build` in web/")
+        for asset in assets:
+            self.assertTrue((desktop / "assets" / asset).is_file(), asset)
+        self.assertTrue((desktop / "preview.html").is_file())
+
     def test_preview_shell_and_icon_are_bundled(self) -> None:
         self.assertIn("location.hash", (UI / "preview.html").read_text(encoding="utf-8"))
         self.assertTrue((UI / "favicon.svg").is_file())

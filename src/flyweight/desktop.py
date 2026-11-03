@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
-from . import gpu_setup, models
+from . import engine_options, gpu_setup, models, sysmon
 
 APP_NAME = "Flyweight"
 DEFAULT_PORT = 8000
@@ -50,31 +50,40 @@ _SPLIT_PART = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 # Settings
 
 
+# Profile keys that are the app's, not a serve flag's.
+EXTRA_KEY = "_extra"            # free-text serve flags, appended as typed
+AUTO_MMPROJ_KEY = "_auto_mmproj"  # use an mmproj found beside the model
+_LEGACY = {"backend": "backend", "context": "context_window", "expert_mode": "expert_mode",
+           "quant": "quant", "cpu_threads": "cpu_threads", "api_key": "api_key", "port": "port"}
+
+
+def _scalar(value: object) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
 @dataclass
 class Settings:
-    """What the window remembers between runs."""
+    """What the window remembers between runs.
+
+    Engine options live in `profiles`: one {dest: value} per model path,
+    holding only what differs from the CLI's defaults, plus "" for models
+    that have no profile of their own yet.
+    """
 
     model: str = ""
-    backend: str = "auto"
-    context: int = 0
-    port: int = DEFAULT_PORT
-    share_on_network: bool = False
     open_chat: bool = True
-    use_mmproj: bool = True
-    expert_mode: str = "auto"
-    quant: str = "Q6_K"
-    cpu_threads: int = 0
-    api_key: str = ""
-    extra_args: str = ""
     recent_models: list[str] = field(default_factory=list)
     models_dir: str = ""        # where "Get a model" downloads to; "" = ~/Flyweight Models
+    profiles: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: object) -> "Settings":
         """Read a saved file, keeping defaults for anything missing or wrong.
 
         A settings file that a newer or older version wrote, or one a person
-        edited by hand, must never stop the window from opening.
+        edited by hand, must never stop the window from opening. A file from
+        before profiles had a handful of fixed fields; those become the
+        default profile.
         """
         settings = cls()
         if not isinstance(data, dict):
@@ -86,17 +95,40 @@ class Settings:
             default = getattr(settings, spec.name)
             if isinstance(default, bool):
                 ok = isinstance(value, bool)
-            elif isinstance(default, int):
-                ok = isinstance(value, int) and not isinstance(value, bool)
             elif isinstance(default, list):
                 ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+            elif isinstance(default, dict):
+                ok = isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, dict)
+                    and all(isinstance(kk, str) and _scalar(vv) for kk, vv in v.items())
+                    for k, v in value.items())
             else:
                 ok = isinstance(value, str)
             if ok:
                 setattr(settings, spec.name, value)
-        if not 1 <= settings.port <= 65535:
-            settings.port = DEFAULT_PORT
+        if "profiles" not in data:
+            legacy: dict[str, object] = {}
+            for old, dest in _LEGACY.items():
+                value = data.get(old)
+                if _scalar(value) and value not in (None, "", 0) and not isinstance(value, bool):
+                    legacy[dest] = value
+            if data.get("share_on_network") is True:
+                legacy["host"] = "0.0.0.0"
+            if data.get("use_mmproj") is False:
+                legacy[AUTO_MMPROJ_KEY] = False
+            if isinstance(data.get("extra_args"), str) and data["extra_args"].strip():
+                legacy[EXTRA_KEY] = data["extra_args"]
+            if legacy:
+                settings.profiles[""] = legacy
         return settings
+
+    def profile(self, model: str | None = None) -> dict[str, object]:
+        """The options for `model` (default: the selected one), as a copy."""
+        key = self.model if model is None else model
+        chosen = self.profiles.get(key)
+        if chosen is None:
+            chosen = self.profiles.get("", {})
+        return dict(chosen)
 
 
 def config_dir() -> Path:
@@ -275,28 +307,45 @@ def engine_command() -> list[str]:
     return [str(interpreter), "-m", "flyweight"]
 
 
-def serve_arguments(settings: Settings, model: ModelCheck, port: int) -> list[str]:
-    """The `serve` arguments for these settings, without the interpreter."""
-    args = ["serve", model.path,
-            "--host", "0.0.0.0" if settings.share_on_network else "127.0.0.1",
-            "--port", str(port),
-            "--backend", settings.backend]
-    if settings.context:
-        args += ["--context", str(settings.context)]
-    if model.kind == "safetensors":
-        # `ask` would wait on a terminal the window does not have.
-        args += ["--quant", settings.quant]
-    if settings.expert_mode != "auto":
-        args += ["--expert-mode", settings.expert_mode]
-    if settings.cpu_threads > 0:
-        args += ["--cpu-threads", str(settings.cpu_threads)]
-    if settings.api_key.strip():
-        args += ["--api-key", settings.api_key.strip()]
-    if settings.use_mmproj and model.mmproj:
-        args += ["--mmproj", model.mmproj]
-    if settings.extra_args.strip():
-        args += shlex.split(settings.extra_args, posix=os.name != "nt")
+def command_arguments(command: str, values: dict[str, object], model: ModelCheck,
+                      overrides: dict[str, object] | None = None) -> list[str]:
+    """`command MODEL ...` for a profile: every option it sets that `command` has.
+
+    One profile drives serve, the plan preview and the benchmark alike;
+    options a command lacks are skipped. A safetensors folder always gets a
+    --quant (the CLI's `ask` would wait on a terminal the app does not have),
+    and a projector found beside the model is used unless switched off.
+    """
+    merged: dict[str, object] = {k: v for k, v in values.items() if not k.startswith("_")}
+    if model.kind == "safetensors" and not merged.get("quant"):
+        merged["quant"] = "Q6_K"
+    if model.mmproj and values.get(AUTO_MMPROJ_KEY, True) and not merged.get("mmproj"):
+        merged["mmproj"] = model.mmproj
+    merged.update(overrides or {})
+    spec = _schema(command)
+    if "mmproj" not in engine_options.options_of(spec):
+        merged.pop("mmproj", None)
+    args = engine_options.build_argv(command, merged, spec, positional={"model": model.path})
+    extra = values.get(EXTRA_KEY)
+    if command == "serve" and isinstance(extra, str) and extra.strip():
+        args += shlex.split(extra, posix=os.name != "nt")
     return args
+
+
+def serve_arguments(settings: Settings, model: ModelCheck, port: int) -> list[str]:
+    """The `serve` arguments for the selected model's profile, on `port`."""
+    return command_arguments("serve", settings.profile(model.path if model.path in
+                                                       settings.profiles else None),
+                             model, {"port": port})
+
+
+_SCHEMAS: dict[str, dict[str, object]] = {}
+
+
+def _schema(command: str) -> dict:
+    if command not in _SCHEMAS:
+        _SCHEMAS[command] = engine_options.schema(command)
+    return _SCHEMAS[command]
 
 
 def chat_url(port: int) -> str:
@@ -455,6 +504,171 @@ class Engine:
             self.process.wait(timeout=5)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------
+# Jobs: the engine's other commands, run from the app
+
+
+GGML_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
+    10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS",
+    17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S",
+    23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M",
+    30: "BF16", 39: "MXFP4", 40: "NVFP4",
+}
+
+
+def summarize_inspect(data: dict) -> dict[str, object]:
+    """The parts of `flyweight inspect` a person reads: shape, size, quantization."""
+    raw_model, raw_config, raw_tensors = data.get("model"), data.get("config"), data.get("tensors")
+    model: dict = raw_model if isinstance(raw_model, dict) else {}
+    config: dict = raw_config if isinstance(raw_config, dict) else {}
+    tensors: list = raw_tensors if isinstance(raw_tensors, list) else []
+    params = 0
+    by_type: dict[str, int] = {}
+    for tensor in tensors:
+        if not isinstance(tensor, dict):
+            continue
+        count = 1
+        for dim in tensor.get("shape") or []:
+            count *= int(dim)
+        params += count
+        name = GGML_TYPES.get(int(tensor.get("ggml_type", -1)), f"type {tensor.get('ggml_type')}")
+        by_type[name] = by_type.get(name, 0) + int(tensor.get("size") or 0)
+    total = sum(by_type.values()) or 1
+    mix = sorted(({"type": k, "bytes": v, "share": v / total} for k, v in by_type.items()),
+                 key=lambda e: -float(e["bytes"]))  # type: ignore[arg-type]
+    keep = ("architecture", "hidden_size", "layer_count", "attention_heads",
+            "attention_kv_heads", "context_length", "intermediate_size", "expert_count",
+            "expert_used_count", "vocabulary_size", "sliding_window", "full_attention_interval",
+            "draft_block_size")
+    return {"name": model.get("name") or "", "architecture": model.get("architecture") or
+            config.get("architecture") or "", "format": model.get("format") or "",
+            "file_size": model.get("file_size"), "tensor_count": len(tensors),
+            "parameters": params, "quant_mix": mix[:8],
+            "config": {k: config.get(k) for k in keep if config.get(k) not in (None, 0, 0.0)}}
+
+
+@dataclass
+class Job:
+    id: str
+    command: str
+    title: str
+    argv: list[str]
+    state: str = "running"          # running, done, failed, cancelled
+    returncode: int | None = None
+    stdout: str = ""
+    log: list[str] = field(default_factory=list)
+    result: object = None
+    error: str = ""
+    started: float = field(default_factory=time.time)
+    ended: float = 0.0
+
+
+class Jobs:
+    """Runs `flyweight <command>` processes and keeps what they printed.
+
+    stdout (a JSON report, a generated answer, a plan table) and stderr (the
+    engine's progress) are read separately, so the result is never mixed
+    with the log. One job per command at a time.
+    """
+
+    STDOUT_LIMIT = 16 << 20
+
+    def __init__(self, on_finish=None) -> None:
+        self.lock = threading.Lock()
+        self.jobs: list[Job] = []
+        self.processes: dict[str, subprocess.Popen] = {}
+        self.on_finish = on_finish
+
+    def run(self, command: str, argv: list[str], title: str,
+            env: dict[str, str] | None = None) -> Job:
+        with self.lock:
+            busy = next((j for j in self.jobs if j.command == command and j.state == "running"), None)
+            if busy:
+                raise RuntimeError(f"a {command} is already running")
+            job = Job(f"{command}-{int(time.time() * 1000)}", command, title, argv)
+            self.jobs.append(job)
+            del self.jobs[:-30]
+        process = subprocess.Popen(
+            engine_command() + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env={**_child_environment(), **(env or {})},
+            **_popen_flags(),  # type: ignore[arg-type]
+        )
+        with self.lock:
+            self.processes[job.id] = process
+        threading.Thread(target=self._read_log, args=(job, process), daemon=True).start()
+        threading.Thread(target=self._read_result, args=(job, process), daemon=True).start()
+        return job
+
+    def _read_log(self, job: Job, process: subprocess.Popen) -> None:
+        assert process.stderr is not None
+        for raw in iter(process.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            # A progress line rewrites itself with \r; keep its last state.
+            line = line.split("\r")[-1]
+            with self.lock:
+                job.log.append(line)
+                del job.log[:-2000]
+
+    def _read_result(self, job: Job, process: subprocess.Popen) -> None:
+        assert process.stdout is not None
+        data = process.stdout.read(self.STDOUT_LIMIT)
+        process.stdout.read()  # drain anything past the limit
+        code = process.wait()
+        text = data.decode("utf-8", "replace")
+        with self.lock:
+            job.stdout, job.returncode, job.ended = text, code, time.time()
+            self.processes.pop(job.id, None)
+            if job.state == "cancelled":
+                return
+            if code == 0:
+                job.state = "done"
+                job.result = _job_result(job.command, text)
+            else:
+                job.state = "failed"
+                job.error = explain_failure("\n".join(job.log + [text]))
+        if self.on_finish:
+            self.on_finish(job)
+
+    def cancel(self, job_id: str) -> None:
+        with self.lock:
+            process = self.processes.get(job_id)
+            job = next((j for j in self.jobs if j.id == job_id), None)
+            if job and job.state == "running":
+                job.state = "cancelled"
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except OSError:
+                pass
+
+    def get(self, job_id: str) -> Job | None:
+        with self.lock:
+            return next((j for j in self.jobs if j.id == job_id), None)
+
+    def snapshot(self) -> list[dict[str, object]]:
+        with self.lock:
+            return [{**asdict(job), "log": job.log[-400:],
+                     "stdout": job.stdout[-200000:]} for job in self.jobs]
+
+    def stop_all(self) -> None:
+        for job_id in list(self.processes):
+            self.cancel(job_id)
+
+
+def _job_result(command: str, stdout: str) -> object:
+    if command in ("inspect", "benchmark", "probe"):
+        try:
+            data = json.loads(stdout)
+        except ValueError:
+            return stdout
+        return summarize_inspect(data) if command == "inspect" and isinstance(data, dict) else data
+    return stdout
 
 
 # --------------------------------------------------------------------------
@@ -638,6 +852,10 @@ class Controller:
             / "model-catalog.json"
         self.fetch_catalog = True
         self.notice = ""                 # a one-off message for the page to toast
+        self.api_key = ""                # the running engine's, for the monitor's own calls
+        self.requests: list[dict[str, object]] = []   # the engine's request table, parsed
+        self.jobs = Jobs(self._job_finished)
+        self.inspected: dict[str, tuple[float, object]] = {}
         self._library: tuple[float, list[dict[str, object]]] = (0.0, [])
         self.downloads = models.Downloads(self.models_dir, self._download_done)
 
@@ -678,7 +896,7 @@ class Controller:
             if self.engine is None:
                 self.settings.model = job.result
                 save_settings(self.settings, self.settings_path)
-                self.notice = f"{job.name} is ready. Press Start on Home."
+                self.notice = f"{job.name} is ready. Press Start in the bar at the top."
             else:
                 self.notice = f"{job.name} is downloaded. Stop the current model to switch."
 
@@ -797,6 +1015,11 @@ class Controller:
                 text = str(payload)
                 self.engine_log.append(text)
                 del self.engine_log[:-400]
+                row = sysmon.parse_request_row(text)
+                if row is not None:
+                    row["at"] = time.time()
+                    self.requests.append(row)
+                    del self.requests[:-500]
                 lowered = text.lower()
                 tag = "error" if ("error" in lowered or "traceback" in lowered
                                   or text.startswith("flyweight:")) else ""
@@ -855,18 +1078,22 @@ class Controller:
             check = check_model(self.settings.model)
             if not check.ok:
                 return {"ok": False, "error": check.message}
+            values = self.settings.profile()
             try:
-                serve_arguments(self.settings, check, self.settings.port)
+                wanted = int(str(values.get("port") or DEFAULT_PORT))
+                serve_arguments(self.settings, check, wanted)
             except ValueError as error:
-                return {"ok": False, "error": f"The extra flags could not be read: {error}"}
-            bind = "0.0.0.0" if self.settings.share_on_network else "127.0.0.1"
-            port = pick_port(self.settings.port, bind)
-            if port != self.settings.port:
-                self.log(f"Port {self.settings.port} is busy; using {port} instead.", "note")
+                return {"ok": False, "error": f"A setting could not be used: {error}"}
+            bind = str(values.get("host") or "127.0.0.1")
+            port = pick_port(wanted, "0.0.0.0" if bind not in ("127.0.0.1", "localhost") else bind)
+            if port != wanted:
+                self.log(f"Port {wanted} is busy; using {port} instead.", "note")
             remember_model(self.settings, check.path)
             save_settings(self.settings, self.settings_path)
             arguments = serve_arguments(self.settings, check, port)
-            secret = self.settings.api_key.strip()
+            self.api_key = str(values.get("api_key") or "").strip()
+            self.requests = []
+            secret = self.api_key
             shown = " ".join("****" if secret and a == secret else shlex.quote(a)
                              for a in arguments)
             self.log("", "")
@@ -938,7 +1165,8 @@ class Controller:
             check = check_model(self.settings.model) if self.settings.model else \
                 ModelCheck(False, message="")
             lan = None
-            if self.status == "running" and self.settings.share_on_network and self.port:
+            if self.status == "running" and self.port and \
+                    self.settings.profile().get("host") not in (None, "", "127.0.0.1", "localhost"):
                 address = lan_address()
                 lan = f"http://{address}:{self.port}/" if address else None
             now = time.time()
@@ -962,6 +1190,12 @@ class Controller:
                 "version": _version(),
                 "platform": sys.platform,
                 "framed": bool(self.frame_origin),
+                "profile": self.settings.profile(),
+                "ownProfile": self.settings.model in self.settings.profiles,
+                "engineKey": self.api_key if self.status in ("loading", "running") else "",
+                "jobs": [{"id": j.id, "command": j.command, "title": j.title, "state": j.state}
+                         for j in self.jobs.jobs[-10:]],
+                "modelInfo": (self.inspected.get(check.path) or (0, None))[1] if check.ok else None,
                 "gpu": self.gpu,
                 "gpuSetup": self.gpu_installer.snapshot(),
                 "update": self.update,
@@ -978,11 +1212,131 @@ class Controller:
                 },
             }
 
+    # -- profiles --------------------------------------------------------------
+
+    def save_profile(self, model: str, values: dict[str, object]) -> dict[str, object]:
+        """Replace a model's options (only non-defaults are kept)."""
+        clean: dict[str, object] = {}
+        options = engine_options.options_of(_schema("serve"))
+        for key, value in values.items():
+            if not isinstance(key, str) or not _scalar(value):
+                continue
+            if key in (EXTRA_KEY, AUTO_MMPROJ_KEY):
+                clean[key] = value
+                continue
+            option = options.get(key)
+            if option is None or option["positional"] or value is None or value == "":
+                continue
+            if engine_options._same(value, option["default"]):
+                continue
+            clean[key] = value
+        with self.lock:
+            self.settings.profiles[model] = clean
+            save_settings(self.settings, self.settings_path)
+        return {"ok": True, "profile": clean}
+
+    def reset_profile(self, model: str) -> None:
+        with self.lock:
+            self.settings.profiles.pop(model, None)
+            save_settings(self.settings, self.settings_path)
+
+    def import_command(self, text: str) -> dict[str, object]:
+        try:
+            values = engine_options.parse_command_line("serve", text)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        model = values.pop("model", None)
+        return {"ok": True, "values": values, "model": model}
+
+    # -- jobs --------------------------------------------------------------------
+
+    def run_job(self, command: str, values: dict[str, object],
+                positional: dict[str, str] | None = None) -> dict[str, object]:
+        if command not in engine_options.COMMANDS + ("inspect",) or command == "serve":
+            return {"ok": False, "error": f"unknown command {command}"}
+        try:
+            if command == "transcript-audit":
+                argv = engine_options.build_argv(command, values, _schema(command), positional)
+                title = "Transcript audit"
+            else:
+                path = (positional or {}).get("model") or self.settings.model
+                check = check_model(path)
+                if not check.ok:
+                    return {"ok": False, "error": check.message}
+                argv = command_arguments(command, values, check)
+                title = f"{command.capitalize()} · {Path(check.path).name}"
+            job = self.jobs.run(command, argv, title, gpu_setup.engine_environment())
+        except (ValueError, RuntimeError, OSError) as error:
+            return {"ok": False, "error": str(error)}
+        self.log(f"$ flyweight {' '.join(shlex.quote(a) for a in argv)}", "note")
+        return {"ok": True, "job": job.id}
+
+    def _job_finished(self, job: Job) -> None:
+        if job.command == "inspect" and job.state == "done" and len(job.argv) > 1:
+            path = job.argv[1]
+            try:
+                self.inspected[path] = (Path(path).stat().st_mtime, job.result)
+            except OSError:
+                pass
+        level = "ok" if job.state == "done" else "error"
+        self.log(f"{job.title}: {job.state}" + (f" — {job.error}" if job.error else ""), level)
+
+    def inspect(self, path: str) -> dict[str, object]:
+        """Model facts, from the cache when the file has not changed."""
+        check = check_model(path)
+        if not check.ok:
+            return {"ok": False, "error": check.message}
+        try:
+            mtime = Path(check.path).stat().st_mtime
+        except OSError as error:
+            return {"ok": False, "error": str(error)}
+        cached = self.inspected.get(check.path)
+        if cached and cached[0] == mtime:
+            return {"ok": True, "info": cached[1]}
+        running = next((j for j in self.jobs.snapshot() if j["command"] == "inspect"
+                        and j["state"] == "running"), None)
+        if running is None:
+            result = self.run_job("inspect", {}, {"model": check.path})
+            if not result["ok"]:
+                return result
+        return {"ok": True, "info": None, "pending": True}
+
+    # -- monitor -----------------------------------------------------------------
+
+    def _engine_get(self, path: str) -> object:
+        if not self.port or self.status != "running":
+            return None
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        if self.api_key:
+            request.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return json.load(response)
+        except (OSError, ValueError):
+            return None
+
+    def monitor(self, since: float = 0.0) -> dict[str, object]:
+        engine = self.engine
+        pid = engine.process.pid if engine is not None and engine.running() else None
+        with self.lock:
+            requests = [r for r in self.requests if float(r["at"]) > since]  # type: ignore[arg-type]
+        return {
+            "system": sysmon.snapshot(pid),
+            "health": self._engine_get("/health"),
+            "props": self._engine_get("/props"),
+            "slots": self._engine_get("/slots"),
+            "requests": requests[-200:],
+            "status": self.status,
+            "startedAt": self.started_at,
+            "readyAt": self.ready_at,
+        }
+
     def _take_notice(self) -> str:
         notice, self.notice = self.notice, ""
         return notice
 
     def shutdown(self) -> None:
+        self.jobs.stop_all()
         self.stop(wait=True)
         with self.lock:
             save_settings(self.settings, self.settings_path)
@@ -1129,18 +1483,42 @@ def _tk_pick(kind: str) -> int:  # pragma: no cover - needs a display
 # -- the local API --------------------------------------------------------------
 
 UI_DIRECTORY = Path(__file__).resolve().parent / "desktop_ui"
-_UI_FILES = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".woff": "font/woff",
+    ".ttf": "font/ttf", ".json": "application/json", ".wasm": "application/wasm",
 }
+# The chat streams straight from the engine, which runs on its own loopback
+# port, so connect-src names loopback; everything else stays same-origin.
 _UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-           "img-src 'self' data:; connect-src 'self'; "
-           "frame-src http://127.0.0.1:* http://localhost:*; "
-           "object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+           "img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; "
+           "font-src 'self' data:; worker-src 'self' blob:; "
+           "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+           "frame-src 'self' blob: data:; object-src 'none'; base-uri 'none'; "
+           "frame-ancestors 'none'")
+_PREVIEW_CSP = ("sandbox allow-scripts allow-modals; "
+                "default-src 'unsafe-inline' 'unsafe-eval' data: blob: https: http:; "
+                "frame-ancestors 'self'")
+DESKTOP_PORT = 47821  # fixed, so the page's saved conversations survive restarts
 
 
-def make_server(controller: Controller, token: str, picker=None):
+def ui_file(path: str) -> Path | None:
+    """A file of the built desktop page for a request path, or None."""
+    relative = "desktop.html" if path in ("", "/", "/index.html") else path.lstrip("/")
+    if not relative or "\\" in relative or any(p in ("", ".", "..") for p in relative.split("/")):
+        return None
+    candidate = UI_DIRECTORY / relative
+    if candidate.suffix.lower() not in _CONTENT_TYPES:
+        return None
+    try:
+        candidate.resolve().relative_to(UI_DIRECTORY.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def make_server(controller: Controller, token: str, picker=None, port: int = 0):
     """The page's backend, on a free loopback port.
 
     Every /api call carries the per-run token in a header. A custom header
@@ -1169,7 +1547,8 @@ def make_server(controller: Controller, token: str, picker=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            if "Cache-Control" not in (extra or {}):
+                self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
@@ -1185,10 +1564,15 @@ def make_server(controller: Controller, token: str, picker=None):
                 self._send(421, b"", "text/plain")
                 return
             path, _, query = self.path.partition("?")
-            if path in _UI_FILES:
-                name, content_type = _UI_FILES[path]
-                self._send(200, (UI_DIRECTORY / name).read_bytes(), content_type,
-                           {"Content-Security-Policy": _UI_CSP} if name.endswith(".html") else None)
+            asset = ui_file(path)
+            if asset is not None:
+                headers = {}
+                if asset.suffix == ".html":
+                    headers["Content-Security-Policy"] = (
+                        _PREVIEW_CSP if asset.name == "preview.html" else _UI_CSP)
+                if asset.parent.name == "assets":
+                    headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                self._send(200, asset.read_bytes(), _CONTENT_TYPES[asset.suffix.lower()], headers)
                 return
             if path == "/icon.svg":
                 self._send(200, _icon_path().read_bytes(), "image/svg+xml")
@@ -1202,6 +1586,24 @@ def make_server(controller: Controller, token: str, picker=None):
                         except ValueError:
                             pass
                 self._json(200, controller.snapshot(since))
+                return
+            if path == "/api/schema" and self._authorized():
+                self._json(200, {name: _schema(name) for name in engine_options.COMMANDS})
+                return
+            if path == "/api/jobs" and self._authorized():
+                wanted = dict(p.split("=", 1) for p in query.split("&") if "=" in p).get("id")
+                jobs = controller.jobs.snapshot()
+                self._json(200, [j for j in jobs if not wanted or j["id"] == wanted])
+                return
+            if path == "/api/monitor" and self._authorized():
+                after = 0.0
+                for part in query.split("&"):
+                    if part.startswith("since="):
+                        try:
+                            after = float(part[6:])
+                        except ValueError:
+                            pass
+                self._json(200, controller.monitor(after))
                 return
             if path.startswith("/api/"):
                 return
@@ -1326,6 +1728,42 @@ def make_server(controller: Controller, token: str, picker=None):
                     self._json(200, {"ok": True, "paths": [str(p) for p in written]})
                 except (OSError, subprocess.CalledProcessError) as error:
                     self._json(200, {"ok": False, "error": str(error)})
+            elif path == "/api/profile":
+                model = str(body.get("model", controller.settings.model))
+                values = body.get("values")
+                if body.get("reset"):
+                    controller.reset_profile(model)
+                    self._json(200, {"ok": True})
+                elif isinstance(values, dict):
+                    self._json(200, controller.save_profile(model, values))
+                else:
+                    self._json(400, {"ok": False, "error": "values missing"})
+            elif path == "/api/pick":
+                # A path for an option (a draft model, an image model folder...),
+                # with no side effect on the selected model.
+                try:
+                    chosen = picker("folder" if body.get("kind") == "folder" else "file",
+                                    str(body.get("start") or ""))
+                except LookupError as error:
+                    controller.log(f"The file dialog could not open: {error}", "error")
+                    self._json(200, {"ok": False, "error": "The file dialog could not open; "
+                                                           "type the path instead."})
+                    return
+                self._json(200, {"ok": True, "path": chosen})
+            elif path == "/api/import":
+                self._json(200, controller.import_command(str(body.get("text", ""))))
+            elif path == "/api/jobs/run":
+                raw_values, raw_positional = body.get("values"), body.get("positional")
+                job_values: dict = raw_values if isinstance(raw_values, dict) else {}
+                job_positional: dict = raw_positional if isinstance(raw_positional, dict) else {}
+                self._json(200, controller.run_job(
+                    str(body.get("command", "")), job_values,
+                    {str(k): str(v) for k, v in job_positional.items()}))
+            elif path == "/api/jobs/cancel":
+                controller.jobs.cancel(str(body.get("id", "")))
+                self._json(200, {"ok": True})
+            elif path == "/api/inspect":
+                self._json(200, controller.inspect(str(body.get("path") or controller.settings.model)))
             elif path.startswith("/api/models/"):
                 self._json(200, self._models(path[len("/api/models/"):], body))
             elif path == "/api/gpu/setup":
@@ -1339,7 +1777,10 @@ def make_server(controller: Controller, token: str, picker=None):
             else:
                 self._json(404, {"error": "unknown"})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:  # taken (a second copy of the app?): any free port still works
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     return server
 
@@ -1425,7 +1866,8 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
         except ImportError:
             use_webview = False
 
-    server = make_server(controller, token, webview_picker if use_webview else None)
+    server = make_server(controller, token, webview_picker if use_webview else None,
+                         port=DESKTOP_PORT)
     port = server.server_address[1]
     controller.frame_origin = f"http://127.0.0.1:{port}"
     url = f"http://127.0.0.1:{port}/#t={token}"
@@ -1445,7 +1887,10 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
             window = webview.create_window(f"{APP_NAME}", url, width=1200, height=820,
                                            min_size=(860, 600), background_color="#0f1115")
             webview_window.append(window)
-            webview.start()
+            # Not private: the chat keeps its conversations in the page's storage.
+            storage = config_dir() / "webview"
+            storage.mkdir(parents=True, exist_ok=True)
+            webview.start(private_mode=False, storage_path=str(storage))
         elif mode != "browser" and _open_app_window(url):
             pass
         else:

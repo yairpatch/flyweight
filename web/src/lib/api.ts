@@ -8,6 +8,18 @@ import type {
 
 const KEY_STORAGE = "flyweight.api-key";
 
+// Where the runtime answers. Empty for the chat UI, which the runtime serves
+// itself; Flyweight Desktop runs the engine on its own port and sets this.
+let apiBase = "";
+
+export function setApiBase(base: string): void {
+  apiBase = base.replace(/\/+$/, "");
+}
+
+export function apiUrl(path: string): string {
+  return path.startsWith("/") ? apiBase + path : path;
+}
+
 export function getApiKey(): string {
   try {
     return sessionStorage.getItem(KEY_STORAGE) ?? "";
@@ -62,7 +74,7 @@ export async function fetchJson<T>(
 ): Promise<T> {
   const { timeoutMs, ...rest } = init;
   const signal = rest.signal ?? (timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined);
-  const response = await fetch(url, {
+  const response = await fetch(apiUrl(url), {
     ...rest,
     signal,
     headers: authHeaders({
@@ -106,7 +118,7 @@ export const api = {
  * SSE stream.
  */
 export async function openStream(url: string, body: unknown, signal: AbortSignal): Promise<Response> {
-  const response = await fetch(url, {
+  const response = await fetch(apiUrl(url), {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
     body: JSON.stringify(body),
