@@ -98,37 +98,44 @@ class ModelCheckTests(unittest.TestCase):
 
 
 class ServeArgumentTests(unittest.TestCase):
-    def test_defaults_are_a_plain_local_serve(self) -> None:
+    def test_an_empty_profile_is_a_plain_serve_on_the_chosen_port(self) -> None:
         model = desktop.ModelCheck(True, "gguf", "/m.gguf")
         args = desktop.serve_arguments(desktop.Settings(), model, 8001)
-        self.assertEqual(args, ["serve", "/m.gguf", "--host", "127.0.0.1",
-                                "--port", "8001", "--backend", "auto"])
+        self.assertEqual(args, ["serve", "/m.gguf", "--port", "8001"])
 
-    def test_every_setting_reaches_the_command_and_the_parser_accepts_it(self) -> None:
-        settings = desktop.Settings(
-            backend="cpu", context=16384, share_on_network=True,
-            expert_mode="cpu", quant="Q4_K", cpu_threads=6, api_key=" k ",
-            extra_args="--parallel 2 --temperature 0.7",
-        )
+    def test_every_profile_value_reaches_the_command_and_the_parser_accepts_it(self) -> None:
+        settings = desktop.Settings(model="/ckpt", profiles={"/ckpt": {
+            "backend": "cpu", "context_window": 16384, "host": "0.0.0.0",
+            "expert_mode": "cpu", "quant": "Q4_K", "cpu_threads": 6, "api_key": "k",
+            "temperature": 0.7, "cache_type_k": "q8_0", "routed_moe": True,
+            "parallel_sequences": 2, desktop.EXTRA_KEY: "--verbose"}})
         model = desktop.ModelCheck(True, "safetensors", "/ckpt", mmproj="/ckpt/mmproj.gguf")
         args = desktop.serve_arguments(settings, model, 9000)
         parsed = _parser().parse_args(args)
-        self.assertEqual(parsed.host, "0.0.0.0")
-        self.assertEqual(parsed.port, 9000)
-        self.assertEqual(parsed.backend, "cpu")
-        self.assertEqual(parsed.context_window, 16384)
-        self.assertEqual(parsed.quant, "Q4_K")
-        self.assertEqual(parsed.expert_mode, "cpu")
-        self.assertEqual(parsed.cpu_threads, 6)
-        self.assertEqual(parsed.api_key, "k")
+        expected = {"host": "0.0.0.0", "port": 9000, "backend": "cpu", "context_window": 16384,
+                    "quant": "Q4_K", "expert_mode": "cpu", "cpu_threads": 6, "api_key": "k",
+                    "temperature": 0.7, "cache_type_k": "q8_0", "routed_moe": True,
+                    "parallel_sequences": 2, "verbose": True}
+        for dest, value in expected.items():
+            self.assertEqual(getattr(parsed, dest), value, dest)
         self.assertEqual(str(parsed.mmproj), "/ckpt/mmproj.gguf")
-        self.assertEqual(parsed.parallel_sequences, 2)
 
-    def test_a_gguf_never_gets_a_quant_and_the_projector_can_be_declined(self) -> None:
-        model = desktop.ModelCheck(True, "gguf", "/m.gguf", mmproj="/mmproj.gguf")
-        args = desktop.serve_arguments(desktop.Settings(use_mmproj=False), model, 8000)
+    def test_safetensors_always_gets_a_quant_and_the_projector_can_be_declined(self) -> None:
+        folder = desktop.ModelCheck(True, "safetensors", "/ckpt")
+        self.assertIn("Q6_K", desktop.serve_arguments(desktop.Settings(), folder, 8000))
+        gguf = desktop.ModelCheck(True, "gguf", "/m.gguf", mmproj="/mmproj.gguf")
+        declined = desktop.Settings(profiles={"": {desktop.AUTO_MMPROJ_KEY: False}})
+        args = desktop.serve_arguments(declined, gguf, 8000)
         self.assertNotIn("--quant", args)
         self.assertNotIn("--mmproj", args)
+
+    def test_one_profile_drives_other_commands_skipping_what_they_lack(self) -> None:
+        model = desktop.ModelCheck(True, "gguf", "/m.gguf")
+        args = desktop.command_arguments("plan", {"context_window": 8192, "temperature": 0.5,
+                                                  "cache_type_k": "q8_0"}, model)
+        self.assertEqual(args, ["plan", "/m.gguf", "--context", "8192", "--cache-type-k", "q8_0"])
+        with self.assertRaises(ValueError):
+            desktop.command_arguments("serve", {"cpu_threads": "many"}, model)
 
     def test_the_serve_command_is_run_under_this_interpreter(self) -> None:
         command = desktop.engine_command()
@@ -153,17 +160,26 @@ class SettingsTests(unittest.TestCase):
     def test_round_trip_and_a_damaged_file_falls_back_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sub" / "desktop.json"
-            settings = desktop.Settings(model="/m.gguf", port=8123)
+            settings = desktop.Settings(model="/m.gguf", profiles={"/m.gguf": {"port": 8123}})
             desktop.remember_model(settings, "/m.gguf")
             desktop.save_settings(settings, path)
             self.assertEqual(desktop.load_settings(path), settings)
-            path.write_text(json.dumps({"port": "eighty", "context": True,
+            path.write_text(json.dumps({"profiles": {"/m": {"bad": [1]}}, "open_chat": "yes",
                                         "model": "/x.gguf", "unknown": 1}))
             loaded = desktop.load_settings(path)
-            self.assertEqual((loaded.port, loaded.context, loaded.model),
-                             (desktop.DEFAULT_PORT, 0, "/x.gguf"))
+            self.assertEqual((loaded.profiles, loaded.open_chat, loaded.model),
+                             ({}, True, "/x.gguf"))
             path.write_text("{not json")
             self.assertEqual(desktop.load_settings(path), desktop.Settings())
+
+    def test_a_settings_file_from_before_profiles_becomes_the_default_profile(self) -> None:
+        old = {"model": "/m.gguf", "backend": "cpu", "context": 65536, "share_on_network": True,
+               "use_mmproj": False, "cpu_threads": 0, "extra_args": "--parallel 2", "port": 8100}
+        settings = desktop.Settings.from_dict(old)
+        self.assertEqual(settings.profile(), {
+            "backend": "cpu", "context_window": 65536, "port": 8100, "host": "0.0.0.0",
+            desktop.AUTO_MMPROJ_KEY: False, desktop.EXTRA_KEY: "--parallel 2"})
+        self.assertEqual(settings.profile("/other.gguf"), settings.profile())
 
     def test_recent_models_are_unique_newest_first_and_bounded(self) -> None:
         settings = desktop.Settings()
@@ -347,16 +363,52 @@ class LocalApiTests(unittest.TestCase):
 
     def test_settings_are_validated_saved_and_reflected(self) -> None:
         status, state = self.call("/api/settings", {
-            "model": str(self.model), "backend": "cpu", "port": "not a port",
-            "recent_models": ["/injected"]})
+            "model": str(self.model), "open_chat": "no", "recent_models": ["/injected"]})
         self.assertEqual(status, 200)
         assert isinstance(state, dict)
-        self.assertEqual(state["settings"]["backend"], "cpu")
-        self.assertEqual(state["settings"]["port"], desktop.DEFAULT_PORT)
+        self.assertTrue(state["settings"]["open_chat"])
         self.assertEqual(state["settings"]["recent_models"], [])
         self.assertTrue(state["model"]["ok"])
         saved = json.loads((self.root / "desktop.json").read_text())
         self.assertEqual(saved["model"], str(self.model))
+
+    def test_profiles_keep_only_real_non_default_options(self) -> None:
+        self.controller.update_settings({"model": str(self.model)})
+        _, result = self.call("/api/profile", {"values": {
+            "temperature": 0.6, "port": 8000, "bogus": 1, "model": "/x", "mmproj": "",
+            desktop.EXTRA_KEY: "--verbose"}})
+        self.assertEqual(result["profile"], {"temperature": 0.6, desktop.EXTRA_KEY: "--verbose"})  # type: ignore[index]
+        _, state = self.call("/api/state")
+        self.assertEqual(state["profile"]["temperature"], 0.6)  # type: ignore[index]
+        self.assertTrue(state["ownProfile"])  # type: ignore[index]
+        self.call("/api/profile", {"reset": True})
+        _, state = self.call("/api/state")
+        self.assertFalse(state["ownProfile"])  # type: ignore[index]
+
+    def test_a_pasted_command_line_is_imported(self) -> None:
+        _, result = self.call("/api/import", {"text":
+            "flyweight serve moe.gguf --expert-mode cpu --cache-type-k q8_0 --context 65536"})
+        self.assertEqual(result["model"], "moe.gguf")  # type: ignore[index]
+        self.assertEqual(result["values"], {"expert_mode": "cpu", "cache_type_k": "q8_0",  # type: ignore[index]
+                                            "context_window": 65536})
+        _, bad = self.call("/api/import", {"text": "flyweight serve m.gguf --no-such-flag"})
+        self.assertFalse(bad["ok"])  # type: ignore[index]
+        self.assertIn("unrecognized", bad["error"])  # type: ignore[index]
+
+    def test_the_schema_lists_every_serve_option(self) -> None:
+        _, schemas = self.call("/api/schema")
+        serve = schemas["serve"]  # type: ignore[index]
+        dests = {o["dest"] for g in serve["groups"] for o in g["options"]}
+        parser_dests = {a.dest for a in desktop.engine_options._subparser("serve")._actions}
+        self.assertEqual(parser_dests - dests, {"help", "quiet", "verbose"})
+        self.assertIn("benchmark", schemas)  # type: ignore[operator]
+
+    def test_the_monitor_reads_the_request_table(self) -> None:
+        self.controller.put(("line", "08:34:28  chat           71      0%   2.4s       8    43.1  length         2.5s"))
+        _, monitor = self.call("/api/monitor")
+        row = monitor["requests"][0]  # type: ignore[index]
+        self.assertEqual((row["endpoint"], row["rate"], row["ttft"]), ("chat", 43.1, 2.4))
+        self.assertIn("memory", monitor["system"])  # type: ignore[index]
 
     def test_browse_sets_the_model_and_a_missing_dialog_is_explained(self) -> None:
         status, result = self.call("/api/browse", {"kind": "folder"})
