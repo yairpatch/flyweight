@@ -677,12 +677,22 @@ async function act(name) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+let browsing = false;
 async function browse(kind) {
+  if (browsing) return toast("A file window is already open. Check your taskbar if you cannot see it.");
+  browsing = true;
+  // The dialog is a separate window; say where it is if it is slow to show.
+  const hint = setTimeout(() => toast("A file window opened. If you cannot see it, check your taskbar."), 2500);
   try {
     const result = await api("/api/browse", { kind });
     if (!result.ok) toast(result.error, "error");
+    else if (result.path) toast("Model selected.");
     await poll();
   } catch (error) { toast(error.message, "error"); }
+  finally {
+    clearTimeout(hint);
+    browsing = false;
+  }
 }
 
 async function copy(text) {

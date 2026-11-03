@@ -991,19 +991,36 @@ class Controller:
 # -- native file dialogs ------------------------------------------------------
 
 _WINDOWS_PICKER = r"""
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form -Property @{TopMost=$true}
-if ($env:FW_KIND -eq 'folder') {
-  $d = New-Object System.Windows.Forms.FolderBrowserDialog
-  $d.Description = 'Choose a safetensors model folder'
-  $d.UseDescriptionForTitle = $true
-  if ($d.ShowDialog($owner) -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }
-} else {
-  $d = New-Object System.Windows.Forms.OpenFileDialog
-  $d.Title = 'Choose a model'
-  $d.Filter = 'GGUF models (*.gguf)|*.gguf|All files (*.*)|*.*'
-  if ($env:FW_START) { $d.InitialDirectory = $env:FW_START }
-  if ($d.ShowDialog($owner) -eq 'OK') { [Console]::Out.Write($d.FileName) }
+[System.Windows.Forms.Application]::EnableVisualStyles()
+# The dialog belongs to a real, shown, topmost window. Owned by a window that
+# was never shown, it opened BEHIND the app (a background process may not
+# take the foreground on Windows), which looked like nothing happening.
+$owner = New-Object System.Windows.Forms.Form -Property @{
+  TopMost = $true; ShowInTaskbar = $false; Opacity = 0
+  FormBorderStyle = 'None'; StartPosition = 'CenterScreen'
+}
+$owner.Show()
+$owner.Activate()
+try {
+  if ($env:FW_KIND -eq 'folder') {
+    $d = New-Object System.Windows.Forms.FolderBrowserDialog
+    $d.Description = 'Choose a safetensors model folder'
+    $d.ShowNewFolderButton = $false
+    if ($env:FW_START) { $d.SelectedPath = $env:FW_START }
+    $answer = $d.ShowDialog($owner)
+    if ($answer -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }
+  } else {
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    $d.Title = 'Choose a model'
+    $d.Filter = 'GGUF models (*.gguf)|*.gguf|All files (*.*)|*.*'
+    if ($env:FW_START) { $d.InitialDirectory = $env:FW_START }
+    $answer = $d.ShowDialog($owner)
+    if ($answer -eq 'OK') { [Console]::Out.Write($d.FileName) }
+  }
+} finally {
+  $owner.Close()
 }
 """
 
@@ -1039,25 +1056,51 @@ def _picker_commands(kind: str, start: str) -> list[tuple[list[str], dict[str, s
     return commands
 
 
+def _cancelled(command: list[str], result: subprocess.CompletedProcess) -> bool:
+    """Did this helper run its dialog and the person close it?
+
+    Each helper says "cancelled" its own way: PowerShell and Flyweight's own
+    Tk dialog exit 0 with no answer, zenity and kdialog exit 1. Anything else,
+    including those codes with an error on stderr (no display, a missing
+    library, a script error), is a failure, and the next helper gets a turn.
+    Reading every exit-1 as a cancel is what made "Choose file" silently do
+    nothing when a helper could not run.
+    """
+    name = Path(command[0]).name.lower()
+    errors = result.stderr.lower()
+    if name.startswith(("zenity", "kdialog")):
+        return result.returncode == 1 and not any(
+            word in errors for word in ("cannot open display", "could not connect",
+                                        "error", "failed"))
+    return result.returncode == 0 and not result.stdout.strip() and \
+        "error" not in errors and "exception" not in errors
+
+
 def pick_path(kind: str, start: str = "") -> str | None:
     """Show a native open dialog; the chosen path, None if cancelled.
 
-    Raises LookupError when no dialog program could run at all, so the page
-    can say "paste the path" instead of silently doing nothing.
+    Raises LookupError, naming what went wrong, when no dialog program could
+    run, so the page can say so instead of silently doing nothing.
     """
+    failures: list[str] = []
     for command, extra in _picker_commands(kind, start):
         try:
-            result = subprocess.run(command, capture_output=True, text=True,
-                                    env={**os.environ, **extra}, timeout=3600)
-        except (OSError, subprocess.TimeoutExpired):
+            result = subprocess.run(
+                command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env={**os.environ, **extra}, timeout=3600,
+                **_popen_flags(),  # type: ignore[arg-type]
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{Path(command[0]).name}: {error}")
             continue
         chosen = result.stdout.strip().splitlines()
         if result.returncode == 0 and chosen:
-            return chosen[-1]
-        if result.returncode in (0, 1) and "Traceback" not in result.stderr \
-                and "No module named" not in result.stderr:
-            return None  # the dialog ran and was cancelled
-    raise LookupError("no file dialog is available")
+            return chosen[-1].strip()
+        if _cancelled(command, result):
+            return None
+        detail = (result.stderr.strip().splitlines() or [f"exit code {result.returncode}"])[-1]
+        failures.append(f"{Path(command[0]).name}: {detail}")
+    raise LookupError("; ".join(failures) or "no file dialog is available")
 
 
 def _tk_pick(kind: str) -> int:  # pragma: no cover - needs a display
@@ -1259,10 +1302,12 @@ def make_server(controller: Controller, token: str, picker=None):
                 start = str(Path(current).parent) if current else ""
                 try:
                     chosen = picker(kind, start)
-                except LookupError:
+                except LookupError as error:
+                    controller.log(f"The file dialog could not open: {error}", "error")
                     self._json(200, {"ok": False, "error":
-                                     "No file dialog is available here. Paste the "
-                                     "model's path into the box instead."})
+                                     "The file dialog could not open (details in "
+                                     "Activity). Paste the model's path into the "
+                                     "box under the buttons instead."})
                     return
                 if chosen:
                     controller.update_settings({"model": chosen})

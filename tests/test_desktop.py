@@ -237,6 +237,48 @@ class ShortcutTests(unittest.TestCase):
             install.assert_called_once()
 
 
+@unittest.skipIf(os.name == "nt", "the fake helpers are shell scripts")
+class FilePickerTests(unittest.TestCase):
+    """A helper that cannot run must hand over to the next one, never pass for a cancel."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def helper(self, name: str, body: str) -> list[str]:
+        path = self.root / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        return [str(path)]
+
+    def pick(self, *helpers: list[str]) -> str | None:
+        with patch.object(desktop, "_picker_commands",
+                          return_value=[(h, {}) for h in helpers]):
+            return desktop.pick_path("file")
+
+    def test_a_broken_helper_falls_through_to_the_next(self) -> None:
+        broken = self.helper("zenity", "echo 'cannot open display: :0' >&2; exit 1")
+        works = self.helper("kdialog", "echo /models/m.gguf")
+        self.assertEqual(self.pick(broken, works), "/models/m.gguf")
+
+    def test_each_helpers_own_cancel_is_a_cancel(self) -> None:
+        later = self.helper("python3", "echo /should/not/run")
+        self.assertIsNone(self.pick(self.helper("zenity", "exit 1"), later))
+        self.assertIsNone(self.pick(self.helper("powershell", "exit 0"), later))
+
+    def test_a_script_error_is_not_a_cancel(self) -> None:
+        # A PowerShell failure used to read as "cancelled": nothing happened.
+        failing = self.helper("powershell", "echo 'Exception calling ShowDialog' >&2; exit 1")
+        tk_missing = self.helper("python3", "exit 2")
+        with self.assertRaises(LookupError) as raised:
+            self.pick(failing, tk_missing)
+        self.assertIn("ShowDialog", str(raised.exception))
+        self.assertIn("exit code 2", str(raised.exception))
+
+
 class LocalApiTests(unittest.TestCase):
     """The page's backend: who may call it, and what the verbs do."""
 
@@ -323,7 +365,7 @@ class LocalApiTests(unittest.TestCase):
         self.assertEqual(self.controller.settings.model, str(self.model))
 
         def no_dialog(kind: str, start: str) -> str | None:
-            raise LookupError
+            raise LookupError("zenity: cannot open display")
 
         self.server.shutdown()
         self.server.server_close()
@@ -334,6 +376,7 @@ class LocalApiTests(unittest.TestCase):
         _, result = self.call("/api/browse", {"kind": "file"})
         self.assertFalse(result["ok"])  # type: ignore[index]
         self.assertIn("Paste", result["error"])  # type: ignore[index]
+        self.assertTrue(any("could not open" in text for _, text, _ in self.controller.logs))
 
     def test_start_refuses_a_bad_model_without_spawning(self) -> None:
         self.controller.update_settings({"model": str(self.root / "missing.gguf")})
