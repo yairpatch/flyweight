@@ -896,7 +896,7 @@ class Controller:
             if self.engine is None:
                 self.settings.model = job.result
                 save_settings(self.settings, self.settings_path)
-                self.notice = f"{job.name} is ready. Press Start on Home."
+                self.notice = f"{job.name} is ready. Press Start in the bar at the top."
             else:
                 self.notice = f"{job.name} is downloaded. Stop the current model to switch."
 
@@ -1483,18 +1483,42 @@ def _tk_pick(kind: str) -> int:  # pragma: no cover - needs a display
 # -- the local API --------------------------------------------------------------
 
 UI_DIRECTORY = Path(__file__).resolve().parent / "desktop_ui"
-_UI_FILES = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".woff": "font/woff",
+    ".ttf": "font/ttf", ".json": "application/json", ".wasm": "application/wasm",
 }
+# The chat streams straight from the engine, which runs on its own loopback
+# port, so connect-src names loopback; everything else stays same-origin.
 _UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-           "img-src 'self' data:; connect-src 'self'; "
-           "frame-src http://127.0.0.1:* http://localhost:*; "
-           "object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+           "img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; "
+           "font-src 'self' data:; worker-src 'self' blob:; "
+           "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+           "frame-src 'self' blob: data:; object-src 'none'; base-uri 'none'; "
+           "frame-ancestors 'none'")
+_PREVIEW_CSP = ("sandbox allow-scripts allow-modals; "
+                "default-src 'unsafe-inline' 'unsafe-eval' data: blob: https: http:; "
+                "frame-ancestors 'self'")
+DESKTOP_PORT = 47821  # fixed, so the page's saved conversations survive restarts
 
 
-def make_server(controller: Controller, token: str, picker=None):
+def ui_file(path: str) -> Path | None:
+    """A file of the built desktop page for a request path, or None."""
+    relative = "desktop.html" if path in ("", "/", "/index.html") else path.lstrip("/")
+    if not relative or "\\" in relative or any(p in ("", ".", "..") for p in relative.split("/")):
+        return None
+    candidate = UI_DIRECTORY / relative
+    if candidate.suffix.lower() not in _CONTENT_TYPES:
+        return None
+    try:
+        candidate.resolve().relative_to(UI_DIRECTORY.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def make_server(controller: Controller, token: str, picker=None, port: int = 0):
     """The page's backend, on a free loopback port.
 
     Every /api call carries the per-run token in a header. A custom header
@@ -1523,7 +1547,8 @@ def make_server(controller: Controller, token: str, picker=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            if "Cache-Control" not in (extra or {}):
+                self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
@@ -1539,10 +1564,15 @@ def make_server(controller: Controller, token: str, picker=None):
                 self._send(421, b"", "text/plain")
                 return
             path, _, query = self.path.partition("?")
-            if path in _UI_FILES:
-                name, content_type = _UI_FILES[path]
-                self._send(200, (UI_DIRECTORY / name).read_bytes(), content_type,
-                           {"Content-Security-Policy": _UI_CSP} if name.endswith(".html") else None)
+            asset = ui_file(path)
+            if asset is not None:
+                headers = {}
+                if asset.suffix == ".html":
+                    headers["Content-Security-Policy"] = (
+                        _PREVIEW_CSP if asset.name == "preview.html" else _UI_CSP)
+                if asset.parent.name == "assets":
+                    headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                self._send(200, asset.read_bytes(), _CONTENT_TYPES[asset.suffix.lower()], headers)
                 return
             if path == "/icon.svg":
                 self._send(200, _icon_path().read_bytes(), "image/svg+xml")
@@ -1708,6 +1738,18 @@ def make_server(controller: Controller, token: str, picker=None):
                     self._json(200, controller.save_profile(model, values))
                 else:
                     self._json(400, {"ok": False, "error": "values missing"})
+            elif path == "/api/pick":
+                # A path for an option (a draft model, an image model folder...),
+                # with no side effect on the selected model.
+                try:
+                    chosen = picker("folder" if body.get("kind") == "folder" else "file",
+                                    str(body.get("start") or ""))
+                except LookupError as error:
+                    controller.log(f"The file dialog could not open: {error}", "error")
+                    self._json(200, {"ok": False, "error": "The file dialog could not open; "
+                                                           "type the path instead."})
+                    return
+                self._json(200, {"ok": True, "path": chosen})
             elif path == "/api/import":
                 self._json(200, controller.import_command(str(body.get("text", ""))))
             elif path == "/api/jobs/run":
@@ -1735,7 +1777,10 @@ def make_server(controller: Controller, token: str, picker=None):
             else:
                 self._json(404, {"error": "unknown"})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:  # taken (a second copy of the app?): any free port still works
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     return server
 
@@ -1821,7 +1866,8 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
         except ImportError:
             use_webview = False
 
-    server = make_server(controller, token, webview_picker if use_webview else None)
+    server = make_server(controller, token, webview_picker if use_webview else None,
+                         port=DESKTOP_PORT)
     port = server.server_address[1]
     controller.frame_origin = f"http://127.0.0.1:{port}"
     url = f"http://127.0.0.1:{port}/#t={token}"
@@ -1841,7 +1887,10 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
             window = webview.create_window(f"{APP_NAME}", url, width=1200, height=820,
                                            min_size=(860, 600), background_color="#0f1115")
             webview_window.append(window)
-            webview.start()
+            # Not private: the chat keeps its conversations in the page's storage.
+            storage = config_dir() / "webview"
+            storage.mkdir(parents=True, exist_ok=True)
+            webview.start(private_mode=False, storage_path=str(storage))
         elif mode != "browser" and _open_app_window(url):
             pass
         else:

@@ -340,17 +340,47 @@ class LocalApiTests(unittest.TestCase):
 
     def test_the_page_is_served_with_a_strict_policy(self) -> None:
         import http.client
+        import re
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         connection.request("GET", "/")
         response = connection.getresponse()
         html = response.read().decode()
         self.assertEqual(response.status, 200)
-        self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
-        self.assertIn('src="/app.js"', html)
+        policy = response.getheader("Content-Security-Policy")
+        self.assertIn("frame-ancestors 'none'", policy)
+        self.assertIn("connect-src 'self' http://127.0.0.1:*", policy)  # the chat reaches the engine
         self.assertNotRegex(html, r"<script(?![^>]*\bsrc=)")
-        for asset in ("/app.js", "/app.css", "/icon.svg"):
+        assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', html)
+        self.assertTrue(assets)
+        for asset in [*assets, "/favicon.svg", "/preview.html"]:
             self.assertEqual(self.call(asset)[0], 200, asset)
+        for hostile in ("/../desktop.py", "/assets/../../desktop.py", "/%2e%2e/desktop.py"):
+            self.assertNotEqual(self.call(hostile)[0], 200, hostile)
+
+    @unittest.skipUnless(any((Path(desktop.__file__).parent / "_native").glob("*flyweight*")),
+                         "needs the native runtime")
+    def test_a_real_plan_job_runs_from_the_profile(self) -> None:
+        from tests.dense_gguf_fixture import build_dense_qwen35_gguf
+
+        model = self.root / "dense.gguf"
+        build_dense_qwen35_gguf(model)
+        self.controller.update_settings({"model": str(model)})
+        self.controller.save_profile(str(model), {"backend": "cpu", "context_window": 4096})
+        _, started = self.call("/api/jobs/run", {"command": "plan", "values": self.controller.settings.profile()})
+        self.assertTrue(started["ok"], started)  # type: ignore[index]
+        deadline = time.monotonic() + 180
+        job = None
+        while time.monotonic() < deadline:
+            _, jobs = self.call(f"/api/jobs?id={started['job']}")  # type: ignore[index]
+            job = jobs[0]  # type: ignore[index]
+            if job["state"] != "running":
+                break
+            time.sleep(0.3)
+        assert job is not None
+        self.assertEqual(job["state"], "done", job.get("log"))
+        self.assertIn("--context", job["argv"])
+        self.assertIn("context 4,096", job["stdout"])
 
     def test_the_api_needs_the_token_and_a_loopback_host(self) -> None:
         self.assertEqual(self.call("/api/state", token="wrong")[0], 403)

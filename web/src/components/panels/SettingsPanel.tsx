@@ -43,7 +43,8 @@ function validJson(text: string): boolean {
   }
 }
 
-export function SettingsPanel() {
+/** `managedKey`: the host (Flyweight Desktop) supplies the API key itself. */
+export function SettingsPanel({ managedKey = false }: { managedKey?: boolean } = {}) {
   const settings = useStore((state) => state.settings);
   const update = useStore((state) => state.updateSettings);
   const reset = useStore((state) => state.resetSettings);
@@ -68,7 +69,7 @@ export function SettingsPanel() {
     <div className="settings">
       <section className="settings__section">
         <h3>Connection</h3>
-        <Field label="API key" hint="kept for this tab only">
+        {!managedKey && <Field label="API key" hint="kept for this tab only">
           <div className="inline">
             <input type="password" value={apiKey} onChange={(event) => setKey(event.target.value)} placeholder="Only if the server was started with --api-key" autoComplete="off" />
             <button
@@ -82,7 +83,7 @@ export function SettingsPanel() {
               Save
             </button>
           </div>
-        </Field>
+        </Field>}
         <Field label="Protocol" hint="which server API the chat goes through">
           <select value={protocol} onChange={(event) => set("protocol")(event.target.value as Protocol)}>
             {(Object.keys(PROTOCOL_LABELS) as Protocol[]).map((key) => (

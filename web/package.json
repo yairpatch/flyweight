@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && vite build -c vite.desktop.config.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:desktop": "tsc --noEmit && vite build -c vite.desktop.config.ts"
   },
   "dependencies": {
     "dexie": "^4.4.5",

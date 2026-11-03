@@ -158,11 +158,39 @@ flyweight app                      # open it
 flyweight app --install-shortcut   # add it to the applications / Start menu
 ~~~
 
-Pick a model (a `.gguf` file, or a safetensors folder), press **Start**, and
-the chat appears in the same window once the model has loaded. A sidebar
-holds five pages: **Home** (model and settings), **Get a model**, **Chat**,
-**Activity** (the engine's live log) and **System check**. The app handles the usual first-run
-problems for you:
+Pick a model from the bar at the top, press **Start**, and chat. The bar stays
+on every page, with the model, its settings profile, the engine's state and
+Start/Stop. Seven pages sit beside it:
+
+- **Chat**: conversations (saved on this computer, searchable, pinnable),
+  streaming answers with thinking, tool calls, images and attachments, plus
+  side panels for generation settings, tool definitions, raw requests and the
+  tokenizer. The image studio appears when an image model is configured. It
+  is built from the same components as the browser chat, so the two agree.
+- **Models**: recommendations for this computer, downloads, your library and
+  Hugging Face search (below).
+- **Server**: every `flyweight serve` option. The page is generated from the
+  CLI's own option definitions, so it always matches the installed engine.
+  Each option shows its flag and help text, marks changes and resets one at
+  a time, and options are searchable or filterable to "only changed". The
+  settings are saved per model, with one set as the default for new models.
+  A live command preview shows exactly what will run (copyable). You can
+  paste a `flyweight serve ...` line to import it. **Memory plan** runs
+  `flyweight plan` with these settings to show what lands on the GPU and in
+  RAM before you start, and a model card shows the architecture, parameter
+  count and quantization mix from `flyweight inspect`.
+- **Monitor**: decode speed per request, time to first token, GPU and system
+  memory, CPU and GPU load, the engine's own memory, KV, prompt, expert and
+  speculative-decoding cache statistics, and a table of recent requests.
+- **Tools**: `benchmark`, `generate`, `imatrix` and `transcript-audit` with
+  every option each takes. They can start from the model's server settings,
+  and show progress and results.
+- **Activity**: the engine's live log, filterable, with every command the
+  app ran.
+- **System**: `flyweight doctor`'s report with copyable fixes, GPU setup and
+  the app-menu shortcut.
+
+The app also handles the usual first-run problems:
 
 - **Checks the computer first.** The first launch runs `flyweight doctor`;
   each problem comes with its fix and a copy button.
@@ -170,10 +198,8 @@ problems for you:
   part 2 of a split GGUF, the folder around a single GGUF, a half-downloaded
   file or a file inside a safetensors folder is either corrected or explained.
   A projector found beside the model is offered as image input.
-- **Plain choices.** Device (automatic, NVIDIA, AMD, CPU only), context length,
-  and "share on my network". MoE expert placement, the safetensors
-  quantization, port, CPU threads, an API key and any extra `serve` flag sit
-  under *Advanced*.
+- **Essentials first.** The Server page opens on the dozen options most
+  people change; the other fifty-odd are a click or a search away.
 - **No port clashes.** A busy port is skipped for the next free one.
 - **Failures in words.** When the engine stops, a one-line diagnosis names the
   fix: out of memory, port taken, CUDA toolkit missing, damaged file.
@@ -182,7 +208,7 @@ problems for you:
   GPU", "Runs well (GPU + memory)", "Too big for this computer") and a
   *Best match*. Downloads pause and resume, are verified against Hugging
   Face's SHA-256, land in `~/Flyweight Models` (changeable), and are selected
-  on Home when done. A search box finds any GGUF on Hugging Face and marks
+  for the next Start when done. A search box finds any GGUF on Hugging Face and marks
   architectures Flyweight cannot run. The recommended list is
   `src/flyweight/model_catalog.json`; the app reads it from the main branch,
   so edits reach installed apps without a release. `HF_ENDPOINT` points at a
@@ -193,7 +219,8 @@ problems for you:
 - **Remembers** your settings and recent models, says when a new version is
   out, and stops the model when the window closes.
 
-The interface is a local web page in its own window. With `pip install
+The interface is a local React app (`web/src/desktop/`, built into
+`src/flyweight/desktop_ui/` by `pnpm build`) in its own window. With `pip install
 "flyweight-llm[desktop]"` it uses a native webview (WebView2 on Windows).
 Without it, Flyweight opens the page as an app window of Edge, Chrome,
 Chromium or Brave (Edge ships with Windows), and as a last resort in a
