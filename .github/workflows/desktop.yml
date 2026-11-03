@@ -1,0 +1,109 @@
+# Flyweight Desktop downloads: the Windows installer and the Linux AppImage.
+#
+# TO ENABLE: copy this file to .github/workflows/desktop.yml. (It lives here
+# because the bot that wrote it is not allowed to create workflow files.)
+#
+# Runs after the Release workflow has built and verified the wheels, freezes
+# those exact wheels into the two downloads, smoke-tests them, and attaches
+# them to the release page under stable names, so these links always point at
+# the newest version:
+#   https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-Setup-windows-x86_64.exe
+#   https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-linux-x86_64.AppImage
+# It is separate from Release on purpose: a packaging problem must never hold
+# up the wheels or PyPI.
+name: Desktop
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: "ID of a successful Release run whose wheels to package"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows installer
+            os: windows-latest
+            wheel: wheel-win-amd64
+            output: Flyweight-Setup-windows-x86_64.exe
+          - name: Linux AppImage
+            # The oldest hosted image: the AppImage carries the build host's
+            # glibc floor, so older is wider.
+            os: ubuntu-22.04
+            wheel: wheel-manylinux-x86_64
+            output: Flyweight-linux-x86_64.AppImage
+    runs-on: ${{ matrix.os }}
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.release_run_id }}
+      TAG: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.wheel }}
+          path: wheelhouse
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the wheel and PyInstaller
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*.whl pyinstaller
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # From outside the checkout, so `import flyweight` is the wheel.
+          cd "${RUNNER_TEMP}"
+          python "${GITHUB_WORKSPACE}/tools/build_desktop.py" --installer --dist "${GITHUB_WORKSPACE}/dist"
+          ls -l "${GITHUB_WORKSPACE}/dist"
+      - name: The bundle runs its engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=dist/Flyweight/Flyweight
+          [ -f "${exe}.exe" ] && exe="${exe}.exe"
+          # No GPU here: doctor warns and exits 0. Non-zero means the bundle
+          # is missing a piece of the package.
+          "${exe}" --engine doctor | tee doctor.txt
+          grep -q "this install can serve" doctor.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.wheel }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(env.TAG, 'v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" "dist/${{ matrix.output }}" --clobber

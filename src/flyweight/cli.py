@@ -770,6 +770,9 @@ examples:
   flyweight inspect model.gguf
       metadata, config and tensor list as JSON
 
+  flyweight app
+      the desktop app: choose a model in a window and press Start
+
 Run `flyweight COMMAND --help` for one command's full options; each groups
 its flags by what they do. The older serve-v2 / generate-text-v2 /
 benchmark-v2 / inspect-gguf / probe-native-v2 spellings are still accepted.\
@@ -1340,6 +1343,38 @@ behind it, and the NVIDIA driver. Exits non-zero if anything that blocks
 serving is missing; a missing driver is reported but does not fail the check,
 because --backend cpu serves without one.\
 """,
+    )
+
+    app = _add_command(
+        commands, "app", aliases=("desktop",),
+        help="open the desktop app: pick a model, press Start",
+        description="Open Flyweight Desktop, a window that checks this "
+                    "computer, serves the model you pick and shows the chat "
+                    "-- no flags to learn. Linux and Windows.",
+        usage="app [--window MODE] [--install-shortcut | --uninstall-shortcut]",
+        epilog="""\
+examples:
+  flyweight app
+      open the window
+
+  flyweight app --install-shortcut
+      add Flyweight to the applications menu (Start menu and desktop on
+      Windows), so it opens without a terminal from then on\
+""",
+    )
+    shortcut = app.add_mutually_exclusive_group()
+    shortcut.add_argument(
+        "--install-shortcut", action="store_true",
+        help="add a menu entry that opens the app, then exit",
+    )
+    shortcut.add_argument(
+        "--uninstall-shortcut", action="store_true",
+        help="remove the menu entry again, then exit",
+    )
+    app.add_argument(
+        "--window", choices=("auto", "webview", "app", "browser"), default="auto",
+        help="how to show the app: auto tries pywebview, then an Edge/Chrome "
+             "app window, then a browser tab",
     )
 
     audit = _add_command(
@@ -2388,8 +2423,9 @@ def _doctor() -> int:
                     report("cuda headers", True, str(headers))
                 else:
                     report("cuda headers", None, "cuda_fp16.h not found",
-                           "install the CUDA toolkit headers, or point CUDA_HOME "
-                           "at a toolkit; until then serve with --backend cpu")
+                           "python -m flyweight.gpu_setup install (fetches the "
+                           "headers and NVRTC, no toolkit needed), or install the "
+                           "CUDA toolkit; until then serve with --backend cpu")
             else:
                 # The probe says only "no"; the two libraries it needs fail
                 # for different reasons with different fixes, so look at each.
@@ -2400,8 +2436,9 @@ def _doctor() -> int:
                 elif not nvrtc:
                     report("nvidia gpu", None,
                            "driver found, but the NVRTC library is missing",
-                           "install the CUDA toolkit (it provides libnvrtc), or "
-                           "serve with --backend cpu")
+                           "python -m flyweight.gpu_setup install (fetches NVRTC "
+                           "and the headers, no toolkit needed), install the CUDA "
+                           "toolkit, or serve with --backend cpu")
                 else:
                     report("nvidia gpu", None, "no usable device",
                            "serve with --backend cpu, or install an NVIDIA driver")
@@ -2470,8 +2507,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"flyweight: {error}") from None
 
 
+def _use_private_cuda() -> None:
+    """Point the runtime at GPU support the desktop app installed, if any.
+
+    Only when nothing names a toolkit already: a CUDA_PATH someone set is
+    theirs. The runtime falls back to CUDA_PATH/lib64 for NVRTC, whose
+    $ORIGIN runpath then finds its companion library, so the variables are
+    enough even though the loader path is fixed by now.
+    """
+    if os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"):
+        return
+    try:
+        from . import gpu_setup
+
+        found = gpu_setup.engine_environment()
+    except Exception:  # noqa: BLE001 - a missing driver is not this function's business
+        return
+    for name in ("CUDA_PATH", "CUDA_HOME"):
+        if name in found:
+            os.environ[name] = found[name]
+
+
 def _run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _use_private_cuda()
     # The routing approximations are read once by the native runtime, from the
     # environment; an explicit flag wins over an inherited variable.
     if getattr(args, "route_prior", None) is not None:
@@ -2480,6 +2539,16 @@ def _run(argv: list[str] | None = None) -> int:
         os.environ["FLYWEIGHT_ROUTE_TAIL_SKIP"] = str(max(0, int(args.route_tail_skip)))
     if args.command == "doctor":
         return _doctor()
+    if args.command in {"app", "desktop"}:
+        from . import desktop
+
+        if args.install_shortcut:
+            return desktop.main(["--install-shortcut"])
+        if args.uninstall_shortcut:
+            return desktop.main(["--uninstall-shortcut"])
+        flag = {"webview": ["--webview"], "app": ["--app-window"],
+                "browser": ["--browser"]}.get(args.window, [])
+        return desktop.main(flag)
     _resolve_quant(args)
     if args.command in {"inspect", "inspect-gguf-v2", "inspect-gguf"}:
         with V2Model(args.model) as model:

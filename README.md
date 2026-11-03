@@ -26,6 +26,32 @@ runs on the same engine beside a chat model (`--image-model`).
 
 ## Install
 
+### The easy way: download the app
+
+No terminal, no Python, no CUDA toolkit.
+
+| | Download | Then |
+| --- | --- | --- |
+| **Windows 10/11** | [Flyweight-Setup-windows-x86_64.exe](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-Setup-windows-x86_64.exe) | Open it and click through. No administrator rights needed. Flyweight lands in the Start menu (and on the desktop). |
+| **Linux** (x86-64) | [Flyweight-linux-x86_64.AppImage](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-linux-x86_64.AppImage) | Double-click it. If your file manager only offers to open it as a file, right-click → *Properties* → *Allow executing as a program* first. It adds itself to your applications menu. |
+
+No model yet? **Get a model** in the app recommends ones that fit this
+computer's memory and graphics card, downloads the right file from Hugging
+Face (resumable, checksum-verified) and selects it, so the next step is
+pressing Start.
+
+The first launch checks the computer. With an NVIDIA card, the app offers
+**Set up GPU**: one click downloads NVIDIA's runtime compiler and headers
+(about 95 MB, once) into Flyweight's own folder, so the CUDA toolkit is never
+needed. If the card's driver is missing, it says so and links to NVIDIA's
+download page. Without an NVIDIA GPU, models run on the CPU.
+
+The installer is not code-signed yet, so Windows may show *"Windows protected
+your PC"*: click **More info**, then **Run anyway**. Uninstall from
+*Settings → Apps* like any other program.
+
+### With pip (developers and servers)
+
 Wheels are on PyPI as `flyweight-llm` for Linux x86-64 (manylinux 2.28) and
 Windows x64. The import package and the command are `flyweight`:
 
@@ -122,6 +148,69 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 safetensors checkpoint directory. The defaults choose the backend and memory
 layout from what the machine has; the flags below are the ones worth
 knowing. `flyweight serve --help` lists everything, grouped.
+
+## Desktop app
+
+Prefer a window to a terminal? Flyweight Desktop runs on Linux and Windows:
+
+~~~bash
+flyweight app                      # open it
+flyweight app --install-shortcut   # add it to the applications / Start menu
+~~~
+
+Pick a model (a `.gguf` file, or a safetensors folder), press **Start**, and
+the chat appears in the same window once the model has loaded. A sidebar
+holds five pages: **Home** (model and settings), **Get a model**, **Chat**,
+**Activity** (the engine's live log) and **System check**. The app handles the usual first-run
+problems for you:
+
+- **Checks the computer first.** The first launch runs `flyweight doctor`;
+  each problem comes with its fix and a copy button.
+- **Catches the wrong file.** Picking the vision projector (`mmproj-*.gguf`),
+  part 2 of a split GGUF, the folder around a single GGUF, a half-downloaded
+  file or a file inside a safetensors folder is either corrected or explained.
+  A projector found beside the model is offered as image input.
+- **Plain choices.** Device (automatic, NVIDIA, AMD, CPU only), context length,
+  and "share on my network". MoE expert placement, the safetensors
+  quantization, port, CPU threads, an API key and any extra `serve` flag sit
+  under *Advanced*.
+- **No port clashes.** A busy port is skipped for the next free one.
+- **Failures in words.** When the engine stops, a one-line diagnosis names the
+  fix: out of memory, port taken, CUDA toolkit missing, damaged file.
+- **Gets you a model.** *Get a model* measures memory, GPU and disk, then
+  lists recommended models with a plain verdict for each ("Runs fast on your
+  GPU", "Runs well (GPU + memory)", "Too big for this computer") and a
+  *Best match*. Downloads pause and resume, are verified against Hugging
+  Face's SHA-256, land in `~/Flyweight Models` (changeable), and are selected
+  on Home when done. A search box finds any GGUF on Hugging Face and marks
+  architectures Flyweight cannot run. The recommended list is
+  `src/flyweight/model_catalog.json`; the app reads it from the main branch,
+  so edits reach installed apps without a release. `HF_ENDPOINT` points at a
+  mirror and `HF_TOKEN` is sent when set.
+- **Sets up the GPU.** An NVIDIA card with only the driver installed gets
+  NVRTC and the CUDA headers in one click; a missing driver is pointed out
+  with a link to it.
+- **Remembers** your settings and recent models, says when a new version is
+  out, and stops the model when the window closes.
+
+The interface is a local web page in its own window. With `pip install
+"flyweight-llm[desktop]"` it uses a native webview (WebView2 on Windows).
+Without it, Flyweight opens the page as an app window of Edge, Chrome,
+Chromium or Brave (Edge ships with Windows), and as a last resort in a
+browser tab (`--window` picks one). File dialogs are the system's own:
+Windows' picker, zenity or kdialog on Linux. The engine is the ordinary
+`flyweight serve`, run as a child process, so everything in this README
+applies to it.
+
+The downloads at the top of this README are this app, frozen with its own
+Python. `python tools/build_desktop.py --installer` builds them from an
+installed wheel: the Inno Setup installer on Windows and the AppImage on Linux
+(`packaging/` holds the installer script and icons). On each release,
+`.github/workflows/desktop.yml` builds both from the released wheels and
+attaches them to the release page.
+
+From a pip install, `python -m flyweight.gpu_setup install` does what the
+app's **Set up GPU** button does, and `flyweight serve` uses the result.
 
 ## Serving
 

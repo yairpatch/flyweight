@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # The distribution name. "flyweight" is prohibited on PyPI; the import
 # package and the command are still `flyweight`.
 name = "flyweight-llm"
-version = "0.25.0"
+version = "0.26.0"
 description = "Native GGUF and safetensors inference runtime for Qwen, Laguna, K2-Horizon, Muse, DeepSeek-V4, Gemma and BailingMoE3 models"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,11 +19,19 @@ client = ["openai>=2.0"]
 # (a fixture build plus two full generations each) run side by side rather
 # than one after another.
 test = ["pytest>=8", "pytest-xdist>=3"]
+# A native window for `flyweight app` (WebView2 on Windows); without it the
+# app opens as an Edge/Chrome app window, which looks the same.
+desktop = ["pywebview>=5"]
 # Image input decoding and resizing for the vision tower (--mmproj).
 vision = ["Pillow>=10"]
 
 [project.scripts]
 flyweight = "flyweight.cli:main"
+
+# The desktop app, as a GUI script: on Windows it opens with no console
+# window behind it. `flyweight app` is the same thing from a terminal.
+[project.gui-scripts]
+flyweight-desktop = "flyweight.desktop:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -39,6 +47,8 @@ flyweight = [
   "ui/*.html",
   "ui/*.svg",
   "ui/assets/*",
+  "desktop_ui/*",
+  "model_catalog.json",
 ]
 
 [tool.ruff.lint]

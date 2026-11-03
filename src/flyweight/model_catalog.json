@@ -1,0 +1,70 @@
+{
+  "_about": "Models Flyweight Desktop recommends. The app reads this file from the main branch on GitHub (falling back to the copy shipped with it), so edits here reach every installed app without a release. Each entry names a Hugging Face repository and the quantizations to prefer, in order; the app looks up the actual file, its size and its SHA-256 itself. 'rank' orders quality (higher is better) among models that fit. 'moe' lets the fit check count system memory for the experts; 'vision' also downloads the repository's mmproj projector. An entry whose repository cannot be found is shown as unavailable, not as a broken download.",
+  "version": 1,
+  "models": [
+    {
+      "id": "qwen3-1.7b",
+      "name": "Qwen3 1.7B",
+      "repo": "unsloth/Qwen3-1.7B-GGUF",
+      "quants": ["Q8_0", "Q6_K", "Q4_K_M"],
+      "description": "Small and quick. Fine for simple questions, summaries and trying things out on any computer.",
+      "tags": ["Small", "Thinking"],
+      "rank": 1
+    },
+    {
+      "id": "lfm2-1.2b",
+      "name": "LFM2 1.2B",
+      "repo": "LiquidAI/LFM2-1.2B-GGUF",
+      "quants": ["Q8_0", "Q6_K", "Q4_K_M"],
+      "description": "A tiny, fast model from Liquid AI, built to run well on laptops without a graphics card.",
+      "tags": ["Small", "Fast on CPU"],
+      "rank": 1
+    },
+    {
+      "id": "qwen3-4b",
+      "name": "Qwen3 4B",
+      "repo": "unsloth/Qwen3-4B-GGUF",
+      "quants": ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_S"],
+      "description": "A capable everyday assistant that runs on most computers, with or without a GPU.",
+      "tags": ["Thinking", "Tools"],
+      "rank": 2
+    },
+    {
+      "id": "qwen3-8b",
+      "name": "Qwen3 8B",
+      "repo": "unsloth/Qwen3-8B-GGUF",
+      "quants": ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_S"],
+      "description": "Noticeably smarter at writing, reasoning and code. Best with a graphics card with 8 GB or more.",
+      "tags": ["Thinking", "Tools", "Code"],
+      "rank": 3
+    },
+    {
+      "id": "qwen3-14b",
+      "name": "Qwen3 14B",
+      "repo": "unsloth/Qwen3-14B-GGUF",
+      "quants": ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_S"],
+      "description": "Strong all-rounder for longer documents and harder problems. Wants a 12 GB graphics card.",
+      "tags": ["Thinking", "Tools", "Code"],
+      "rank": 4
+    },
+    {
+      "id": "qwen3-30b-a3b",
+      "name": "Qwen3 30B-A3B",
+      "repo": "unsloth/Qwen3-30B-A3B-GGUF",
+      "quants": ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_S"],
+      "description": "A mixture-of-experts model: large-model quality at small-model speed. Runs well with 32 GB of memory, even on a modest GPU.",
+      "tags": ["Mixture of experts", "Thinking", "Tools"],
+      "moe": true,
+      "rank": 5
+    },
+    {
+      "id": "qwen3-32b",
+      "name": "Qwen3 32B",
+      "repo": "unsloth/Qwen3-32B-GGUF",
+      "quants": ["Q4_K_M", "UD-Q4_K_XL", "Q4_K_S"],
+      "description": "The largest dense Qwen3. Excellent answers, but needs a 24 GB graphics card to be fast.",
+      "tags": ["Thinking", "Tools", "Code"],
+      "rank": 6
+    }
+  ]
+}
