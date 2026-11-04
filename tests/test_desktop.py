@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -293,6 +294,24 @@ class FilePickerTests(unittest.TestCase):
             self.pick(failing, tk_missing)
         self.assertIn("ShowDialog", str(raised.exception))
         self.assertIn("exit code 2", str(raised.exception))
+
+    def test_a_library_load_failure_is_not_a_cancel(self) -> None:
+        # kdialog started with the app bundle's libstdc++ exits 1 like a cancel.
+        broken = self.helper("kdialog", "echo \"kdialog: libstdc++.so.6: version "
+                                        "'CXXABI_1.3.15' not found\" >&2; exit 1")
+        works = self.helper("zenity", "echo /models/m.gguf")
+        self.assertEqual(self.pick(broken, works), "/models/m.gguf")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the bundle's library path is Linux only")
+    def test_system_helpers_get_the_original_library_path(self) -> None:
+        env = {"LD_LIBRARY_PATH": "/bundle/_internal", "LD_LIBRARY_PATH_ORIG": "/usr/local/lib"}
+        show = self.helper("kdialog", 'echo "$LD_LIBRARY_PATH"')
+        with patch.dict(os.environ, env), patch.object(desktop.sys, "frozen", True, create=True):
+            self.assertEqual(self.pick(show), "/usr/local/lib")
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": "/bundle/_internal"}), \
+                patch.object(desktop.sys, "frozen", True, create=True):
+            os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+            self.assertNotIn("LD_LIBRARY_PATH", desktop.models.system_environment())
 
 
 class LocalApiTests(unittest.TestCase):
