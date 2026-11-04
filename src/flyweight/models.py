@@ -463,6 +463,25 @@ def delete_model(models_dir: Path, folder: str) -> None:
     shutil.rmtree(target)
 
 
+def system_environment() -> dict[str, str]:
+    """The environment for the computer's own programs: file dialogs, the file
+    manager, a browser.
+
+    The Linux app bundle points LD_LIBRARY_PATH at its own libstdc++, libssl
+    and friends, older than the system's, so kdialog, zenity or a browser
+    started with it fail to load (kdialog just exits 1). PyInstaller keeps the
+    original value in LD_LIBRARY_PATH_ORIG; put that back.
+    """
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is None:
+            env.pop("LD_LIBRARY_PATH", None)
+        else:
+            env["LD_LIBRARY_PATH"] = original
+    return env
+
+
 def reveal(path: str) -> None:
     folder = Path(path) if Path(path).is_dir() else Path(path).parent
     if os.name == "nt":
@@ -471,7 +490,7 @@ def reveal(path: str) -> None:
         subprocess.Popen(["open", str(folder)])
     else:
         subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+                         stderr=subprocess.DEVNULL, env=system_environment())
 
 
 # -- downloading ------------------------------------------------------------------------------

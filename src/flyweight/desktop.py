@@ -1425,7 +1425,8 @@ def _cancelled(command: list[str], result: subprocess.CompletedProcess) -> bool:
     if name.startswith(("zenity", "kdialog")):
         return result.returncode == 1 and not any(
             word in errors for word in ("cannot open display", "could not connect",
-                                        "error", "failed"))
+                                        "error", "failed", "not found",
+                                        "symbol lookup", "cannot"))
     return result.returncode == 0 and not result.stdout.strip() and \
         "error" not in errors and "exception" not in errors
 
@@ -1438,10 +1439,13 @@ def pick_path(kind: str, start: str = "") -> str | None:
     """
     failures: list[str] = []
     for command, extra in _picker_commands(kind, start):
+        # Flyweight's own Tk dialog needs the bundle's libraries; the rest
+        # are the computer's programs and need its own.
+        base = os.environ if command[0] == sys.executable else models.system_environment()
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                env={**os.environ, **extra}, timeout=3600,
+                env={**base, **extra}, timeout=3600,
                 **_popen_flags(),  # type: ignore[arg-type]
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -1720,7 +1724,7 @@ def make_server(controller: Controller, token: str, picker=None, port: int = 0):
                 if controller.update:
                     allowed.add(controller.update["url"])
                 if url in allowed or re.fullmatch(r"http://(127\.0\.0\.1|[0-9.]+):\d+/", url):
-                    webbrowser.open(url)
+                    open_url(url)
                 self._json(200, {"ok": True})
             elif path == "/api/shortcut":
                 try:
@@ -1815,6 +1819,20 @@ def _app_browsers() -> list[str]:
     return found
 
 
+def open_url(url: str) -> None:
+    """Open a link in the default browser, started with the computer's own
+    libraries rather than the app bundle's."""
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=models.system_environment(),
+                             start_new_session=True)
+            return
+        except OSError:
+            pass
+    webbrowser.open(url)
+
+
 def _open_app_window(url: str) -> bool:  # pragma: no cover - needs a display
     """Show the page in a browser app window and wait for it to close."""
     for browser in _app_browsers():
@@ -1828,7 +1846,8 @@ def _open_app_window(url: str) -> bool:  # pragma: no cover - needs a display
             command.append("--no-sandbox")  # Chromium refuses to run as root otherwise
         try:
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
+                                       stderr=subprocess.DEVNULL,
+                                       env=models.system_environment())
         except OSError:
             continue
         started = time.monotonic()
@@ -1894,7 +1913,7 @@ def run_window(mode: str | None = None) -> int:  # pragma: no cover - needs a di
         elif mode != "browser" and _open_app_window(url):
             pass
         else:
-            webbrowser.open(url)
+            open_url(url)
             print(f"{APP_NAME} is open in your browser: {url}\n"
                   "Close the tab or press Ctrl-C here to quit.", file=sys.stderr)
             # The page polls every second (once a minute when hidden). No
