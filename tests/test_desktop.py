@@ -401,6 +401,31 @@ class LocalApiTests(unittest.TestCase):
         self.assertIn("--context", job["argv"])
         self.assertIn("context 4,096", job["stdout"])
 
+    def test_a_settings_search_asks_for_json_and_holds_off_the_engine(self) -> None:
+        self.controller.update_settings({"model": str(self.model)})
+        started: list[list[str]] = []
+
+        def run(command, argv, title, env=None):
+            started.append(argv)
+            job = desktop.Job("tune-1", command, title, argv)
+            self.controller.jobs.jobs.append(job)
+            return job
+
+        with patch.object(self.controller.jobs, "run", side_effect=run):
+            _, result = self.call("/api/jobs/run", {
+                "command": "tune", "values": {"context_window": 16384, "goal": "prefill",
+                                              "time_limit": 5, "port": 9000}})
+        self.assertTrue(result["ok"], result)  # type: ignore[index]
+        argv = started[0]
+        self.assertEqual(argv[:2], ["tune", str(self.model)])
+        self.assertIn("--json", argv)
+        self.assertEqual(argv[argv.index("--goal") + 1], "prefill")
+        self.assertEqual(argv[argv.index("--context") + 1], "16384")
+        self.assertNotIn("--port", argv)  # the search picks its own
+        _, refused = self.call("/api/start", {})
+        self.assertFalse(refused["ok"])  # type: ignore[index]
+        self.assertIn("settings search", refused["error"])  # type: ignore[index]
+
     def test_the_api_needs_the_token_and_a_loopback_host(self) -> None:
         self.assertEqual(self.call("/api/state", token="wrong")[0], 403)
         self.assertEqual(self.call("/api/start", {}, token="")[0], 403)

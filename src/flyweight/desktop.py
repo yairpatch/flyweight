@@ -639,6 +639,11 @@ class Jobs:
             if job and job.state == "running":
                 job.state = "cancelled"
         if process is not None:
+            if os.name == "nt":
+                # terminate() would leave a job's own children (the servers a
+                # settings search starts) running and holding the GPU.
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                               capture_output=True, **_popen_flags())  # type: ignore[arg-type]
             try:
                 process.terminate()
                 process.wait(timeout=10)
@@ -662,7 +667,7 @@ class Jobs:
 
 
 def _job_result(command: str, stdout: str) -> object:
-    if command in ("inspect", "benchmark", "probe"):
+    if command in ("inspect", "benchmark", "probe", "tune"):
         try:
             data = json.loads(stdout)
         except ValueError:
@@ -1075,6 +1080,9 @@ class Controller:
         with self.lock:
             if self.engine is not None:
                 return {"ok": False, "error": "Already running."}
+            if any(j["command"] == "tune" and j["state"] == "running" for j in self.jobs.snapshot()):
+                return {"ok": False, "error": "A settings search is using the GPU. Wait for it "
+                                              "to finish, or cancel it, then start."}
             check = check_model(self.settings.model)
             if not check.ok:
                 return {"ok": False, "error": check.message}
@@ -1263,8 +1271,15 @@ class Controller:
                 check = check_model(path)
                 if not check.ok:
                     return {"ok": False, "error": check.message}
+                if command == "tune":
+                    # Its servers need the GPU this app's engine is holding.
+                    values = {**values, "json": True}
+                    if self.engine is not None:
+                        self.log("Stopping the model so the settings search has the GPU.", "note")
+                        self.stop(wait=True)
                 argv = command_arguments(command, values, check)
-                title = f"{command.capitalize()} · {Path(check.path).name}"
+                title = ("Settings search" if command == "tune" else command.capitalize()) + \
+                    f" · {Path(check.path).name}"
             job = self.jobs.run(command, argv, title, gpu_setup.engine_environment())
         except (ValueError, RuntimeError, OSError) as error:
             return {"ok": False, "error": str(error)}

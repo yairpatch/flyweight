@@ -178,7 +178,10 @@ Start/Stop. Seven pages sit beside it:
   paste a `flyweight serve ...` line to import it. **Memory plan** runs
   `flyweight plan` with these settings to show what lands on the GPU and in
   RAM before you start, and a model card shows the architecture, parameter
-  count and quantization mix from `flyweight inspect`.
+  count and quantization mix from `flyweight inspect`. **Find best settings**
+  runs `flyweight tune` at the context you choose (it stops the running
+  model first), shows every setup it tried, and applies the winner to the
+  model's settings with one click.
 - **Monitor**: decode speed per request, time to first token, GPU and system
   memory, CPU and GPU load, the engine's own memory, KV, prompt, expert and
   speculative-decoding cache statistics, and a table of recent requests.
@@ -583,6 +586,7 @@ drafting request answers as a non-drafting one would.
 | `flyweight benchmark MODEL` | preparation, prefill and steady decode timings as JSON (`--chat`, `--iterations`, `--cold-cache`) |
 | `flyweight inspect MODEL` | metadata, resolved config and tensor list as JSON |
 | `flyweight plan MODEL` | load with serve's placement flags and print where weights, KV and experts went in VRAM and RAM (`--json`); serve prints the same at startup |
+| `flyweight tune MODEL --context N` | find the fastest serve settings for this model on this machine by timing real servers: expert placement, KV precision, MTP drafts, dense requant, prefill paths, CPU threads, expert paging, tried one at a time and kept only when a win repeats; the winner is checked against a prompt that fills the context (`--goal balanced\|prefill\|decode`, `--time-limit` minutes, default 20, `--skip`, `--json`) |
 | `flyweight imatrix MODEL --text FILE` | gather an importance matrix |
 | `flyweight probe MODEL` | run a few tokens and dump runtime counters |
 | `flyweight doctor` | check the install |

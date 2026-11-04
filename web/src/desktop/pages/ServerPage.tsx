@@ -4,6 +4,7 @@ import { useDesk, gb } from "../state";
 import type { OptionSpec, Scalar, Values } from "../api";
 import { OptionField, invalid, isDefault } from "../components/OptionField";
 import { useJob, latestJob } from "../components/useJob";
+import { TuneCard } from "../components/TuneCard";
 
 // The CLI groups flags by what they touch; "hardware and placement" is long
 // enough to deserve sub-sections. Anything not named here keeps its group.
@@ -360,6 +361,15 @@ export function ServerPage() {
           <pre className="d-pre d-pre--wrap">{command}</pre>
           <p className="d-muted d-small">{changedCount} of {options.filter((o) => !o.positional).length} options changed. The app picks a free port if this one is busy.</p>
         </section>
+        <TuneCard values={values} onApply={(changes, context) => {
+          const next: Values = { ...values, context_window: context };
+          for (const [dest, value] of Object.entries(changes)) {
+            if (value === null) delete next[dest];
+            else next[dest] = value;
+          }
+          save(next);
+          toast("Applied. Start the model to use them.", "ok");
+        }} />
         <PlanCard values={values} />
         <ModelCard />
       </aside>

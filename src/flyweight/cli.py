@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .server import serve as serve_http
+from .tune import KNOB_NAMES as TUNE_SETTINGS
 from .v2 import (
     AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Error, V2Model, V2QwenRuntime,
 )
@@ -1233,6 +1234,83 @@ the same way. serve and generate print the same report at startup.\
         plan.add_argument_group("backend", "Which processor runs the model.")
     )
     _add_runtime_options(plan, serving=False)
+
+    tune = _add_command(
+        commands, "tune",
+        help="find the fastest serve settings for a model on this machine",
+        description="Start real servers with different settings, time each "
+                    "one over HTTP, and report the fastest setup that holds "
+                    "the context you asked for.",
+        usage="tune MODEL --context N [--goal GOAL] [--time-limit MIN] [options]",
+        epilog="""\
+examples:
+  flyweight tune model.gguf --context 32768
+      twenty minutes of searching for the best balance of prompt and
+      generation speed at a 32K context
+  flyweight tune moe.gguf --context 65536 --goal prefill --time-limit 40
+  flyweight tune model.gguf --context 16384 --skip mtp --json
+
+Settings are tried one at a time from the ones given (any serve option may be
+passed and is kept), most consequential first, and only those that apply to
+this model and machine: expert placement, KV cache precision, MTP drafts,
+dense requant, prefill paths, CPU threads, expert paging. A win is kept only
+when it holds up measured again. Approximate routing options are never tried.
+The best setup is loaded once more with a prompt that fills the context.
+Stop any other server using the GPU first: it changes what fits.\
+""",
+    )
+    _add_model_argument(tune)
+    search = tune.add_argument_group("search")
+    search.add_argument(
+        "--context", "--context-window", dest="context_window", type=int,
+        default=32768, metavar="N", action=_ExplicitContext,
+        help="the context window the setup must hold (default 32768)",
+    )
+    search.add_argument(
+        "--goal", choices=("balanced", "prefill", "decode"), default="balanced",
+        help="what fastest means: prompt processing and generation equally, "
+             "or mostly one of them",
+    )
+    search.add_argument(
+        "--time-limit", type=float, default=20.0, metavar="MIN",
+        help="minutes to search; it stops starting new setups after this",
+    )
+    search.add_argument(
+        "--skip", action="append", metavar="SETTING",
+        choices=TUNE_SETTINGS,
+        help="a setting not to try (repeatable): " + ", ".join(TUNE_SETTINGS),
+    )
+    search.add_argument(
+        "--prompt-tokens", type=int, default=0, metavar="N",
+        help="benchmark prompt length (default: half the context, at most 4096)",
+    )
+    search.add_argument(
+        "--decode-tokens", type=int, default=128, metavar="N",
+        help="tokens generated per measurement",
+    )
+    search.add_argument(
+        "--repeats", type=int, default=2, metavar="N",
+        help="measured requests per setup, after one warm-up",
+    )
+    search.add_argument(
+        "--min-gain", type=float, default=3.0, metavar="PERCENT",
+        help="smallest improvement worth changing a setting for",
+    )
+    search.add_argument(
+        "--load-timeout", type=float, default=900.0, metavar="SECONDS",
+        help="give up on a setup that has not loaded after this long",
+    )
+    search.add_argument(
+        "--no-verify", action="store_true",
+        help="skip the final full-context check of the best setup",
+    )
+    search.add_argument(
+        "--json", action="store_true", help="print the report as JSON",
+    )
+    _add_backend_option(
+        tune.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(tune, serving=True, cache_default=AUTO_PROMPT_CACHE_MIB)
 
     imatrix = _add_command(
         commands, "imatrix",
@@ -2557,6 +2635,11 @@ def _run(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "plan":
         return _plan(args)
+    if args.command == "tune":
+        from . import tune
+
+        _validate_runtime_args(args)
+        return tune.main(args)
     if args.command in {"benchmark-v2", "benchmark"}:
         return _benchmark(args)
     if args.command in {"generate", "generate-text-v2"}:

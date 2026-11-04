@@ -1,7 +1,7 @@
 """The engine's command-line options as data, for Flyweight Desktop.
 
 The desktop app offers every option of `flyweight serve` (and of `plan`,
-`benchmark`, `generate`, `imatrix`, `transcript-audit`) without keeping a
+`tune`, `benchmark`, `generate`, `imatrix`, `transcript-audit`) without keeping a
 second list of them: the schema is read from the CLI's own argparse parser,
 so a flag added to the CLI appears in the app with its help text, choices and
 default, and a flag removed disappears. Values go back the same way --
@@ -17,7 +17,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-COMMANDS = ("serve", "plan", "benchmark", "generate", "imatrix", "transcript-audit")
+COMMANDS = ("serve", "plan", "tune", "benchmark", "generate", "imatrix", "transcript-audit")
 # Things the app decides itself rather than asking about.
 HIDDEN = {"help", "version", "quiet", "verbose"}
 
