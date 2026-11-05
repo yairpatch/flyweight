@@ -1167,6 +1167,64 @@ void qwen_copy_vector(
     if (index < elements) output[index] = input[index];
 }
 
+// The argmax of a logits row and its softmax probability: out[0] = index,
+// out[1] = the probability's float bits. One block (up to 1024 threads) over
+// the whole vocabulary -- the MTP draft head's confidence, read once per
+// draft, where the vocabulary pass is small next to the head projection that
+// produced it. Ties go to the lower index; NaN is never picked.
+extern "C" __global__
+void qwen_logits_top_prob(
+    const float* logits,
+    const int count,
+    unsigned int* out
+) {
+    float best = -3.402823466e+38F;
+    int best_index = 0x7fffffff;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best) { best = v; best_index = i; }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_down_sync(0xffffffff, best, offset);
+        const int other_index = __shfl_down_sync(0xffffffff, best_index, offset);
+        if (other > best || (other == best && other_index < best_index)) {
+            best = other; best_index = other_index;
+        }
+    }
+    __shared__ float warp_best[32];
+    __shared__ int warp_index[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (int)((blockDim.x + 31) >> 5);
+    if (lane == 0) { warp_best[warp] = best; warp_index[warp] = best_index; }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < warps ? warp_best[lane] : -3.402823466e+38F;
+        best_index = lane < warps ? warp_index[lane] : 0x7fffffff;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(0xffffffff, best, offset);
+            const int other_index = __shfl_down_sync(0xffffffff, best_index, offset);
+            if (other > best || (other == best && other_index < best_index)) {
+                best = other; best_index = other_index;
+            }
+        }
+        if (lane == 0) { warp_best[0] = best; warp_index[0] = best_index; }
+    }
+    __syncthreads();
+    best = warp_best[0];
+    best_index = warp_index[0];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const float v = logits[i];
+        if (v == v) sum += __expf(v - best);
+    }
+    sum = block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        out[0] = (unsigned int)(best_index == 0x7fffffff ? 0 : best_index);
+        out[1] = __float_as_uint(sum > 0.0f ? 1.0f / sum : 0.0f);
+    }
+}
+
 // Expert grouping for the prefill GEMM path: pack the rows routed to one
 // expert into a contiguous tile so the batched matmul kernels see an
 // ordinary matrix, and fold the result back weighted per route. Rows within

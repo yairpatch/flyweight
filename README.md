@@ -587,7 +587,7 @@ which, listing sizes and marking cached ones; `--quant` or
 
 | Family | Mechanism |
 | --- | --- |
-| Qwen (all) | `--mtp-drafts N` with the checkpoint's draft block or a `--mtp-model` overlay. Drafting is trialled against plain decode and kept only when it wins |
+| Qwen (all) | `--mtp-drafts N` with the checkpoint's draft block or a `--mtp-model` overlay. Drafting is trialled against plain decode and kept only when it wins. On Qwen3.8-Flash-Next the chain stops at the first draft the draft head gives less than 0.5 probability, and a round whose first draft is that unsure runs as a plain decode step (`FLYWEIGHT_MTP_MIN_P`, `0` drafts every round in full) |
 | DeepSeek-V4-Flash | `--mtp-model` pointing at the DSpark draft GGUF |
 | BailingMoE3 | draft block loads; the server does not drive it yet |
 | Qwen without a draft block | `FLYWEIGHT_LOOKUP_DRAFTS=N` (up to 7): prompt-lookup self-speculation, worth 10-15% on code, neutral on prose |
@@ -630,6 +630,7 @@ holding both what the client sent and what the model saw.
 | `FLYWEIGHT_HF_CACHE` | where packed safetensors go; `off` disables the cache |
 | `FLYWEIGHT_TRANSCRIPT_DUMP`, `FLYWEIGHT_TRANSCRIPT_PROMPT=0` | request recording for `transcript-audit`; `=0` stores a digest instead of the prompt |
 | `FLYWEIGHT_LOOKUP_DRAFTS` | prompt-lookup speculation, above |
+| `FLYWEIGHT_MTP_MIN_P` | Flash-Next draft confidence cut, above (default 0.5) |
 | `FLYWEIGHT_DS4_EXPERT_CACHE_MIB` | a GPU expert cache for DeepSeek-V4 |
 | `FLYWEIGHT_QSA=1` | Qwen3.8-Flash-Next's learned sparse-attention indexer (experimental; dense by default) |
 | `FLYWEIGHT_V2_MLOCK=1` | lock the mapped model in RAM |

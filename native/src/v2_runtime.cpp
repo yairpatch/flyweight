@@ -1354,6 +1354,11 @@ struct FlyweightV2QwenRuntime {
     // sampler's own scratch (decode-layout regions) may overlap them there.
     // 8 x hidden floats, allocated on first use, freed with the device state.
     std::uint64_t mtp_sampling_rows = 0;
+    // The draft head's full logits (vocabulary floats) and its argmax +
+    // probability pair, for FLYWEIGHT_MTP_MIN_P's confidence gate. Allocated
+    // on first gated draft, freed with the device state.
+    std::uint64_t mtp_draft_logits = 0;
+    std::uint64_t mtp_draft_top = 0;
     std::uint64_t decode_calls = 0;
     std::uint64_t decode_nanoseconds = 0;
     std::uint64_t route_wait_nanoseconds = 0;
@@ -2511,6 +2516,10 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_host_free(runtime.embedding_host);
     flyweight_gpu_free(runtime.mtp_sampling_rows);
     runtime.mtp_sampling_rows = 0;
+    flyweight_gpu_free(runtime.mtp_draft_logits);
+    runtime.mtp_draft_logits = 0;
+    flyweight_gpu_free(runtime.mtp_draft_top);
+    runtime.mtp_draft_top = 0;
     flyweight_gpu_free(runtime.turbo_kv_stage);
     runtime.turbo_kv_stage = 0;
     runtime.turbo_kv_stage_bytes = 0;
@@ -24513,7 +24522,7 @@ void qwen_mtp_append_prompt_pair(
 // re-scores every drafted token with the target model.
 std::uint32_t qwen4exp_mtp_draft(
     FlyweightV2QwenRuntime& runtime, std::uint32_t token,
-    std::uint64_t input_hidden
+    std::uint64_t input_hidden, float* probability
 ) {
     const auto& config = runtime.model->config;
     const int hidden_size = static_cast<int>(config.hidden_size);
@@ -24797,10 +24806,65 @@ std::uint32_t qwen4exp_mtp_draft(
         hc_pre(runtime.device_tensors[runtime.output_hc_norm],
                runtime.output_hc_down, runtime.output_hc_up,
                std::numeric_limits<std::uint64_t>::max());
-    if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
-        throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     int vocabulary = static_cast<int>(config.vocabulary_size);
     auto lm_head = runtime.device_tensors[runtime.lm_head];
+    // The confidence gate needs the distribution, which the fused argmax head
+    // never writes: project the full logits with the group-decode matvec the
+    // temperature path uses, then reduce them to the argmax and its
+    // probability in one pass.
+    if (probability) {
+        if (!runtime.mtp_draft_logits &&
+            flyweight_gpu_alloc(static_cast<std::uint64_t>(vocabulary) * sizeof(float),
+                                &runtime.mtp_draft_logits) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft logits allocation failed");
+        if (!runtime.mtp_draft_top &&
+            flyweight_gpu_alloc(2 * sizeof(std::uint32_t), &runtime.mtp_draft_top) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft top allocation failed");
+        // The sampler's projection order: the group-decode Q8 matvec where
+        // the head's format has one, else the per-type float kernels.
+        int projected = -1;
+        if (const char* q8_matvec = qwen_q8_matvec_kernel(runtime.lm_head_type);
+            q8_matvec && qwen_q8_head_enabled() &&
+            qwen_q8_row_fits(runtime.lm_head_type, hidden_size)) {
+            void* quant_args[] = {const_cast<std::uint64_t*>(&normalized),
+                                  const_cast<std::uint64_t*>(&draft_q8),
+                                  const_cast<std::uint64_t*>(&draft_q8_scales),
+                                  const_cast<int*>(&hidden_size)};
+            void* matvec_args[] = {&lm_head, const_cast<std::uint64_t*>(&draft_q8),
+                                   const_cast<std::uint64_t*>(&draft_q8_scales),
+                                   &runtime.mtp_draft_logits,
+                                   const_cast<int*>(&hidden_size), &vocabulary};
+            projected = flyweight_gpu_launch_named("quantize_q8_blocks", (hidden_size + 31) / 32,
+                                                   1, 32, 0, runtime.stream, quant_args);
+            if (projected == 0)
+                projected = flyweight_gpu_launch_named(q8_matvec, static_cast<std::uint32_t>(vocabulary),
+                                                       1, 128, 0, runtime.stream, matvec_args);
+        }
+        if (projected != 0)
+            projected = runtime.lm_head_type == 30
+                ? flyweight_gpu_bf16_matvec_transposed(lm_head, normalized, runtime.mtp_draft_logits,
+                                                       hidden_size, vocabulary, runtime.stream)
+                : qwen_gpu_matvec_by_type(runtime.lm_head_type, lm_head, normalized,
+                                          runtime.mtp_draft_logits, hidden_size, vocabulary,
+                                          runtime.stream);
+        if (projected != 0)
+            throw std::runtime_error("native qwen4exp MTP draft logits projection failed");
+        void* top_args[] = {&runtime.mtp_draft_logits, &vocabulary, &runtime.mtp_draft_top};
+        if (flyweight_gpu_launch_named("qwen_logits_top_prob", 1, 1, 1024,
+                                       0, runtime.stream, top_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft confidence failed");
+        auto* top = reinterpret_cast<std::uint32_t*>(staging);
+        if (flyweight_gpu_download(top, runtime.mtp_draft_top, 2 * sizeof(std::uint32_t),
+                                   runtime.stream) != 0
+            || flyweight_gpu_stream_sync(runtime.stream) != 0)
+            throw std::runtime_error("native qwen4exp MTP output synchronization failed");
+        std::memcpy(probability, &top[1], sizeof(float));
+        ++runtime.mtp_cache_tokens;
+        ++runtime.mtp_draft_tokens;
+        return top[0];
+    }
+    if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime.lm_head_type);
         lm_q8_kernel && qwen_q8_head_enabled() &&
         qwen_q8_row_fits(runtime.lm_head_type, hidden_size)) {
@@ -31691,6 +31755,21 @@ static uint32_t qwen_lookup_draft(FlyweightV2QwenRuntime&runtime,uint32_t next_t
     return count;
 }
 
+// FLYWEIGHT_MTP_MIN_P: the draft chain stops at the first draft whose own
+// probability under the draft head is below this, and a round whose FIRST
+// draft is below it runs as one ordinary decode step. A verify row costs about
+// as much as a decode step on an MoE that does not fit VRAM (its experts are
+// mostly new reads), so a row the drafter itself doubts is a row paid for
+// nothing. Default 0.5 (Strata's --spec-min-p); 0 drafts every round to the
+// full budget. Measured on Flash-Next UD-Q2_0 (12 GB card, temp 0.8, served
+// prompt): xhigh reasoning 31.8 -> 38.8 tok/s against 40.4 without drafting,
+// medium 44.0 -> 45.9 against 39.9, greedy prose level.
+// Read per round (once per several tokens), so a process can change it.
+static float qwen_mtp_min_p(){
+    const char*setting=std::getenv("FLYWEIGHT_MTP_MIN_P");
+    return setting?std::strtof(setting,nullptr):0.5f;
+}
+
 static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr,const uint32_t*preset_drafts=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
@@ -31699,7 +31778,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     // gets to count -- if it is fed as an input too. Verifying `wanted` rows
     // for `wanted` drafts computed the last draft for nothing every round and
     // capped a round at `wanted` tokens where `wanted+1` were earned.
-    const uint32_t rows=wanted+1;
+    uint32_t rows=wanted+1;
     // The draft block's KV cache is sized for the context limit and, unlike the
     // target caches, is never rewound by a new request. Recycling it when it
     // would overflow keeps a long-running server in bounds; the cost is a few
@@ -31714,14 +31793,40 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         for(uint32_t index=0;index<wanted;++index)drafts[index]=preset_drafts[index];
         runtime.mtp_draft_tokens+=wanted;
         ++runtime.lookup_rounds;
-    }else for(uint32_t index=0;index<wanted;++index){
-        drafts[index]=runtime.qwen4exp
-            ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden)
-            :qwen_mtp_draft(runtime,draft_input,draft_hidden);
-        draft_input=drafts[index];
-        draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
+    }else{
+        const float min_p=runtime.qwen4exp?qwen_mtp_min_p():0.0f;
+        for(uint32_t index=0;index<wanted;++index){
+            float confidence=1.0f;
+            drafts[index]=runtime.qwen4exp
+                ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden,min_p>0.0f?&confidence:nullptr)
+                :qwen_mtp_draft(runtime,draft_input,draft_hidden);
+            draft_input=drafts[index];
+            draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
+            if(confidence<min_p){
+                // Dropped, not verified: its cache entry is rebuilt (or
+                // overwritten) by the commit below like any rejected draft's.
+                --runtime.mtp_draft_tokens;
+                wanted=index;
+                break;
+            }
+        }
     }
     runtime.mtp_draft_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-draft_started).count();
+    if(!wanted){
+        // Not even the first draft is likely: one ordinary decode step, as the
+        // engine would have taken without drafting. The first draft read the
+        // target's real hidden state, so its cache entry stays valid -- the
+        // same state an ordinary step leaves for the next round.
+        runtime.mtp_cache_tokens=base_cache_tokens+1;
+        uint32_t produced=0;
+        if(flyweight_v2_qwen_runtime_decode(&runtime,next_token,&produced)!=0)
+            throw std::runtime_error("native Qwen decode failed");
+        if(sampling&&sampling->active())
+            produced=qwen_sample_last_logits(runtime,*sampling,produced);
+        out[0]=produced;
+        return 1;
+    }
+    rows=wanted+1;
     std::array<uint32_t,9>inputs{},verified{};
     inputs[0]=next_token;
     for(uint32_t index=1;index<rows;++index)inputs[index]=drafts[index-1];
