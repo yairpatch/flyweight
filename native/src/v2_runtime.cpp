@@ -20127,7 +20127,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         runtime->prefill_rows=runtime->prefill_rows_cap;
     if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
-        runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
+        runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,16384));
     }
     // Mid-prefill recurrent-state checkpoints let a follow-up request whose
     // prompt diverges mid-stream (agentic clients mutate the prefix: injected
