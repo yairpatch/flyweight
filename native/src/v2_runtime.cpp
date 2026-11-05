@@ -1197,6 +1197,10 @@ struct FlyweightV2QwenRuntime {
     // probe (ExLlama-style): a slow PCIe link needs more reuse to break even.
     // 1 keeps today's "any routed expert may stage" behaviour.
     std::uint32_t prefill_stream_token_floor = 1;
+    // Rows the prefill core phase runs per sub-span (qwen4exp), so its
+    // private scratch is sized for that many rows while the expert phase
+    // still sees the whole chunk. 0: the core runs the whole chunk.
+    std::uint32_t prefill_core_rows = 0;
     // Last probe result in GB/s (0 = not probed / disabled / failed).
     float prefill_stream_pcie_gbs = 0.0f;
     // One-shot hugepage collapse after the first prompt has faulted expert pages.
@@ -20944,6 +20948,18 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
             runtime->prefill_rows=runtime->prefill_rows_cap;
         runtime->forward_rows_capacity=std::max<std::uint32_t>(runtime->prefill_rows,9);
         const std::uint64_t rows=runtime->forward_rows_capacity;
+        // FLYWEIGHT_PREFILL_CORE_ROWS=S: sub-spans of S rows, a multiple of
+        // the DeltaNet chunk so chunk boundaries stay where the whole-chunk
+        // core puts them. Below kDeltaChunkedMinimumRows a sub-span takes the
+        // sequential recurrence instead of the WY form.
+        runtime->prefill_core_rows=0;
+        if(const char*core_env=std::getenv("FLYWEIGHT_PREFILL_CORE_ROWS");
+           core_env&&runtime->qwen4exp){
+            const auto chunk=flyweight::v2::workspace::kDeltaChunk;
+            auto value=static_cast<std::uint64_t>(std::max(0L,std::strtol(core_env,nullptr,10)));
+            value=std::max<std::uint64_t>(value/chunk*chunk,chunk);
+            if(value<rows)runtime->prefill_core_rows=static_cast<std::uint32_t>(value);
+        }
         const std::uint64_t hidden=runtime->model->config.hidden_size;
         const std::uint64_t top_k=runtime->model->config.expert_used_count;
         // The chunked DeltaNet prefill kernels need per-chunk intermediates, but
@@ -20979,7 +20995,7 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
             runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
             qsa_heads,qsa_key_len,qsa_budget,qsa_ratio,
-            attention_head_dim);
+            attention_head_dim,runtime->prefill_core_rows);
         runtime->rows_host_layout=
             flyweight::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
