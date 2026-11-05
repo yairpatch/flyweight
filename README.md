@@ -7,6 +7,14 @@ through ROCm) and a lot of host RAM: mixture-of-experts
 checkpoints larger than VRAM run with their routed experts on the CPU, or
 split between the two, and the runtime measures what fits rather than asking.
 
+**[Flyweight Desktop](#desktop-app)** puts all of it in an app for Windows and
+Linux: pick or download a model, press Start and chat, with every engine
+option, a live monitor and benchmarks a click away. No terminal, Python or CUDA
+toolkit needed. **[Download it](#the-easy-way-download-the-app)**, or run
+`flyweight app` from a pip install.
+
+![Flyweight Desktop: the run bar, the sidebar, and the Server page listing every engine option with its flag and help](https://raw.githubusercontent.com/yairpatch/flyweight/main/docs/images/desktop-server.png)
+
 | Family | Formats | Highlights |
 | --- | --- | --- |
 | Qwen 3 / 3.5 / 3.6 / 3.8, dense and MoE | GGUF; safetensors (3.5 family) | Full feature set: multi-token prediction, expert offload, image input via `mmproj` |
@@ -35,6 +43,12 @@ No terminal, no Python, no CUDA toolkit.
 | **Windows 10/11** | [Flyweight-Setup-windows-x86_64.exe](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-Setup-windows-x86_64.exe) | Open it and click through. No administrator rights needed. Flyweight lands in the Start menu (and on the desktop). |
 | **Linux** (x86-64) | [Flyweight-linux-x86_64.AppImage](https://github.com/yairpatch/flyweight/releases/latest/download/Flyweight-linux-x86_64.AppImage) | Double-click it. If your file manager only offers to open it as a file, right-click → *Properties* → *Allow executing as a program* first. It adds itself to your applications menu. |
 
+If a link answers 404, the newest release does not carry the app yet. The
+latest builds are then on the newest successful
+[Desktop workflow run](https://github.com/yairpatch/flyweight/actions/workflows/desktop.yml):
+sign in to GitHub, open the run, and download from *Artifacts* (each is a zip
+holding the installer or the AppImage).
+
 No model yet? **Get a model** in the app recommends ones that fit this
 computer's memory and graphics card, downloads the right file from Hugging
 Face (resumable, checksum-verified) and selects it, so the next step is
@@ -59,6 +73,7 @@ Windows x64. The import package and the command are `flyweight`:
 python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\Activate.ps1 on Windows
 pip install flyweight-llm
 flyweight doctor
+flyweight app        # the desktop app (see "Desktop app" below)
 ~~~
 
 `doctor` reports whether this machine can serve and names the fix for
@@ -131,6 +146,9 @@ tool it cannot see. If the `flyweight` command is not on PATH, `python -m
 flyweight` takes the same arguments.
 
 ## Quick start
+
+From a terminal, `flyweight app` opens the [desktop app](#desktop-app). To
+serve without it:
 
 ~~~bash
 flyweight serve model.gguf
