@@ -1045,6 +1045,10 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t plan_static_tensor_bytes = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_tensor_bytes = 0;
     std::uint64_t mtp_tensor_bytes = 0;
+    // qwen4exp: the draft block's routed experts are resident in the static
+    // arena and the draft's MoE runs on the GPU (FLYWEIGHT_MTP_GPU_EXPERTS=0
+    // keeps the host path).
+    bool mtp_gpu_experts = false;
     std::uint32_t scratch_elements = 0;
     std::uint32_t moe_intermediate = 0;
     std::vector<std::uint64_t> device_tensors;
@@ -1354,6 +1358,11 @@ struct FlyweightV2QwenRuntime {
     // sampler's own scratch (decode-layout regions) may overlap them there.
     // 8 x hidden floats, allocated on first use, freed with the device state.
     std::uint64_t mtp_sampling_rows = 0;
+    // The draft head's full logits (vocabulary floats) and its argmax +
+    // probability pair, for FLYWEIGHT_MTP_MIN_P's confidence gate. Allocated
+    // on first gated draft, freed with the device state.
+    std::uint64_t mtp_draft_logits = 0;
+    std::uint64_t mtp_draft_top = 0;
     std::uint64_t decode_calls = 0;
     std::uint64_t decode_nanoseconds = 0;
     std::uint64_t route_wait_nanoseconds = 0;
@@ -2511,6 +2520,10 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_host_free(runtime.embedding_host);
     flyweight_gpu_free(runtime.mtp_sampling_rows);
     runtime.mtp_sampling_rows = 0;
+    flyweight_gpu_free(runtime.mtp_draft_logits);
+    runtime.mtp_draft_logits = 0;
+    flyweight_gpu_free(runtime.mtp_draft_top);
+    runtime.mtp_draft_top = 0;
     flyweight_gpu_free(runtime.turbo_kv_stage);
     runtime.turbo_kv_stage = 0;
     runtime.turbo_kv_stage_bytes = 0;
@@ -7312,6 +7325,32 @@ bool qwen_q8_head_enabled() {
     return !setting || setting[0] != '0';
 }
 
+// The codebook and flat formats' Q8 grouped kernels (swiglu or down), or null
+// for a type without one. Their float twins decode an octet at a time and run
+// compute-bound near 90 GB/s; these measured 4-5x faster on 2560x640 stacks.
+const char* qwen_q8_grouped_codebook(std::uint32_t type, bool swiglu) {
+    switch (type) {
+        case 16: return swiglu ? "iq2xxs_q8_grouped_swiglu" : "iq2xxs_q8_grouped_down";
+        case 17: return swiglu ? "iq2xs_q8_grouped_swiglu" : "iq2xs_q8_grouped_down";
+        case 18: return swiglu ? "iq3xxs_q8_grouped_swiglu" : "iq3xxs_q8_grouped_down";
+        case 19: return swiglu ? "iq1s_q8_grouped_swiglu" : "iq1s_q8_grouped_down";
+        case 20: return swiglu ? "iq4nl_q8_grouped_swiglu" : "iq4nl_q8_grouped_down";
+        case 21: return swiglu ? "iq3s_q8_grouped_swiglu" : "iq3s_q8_grouped_down";
+        case 22: return swiglu ? "iq2s_q8_grouped_swiglu" : "iq2s_q8_grouped_down";
+        case 23: return swiglu ? "iq4xs_q8_grouped_swiglu" : "iq4xs_q8_grouped_down";
+        case 29: return swiglu ? "iq1m_q8_grouped_swiglu" : "iq1m_q8_grouped_down";
+        case 42: return swiglu ? "q20_q8_grouped_swiglu" : "q20_q8_grouped_down";
+        default: return nullptr;
+    }
+}
+
+// Whether a row of `input_size` is whole blocks of the type: 32 for IQ4_NL's
+// flat blocks, 64 for Q2_0's, 256 for the super-block formats.
+bool qwen_q8_grouped_width_fits(std::uint32_t type, int input_size) {
+    const int unit = type == 20 ? 32 : type == 42 ? 64 : 256;
+    return input_size > 0 && input_size % unit == 0;
+}
+
 // The Q8-activation grouped SwiGLU for a K-quant expert stack, or null where
 // gate and up differ in type, the row is not super-block aligned, the kernel is
 // missing, or FLYWEIGHT_Q8_EXPERTS=0 (or the FLYWEIGHT_IQ2_Q8_DECODE kill
@@ -7324,22 +7363,25 @@ const char* qwen_q8_grouped_swiglu_kernel(
         return !setting || setting[0] != '0';
     }();
     if (!enabled || !qwen_q8_head_enabled() || gate_type != up_type ||
-        (input_size & 255))
+        !qwen_q8_grouped_width_fits(gate_type, input_size))
         return nullptr;
     const char* name = gate_type == 12 ? "q4k_q8_grouped_swiglu"
         : gate_type == 13 ? "q5k_q8_grouped_swiglu"
-        : gate_type == 14 ? "q6k_q8_grouped_swiglu" : nullptr;
+        : gate_type == 14 ? "q6k_q8_grouped_swiglu"
+        : qwen_q8_grouped_codebook(gate_type, true);
     return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
 }
 
 // The Q8-activation grouped down projection for a K-quant expert stack, under
 // the same switches as qwen_q8_grouped_swiglu_kernel.
 const char* qwen_q8_grouped_down_kernel(std::uint32_t down_type, int input_size) {
-    if (!qwen_q8_grouped_swiglu_kernel(12, 12, 256) || (input_size & 255))
+    if (!qwen_q8_grouped_swiglu_kernel(12, 12, 256) ||
+        !qwen_q8_grouped_width_fits(down_type, input_size))
         return nullptr;
     const char* name = down_type == 12 ? "q4k_q8_grouped_down"
         : down_type == 13 ? "q5k_q8_grouped_down"
-        : down_type == 14 ? "q6k_q8_grouped_down" : nullptr;
+        : down_type == 14 ? "q6k_q8_grouped_down"
+        : qwen_q8_grouped_codebook(down_type, false);
     return name && flyweight_gpu_kernel_available(name) ? name : nullptr;
 }
 
@@ -21519,9 +21561,46 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
                 persistent[layer.static_tensors[slot]]=true;
             }
         }
+        runtime->mtp_gpu_experts=false;
         if(runtime->options.mtp_drafts){
             for(auto tensor:runtime->mtp_layer_plan.static_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
             for(auto tensor:runtime->mtp_special_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
+            // The draft runs once per drafted token and its routed experts
+            // were all host work: a route download, a sync, the CPU MoE and an
+            // upload, ~2-5 ms a draft. Strata keeps the block's 512 experts in
+            // VRAM (~0.7 GB at Q2_0) and drafts without leaving the GPU; so do
+            // we where the types have grouped kernels.
+            static const bool gpu_experts_enabled=[]{
+                const char*setting=std::getenv("FLYWEIGHT_MTP_GPU_EXPERTS");
+                return !setting||setting[0]!='0';
+            }();
+            const auto&draft=runtime->mtp_layer_plan;
+            if(gpu_experts_enabled&&runtime->qwen4exp&&runtime->mtp_available&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[0]].type)&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[1]].type)&&
+               qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[2]].type)&&
+               runtime->model->tensors[draft.expert_tensors[0]].type==
+                   runtime->model->tensors[draft.expert_tensors[1]].type&&
+               [&]{
+                   // Every MiB here comes out of the routed-expert cache. A
+                   // Q2_0 sidecar's 512 experts (0.71 GB) pay for themselves;
+                   // the Q4_K/Q8_0 ones of the shared-Q4_K_M sidecar (1.7 GB)
+                   // cost ~280 cache slots on a 12 GB card and took Flash-Next
+                   // MTP from 49.9 to 37.1 tok/s. FLYWEIGHT_MTP_GPU_EXPERTS_MIB
+                   // moves the cap (default 1024).
+                   const char*setting=std::getenv("FLYWEIGHT_MTP_GPU_EXPERTS_MIB");
+                   const std::uint64_t cap=(setting?std::strtoull(setting,nullptr,10):1024ull)<<20;
+                   std::uint64_t bytes=0;
+                   for(int role=0;role<3;++role)bytes+=runtime->model->tensors[draft.expert_tensors[role]].size;
+                   if(bytes>cap)std::fprintf(stderr,
+                       "[flyweight] MTP draft experts stay on the host: %llu MiB is over the %llu MiB "
+                       "a resident copy may take from the expert cache (FLYWEIGHT_MTP_GPU_EXPERTS_MIB)\n",
+                       static_cast<unsigned long long>(bytes>>20),static_cast<unsigned long long>(cap>>20));
+                   return bytes<=cap;
+               }()){
+                for(int role=0;role<3;++role)persistent[draft.expert_tensors[role]]=true;
+                runtime->mtp_gpu_experts=true;
+            }
         }
         // NVFP4 checkpoints quantize only the routed experts and ship every
         // dense weight as bf16, which costs ~1.9x Q8_0's bytes for the same
@@ -24513,7 +24592,7 @@ void qwen_mtp_append_prompt_pair(
 // re-scores every drafted token with the target model.
 std::uint32_t qwen4exp_mtp_draft(
     FlyweightV2QwenRuntime& runtime, std::uint32_t token,
-    std::uint64_t input_hidden
+    std::uint64_t input_hidden, float* probability
 ) {
     const auto& config = runtime.model->config;
     const int hidden_size = static_cast<int>(config.hidden_size);
@@ -24555,7 +24634,6 @@ std::uint32_t qwen4exp_mtp_draft(
     const auto third = take(runtime.scratch_elements * sizeof(float));
     const auto fourth = take(runtime.scratch_elements * sizeof(float));
     const auto activated = take(top_k * runtime.moe_intermediate * sizeof(float));
-    (void)activated;
     const auto router_logits = take(experts * sizeof(float));
     const auto selected_device = take(top_k * sizeof(std::int32_t));
     const auto route_weights = take(top_k * sizeof(float));
@@ -24712,6 +24790,69 @@ std::uint32_t qwen4exp_mtp_draft(
     if (flyweight_gpu_route_topk(router_logits, selected_device, route_weights,
                                experts, top_k, runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP routing failed");
+    auto shared_expert = [&] {
+        auto up_half = first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
+        dense(9, normalized, first, hidden_size, intermediate);
+        dense(10, normalized, up_half, hidden_size, intermediate);
+        int count = intermediate;
+        void* silu_args[] = {const_cast<std::uint64_t*>(&first),
+                             const_cast<std::uint64_t*>(&second), &count};
+        launch("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, silu_args);
+        dense(11, second, third, intermediate, hidden_size);
+        auto shared_gate = tensor(12);
+        const auto sg_type = runtime.model->tensors[layer.static_tensors.at(12)].type;
+        void* shared_args[] = {const_cast<std::uint64_t*>(&normalized), &shared_gate,
+                               const_cast<std::uint64_t*>(&third),
+                               const_cast<int*>(&hidden_size)};
+        launch(sg_type == 30 ? "qwen_shared_scale_bf16" : "qwen_shared_scale", 1, 1, shared_args);
+    };
+    if (runtime.mtp_gpu_experts) {
+        // Resident experts: tables from the device routes, grouped SwiGLU,
+        // grouped down accumulated onto the shared expert's output. No host
+        // round trip until the drafted token itself.
+        shared_expert();
+        const auto tables = take(static_cast<std::uint64_t>(top_k) *
+                                 (3 * sizeof(std::uint64_t) + 2 * sizeof(float)));
+        std::uint64_t gate_table = tables;
+        std::uint64_t up_table = gate_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t down_table = up_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t gate_scales = down_table + top_k * sizeof(std::uint64_t);
+        std::uint64_t up_scales = gate_scales + top_k * sizeof(float);
+        const auto& gate_t = runtime.model->tensors[layer.expert_tensors[0]];
+        const auto& up_t = runtime.model->tensors[layer.expert_tensors[1]];
+        const auto& down_t = runtime.model->tensors[layer.expert_tensors[2]];
+        unsigned long long gate_base = runtime.device_tensors[layer.expert_tensors[0]];
+        unsigned long long up_base = runtime.device_tensors[layer.expert_tensors[1]];
+        unsigned long long down_base = runtime.device_tensors[layer.expert_tensors[2]];
+        unsigned long long gate_stride = gate_t.size / experts;
+        unsigned long long up_stride = up_t.size / experts;
+        unsigned long long down_stride = down_t.size / experts;
+        int count = top_k;
+        void* table_args[] = {const_cast<std::uint64_t*>(&selected_device),
+                              &gate_base, &up_base, &down_base,
+                              &gate_stride, &up_stride, &down_stride,
+                              &gate_table, &up_table, &down_table,
+                              &gate_scales, &up_scales, &count};
+        if (flyweight_gpu_launch_named("expert_tables_from_routes", 1, 1, 32, 0,
+                                       runtime.stream, table_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP expert tables failed");
+        std::uint64_t activated_rows = activated;
+        void* gate_up_args[] = {&gate_table, &up_table,
+                                const_cast<std::uint64_t*>(&normalized), &activated_rows,
+                                const_cast<int*>(&hidden_size),
+                                const_cast<int*>(&intermediate), &count,
+                                &gate_scales, &up_scales};
+        if (flyweight_gpu_launch_named(
+                qwen_grouped_swiglu_name(gate_t.type, false, false).c_str(),
+                static_cast<std::uint32_t>(intermediate),
+                static_cast<std::uint32_t>(top_k), 256, 0, runtime.stream,
+                gate_up_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP grouped SwiGLU failed");
+        if (qwen_launch_grouped_accumulate(runtime.stream, down_t.type, down_table,
+                                           activated_rows, third, route_weights,
+                                           intermediate, hidden_size, top_k) != 0)
+            throw std::runtime_error("native qwen4exp MTP grouped down failed");
+    } else {
     auto* selected_host = reinterpret_cast<std::int32_t*>(staging);
     const auto weights_offset = device_align(top_k * sizeof(std::int32_t));
     const auto input_offset = weights_offset + device_align(top_k * sizeof(float));
@@ -24729,26 +24870,9 @@ std::uint32_t qwen4exp_mtp_draft(
         || flyweight_gpu_download(cpu_input, normalized, hidden_size * sizeof(float),
                                 runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP route transfer failed");
-    {
-        // Shared expert, then the routed experts on the host -- the same split
-        // the ordinary qwen4exp decode uses.
-        auto up_half = first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
-        dense(9, normalized, first, hidden_size, intermediate);
-        dense(10, normalized, up_half, hidden_size, intermediate);
-        int count = intermediate;
-        void* silu_args[] = {const_cast<std::uint64_t*>(&first),
-                             const_cast<std::uint64_t*>(&second), &count};
-        launch("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, silu_args);
-        dense(11, second, third, intermediate, hidden_size);
-    }
-    {
-        auto shared_gate = tensor(12);
-        const auto sg_type = runtime.model->tensors[layer.static_tensors.at(12)].type;
-        void* shared_args[] = {const_cast<std::uint64_t*>(&normalized), &shared_gate,
-                               const_cast<std::uint64_t*>(&third),
-                               const_cast<int*>(&hidden_size)};
-        launch(sg_type == 30 ? "qwen_shared_scale_bf16" : "qwen_shared_scale", 1, 1, shared_args);
-    }
+    // Shared expert, then the routed experts on the host -- the same split
+    // the ordinary qwen4exp decode uses.
+    shared_expert();
     if (flyweight_gpu_stream_sync(runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp MTP route synchronization failed");
     for (int rank = 0; rank < top_k; ++rank) {
@@ -24768,6 +24892,7 @@ std::uint32_t qwen4exp_mtp_draft(
         void* add_args[] = {const_cast<std::uint64_t*>(&third),
                             const_cast<std::uint64_t*>(&fourth), &one, &count};
         launch("scaled_add", (hidden_size + 255) / 256, 1, add_args);
+    }
     }
     hc_post(third);
 
@@ -24797,10 +24922,65 @@ std::uint32_t qwen4exp_mtp_draft(
         hc_pre(runtime.device_tensors[runtime.output_hc_norm],
                runtime.output_hc_down, runtime.output_hc_up,
                std::numeric_limits<std::uint64_t>::max());
-    if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
-        throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     int vocabulary = static_cast<int>(config.vocabulary_size);
     auto lm_head = runtime.device_tensors[runtime.lm_head];
+    // The confidence gate needs the distribution, which the fused argmax head
+    // never writes: project the full logits with the group-decode matvec the
+    // temperature path uses, then reduce them to the argmax and its
+    // probability in one pass.
+    if (probability) {
+        if (!runtime.mtp_draft_logits &&
+            flyweight_gpu_alloc(static_cast<std::uint64_t>(vocabulary) * sizeof(float),
+                                &runtime.mtp_draft_logits) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft logits allocation failed");
+        if (!runtime.mtp_draft_top &&
+            flyweight_gpu_alloc(2 * sizeof(std::uint32_t), &runtime.mtp_draft_top) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft top allocation failed");
+        // The sampler's projection order: the group-decode Q8 matvec where
+        // the head's format has one, else the per-type float kernels.
+        int projected = -1;
+        if (const char* q8_matvec = qwen_q8_matvec_kernel(runtime.lm_head_type);
+            q8_matvec && qwen_q8_head_enabled() &&
+            qwen_q8_row_fits(runtime.lm_head_type, hidden_size)) {
+            void* quant_args[] = {const_cast<std::uint64_t*>(&normalized),
+                                  const_cast<std::uint64_t*>(&draft_q8),
+                                  const_cast<std::uint64_t*>(&draft_q8_scales),
+                                  const_cast<int*>(&hidden_size)};
+            void* matvec_args[] = {&lm_head, const_cast<std::uint64_t*>(&draft_q8),
+                                   const_cast<std::uint64_t*>(&draft_q8_scales),
+                                   &runtime.mtp_draft_logits,
+                                   const_cast<int*>(&hidden_size), &vocabulary};
+            projected = flyweight_gpu_launch_named("quantize_q8_blocks", (hidden_size + 31) / 32,
+                                                   1, 32, 0, runtime.stream, quant_args);
+            if (projected == 0)
+                projected = flyweight_gpu_launch_named(q8_matvec, static_cast<std::uint32_t>(vocabulary),
+                                                       1, 128, 0, runtime.stream, matvec_args);
+        }
+        if (projected != 0)
+            projected = runtime.lm_head_type == 30
+                ? flyweight_gpu_bf16_matvec_transposed(lm_head, normalized, runtime.mtp_draft_logits,
+                                                       hidden_size, vocabulary, runtime.stream)
+                : qwen_gpu_matvec_by_type(runtime.lm_head_type, lm_head, normalized,
+                                          runtime.mtp_draft_logits, hidden_size, vocabulary,
+                                          runtime.stream);
+        if (projected != 0)
+            throw std::runtime_error("native qwen4exp MTP draft logits projection failed");
+        void* top_args[] = {&runtime.mtp_draft_logits, &vocabulary, &runtime.mtp_draft_top};
+        if (flyweight_gpu_launch_named("qwen_logits_top_prob", 1, 1, 1024,
+                                       0, runtime.stream, top_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP draft confidence failed");
+        auto* top = reinterpret_cast<std::uint32_t*>(staging);
+        if (flyweight_gpu_download(top, runtime.mtp_draft_top, 2 * sizeof(std::uint32_t),
+                                   runtime.stream) != 0
+            || flyweight_gpu_stream_sync(runtime.stream) != 0)
+            throw std::runtime_error("native qwen4exp MTP output synchronization failed");
+        std::memcpy(probability, &top[1], sizeof(float));
+        ++runtime.mtp_cache_tokens;
+        ++runtime.mtp_draft_tokens;
+        return top[0];
+    }
+    if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime.lm_head_type);
         lm_q8_kernel && qwen_q8_head_enabled() &&
         qwen_q8_row_fits(runtime.lm_head_type, hidden_size)) {
@@ -31691,6 +31871,21 @@ static uint32_t qwen_lookup_draft(FlyweightV2QwenRuntime&runtime,uint32_t next_t
     return count;
 }
 
+// FLYWEIGHT_MTP_MIN_P: the draft chain stops at the first draft whose own
+// probability under the draft head is below this, and a round whose FIRST
+// draft is below it runs as one ordinary decode step. A verify row costs about
+// as much as a decode step on an MoE that does not fit VRAM (its experts are
+// mostly new reads), so a row the drafter itself doubts is a row paid for
+// nothing. Default 0.5 (Strata's --spec-min-p); 0 drafts every round to the
+// full budget. Measured on Flash-Next UD-Q2_0 (12 GB card, temp 0.8, served
+// prompt): xhigh reasoning 31.8 -> 38.8 tok/s against 40.4 without drafting,
+// medium 44.0 -> 45.9 against 39.9, greedy prose level.
+// Read per round (once per several tokens), so a process can change it.
+static float qwen_mtp_min_p(){
+    const char*setting=std::getenv("FLYWEIGHT_MTP_MIN_P");
+    return setting?std::strtof(setting,nullptr):0.5f;
+}
+
 static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr,const uint32_t*preset_drafts=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
@@ -31699,7 +31894,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     // gets to count -- if it is fed as an input too. Verifying `wanted` rows
     // for `wanted` drafts computed the last draft for nothing every round and
     // capped a round at `wanted` tokens where `wanted+1` were earned.
-    const uint32_t rows=wanted+1;
+    uint32_t rows=wanted+1;
     // The draft block's KV cache is sized for the context limit and, unlike the
     // target caches, is never rewound by a new request. Recycling it when it
     // would overflow keeps a long-running server in bounds; the cost is a few
@@ -31714,14 +31909,40 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         for(uint32_t index=0;index<wanted;++index)drafts[index]=preset_drafts[index];
         runtime.mtp_draft_tokens+=wanted;
         ++runtime.lookup_rounds;
-    }else for(uint32_t index=0;index<wanted;++index){
-        drafts[index]=runtime.qwen4exp
-            ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden)
-            :qwen_mtp_draft(runtime,draft_input,draft_hidden);
-        draft_input=drafts[index];
-        draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
+    }else{
+        const float min_p=runtime.qwen4exp?qwen_mtp_min_p():0.0f;
+        for(uint32_t index=0;index<wanted;++index){
+            float confidence=1.0f;
+            drafts[index]=runtime.qwen4exp
+                ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden,min_p>0.0f?&confidence:nullptr)
+                :qwen_mtp_draft(runtime,draft_input,draft_hidden);
+            draft_input=drafts[index];
+            draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
+            if(confidence<min_p){
+                // Dropped, not verified: its cache entry is rebuilt (or
+                // overwritten) by the commit below like any rejected draft's.
+                --runtime.mtp_draft_tokens;
+                wanted=index;
+                break;
+            }
+        }
     }
     runtime.mtp_draft_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-draft_started).count();
+    if(!wanted){
+        // Not even the first draft is likely: one ordinary decode step, as the
+        // engine would have taken without drafting. The first draft read the
+        // target's real hidden state, so its cache entry stays valid -- the
+        // same state an ordinary step leaves for the next round.
+        runtime.mtp_cache_tokens=base_cache_tokens+1;
+        uint32_t produced=0;
+        if(flyweight_v2_qwen_runtime_decode(&runtime,next_token,&produced)!=0)
+            throw std::runtime_error("native Qwen decode failed");
+        if(sampling&&sampling->active())
+            produced=qwen_sample_last_logits(runtime,*sampling,produced);
+        out[0]=produced;
+        return 1;
+    }
+    rows=wanted+1;
     std::array<uint32_t,9>inputs{},verified{};
     inputs[0]=next_token;
     for(uint32_t index=1;index<rows;++index)inputs[index]=drafts[index-1];

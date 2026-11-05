@@ -862,14 +862,39 @@ void qwen_forward_rows(
         // A handful of rows -- MTP verify -- reads each weight once for up to
         // eight of them instead of once per token.
         if(bf16_tiled&&type==30&&rows>=2&&rows<16){
+            // Under ~1K output rows the warp form leaves the card idle (one
+            // block for the 4-row inject); split the columns instead, aiming
+            // for ~512 blocks, each at least 1024 columns.
+            const bool split=output_size<1024&&input_size>=1024&&input_size%8==0&&
+                matrix%16==0&&input%16==0;
+            // Many rows of a few hundred columns (the 10240 x 320 up mix) put
+            // eight lanes on a row instead of a warp.
+            const bool short_rows=!split&&output_size>=2048&&input_size<=512&&
+                input_size%8==0&&matrix%16==0&&input%16==0;
+            int splits=1,chunk=input_size;
+            if(split){
+                splits=std::clamp((512+output_size-1)/output_size,1,input_size/1024);
+                chunk=((input_size+splits-1)/splits+7)/8*8;
+                splits=(input_size+chunk-1)/chunk;
+            }
             for(int first=0;first<rows;first+=8){
                 int batch=std::min(8,rows-first);
                 auto batch_input=input+static_cast<std::uint64_t>(first)*input_size*sizeof(float);
                 auto batch_output=output+static_cast<std::uint64_t>(first)*output_size*sizeof(float);
+                if(split){
+                    if(splits>1&&flyweight_gpu_memset(batch_output,0,
+                           static_cast<std::uint64_t>(batch)*output_size*sizeof(float),runtime.stream)!=0)
+                        throw std::runtime_error("native Qwen rows bf16 split clear failed");
+                    void*args[]={&matrix,&batch_input,&batch_output,&output_size,&input_size,&batch,&chunk};
+                    launch("bf16_matvec_rows_split",output_size,static_cast<std::uint32_t>(splits),128,args);
+                    continue;
+                }
                 void*args[]={&matrix,&batch_input,&batch_output,&output_size,&input_size,&batch};
-                launch("bf16_matvec_rows_warp",(output_size+7)/8,1,256,args);
+                if(short_rows)launch("bf16_matvec_rows_short",(output_size+31)/32,1,256,args);
+                else launch("bf16_matvec_rows_warp",(output_size+7)/8,1,256,args);
             }
-            dense_trace("bf16_matvec_rows_warp");
+            dense_trace(split?"bf16_matvec_rows_split":
+                        short_rows?"bf16_matvec_rows_short":"bf16_matvec_rows_warp");
             return;
         }
         if(bf16_tiled&&type==30&&rows>=16){

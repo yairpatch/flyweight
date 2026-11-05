@@ -106,8 +106,9 @@ class Qwen4ExpMtpDecodeTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._directory.cleanup()
 
-    def _generate(self, drafts: int) -> tuple[list[int], dict]:
-        with mock.patch.dict(os.environ, {"FLYWEIGHT_MTP_ADAPTIVE": "0"}):
+    def _generate(self, drafts: int, min_p: float = 0.0) -> tuple[list[int], dict]:
+        environment = {"FLYWEIGHT_MTP_ADAPTIVE": "0", "FLYWEIGHT_MTP_MIN_P": repr(min_p)}
+        with mock.patch.dict(os.environ, environment):
             V2Model.select_backend("cpu")
             try:
                 with V2Model(str(self.path)) as model:
@@ -139,6 +140,25 @@ class Qwen4ExpMtpDecodeTest(unittest.TestCase):
                 # A run that never drafted would compare nothing.
                 self.assertGreater(int(info["mtp_draft_tokens"]), 0)
 
+    def test_confidence_gate_keeps_the_output(self) -> None:
+        """FLYWEIGHT_MTP_MIN_P cuts the draft chain short, and a round whose
+        first draft is unsure runs as a plain decode step instead.
+
+        The fixture's drafter is near-uniform over its 96 tokens, so its top
+        probabilities sit around 0.03-0.1: 0.05 gates part of the drafts, 0.08
+        nearly all, and 1.0 every round -- the decode fallback alone.
+        """
+        plain, _ = self._generate(0)
+        ungated, ungated_info = self._generate(3)
+        for min_p in (0.05, 0.08, 1.0):
+            with self.subTest(min_p=min_p):
+                gated, info = self._generate(3, min_p)
+                self.assertEqual(plain, gated)
+                self.assertLess(int(info["mtp_draft_tokens"]),
+                                int(ungated_info["mtp_draft_tokens"]))
+                if min_p == 1.0:
+                    self.assertEqual(int(info["mtp_draft_tokens"]), 0)
+
 
 class Qwen4ExpMtpSidecarTest(unittest.TestCase):
     """A trunk with no draft block gets one from a companion GGUF.
@@ -168,7 +188,9 @@ class Qwen4ExpMtpSidecarTest(unittest.TestCase):
         cls._directory.cleanup()
 
     def _generate(self, drafts: int, sidecar: bool) -> tuple[list[int], dict]:
-        with mock.patch.dict(os.environ, {"FLYWEIGHT_MTP_ADAPTIVE": "0"}):
+        with mock.patch.dict(
+            os.environ, {"FLYWEIGHT_MTP_ADAPTIVE": "0", "FLYWEIGHT_MTP_MIN_P": "0"}
+        ):
             V2Model.select_backend("cpu")
             try:
                 with V2Model(
@@ -221,8 +243,9 @@ class Qwen4ExpSampledMtpTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._directory.cleanup()
 
-    def _engine_tokens(self, drafts: int, **sampling) -> tuple[list[int], dict]:
-        with mock.patch.dict(os.environ, {"FLYWEIGHT_MTP_ADAPTIVE": "0"}):
+    def _engine_tokens(self, drafts: int, min_p: float = 0.0, **sampling) -> tuple[list[int], dict]:
+        environment = {"FLYWEIGHT_MTP_ADAPTIVE": "0", "FLYWEIGHT_MTP_MIN_P": repr(min_p)}
+        with mock.patch.dict(os.environ, environment):
             V2Model.select_backend("cpu")
             try:
                 with V2Model(str(self.path)) as model:
@@ -265,6 +288,18 @@ class Qwen4ExpSampledMtpTest(unittest.TestCase):
         drafted, info = self._engine_tokens(2, **sampling)
         self.assertGreater(int(info["mtp_rejected_tokens"]), 0)
         self.assertEqual(drafted, plain)
+
+    def test_gated_rounds_sample_like_plain_decode(self) -> None:
+        # A gated round's decode step goes through the task's own sampler.
+        for sampling in (
+            dict(temperature=0.8, top_k=20, top_p=0.95, seed=1234, forbid_tool_calls=True),
+            dict(repetition_penalty=1.8, penalty_window=64, forbid_tool_calls=True),
+        ):
+            plain, _ = self._engine_tokens(0, **sampling)
+            for min_p in (0.05, 1.0):
+                with self.subTest(sampling=sampling, min_p=min_p):
+                    gated, _ = self._engine_tokens(2, min_p, **sampling)
+                    self.assertEqual(gated, plain)
 
 
 if __name__ == "__main__":

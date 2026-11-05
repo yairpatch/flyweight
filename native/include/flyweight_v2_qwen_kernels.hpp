@@ -626,6 +626,30 @@ void sampling_block_topk_pairs(
     }
 }
 
+// Pointer and scale tables for the grouped expert kernels, straight from the
+// router's device output: rank r's gate/up/down rows live at
+// base + selected[r] * stride. Lets a fully resident expert set (qwen4exp's
+// MTP draft block) run its MoE without the routes ever visiting the host.
+extern "C" __global__
+void expert_tables_from_routes(
+    const int* selected,
+    const unsigned long long gate_base, const unsigned long long up_base,
+    const unsigned long long down_base, const unsigned long long gate_stride,
+    const unsigned long long up_stride, const unsigned long long down_stride,
+    unsigned long long* gate_table, unsigned long long* up_table,
+    unsigned long long* down_table, float* gate_scales, float* up_scales,
+    const int count
+) {
+    const int rank = threadIdx.x;
+    if (rank >= count) return;
+    const unsigned long long expert = (unsigned long long)selected[rank];
+    gate_table[rank] = gate_base + expert * gate_stride;
+    up_table[rank] = up_base + expert * up_stride;
+    down_table[rank] = down_base + expert * down_stride;
+    gate_scales[rank] = 1.0f;
+    up_scales[rank] = 1.0f;
+}
+
 // Softmax top-k over `rows` router rows with an optional residency prior: an
 // expert whose `resident` flag is set competes with `prior` added to its
 // logit (Strata's STRATA_ROUTE_PRIOR), so routing leans toward experts the
@@ -948,6 +972,93 @@ void bf16_matvec_long_rows(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Split-K twin of bf16_matvec_rows_warp for few, long output rows over 2-8
+// tokens: qwen4exp's hyper-connection inject (4 x 10240) ran as one block and
+// its down mix (320 x 10240) as 40, ~25 us each in MTP verify. grid (rows,
+// splits); a block covers `chunk` columns (a multiple of 8) of one row and,
+// with more than one split, adds into an output the host zeroed. The host
+// only launches it for 16-byte aligned rows with columns % 8 == 0.
+extern "C" __global__
+void bf16_matvec_rows_split(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens,
+    const int chunk
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int split = (int)blockIdx.y;
+    const int begin = (split * chunk) >> 3;
+    const int end = min(columns, (split + 1) * chunk) >> 3;
+    const uint4* packed = (const uint4*)(weights + (long long)row * (long long)columns);
+    float partial[8] = {};
+    for (int step = begin + threadIdx.x; step < end; step += blockDim.x) {
+        const uint4 value = packed[step];
+        #pragma unroll
+        for (int token = 0; token < 8; ++token)
+            if (token < tokens)
+                partial[token] += bf16_dot8(
+                    value, vectors + (long long)token * columns + step * 8);
+    }
+    __shared__ float sums[8][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int token = 0; token < 8; ++token) {
+        float value = partial[token];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        if (lane == 0) sums[warp][token] = value;
+    }
+    __syncthreads();
+    if ((int)threadIdx.x >= tokens) return;
+    float value = 0.0f;
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) value += sums[w][threadIdx.x];
+    float* target = output + (long long)threadIdx.x * rows + row;
+    if ((int)gridDim.y == 1) *target = value;
+    else atomicAdd(target, value);
+}
+
+// Short-row twin for many rows of a few hundred columns over 2-8 tokens:
+// qwen4exp's hyper-connection up mix (10240 x 320) is 40 16-byte steps a row,
+// which a warp per row covers in two passes, the second a quarter full. Here
+// eight lanes share a row (four rows a warp, 32 a 256-thread block). Same
+// alignment contract as bf16_matvec_rows_split.
+extern "C" __global__
+void bf16_matvec_rows_short(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens
+) {
+    const int sub = threadIdx.x & 7;
+    const int row = blockIdx.x * (int)(blockDim.x >> 3) + (int)(threadIdx.x >> 3);
+    const uint4* packed = (const uint4*)(weights + (long long)min(row, rows - 1) * (long long)columns);
+    const int steps = columns >> 3;
+    float partial[8] = {};
+    for (int step = sub; step < steps; step += 8) {
+        const uint4 value = packed[step];
+        #pragma unroll
+        for (int token = 0; token < 8; ++token)
+            if (token < tokens)
+                partial[token] += bf16_dot8(
+                    value, vectors + (long long)token * columns + step * 8);
+    }
+    #pragma unroll
+    for (int token = 0; token < 8; ++token) {
+        if (token >= tokens) break;
+        float value = partial[token];
+        for (int offset = 4; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffff, value, offset, 8);
+        if (sub == 0 && row < rows) output[(long long)token * rows + row] = value;
+    }
+}
+
 extern "C" __global__
 void bf16_matmul(
     const unsigned short* weights,
@@ -1165,6 +1276,64 @@ void qwen_copy_vector(
 ) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elements) output[index] = input[index];
+}
+
+// The argmax of a logits row and its softmax probability: out[0] = index,
+// out[1] = the probability's float bits. One block (up to 1024 threads) over
+// the whole vocabulary -- the MTP draft head's confidence, read once per
+// draft, where the vocabulary pass is small next to the head projection that
+// produced it. Ties go to the lower index; NaN is never picked.
+extern "C" __global__
+void qwen_logits_top_prob(
+    const float* logits,
+    const int count,
+    unsigned int* out
+) {
+    float best = -3.402823466e+38F;
+    int best_index = 0x7fffffff;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best) { best = v; best_index = i; }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_down_sync(0xffffffff, best, offset);
+        const int other_index = __shfl_down_sync(0xffffffff, best_index, offset);
+        if (other > best || (other == best && other_index < best_index)) {
+            best = other; best_index = other_index;
+        }
+    }
+    __shared__ float warp_best[32];
+    __shared__ int warp_index[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (int)((blockDim.x + 31) >> 5);
+    if (lane == 0) { warp_best[warp] = best; warp_index[warp] = best_index; }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < warps ? warp_best[lane] : -3.402823466e+38F;
+        best_index = lane < warps ? warp_index[lane] : 0x7fffffff;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(0xffffffff, best, offset);
+            const int other_index = __shfl_down_sync(0xffffffff, best_index, offset);
+            if (other > best || (other == best && other_index < best_index)) {
+                best = other; best_index = other_index;
+            }
+        }
+        if (lane == 0) { warp_best[0] = best; warp_index[0] = best_index; }
+    }
+    __syncthreads();
+    best = warp_best[0];
+    best_index = warp_index[0];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        const float v = logits[i];
+        if (v == v) sum += __expf(v - best);
+    }
+    sum = block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        out[0] = (unsigned int)(best_index == 0x7fffffff ? 0 : best_index);
+        out[1] = __float_as_uint(sum > 0.0f ? 1.0f / sum : 0.0f);
+    }
 }
 
 // Expert grouping for the prefill GEMM path: pack the rows routed to one
@@ -9369,11 +9538,10 @@ R"FLYWEIGHT_CUDA(
         if (token >= rows || route - token * top_k >= counts[token]) return;   \
     } else if (route >= experts) return;                                        \
     if (row >= output_size) return;                                            \
-    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
-    const unsigned char* gate_row =                                             \
-        (const unsigned char*)gate_ptrs[route] + (long long)row * row_bytes;    \
-    const unsigned char* up_row =                                               \
-        (const unsigned char*)up_ptrs[route] + (long long)row * row_bytes;      \
+    const unsigned char* gate_row = q8_weight_row(                              \
+        (const unsigned char*)gate_ptrs[route], row, input_size, STRIDE);       \
+    const unsigned char* up_row = q8_weight_row(                                \
+        (const unsigned char*)up_ptrs[route], row, input_size, STRIDE);         \
     const signed char* act = vectors + (long long)token * input_size;           \
     const __half* act_scales = vector_scales + (long long)token * scale_stride; \
     const int groups = input_size >> 5;                                         \
@@ -9489,14 +9657,14 @@ extern "C" __global__ void name(                                                
     if (row >= output_size) return;                                            \
     const int base = counts ? token * top_k : 0;                                \
     const int count = counts ? counts[token] : experts;                         \
-    const long long row_bytes = (long long)(input_size >> 8) * (STRIDE);        \
     const int groups = input_size >> 5;                                         \
     float partial = 0.0f;                                                       \
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {                    \
         for (int rank = 0; rank < count; ++rank) {                              \
             const int entry = base + rank;                                      \
-            const unsigned char* down_row = (const unsigned char*)              \
-                down_ptrs[entry] + (long long)row * row_bytes;                  \
+            const unsigned char* down_row = q8_weight_row(                      \
+                (const unsigned char*)down_ptrs[entry], row, input_size,        \
+                STRIDE);                                                        \
             const int4* av = (const int4*)(vectors                              \
                 + (long long)entry * input_size + (long long)g * 32);           \
             const int4 lo = av[0], hi = av[1];                                  \
@@ -9540,6 +9708,31 @@ FLYWEIGHT_Q8_GROUPED_DOWN_SIGNATURE(name) {                                     
 FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q4k_q8_grouped_down, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_GROUPED_DOWN_MIN(q5k_q8_grouped_down, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_GROUPED_DOWN(q6k_q8_grouped_down, q6k_q8_decode, 210)
+
+// The codebook and flat formats, whose float grouped kernels decode an octet
+// at a time and run compute-bound at ~90 GB/s (an IQ3_XXS 2560x640 gate+up
+// pair took ~13 us). Row bases go through q8_weight_row, so the flat formats'
+// 640-wide down rows (Q2_0, IQ4_NL) fit as well as the super-block ones.
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2xxs_q8_grouped_swiglu, iq2xxs_q8_decode, 66)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2xs_q8_grouped_swiglu, iq2xs_q8_decode, 74)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq2s_q8_grouped_swiglu, iq2s_q8_decode, 82)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq3xxs_q8_grouped_swiglu, iq3xxs_q8_decode, 98)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq3s_q8_grouped_swiglu, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq4xs_q8_grouped_swiglu, iq4xs_q8_decode, 136)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq4nl_q8_grouped_swiglu, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq1s_q8_grouped_swiglu, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(iq1m_q8_grouped_swiglu, iq1m_q8_decode, 56)
+FLYWEIGHT_Q8_GROUPED_SWIGLU(q20_q8_grouped_swiglu, q20_q8_decode, 72)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2xxs_q8_grouped_down, iq2xxs_q8_decode, 66)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2xs_q8_grouped_down, iq2xs_q8_decode, 74)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq2s_q8_grouped_down, iq2s_q8_decode, 82)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq3xxs_q8_grouped_down, iq3xxs_q8_decode, 98)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq3s_q8_grouped_down, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq4xs_q8_grouped_down, iq4xs_q8_decode, 136)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq4nl_q8_grouped_down, iq4nl_q8_decode, 144)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq1s_q8_grouped_down, iq1s_q8_decode, 50)
+FLYWEIGHT_Q8_GROUPED_DOWN(iq1m_q8_grouped_down, iq1m_q8_decode, 56)
+FLYWEIGHT_Q8_GROUPED_DOWN(q20_q8_grouped_down, q20_q8_decode, 72)
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 
