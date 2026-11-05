@@ -4831,9 +4831,23 @@ bool qwen_iq_avx512_enabled(){
 // Intel parts (AVX-VNNI, no AVX-512) keep the integer path; IQ3_S's masked
 // signs exist only in the 512-bit kernel.
 using QwenIqQ8Dot=float(*)(const std::uint8_t*,const QwenQ8KBlock*,int,std::uint64_t);
+// Qwen's IQ2_XXS and IQ2_S gate/up stacks take Q8_K activations through the
+// multi-token VNNI dots (qwen_iq2_dot_q8_k_vnni512_tokens) instead of the
+// float dot, which decoded every row once per token and ran IQ2_S at ~36 GB/s
+// for one token and half that for two (57 and 57 now). bench_kernel_quality
+// arm iq2-float: teacher-forced agreement inside the rerun noise.
+// FLYWEIGHT_IQ2_Q8=0 restores the float dot.
+bool qwen_iq2_q8_enabled(){
+    static const bool enabled=[]{
+        const char*setting=std::getenv("FLYWEIGHT_IQ2_Q8");
+        return !setting||setting[0]!='0';
+    }();
+    return enabled&&(flyweight_cpu_features()&8u)!=0;
+}
 bool qwen_iq_q8_admitted(std::uint32_t type){
     const auto features=flyweight_cpu_features();
-    if((features&8u)!=0)return type==19||type==21;
+    if((features&8u)!=0)
+        return type==19||type==21||((type==16||type==22)&&qwen_iq2_q8_enabled());
     return (features&4u)!=0&&type==19;
 }
 // Nemotron H's experts add IQ2_XXS (512-bit kernel only). Qwen's IQ2_XXS
@@ -4843,6 +4857,7 @@ bool nemotron_iq_q8_admitted(std::uint32_t type){
 }
 QwenIqQ8Dot qwen_iq_q8_dot(std::uint32_t type){
     if(type==16)return &qwen_iq2xxs_dot_q8_k_vnni512;
+    if(type==22)return &qwen_iq2s_dot_q8_k_vnni512;
     if(type==21)return &qwen_iq3s_dot_q8_k_vnni512;
     return (flyweight_cpu_features()&8u)!=0
         ?&qwen_iq1s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_avx_vnni;
@@ -8520,6 +8535,7 @@ void qwen_cpu_moe_rows(
         &&!(iq1s_q8_setting&&iq1s_q8_setting[0]=='0')
         &&!(q8_setting&&q8_setting[0]=='0');
     const auto iq_q8_dot=qwen_iq_q8_dot(gate_type);
+    const bool iq2_tokens=iq1s_q8&&(gate_type==16||gate_type==22);
     thread_local std::vector<QwenQ8KBlock> tl_input_q8;
     auto& input_q8=tl_input_q8;
     const int q8_blocks=hidden/256;
@@ -8640,10 +8656,18 @@ void qwen_cpu_moe_rows(
         // the matching comment in qwen_cpu_moe.
         const float gate_scale=qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert);
         const float up_scale=qwen_expert_role_scale(runtime,layer.expert_up_scale,expert);
-        if(count<=2){
+        if(count<=2||(iq2_tokens&&count<=4)){
             for(int i=0;i<mr;++i){
-                float gate_values[2]{},up_values[2]{};
-                if(iq1s_q8){
+                float gate_values[4]{},up_values[4]{};
+                if(iq2_tokens){
+                    // Each row decoded once for all of the expert's tokens.
+                    const QwenQ8KBlock* token_inputs[4];
+                    for(int occurrence=0;occurrence<count;++occurrence)
+                        token_inputs[occurrence]=input_q8_data+static_cast<std::size_t>(
+                            occurrences[begin+occurrence]/routed_count)*q8_blocks;
+                    qwen_iq2_dot_q8_k_vnni512_tokens(gate_type,gate_data,token_inputs,count,hidden,row0+i,gate_values);
+                    qwen_iq2_dot_q8_k_vnni512_tokens(up_type,up_data,token_inputs,count,hidden,row0+i,up_values);
+                }else if(iq1s_q8){
                     for(int occurrence=0;occurrence<count;++occurrence){
                         const auto*q8=input_q8_data+static_cast<std::size_t>(
                             occurrences[begin+occurrence]/routed_count)*q8_blocks;

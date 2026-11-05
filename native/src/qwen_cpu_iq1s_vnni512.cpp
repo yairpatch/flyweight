@@ -1389,3 +1389,160 @@ void qwen_i16_gemm_k256_vnni512(
                                   activation_scales + t, row_out + t);
     }
 }
+
+// IQ2_XXS / IQ2_S rows against 1-4 tokens' Q8_K activations. Each 64-value
+// chunk is decoded once -- unsigned grid magnitudes, the sign mask, and the
+// integer group scale of every dword lane -- and dotted with every token: the
+// float dot decoded the row again per token, which left these gate/up stacks
+// compute-bound (IQ2_S at ~36 GB/s for one token, half that for two).
+// Accumulation is exact int32, so a token's result does not depend on how
+// many tokens share the call.
+namespace {
+
+// dword lane i of a 64-value chunk holds values 4i..4i+3: IQ2_S scales every
+// 16 values (four lanes), IQ2_XXS every 32 (eight, kScaleLanes above).
+alignas(64) constexpr std::int32_t kQuarterLanes[16] = {
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+
+struct Iq2Chunk {
+    __m512i magnitudes;
+    __mmask64 signs;
+    __m512i scales;
+};
+
+inline Iq2Chunk iq2xxs_chunk(const std::uint8_t* base, const __m512i& block_scales, int pair) {
+    std::uint32_t low0 = 0, high0 = 0, low1 = 0, high1 = 0;
+    std::memcpy(&low0, base + 2 + (2 * pair) * 8, sizeof(low0));
+    std::memcpy(&high0, base + 2 + (2 * pair) * 8 + 4, sizeof(high0));
+    std::memcpy(&low1, base + 2 + (2 * pair + 1) * 8, sizeof(low1));
+    std::memcpy(&high1, base + 2 + (2 * pair + 1) * 8 + 4, sizeof(high1));
+    const std::uint64_t indices =
+        static_cast<std::uint64_t>(low0) | (static_cast<std::uint64_t>(low1) << 32);
+    const __m256i index = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(indices)));
+    const std::uint64_t sign_mask =
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 0) & 127]) << 0) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 7) & 127]) << 8) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 14) & 127]) << 16) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high0 >> 21) & 127]) << 24) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 0) & 127]) << 32) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 7) & 127]) << 40) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 14) & 127]) << 48) |
+        (static_cast<std::uint64_t>(kIq2xxsSigns[(high1 >> 21) & 127]) << 56);
+    return {_mm512_i32gather_epi64(index, static_cast<const void*>(kIq2xxsGrid), 8),
+            static_cast<__mmask64>(sign_mask),
+            _mm512_permutexvar_epi32(scale_lane_select(pair), block_scales)};
+}
+
+inline __m512i iq2xxs_block_scales(const std::uint8_t* base) {
+    alignas(32) std::int32_t group_scales[8];
+    for (int g = 0; g < 8; ++g) {
+        std::uint32_t high = 0;
+        std::memcpy(&high, base + 2 + g * 8 + 4, sizeof(high));
+        group_scales[g] = static_cast<std::int32_t>(1 + 2 * ((high >> 28) & 15));
+    }
+    return _mm512_castsi256_si512(
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(group_scales)));
+}
+
+inline Iq2Chunk iq2s_chunk(const std::uint8_t* base, int gather) {
+    const auto* quants = base + 2;
+    const auto* signs = base + 34;
+    const auto* high = base + 66;
+    const auto* scales = base + 74;
+    std::uint16_t qh_pair = 0;
+    std::memcpy(&qh_pair, high + gather * 2, sizeof(qh_pair));
+    const __m256i index = _mm256_or_si256(
+        _mm256_cvtepu8_epi32(_mm_loadu_si64(quants + gather * 8)),
+        _mm256_slli_epi32(
+            _mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(qh_pair)),
+                                  _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14)),
+                _mm256_set1_epi32(3)),
+            8));
+    std::uint64_t sign_mask = 0;
+    std::memcpy(&sign_mask, signs + gather * 8, sizeof(sign_mask));
+    // Groups 4*gather .. 4*gather+3 sit in scales[2*gather] and [2*gather+1].
+    const int s0 = scales[2 * gather], s1 = scales[2 * gather + 1];
+    const __m128i quarter_scales = _mm_setr_epi32(
+        1 + 2 * (s0 & 15), 1 + 2 * (s0 >> 4), 1 + 2 * (s1 & 15), 1 + 2 * (s1 >> 4));
+    return {_mm512_i32gather_epi64(index, static_cast<const void*>(kIq2sGrid), 8),
+            static_cast<__mmask64>(sign_mask),
+            _mm512_permutexvar_epi32(
+                _mm512_load_si512(static_cast<const void*>(kQuarterLanes)),
+                _mm512_castsi128_si512(quarter_scales))};
+}
+
+template <int Tokens, bool Xxs>
+void iq2_dot_q8_k_tokens(
+    const std::uint8_t* packed, const QwenQ8KBlock* const* inputs, int elements,
+    std::uint64_t row, float* out
+) {
+    const int blocks = elements / 256;
+    const std::uint32_t block_bytes = Xxs ? kIq2xxsBlockBytes : kIq2sBlockBytes;
+    const auto* row_data = packed + row * static_cast<std::uint64_t>(blocks) * block_bytes;
+    const __m512i zero = _mm512_setzero_si512();
+    float result[Tokens] = {};
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * block_bytes;
+        const __m512i block_scales = Xxs ? iq2xxs_block_scales(base) : zero;
+        __m512i accumulator[Tokens];
+        for (int t = 0; t < Tokens; ++t) accumulator[t] = zero;
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const Iq2Chunk c = Xxs ? iq2xxs_chunk(base, block_scales, chunk) : iq2s_chunk(base, chunk);
+            for (int t = 0; t < Tokens; ++t) {
+                const __m512i activation = _mm512_loadu_si512(
+                    static_cast<const void*>(inputs[t][block].values + chunk * 64));
+                const __m512i signed_activation =
+                    _mm512_mask_sub_epi8(activation, c.signs, zero, activation);
+                accumulator[t] = _mm512_add_epi32(
+                    accumulator[t],
+                    _mm512_mullo_epi32(_mm512_dpbusd_epi32(zero, c.magnitudes, signed_activation),
+                                       c.scales));
+            }
+        }
+        // Both formats carry d * (1 + 2 * scale) / 8 per group.
+        for (int t = 0; t < Tokens; ++t)
+            result[t] += half_value(base) * 0.125f * inputs[t][block].scale *
+                static_cast<float>(_mm512_reduce_add_epi32(accumulator[t]));
+    }
+    for (int t = 0; t < Tokens; ++t) out[t] = result[t];
+}
+
+template <bool Xxs>
+void iq2_dot_q8_k_dispatch(
+    const std::uint8_t* packed, const QwenQ8KBlock* const* inputs, int tokens, int elements,
+    std::uint64_t row, float* out
+) {
+    switch (tokens) {
+        case 1: iq2_dot_q8_k_tokens<1, Xxs>(packed, inputs, elements, row, out); break;
+        case 2: iq2_dot_q8_k_tokens<2, Xxs>(packed, inputs, elements, row, out); break;
+        case 3: iq2_dot_q8_k_tokens<3, Xxs>(packed, inputs, elements, row, out); break;
+        default: iq2_dot_q8_k_tokens<4, Xxs>(packed, inputs, elements, row, out); break;
+    }
+}
+
+}  // namespace
+
+void qwen_iq2_dot_q8_k_vnni512_tokens(
+    std::uint32_t type, const std::uint8_t* packed, const QwenQ8KBlock* const* inputs,
+    int tokens, int elements, std::uint64_t row, float* out
+) {
+    if (type == 16) iq2_dot_q8_k_dispatch<true>(packed, inputs, tokens, elements, row, out);
+    else iq2_dot_q8_k_dispatch<false>(packed, inputs, tokens, elements, row, out);
+}
+
+float qwen_iq2xxs_dot_q8_k_tokens1_vnni512(
+    const std::uint8_t* packed, const QwenQ8KBlock* input, int elements, std::uint64_t row
+) {
+    float out = 0.0f;
+    iq2_dot_q8_k_tokens<1, true>(packed, &input, elements, row, &out);
+    return out;
+}
+
+float qwen_iq2s_dot_q8_k_vnni512(
+    const std::uint8_t* packed, const QwenQ8KBlock* input, int elements, std::uint64_t row
+) {
+    float out = 0.0f;
+    iq2_dot_q8_k_tokens<1, false>(packed, &input, elements, row, &out);
+    return out;
+}

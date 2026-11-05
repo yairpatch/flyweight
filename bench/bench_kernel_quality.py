@@ -91,6 +91,9 @@ ARMS: dict[str, dict[str, str]] = {
     # K-quant routed experts on the float grouped kernels, which the
     # Q8-activation q*k_q8_grouped_swiglu / _down kernels replaced.
     "experts-float": {"FLYWEIGHT_Q8_EXPERTS": "0"},
+    # Qwen IQ2_XXS / IQ2_S CPU gate/up on the float dot, which the
+    # multi-token Q8_K VNNI dots replaced.
+    "iq2-float": {"FLYWEIGHT_IQ2_Q8": "0"},
     # Every Q8-activation path off: dense projections, heads and experts.
     "all-float": {"FLYWEIGHT_IQ2_Q8_DECODE": "0"},
     # Nemotron H CPU expert decode on the int8 Q8_K dot (up is the default,

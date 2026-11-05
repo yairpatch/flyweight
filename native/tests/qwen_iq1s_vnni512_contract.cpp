@@ -202,6 +202,71 @@ int main() {
     }
     std::printf("qwen_iq2xxs_vnni512: %d rows, worst rel error %.2e vs exact, %.2e vs float path\n",
                 kRows, worst2_tight, worst2_loose);
+    // The multi-token IQ2_XXS / IQ2_S dots (Qwen gate/up): each of 1-4 tokens
+    // against its own exact sum, the float path, and itself at every other
+    // token count -- the accumulation is exact int32, so a token's value may
+    // not depend on how many tokens share the call.
+    {
+        constexpr int kTokens = 4;
+        std::vector<std::vector<float>> token_input(kTokens, std::vector<float>(kElements));
+        std::vector<std::vector<QwenQ8KBlock>> token_q8(kTokens, std::vector<QwenQ8KBlock>(kBlocks));
+        std::vector<std::vector<float>> token_dequant(kTokens, std::vector<float>(kElements));
+        const QwenQ8KBlock* inputs[kTokens];
+        for (int t = 0; t < kTokens; ++t) {
+            for (auto& value : token_input[t]) value = spread(generator) * spread(generator);
+            qwen_quantize_q8_k_avx2(token_input[t].data(), kElements, token_q8[t].data());
+            for (int block = 0; block < kBlocks; ++block)
+                for (int lane = 0; lane < 256; ++lane)
+                    token_dequant[t][block * 256 + lane] =
+                        token_q8[t][block].scale * static_cast<float>(token_q8[t][block].values[lane]);
+            inputs[t] = token_q8[t].data();
+        }
+        for (const std::uint32_t type : {16u, 22u}) {
+            const std::uint32_t block_bytes = type == 16 ? kIq2xxsBlockBytes : kIq2sBlockBytes;
+            const std::uint64_t row_bytes = static_cast<std::uint64_t>(kBlocks) * block_bytes;
+            std::vector<std::uint8_t> rows(row_bytes * kRows);
+            for (auto& byte : rows) byte = static_cast<std::uint8_t>(generator());
+            for (int row = 0; row < kRows; ++row)
+                for (int block = 0; block < kBlocks; ++block) {
+                    auto* base = rows.data() + row * row_bytes + block * block_bytes;
+                    base[0] = 0x00; base[1] = 0x3c;
+                }
+            double worst_t = 0.0, worst_l = 0.0;
+            int mismatched = 0;
+            for (int row = 0; row < kRows; ++row) {
+                const auto* row_data = rows.data() + row * row_bytes;
+                float all[kTokens];
+                qwen_iq2_dot_q8_k_vnni512_tokens(type, rows.data(), inputs, kTokens, kElements, row, all);
+                for (int count = 1; count < kTokens; ++count) {
+                    float some[kTokens];
+                    qwen_iq2_dot_q8_k_vnni512_tokens(type, rows.data(), inputs, count, kElements, row, some);
+                    for (int t = 0; t < count; ++t)
+                        if (std::memcmp(&some[t], &all[t], sizeof(float)) != 0) ++mismatched;
+                }
+                for (int t = 0; t < kTokens; ++t) {
+                    double exact = 0.0, magnitude = 0.0;
+                    for (int index = 0; index < kElements; ++index) {
+                        const double weight = type == 16 ? qwen_iq2xxs_value(row_data, index)
+                                                         : qwen_iq2s_value(row_data, index);
+                        exact += weight * token_dequant[t][index];
+                        magnitude += std::fabs(weight * token_dequant[t][index]);
+                    }
+                    const float floating =
+                        qwen_quant_dot_avx2(rows.data(), type, token_input[t].data(), kElements, row);
+                    worst_t = std::max(worst_t, std::fabs(all[t] - exact) / (magnitude + 1e-6));
+                    worst_l = std::max(worst_l, std::fabs(all[t] - floating) / (magnitude + 1e-6));
+                }
+            }
+            if (worst_t > 2e-5 || worst_l > 1e-2 || mismatched) {
+                std::printf("iq2 tokens type %u: tight %.2e, loose %.2e, %d count-dependent values\n",
+                            type, worst_t, worst_l, mismatched);
+                ++failures;
+            }
+            std::printf("qwen_iq2_dot_q8_k_vnni512_tokens type %u: %d rows x %d tokens, worst rel error "
+                        "%.2e vs exact, %.2e vs float path, token counts bit-identical\n",
+                        type, kRows, kTokens, worst_t, worst_l);
+        }
+    }
     std::printf("qwen_iq1s_vnni512_contract: %d rows, worst rel error %.2e vs exact, %.2e vs float path, dequant bit-exact\n",
                 kRows, worst_tight, worst_loose);
     return failures ? 1 : 0;
