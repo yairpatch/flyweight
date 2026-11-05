@@ -21580,7 +21580,24 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
                qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[1]].type)&&
                qwen_gpu_expert_type_supported(runtime->model->tensors[draft.expert_tensors[2]].type)&&
                runtime->model->tensors[draft.expert_tensors[0]].type==
-                   runtime->model->tensors[draft.expert_tensors[1]].type){
+                   runtime->model->tensors[draft.expert_tensors[1]].type&&
+               [&]{
+                   // Every MiB here comes out of the routed-expert cache. A
+                   // Q2_0 sidecar's 512 experts (0.71 GB) pay for themselves;
+                   // the Q4_K/Q8_0 ones of the shared-Q4_K_M sidecar (1.7 GB)
+                   // cost ~280 cache slots on a 12 GB card and took Flash-Next
+                   // MTP from 49.9 to 37.1 tok/s. FLYWEIGHT_MTP_GPU_EXPERTS_MIB
+                   // moves the cap (default 1024).
+                   const char*setting=std::getenv("FLYWEIGHT_MTP_GPU_EXPERTS_MIB");
+                   const std::uint64_t cap=(setting?std::strtoull(setting,nullptr,10):1024ull)<<20;
+                   std::uint64_t bytes=0;
+                   for(int role=0;role<3;++role)bytes+=runtime->model->tensors[draft.expert_tensors[role]].size;
+                   if(bytes>cap)std::fprintf(stderr,
+                       "[flyweight] MTP draft experts stay on the host: %llu MiB is over the %llu MiB "
+                       "a resident copy may take from the expert cache (FLYWEIGHT_MTP_GPU_EXPERTS_MIB)\n",
+                       static_cast<unsigned long long>(bytes>>20),static_cast<unsigned long long>(cap>>20));
+                   return bytes<=cap;
+               }()){
                 for(int role=0;role<3;++role)persistent[draft.expert_tensors[role]]=true;
                 runtime->mtp_gpu_experts=true;
             }
