@@ -74,6 +74,20 @@ class SplitGgufTests(unittest.TestCase):
             whole.close()
             sharded.close()
 
+    def test_tensorless_first_shard_need_not_be_padded(self):
+        # Unsloth's Qwen3.8-Flash-Next split ends shard 1 mid-alignment-block;
+        # the aligned data offset then lies past the file end.
+        single, first, _ = _fixture(shards=3, metadata_only_first=True, pad_empty=False)
+        self.assertNotEqual(first.stat().st_size % 32, 0)
+        whole, sharded = V2Model(single), V2Model(first)
+        try:
+            self.assertEqual(
+                whole.info["tensor_count"], sharded.info["tensor_count"]
+            )
+        finally:
+            whole.close()
+            sharded.close()
+
     def test_tensor_payloads_survive_the_split(self):
         single, first, _ = _fixture(shards=3)
         whole, sharded = V2Model(single), V2Model(first)

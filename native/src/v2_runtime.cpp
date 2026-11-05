@@ -3267,7 +3267,11 @@ int parse(FlyweightV2Model& m) {
     if(!m.config.attention_kv_heads_by_layer.empty()&&m.config.attention_kv_heads_by_layer.size()<m.config.layer_count)
         throw std::runtime_error("GGUF per-layer KV-head array is shorter than the model layer count");
     if(!m.config.intermediate_size)m.config.intermediate_size=m.config.expert_intermediate_size?m.config.expert_intermediate_size:m.config.dense_intermediate_size;
-    uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32); if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
+    uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32);
+    // A metadata-only split shard (0 tensors) may end right after its header,
+    // with no padding up to the alignment the data section would start at.
+    if(m.tensors.empty()&&data_offset>m.size) data_offset=m.size;
+    if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
     for(size_t i=0;i<m.tensors.size();i++) { auto& t=m.tensors[i]; uint64_t next=m.size; for(auto const& other:m.tensors) if(other.offset>t.offset) next=std::min(next,other.offset); t.size=next-t.offset; }
     // A tensor's shape and type must be backed by bytes actually present.
     // t.size above is the gap to the next tensor (or the file end), never

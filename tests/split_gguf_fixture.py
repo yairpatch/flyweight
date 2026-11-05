@@ -75,11 +75,14 @@ def split_gguf(
     shards: int = 4,
     stem: str = "model",
     metadata_only_first: bool = False,
+    pad_empty: bool = True,
 ) -> Path:
     """Write `source` as `shards` files and return the path of the first.
 
     ``metadata_only_first`` reproduces the DeepSeek-V4-Flash layout, where the
     opened file holds all of the metadata and none of the tensors.
+    ``pad_empty=False`` ends a tensorless shard right after its header, without
+    padding up to the alignment, as some published splits do.
     """
     if shards < 1:
         raise ValueError("a split needs at least one shard")
@@ -165,7 +168,8 @@ def split_gguf(
 
         header = b"GGUF" + struct.pack("<IQQ", version, len(bucket), len(keys))
         out = bytearray(header + b"".join(raw for _, raw in keys) + bytes(infos))
-        out += b"\0" * ((-len(out)) % alignment)
+        if bucket or pad_empty:
+            out += b"\0" * ((-len(out)) % alignment)
         path = Path(directory) / f"{stem}-{index + 1:05d}-of-{shards:05d}.gguf"
         path.write_bytes(bytes(out) + bytes(body))
         paths.append(path)
