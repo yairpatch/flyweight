@@ -1201,6 +1201,20 @@ struct FlyweightV2QwenRuntime {
     // private scratch is sized for that many rows while the expert phase
     // still sees the whole chunk. 0: the core runs the whole chunk.
     std::uint32_t prefill_core_rows = 0;
+    // FLYWEIGHT_PREFILL_LEND: the chunk-sized rows workspace lives in the
+    // expert cache's last slots while a prompt chunk runs (their experts are
+    // evicted for it and come back through admission and the prompt's cache
+    // seed), so the base workspace only holds `base_rows_capacity` rows and
+    // the cache keeps that VRAM for decode. Planned at prepare; a cache too
+    // small to lend from re-prepares without it.
+    flyweight::v2::workspace::QwenRowsWorkspaceLayout prefill_workspace_layout;
+    std::uint32_t base_rows_capacity = 0;
+    bool prefill_lend = false;
+    bool prefill_lend_disabled = false;
+    bool prefill_lend_retry = false;
+    std::size_t prefill_lend_slots = 0;
+    bool prefill_lend_active = false;
+    std::uint64_t prefill_lend_base = 0;
     // Last probe result in GB/s (0 = not probed / disabled / failed).
     float prefill_stream_pcie_gbs = 0.0f;
     // One-shot hugepage collapse after the first prompt has faulted expert pages.
@@ -2683,6 +2697,9 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.vision_workspace_bytes = 0;
     runtime.decode_workspace_layout = {};
     runtime.rows_workspace_layout = {};
+    runtime.prefill_workspace_layout = {};
+    runtime.prefill_lend_active = false;
+    runtime.prefill_lend_slots = 0;
     runtime.decode_host_layout = {};
     runtime.rows_host_layout = {};
     runtime.state_bytes = runtime.expert_staging_bytes = 0;
@@ -20099,13 +20116,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
-    // qwen4exp takes 2048: once its bf16 hyper-connection projections run as
-    // a tiled GEMM, its prefill is the CPU expert phase, which reads each
-    // routed expert once per chunk. Flash-Next IQ3_XXS, 6K-token prompt:
-    // 1024 rows 520-536 tok/s, 2048 rows 570-676 (4096 adds nothing and
-    // halves the expert cache). The 2048-row workspace costs the expert cache
-    // ~19% of its slots, and decode speed is flat across that range.
-    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:(runtime->qwen4exp?2048:1024)));
+    // qwen4exp takes 4096: its prefill is the CPU expert phase, which routes
+    // and reads each expert once per pipeline half, so wider chunks cut it
+    // (Flash-Next UD-Q2_0, 16K prompt at 32K context: 1024 rows 501 tok/s,
+    // 2048 611, 4096 702). The chunk workspace is lent from the expert cache
+    // (prefill_lend) and the core runs in 1024-row sub-spans
+    // (prefill_core_rows), so the width costs decode nothing.
+    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:(runtime->qwen4exp?4096:1024)));
     if(runtime->prefill_rows_cap&&runtime->prefill_rows>runtime->prefill_rows_cap)
         runtime->prefill_rows=runtime->prefill_rows_cap;
     if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
@@ -20952,13 +20969,17 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
         // the DeltaNet chunk so chunk boundaries stay where the whole-chunk
         // core puts them. Below kDeltaChunkedMinimumRows a sub-span takes the
         // sequential recurrence instead of the WY form.
+        // Default 1024 on qwen4exp: the core's own scratch is ~340 KB a row,
+        // and 1024-row sub-spans keep the WY recurrence and full MMQ tiles.
         runtime->prefill_core_rows=0;
-        if(const char*core_env=std::getenv("FLYWEIGHT_PREFILL_CORE_ROWS");
-           core_env&&runtime->qwen4exp){
+        if(runtime->qwen4exp){
+            const char*core_env=std::getenv("FLYWEIGHT_PREFILL_CORE_ROWS");
             const auto chunk=flyweight::v2::workspace::kDeltaChunk;
-            auto value=static_cast<std::uint64_t>(std::max(0L,std::strtol(core_env,nullptr,10)));
-            value=std::max<std::uint64_t>(value/chunk*chunk,chunk);
-            if(value<rows)runtime->prefill_core_rows=static_cast<std::uint32_t>(value);
+            auto value=core_env
+                ?static_cast<std::uint64_t>(std::max(0L,std::strtol(core_env,nullptr,10)))
+                :std::uint64_t{1024};
+            value=value?std::max<std::uint64_t>(value/chunk*chunk,chunk):0;
+            if(value&&value<rows)runtime->prefill_core_rows=static_cast<std::uint32_t>(value);
         }
         const std::uint64_t hidden=runtime->model->config.hidden_size;
         const std::uint64_t top_k=runtime->model->config.expert_used_count;
@@ -20985,17 +21006,40 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
         for(const auto&layer:runtime->layers)
             if(layer.attention)
                 attention_head_dim=std::max<std::uint64_t>(attention_head_dim,layer.head_dim);
-        runtime->rows_workspace_layout=flyweight::v2::workspace::qwen_rows(
-            rows,hidden,runtime->scratch_elements,top_k,
-            runtime->moe_intermediate,runtime->model->config.expert_count,
-            runtime->model->config.attention_heads,
-            runtime->options.context_limit,delta_value_heads,
-            qwen_spec_drafts(*runtime)!=0,
-            runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
-            runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
-            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
-            qsa_heads,qsa_key_len,qsa_budget,qsa_ratio,
-            attention_head_dim,runtime->prefill_core_rows);
+        auto rows_layout=[&](std::uint64_t capacity,std::uint64_t core){
+            return flyweight::v2::workspace::qwen_rows(
+                capacity,hidden,runtime->scratch_elements,top_k,
+                runtime->moe_intermediate,runtime->model->config.expert_count,
+                runtime->model->config.attention_heads,
+                runtime->options.context_limit,delta_value_heads,
+                qwen_spec_drafts(*runtime)!=0,
+                runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
+                runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
+                runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
+                qsa_heads,qsa_key_len,qsa_budget,qsa_ratio,
+                attention_head_dim,core);
+        };
+        // Chunks of at most kLendBaseRows (MTP verify, checkpoint-split
+        // pieces, short prompts) run in the base workspace and never lend.
+        constexpr std::uint64_t kLendBaseRows=256;
+        static const bool lend_requested=[]{
+            const char*setting=std::getenv("FLYWEIGHT_PREFILL_LEND");
+            return !setting||setting[0]!='0';
+        }();
+        runtime->prefill_lend=lend_requested&&runtime->qwen4exp&&
+            !flyweight_backend_is_cpu()&&
+            !runtime->prefill_lend_disabled&&rows>kLendBaseRows;
+        runtime->prefill_lend_retry=false;
+        runtime->prefill_lend_slots=0;
+        if(runtime->prefill_lend){
+            runtime->prefill_workspace_layout=rows_layout(rows,runtime->prefill_core_rows);
+            runtime->rows_workspace_layout=rows_layout(kLendBaseRows,0);
+            runtime->base_rows_capacity=static_cast<std::uint32_t>(kLendBaseRows);
+        }else{
+            runtime->rows_workspace_layout=rows_layout(rows,runtime->prefill_core_rows);
+            runtime->prefill_workspace_layout={};
+            runtime->base_rows_capacity=static_cast<std::uint32_t>(rows);
+        }
         runtime->rows_host_layout=
             flyweight::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
@@ -22811,6 +22855,26 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
             }
         }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
+        if(runtime->prefill_lend){
+            // Lend at most 85% of the slots (Basalt's ceiling), so the cache
+            // keeps a working set through the prompt; below that, or with no
+            // cache to lend from, prepare again with the chunk workspace in
+            // the base allocation.
+            const auto slots=runtime->expert_slots.size();
+            const auto need=runtime->expert_slot_bytes
+                ?(runtime->prefill_workspace_layout.bytes+runtime->expert_slot_bytes-1)/
+                    runtime->expert_slot_bytes:0;
+            if(!slots||!need||need*100>slots*85||!runtime->whole_expert_layer_slots.empty())
+                runtime->prefill_lend_retry=true;
+            else{
+                runtime->prefill_lend_slots=static_cast<std::size_t>(need);
+                std::fprintf(stderr,
+                    "[flyweight] prefill lends %zu of %zu expert slots (%llu MiB) for "
+                    "%u-row chunks\n",runtime->prefill_lend_slots,slots,
+                    static_cast<unsigned long long>(need*runtime->expert_slot_bytes/(1024ull*1024)),
+                    runtime->forward_rows_capacity);
+            }
+        }
         // qwen4exp's 2048-row workspace is about twice the 1024-row one. When
         // the expert cache came out smaller than that workspace, halving the
         // chunk at least doubles the cache -- worth more to decode than the
@@ -23395,17 +23459,28 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){
     if(!runtime)return qwen_runtime_prepare_once(runtime);
     const auto expert_mode=runtime->expert_mode;
     const auto moe_device=runtime->options.moe_device;
-    const int status=qwen_runtime_prepare_once(runtime);
-    if(!runtime->prefill_rows_retry)return status;
-    runtime->prefill_rows_retry=false;
-    std::fprintf(stderr,
-        "[flyweight] 2048-row prefill chunks leave too little VRAM for the expert "
-        "cache; using 1024-row chunks\n");
-    release_qwen_device(*runtime);
-    runtime->prefill_rows_cap=1024;
-    runtime->expert_mode=expert_mode;
-    runtime->options.moe_device=moe_device;
-    return qwen_runtime_prepare_once(runtime);
+    int status=qwen_runtime_prepare_once(runtime);
+    for(int attempt=0;attempt<2&&
+        (runtime->prefill_lend_retry||runtime->prefill_rows_retry);++attempt){
+        if(runtime->prefill_lend_retry){
+            std::fprintf(stderr,
+                "[flyweight] the expert cache is too small to lend the prefill "
+                "workspace; keeping it in its own allocation\n");
+            runtime->prefill_lend_disabled=true;
+        }else{
+            std::fprintf(stderr,
+                "[flyweight] %u-row prefill chunks leave too little VRAM for the expert "
+                "cache; using 1024-row chunks\n",runtime->prefill_rows);
+            runtime->prefill_rows_cap=1024;
+        }
+        runtime->prefill_lend_retry=false;
+        runtime->prefill_rows_retry=false;
+        release_qwen_device(*runtime);
+        runtime->expert_mode=expert_mode;
+        runtime->options.moe_device=moe_device;
+        status=qwen_runtime_prepare_once(runtime);
+    }
+    return status;
 }
 
 // KV cache kernel selection by configured precision (0=f32, 1=f16, 2=bf16).
@@ -25778,6 +25853,46 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
     if (override_rows >= 0) return override_rows;
     return runtime.fp4_tensor_cores ? 16 : 0;
 }
+
+// Hand the expert cache's last prefill_lend_slots slots to a prompt chunk's
+// rows workspace. Their experts leave the cache: every structure that maps an
+// expert to a slot is rebuilt from expert_slots (residency here, the route
+// prior mask by the refresh, the GPU tables per routing pass), and uploads
+// that may still be landing in the slots ride the prefetch stream.
+static void qwen_lend_expert_cache_tail(FlyweightV2QwenRuntime& runtime) {
+    if (runtime.prefetch_stream &&
+        flyweight_gpu_stream_sync(runtime.prefetch_stream) != 0)
+        throw std::runtime_error("native Qwen prefill lend fence failed");
+    const auto slots = runtime.expert_slots.size();
+    const auto first = slots - runtime.prefill_lend_slots;
+    for (std::size_t index = first; index < slots; ++index) {
+        auto& slot = runtime.expert_slots[index];
+        if (slot.valid) {
+            const auto resident = runtime.expert_residency.find(slot.key);
+            if (resident != runtime.expert_residency.end() && resident->second == index)
+                runtime.expert_residency.erase(resident);
+        }
+        slot = QwenExpertSlot{};
+    }
+    runtime.prefill_lend_base =
+        runtime.expert_cache + static_cast<std::uint64_t>(first) * runtime.expert_slot_bytes;
+    runtime.prefill_lend_active = true;
+    qwen_route_prior_refresh(runtime);
+}
+// The lent slots return empty; admission and the prompt's seed refill them.
+struct QwenPrefillLend {
+    FlyweightV2QwenRuntime& runtime;
+    bool active;
+    QwenPrefillLend(FlyweightV2QwenRuntime& value, bool lend)
+        : runtime(value), active(lend) { if (active) qwen_lend_expert_cache_tail(runtime); }
+    ~QwenPrefillLend() {
+        if (!active) return;
+        runtime.prefill_lend_active = false;
+        runtime.prefill_lend_base = 0;
+    }
+    QwenPrefillLend(const QwenPrefillLend&) = delete;
+    QwenPrefillLend& operator=(const QwenPrefillLend&) = delete;
+};
 
 #include "v2_mtp_verifier.inc"
 #include "v2_raon_prefill.inc"

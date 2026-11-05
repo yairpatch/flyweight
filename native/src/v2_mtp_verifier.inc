@@ -311,7 +311,8 @@ void qwen_forward_rows(
     // and the shared expert's output buffer for the installed span.
     bool span_local=false;
     std::uint64_t shexp_out=0;
-    if(rows<=0||rows>static_cast<int>(runtime.forward_rows_capacity))
+    if(rows<=0||rows>static_cast<int>(runtime.forward_rows_capacity)||
+       (!runtime.prefill_lend_active&&rows>static_cast<int>(runtime.base_rows_capacity)))
         throw std::runtime_error("native Qwen rows forward batch exceeds the prepared capacity");
     if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
     const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
@@ -389,9 +390,17 @@ void qwen_forward_rows(
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
             throw std::runtime_error("native Qwen input token is out of range");
-    const auto&workspace_layout=runtime.rows_workspace_layout;
+    // A lent chunk (QwenPrefillLend) runs in the expert cache's tail with the
+    // chunk-sized layout; everything else in the base workspace.
+    const auto&workspace_layout=runtime.prefill_lend_active
+        ?runtime.prefill_workspace_layout:runtime.rows_workspace_layout;
+    const std::uint64_t rows_workspace=runtime.prefill_lend_active
+        ?runtime.prefill_lend_base:runtime.workspace;
     const auto&host_layout=runtime.rows_host_layout;
-    if(workspace_layout.bytes>runtime.workspace_bytes)
+    const std::uint64_t rows_workspace_bytes=runtime.prefill_lend_active
+        ?static_cast<std::uint64_t>(runtime.prefill_lend_slots)*runtime.expert_slot_bytes
+        :runtime.workspace_bytes;
+    if(workspace_layout.bytes>rows_workspace_bytes)
         throw std::runtime_error("native Qwen rows forward workspace is too small");
     if(host_layout.bytes>runtime.host_staging_bytes)
         throw std::runtime_error("native Qwen rows forward host workspace overflow");
@@ -399,17 +408,17 @@ void qwen_forward_rows(
     // region address for the span it is about to run (base plus span_begin
     // rows of that region's stride), so two spans read and write disjoint
     // slices of the same regions.
-    std::uint64_t hidden=workspace_layout.hidden.address(runtime.workspace);
-    std::uint64_t residual=workspace_layout.residual.address(runtime.workspace);
-    std::uint64_t normalized=workspace_layout.normalized.address(runtime.workspace);
-    std::uint64_t first=workspace_layout.first.address(runtime.workspace);
-    std::uint64_t second=workspace_layout.second.address(runtime.workspace);
-    std::uint64_t third=workspace_layout.third.address(runtime.workspace);
-    std::uint64_t fourth=workspace_layout.fourth.address(runtime.workspace);
-    std::uint64_t router_logits=workspace_layout.router_logits.address(runtime.workspace);
-    std::uint64_t selected_device=workspace_layout.selected_device.address(runtime.workspace);
-    std::uint64_t route_weights=workspace_layout.route_weights.address(runtime.workspace);
-    std::uint64_t gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace);
+    std::uint64_t hidden=workspace_layout.hidden.address(rows_workspace);
+    std::uint64_t residual=workspace_layout.residual.address(rows_workspace);
+    std::uint64_t normalized=workspace_layout.normalized.address(rows_workspace);
+    std::uint64_t first=workspace_layout.first.address(rows_workspace);
+    std::uint64_t second=workspace_layout.second.address(rows_workspace);
+    std::uint64_t third=workspace_layout.third.address(rows_workspace);
+    std::uint64_t fourth=workspace_layout.fourth.address(rows_workspace);
+    std::uint64_t router_logits=workspace_layout.router_logits.address(rows_workspace);
+    std::uint64_t selected_device=workspace_layout.selected_device.address(rows_workspace);
+    std::uint64_t route_weights=workspace_layout.route_weights.address(rows_workspace);
+    std::uint64_t gpu_activated=workspace_layout.gpu_activated.address(rows_workspace);
     // Small MTP batches are decode-shaped rather than prefill-shaped.  Their
     // k-quant matrix kernels are dominated by reconstructing weights against
     // f32 activations, while decode's DP4A path quantizes each activation once
@@ -418,26 +427,26 @@ void qwen_forward_rows(
     // only after all dense projections for the layer have finished.
     // Dedicated regions rather than borrowing `gpu_activated`, which is sized
     // off top_k and so is empty on a dense model.
-    std::uint64_t small_q8=workspace_layout.rows_q8.address(runtime.workspace);
+    std::uint64_t small_q8=workspace_layout.rows_q8.address(rows_workspace);
     std::uint64_t small_q8_scales=
-        workspace_layout.rows_q8_scales.address(runtime.workspace);
+        workspace_layout.rows_q8_scales.address(rows_workspace);
     std::uint64_t q8_cached_input=0;
     int q8_cached_width=0;
     const auto gpu_table_entries=static_cast<std::uint64_t>(total_rows)*top_k;
-    std::uint64_t gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace);
-    std::uint64_t gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace);
-    std::uint64_t gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace);
-    std::uint64_t gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace);
+    std::uint64_t gpu_gate_table=workspace_layout.gpu_gate_table.address(rows_workspace);
+    std::uint64_t gpu_up_table=workspace_layout.gpu_up_table.address(rows_workspace);
+    std::uint64_t gpu_down_table=workspace_layout.gpu_down_table.address(rows_workspace);
+    std::uint64_t gpu_weight_table=workspace_layout.gpu_weight_table.address(rows_workspace);
     // NVFP4 weight_scale_2 per route, mirroring the decode path: gate/up before
     // SiLU, the linear down scale folded into `up`.
-    std::uint64_t gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace);
-    std::uint64_t gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace);
-    std::uint64_t gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace);
-    const auto token_device=workspace_layout.token_device.address(runtime.workspace);
-    const auto winners=workspace_layout.winners.address(runtime.workspace);
-    const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
+    std::uint64_t gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(rows_workspace);
+    std::uint64_t gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(rows_workspace);
+    std::uint64_t gpu_count_table=workspace_layout.gpu_count_table.address(rows_workspace);
+    const auto token_device=workspace_layout.token_device.address(rows_workspace);
+    const auto winners=workspace_layout.winners.address(rows_workspace);
+    const auto attention_scores=workspace_layout.attention_scores.address(rows_workspace);
     const auto mtp_prompt_hidden=
-        workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
+        workspace_layout.mtp_prompt_hidden.address(rows_workspace);
     // FLYWEIGHT_PREFILL_LAUNCHES=1 tallies launches and total blocks per kernel
     // name over the whole rows forward, dumped by qwen_prefill_launch_report.
     // Launch *count* is the thing the phase trace cannot show: a phase that
@@ -964,19 +973,19 @@ void qwen_forward_rows(
     const int hc_count=static_cast<int>(runtime.model->config.hyper_connection_count);
     const int hc_low_rank=static_cast<int>(runtime.model->config.hyper_connection_low_rank);
     const std::uint64_t hc_wide_size=static_cast<std::uint64_t>(hc_count)*hidden_size;
-    const auto hc_streams_base=workspace_layout.streams.address(runtime.workspace);
-    const auto hc_normed_base=workspace_layout.hc_normed.address(runtime.workspace);
-    const auto hc_wide_base=workspace_layout.hc_wide.address(runtime.workspace);
-    const auto hc_low_base=workspace_layout.hc_low.address(runtime.workspace);
-    const auto hc_gates_base=workspace_layout.hc_gates.address(runtime.workspace);
-    const auto ple_embed_base=workspace_layout.ple_embed.address(runtime.workspace);
+    const auto hc_streams_base=workspace_layout.streams.address(rows_workspace);
+    const auto hc_normed_base=workspace_layout.hc_normed.address(rows_workspace);
+    const auto hc_wide_base=workspace_layout.hc_wide.address(rows_workspace);
+    const auto hc_low_base=workspace_layout.hc_low.address(rows_workspace);
+    const auto hc_gates_base=workspace_layout.hc_gates.address(rows_workspace);
+    const auto ple_embed_base=workspace_layout.ple_embed.address(rows_workspace);
     // QSA scratch (qwen4exp): NOT span-sliced -- each span's usage is
     // enqueue-local (projected, consumed, and free before the other span's
     // layer body queues), and the score/slot buffers are single-row anyway.
-    const auto qsa_query_base=workspace_layout.qsa_query.address(runtime.workspace);
-    const auto qsa_keys_base=workspace_layout.qsa_keys.address(runtime.workspace);
-    const auto qsa_scores_base=workspace_layout.qsa_block_scores.address(runtime.workspace);
-    const auto qsa_slots_base=workspace_layout.qsa_slots.address(runtime.workspace);
+    const auto qsa_query_base=workspace_layout.qsa_query.address(rows_workspace);
+    const auto qsa_keys_base=workspace_layout.qsa_keys.address(rows_workspace);
+    const auto qsa_scores_base=workspace_layout.qsa_block_scores.address(rows_workspace);
+    const auto qsa_slots_base=workspace_layout.qsa_slots.address(rows_workspace);
     auto hc_slice=[&](std::uint64_t base,std::uint64_t per_row){
         return base+static_cast<std::uint64_t>(span_begin)*per_row*sizeof(float);
     };
@@ -1247,37 +1256,37 @@ void qwen_forward_rows(
         const auto core_row=span.addressing==RowsSpan::Addressing::absolute?row:0;
         hidden=span.hidden+row*hidden_size*sizeof(float);
         residual=span.residual+row*hidden_size*sizeof(float);
-        normalized=workspace_layout.normalized.address(runtime.workspace)+row*hidden_size*sizeof(float);
-        first=workspace_layout.first.address(runtime.workspace)+core_row*scratch_stride*sizeof(float);
-        second=workspace_layout.second.address(runtime.workspace)+core_row*scratch_stride*sizeof(float);
-        third=workspace_layout.third.address(runtime.workspace)+core_row*scratch_stride*sizeof(float);
-        fourth=workspace_layout.fourth.address(runtime.workspace)+core_row*scratch_stride*sizeof(float);
+        normalized=workspace_layout.normalized.address(rows_workspace)+row*hidden_size*sizeof(float);
+        first=workspace_layout.first.address(rows_workspace)+core_row*scratch_stride*sizeof(float);
+        second=workspace_layout.second.address(rows_workspace)+core_row*scratch_stride*sizeof(float);
+        third=workspace_layout.third.address(rows_workspace)+core_row*scratch_stride*sizeof(float);
+        fourth=workspace_layout.fourth.address(rows_workspace)+core_row*scratch_stride*sizeof(float);
         shexp_out=sub_spans
-            ?workspace_layout.shexp_out.address(runtime.workspace)+row*hidden_size*sizeof(float)
+            ?workspace_layout.shexp_out.address(rows_workspace)+row*hidden_size*sizeof(float)
             :third;
-        router_logits=workspace_layout.router_logits.address(runtime.workspace)+row*experts*sizeof(float);
-        selected_device=workspace_layout.selected_device.address(runtime.workspace)+row*top_k*sizeof(std::int32_t);
-        route_weights=workspace_layout.route_weights.address(runtime.workspace)+row*top_k*sizeof(float);
-        gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace)+row*top_k*intermediate*sizeof(float);
-        small_q8=workspace_layout.rows_q8.address(runtime.workspace)+core_row*scratch_stride;
-        small_q8_scales=workspace_layout.rows_q8_scales.address(runtime.workspace)+core_row*(scratch_stride/32+1)*sizeof(float);
+        router_logits=workspace_layout.router_logits.address(rows_workspace)+row*experts*sizeof(float);
+        selected_device=workspace_layout.selected_device.address(rows_workspace)+row*top_k*sizeof(std::int32_t);
+        route_weights=workspace_layout.route_weights.address(rows_workspace)+row*top_k*sizeof(float);
+        gpu_activated=workspace_layout.gpu_activated.address(rows_workspace)+row*top_k*intermediate*sizeof(float);
+        small_q8=workspace_layout.rows_q8.address(rows_workspace)+core_row*scratch_stride;
+        small_q8_scales=workspace_layout.rows_q8_scales.address(rows_workspace)+core_row*(scratch_stride/32+1)*sizeof(float);
         if(span.addressing==RowsSpan::Addressing::experts){
             // The upload staging and the routed accumulator are hidden-wide
             // rows, and the Q8 rows carry hidden bytes plus (hidden/32)*2
             // half scales each.
-            first=workspace_layout.first.address(runtime.workspace)+row*hidden_size*sizeof(float);
-            fourth=workspace_layout.fourth.address(runtime.workspace)+row*hidden_size*sizeof(float);
-            small_q8=workspace_layout.rows_q8.address(runtime.workspace)+row*hidden_size;
-            small_q8_scales=workspace_layout.rows_q8_scales.address(runtime.workspace)+
+            first=workspace_layout.first.address(rows_workspace)+row*hidden_size*sizeof(float);
+            fourth=workspace_layout.fourth.address(rows_workspace)+row*hidden_size*sizeof(float);
+            small_q8=workspace_layout.rows_q8.address(rows_workspace)+row*hidden_size;
+            small_q8_scales=workspace_layout.rows_q8_scales.address(rows_workspace)+
                 row*(static_cast<std::uint64_t>(hidden_size)/32)*2*sizeof(std::uint16_t);
         }
-        gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
-        gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
-        gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
-        gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace)+row*top_k*sizeof(float);
-        gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace)+row*top_k*sizeof(float);
-        gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace)+row*top_k*sizeof(float);
-        gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace)+row*sizeof(std::int32_t);
+        gpu_gate_table=workspace_layout.gpu_gate_table.address(rows_workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_up_table=workspace_layout.gpu_up_table.address(rows_workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_down_table=workspace_layout.gpu_down_table.address(rows_workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_weight_table=workspace_layout.gpu_weight_table.address(rows_workspace)+row*top_k*sizeof(float);
+        gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(rows_workspace)+row*top_k*sizeof(float);
+        gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(rows_workspace)+row*top_k*sizeof(float);
+        gpu_count_table=workspace_layout.gpu_count_table.address(rows_workspace)+row*sizeof(std::int32_t);
         gpu_weights=gpu_weights_store.data()+row*top_k;
         gpu_gate_scales=gpu_gate_scales_store.data()+row*top_k;
         gpu_up_scales=gpu_up_scales_store.data()+row*top_k;
@@ -1672,14 +1681,14 @@ void qwen_forward_rows(
                     runtime.delta_value_heads)&&
                 !std::getenv("FLYWEIGHT_DELTA_SEQUENTIAL");
             if(chunked_delta){
-                const auto attn=workspace_layout.delta_attn.address(runtime.workspace);
-                const auto pmat=workspace_layout.delta_pmat.address(runtime.workspace);
-                const auto gcum=workspace_layout.delta_gcum.address(runtime.workspace);
-                const auto beta_out=workspace_layout.delta_beta.address(runtime.workspace);
-                const auto qinv=workspace_layout.delta_qinv.address(runtime.workspace);
-                const auto kinv=workspace_layout.delta_kinv.address(runtime.workspace);
-                const auto w_rows=workspace_layout.delta_w.address(runtime.workspace);
-                const auto u_rows=workspace_layout.delta_u.address(runtime.workspace);
+                const auto attn=workspace_layout.delta_attn.address(rows_workspace);
+                const auto pmat=workspace_layout.delta_pmat.address(rows_workspace);
+                const auto gcum=workspace_layout.delta_gcum.address(rows_workspace);
+                const auto beta_out=workspace_layout.delta_beta.address(rows_workspace);
+                const auto qinv=workspace_layout.delta_qinv.address(rows_workspace);
+                const auto kinv=workspace_layout.delta_kinv.address(rows_workspace);
+                const auto w_rows=workspace_layout.delta_w.address(rows_workspace);
+                const auto u_rows=workspace_layout.delta_u.address(rows_workspace);
                 // `first` held the qkv projection, which the causal conv has
                 // already consumed into `fourth`; the epilogue then normalizes it
                 // in place, which is where the sequential kernel leaves its output.
@@ -1748,10 +1757,10 @@ void qwen_forward_rows(
                     workspace_layout.delta_w.size&&workspace_layout.delta_u.size&&
                     workspace_layout.delta_qinv.size&&workspace_layout.delta_kinv.size;
                 if(prologue_ok){
-                    const auto norm_q=workspace_layout.delta_w.address(runtime.workspace);
-                    const auto norm_k=workspace_layout.delta_u.address(runtime.workspace);
-                    const auto beta_pre=workspace_layout.delta_qinv.address(runtime.workspace);
-                    const auto decay_pre=workspace_layout.delta_kinv.address(runtime.workspace);
+                    const auto norm_q=workspace_layout.delta_w.address(rows_workspace);
+                    const auto norm_k=workspace_layout.delta_u.address(rows_workspace);
+                    const auto beta_pre=workspace_layout.delta_qinv.address(rows_workspace);
+                    const auto decay_pre=workspace_layout.delta_kinv.address(rows_workspace);
                     void*prologue_args[]={const_cast<std::uint64_t*>(&fourth),
                         &beta_logits,const_cast<std::uint64_t*>(&decay_logits),
                         &decay,&dt,
@@ -2062,7 +2071,7 @@ void qwen_forward_rows(
             // The region's own size: the layout floors it for a 64-row tile
             // (flyweight_v2_workspace.hpp), so a short context still fits one.
             const std::uint64_t attention_workspace=
-                runtime.rows_workspace_layout.attention_scores.size;
+                workspace_layout.attention_scores.size;
             auto tile_buffers=[&](int tile_rows){
                 return device_align(static_cast<std::uint64_t>(tile_rows)*heads*head_dim*sizeof(std::uint16_t))
                     +device_align(static_cast<std::uint64_t>(tile_rows)*heads*head_dim*sizeof(float))
@@ -3253,8 +3262,8 @@ void qwen_forward_rows(
                     const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
                     void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
                     if(const char*q8_down=qwen_q8_grouped_down_kernel(down_type,intermediate)){
-                        std::uint64_t q8=workspace_layout.expert_q8.address(runtime.workspace);
-                        std::uint64_t q8_scales=workspace_layout.expert_q8_scales.address(runtime.workspace);
+                        std::uint64_t q8=workspace_layout.expert_q8.address(rows_workspace);
+                        std::uint64_t q8_scales=workspace_layout.expert_q8_scales.address(rows_workspace);
                         std::uint64_t input=gpu_activated;
                         int width=intermediate,scale_stride=(intermediate/32)*2,entries=rows*top_k,no_experts=0;
                         void*quant_args[]={&input,&q8,&q8_scales,&width,&scale_stride};
@@ -4021,10 +4030,13 @@ void qwen_prefill_rows(
     if(runtime.gemma4){gemma4_prefill_rows(runtime,tokens,rows);return;}
     const auto started=std::chrono::steady_clock::now();
     const bool had_mtp_target_hidden=runtime.mtp_has_target_hidden;
+    const QwenPrefillLend lend(runtime,runtime.prefill_lend&&runtime.prefill_lend_slots&&
+        rows>static_cast<int>(runtime.base_rows_capacity));
     qwen_forward_rows(runtime,tokens,rows,nullptr,nullptr);
     if(runtime.options.mtp_drafts){
-        const auto preserved=
-            runtime.rows_workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
+        const auto preserved=runtime.prefill_lend_active
+            ?runtime.prefill_workspace_layout.mtp_prompt_hidden.address(runtime.prefill_lend_base)
+            :runtime.rows_workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
         // The preserved rows are hand-over rows: the streams on qwen4exp. They
         // used to be indexed at `hidden` stride, so every prompt pair's draft
         // K/V was built from the wrong slice of a stream row -- the draft

@@ -1,6 +1,9 @@
 # Prefill in large chunks — experts streamed once per chunk
 
-> **STATUS 2026-11-05**: PLANNED. Milestone 1 in progress on `perf/prefill-rework`.
+> **STATUS 2026-11-06**: milestones 1-2 DONE on `perf/prefill-rework` (default on for
+> qwen4exp: 4096-row chunks, 1024-row core sub-spans, workspace lent from the
+> expert cache). Served Flash-Next UD-Q2_0 at 126K: prefill ~450-540 -> ~650 tok/s,
+> decode level or better (45-47 -> 48-49 tok/s). Milestones 3-4 next.
 
 ## Motivation (measured 2026-11-05)
 
