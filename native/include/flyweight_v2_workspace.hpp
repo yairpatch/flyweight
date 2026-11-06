@@ -218,6 +218,10 @@ struct QwenRowsWorkspaceLayout {
     Region qsa_keys;
     Region qsa_block_scores;
     Region qsa_slots;
+    // Chunk-wide hand-off of the shared expert's output from the core phase
+    // to the combine, when the core runs in sub-spans (core_rows < rows) and
+    // `third` is sub-span scratch. Zero-sized otherwise.
+    Region shexp_out;
     std::uint64_t bytes = 0;
 };
 
@@ -245,17 +249,29 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     bool ple = false,
     std::uint64_t qsa_heads = 0, std::uint64_t qsa_key_len = 0,
     std::uint64_t qsa_budget = 0, std::uint64_t qsa_ratio = 0,
-    std::uint64_t attention_head_dim = 0
+    std::uint64_t attention_head_dim = 0, std::uint64_t core_rows = 0
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
+    // `core_rows` below `rows`: the core phase (mixer, hyper-connections,
+    // router, shared expert) runs in sub-spans of that many rows, so its
+    // private scratch is sized for one sub-span. The expert phase and the
+    // combine still see the whole chunk, and use `first`, `fourth` and the Q8
+    // rows at hidden width for every row -- hence the max.
+    const std::uint64_t core = core_rows && core_rows < rows ? core_rows : rows;
+    const bool split = core < rows;
+    const auto core_or_chunk = [&](std::uint64_t per_core_row, std::uint64_t per_chunk_row) {
+        return split ? (core * per_core_row > rows * per_chunk_row
+                            ? core * per_core_row : rows * per_chunk_row)
+                     : rows * per_core_row;
+    };
     layout.hidden = builder.add(rows * hidden * sizeof(float));
     layout.residual = builder.add(rows * hidden * sizeof(float));
     layout.normalized = builder.add(rows * hidden * sizeof(float));
-    layout.first = builder.add(rows * scratch * sizeof(float));
-    layout.second = builder.add(rows * scratch * sizeof(float));
-    layout.third = builder.add(rows * scratch * sizeof(float));
-    layout.fourth = builder.add(rows * scratch * sizeof(float));
+    layout.first = builder.add(core_or_chunk(scratch, hidden) * sizeof(float));
+    layout.second = builder.add(core * scratch * sizeof(float));
+    layout.third = builder.add(core * scratch * sizeof(float));
+    layout.fourth = builder.add(core_or_chunk(scratch, hidden) * sizeof(float));
     layout.router_logits = builder.add(rows * experts * sizeof(float));
     layout.selected_device = builder.add(rows * top_k * sizeof(std::int32_t));
     layout.route_weights = builder.add(rows * top_k * sizeof(float));
@@ -267,8 +283,9 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     // rows fell back to reconstructing every weight in float. One byte per
     // element plus an fp16 scale per 32-element block; the scales keep a float
     // stride so the region stays aligned for either width.
-    layout.rows_q8 = builder.add(rows * scratch);
-    layout.rows_q8_scales = builder.add(rows * (scratch / 32 + 1) * sizeof(float));
+    layout.rows_q8 = builder.add(core_or_chunk(scratch, hidden));
+    layout.rows_q8_scales = builder.add(
+        core_or_chunk(scratch / 32 + 1, hidden / 32 + 1) * sizeof(float));
     layout.expert_q8 = builder.add(rows * top_k * intermediate);
     layout.expert_q8_scales =
         builder.add(rows * top_k * (intermediate / 32 + 1) * sizeof(float));
@@ -306,9 +323,9 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
         // free once the causal conv has consumed it, and the epilogue rewrites it
         // in place.
         const std::uint64_t chunks =
-            (rows + kDeltaChunk - 1) / kDeltaChunk * (delta_value_heads ? 1 : 0);
+            (core + kDeltaChunk - 1) / kDeltaChunk * (delta_value_heads ? 1 : 0);
         const std::uint64_t pairs = chunks * delta_value_heads * kDeltaChunk * kDeltaChunk;
-        const std::uint64_t scalars = rows * delta_value_heads * (delta_value_heads ? 1 : 0);
+        const std::uint64_t scalars = core * delta_value_heads * (delta_value_heads ? 1 : 0);
         const std::uint64_t vectors = scalars * kDeltaDim;
         layout.delta_attn = builder.add(pairs * sizeof(float));
         layout.delta_pmat = builder.add(pairs * sizeof(float));
@@ -327,23 +344,24 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
         builder.add((mtp ? rows + 1 : 0) * (hc_count ? hc_count : 1)
                     * hidden * sizeof(float));
     layout.streams = builder.add(rows * hc_count * hidden * sizeof(float));
-    layout.hc_normed = builder.add(rows * hc_count * hidden * sizeof(float));
-    layout.hc_wide = builder.add(rows * hc_count * hidden * sizeof(float));
-    layout.hc_low = builder.add(rows * hc_low_rank * sizeof(float));
+    layout.hc_normed = builder.add(core * hc_count * hidden * sizeof(float));
+    layout.hc_wide = builder.add(core * hc_count * hidden * sizeof(float));
+    layout.hc_low = builder.add(core * hc_low_rank * sizeof(float));
     layout.hc_gates = builder.add(rows * hc_count * sizeof(float));
     layout.ple_embed = builder.add((ple ? rows * hidden : 0) * sizeof(float));
     layout.qsa_query =
-        builder.add(rows * qsa_heads * qsa_key_len * sizeof(float));
+        builder.add(core * qsa_heads * qsa_key_len * sizeof(float));
     // Gated on the SAME predicate the runtime activates on (a nonzero ratio
     // and key length), not on the head count: a file with a ratio but no
     // indexer.head_count would otherwise size this to zero while the raw-key
     // projection still wrote a whole chunk into it.
     layout.qsa_keys =
-        builder.add(rows * (qsa_ratio ? 1 : 0) * qsa_key_len * sizeof(float));
+        builder.add(core * (qsa_ratio ? 1 : 0) * qsa_key_len * sizeof(float));
     layout.qsa_block_scores =
         builder.add((qsa_ratio ? context / qsa_ratio + 1 : 0) * sizeof(float));
     layout.qsa_slots = builder.add(
         (qsa_ratio ? qsa_budget + qsa_ratio - 1 : 0) * sizeof(std::int32_t));
+    layout.shexp_out = builder.add((split ? rows * hidden : 0) * sizeof(float));
     layout.bytes = builder.bytes();
     return layout;
 }

@@ -357,6 +357,55 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
         self.assertEqual(generated, decoded)
 
 
+class Qwen4ExpCoreSubSpanTest(unittest.TestCase):
+    """FLYWEIGHT_PREFILL_CORE_ROWS: the prefill core runs in sub-spans with
+    sub-span-sized scratch while the expert phase sees the whole chunk (or
+    pipeline half). Every row still meets the same kernels in the same
+    order, so the continuation must match the whole-chunk core exactly."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        cls.path = Path(cls._directory.name) / "qwen4exp_subspan.gguf"
+        build_qwen4exp_gguf(cls.path, Qwen4ExpSpec())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def _continue(self, environment: dict[str, str]) -> tuple[list[int], int]:
+        prompt = [(7 * i + 3) % 88 + 6 for i in range(300)]
+        generated: list[int] = []
+        V2Model.select_backend("cpu")
+        previous = {key: os.environ.get(key) for key in environment}
+        os.environ.update(environment)
+        try:
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(context_limit=512) as runtime:
+                    runtime.prepare()
+                    runtime.generate(
+                        prompt, 8,
+                        lambda token: (generated.append(token) or len(generated) < 8))
+                    workspace = int(runtime.info["workspace_bytes"])
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            V2Model.select_backend("auto")
+        return generated, workspace
+
+    def test_sub_spans_match_the_whole_chunk_core(self) -> None:
+        # 256-row chunks run as two pipeline halves of 128; a 64-row core
+        # gives each half two sub-spans, and the 44-row tail chunk one.
+        whole, whole_bytes = self._continue({"FLYWEIGHT_PREFILL_ROWS": "256"})
+        split, split_bytes = self._continue({"FLYWEIGHT_PREFILL_ROWS": "256",
+                                             "FLYWEIGHT_PREFILL_CORE_ROWS": "64"})
+        self.assertEqual(len(whole), 8)
+        self.assertEqual(whole, split)
+
+
 class Qwen4ExpQsaPathTest(unittest.TestCase):
     """QSA on the paths transformers cannot referee: CUDA and multi-sequence.
 
