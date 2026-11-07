@@ -2887,7 +2887,7 @@ void qwen_forward_rows(
         const std::uint64_t routed_routes=stream_cap*top_k;
         const std::uint64_t routed_padded=
             routed_routes+static_cast<std::uint64_t>(experts)*
-                (flyweight::v2::moe::kMmqBlockSize-1);
+                (flyweight::v2::moe::kMmqWideBlockSize-1);
         const std::uint64_t routed_blocks=
             routed_padded/flyweight::v2::moe::kMmqBlockSize+1;
         std::uint64_t routed_role_ptrs[3];
@@ -3506,6 +3506,16 @@ void qwen_forward_rows(
             const bool routed_moe=!runtime.nemotron&&routed_setting&&runtime.int8_tensor_cores&&
                 !routed_gate.empty()&&!routed_up.empty()&&!routed_down.empty()&&
                 !routed_route_weights.empty();
+            // Experts with enough routes take the 128-token tile, which decodes
+            // their weights a quarter as often. The _MIN shape has no wide
+            // variant, and a wide block must fit the per-tile scratch.
+            // FLYWEIGHT_ROUTED_WIDE=0 keeps every expert on the 32-token tile.
+            static const char*wide_env=std::getenv("FLYWEIGHT_ROUTED_WIDE");
+            const bool routed_wide=routed_moe&&!(wide_env&&wide_env[0]=='0')&&
+                !routed_is_min(gate_type)&&!routed_is_min(up_type)&&
+                !routed_is_min(down_type)&&
+                stream_cap>=static_cast<std::uint64_t>(
+                    flyweight::v2::moe::kMmqWideBlockSize);
             if(routed_moe){
                 flyweight::v2::moe::AlignedRoutes aligned;
                 {
@@ -3517,10 +3527,13 @@ void qwen_forward_rows(
                     for(int route=0;route<rows*top_k;++route)
                         if(routed_route_weights[route]!=0.0f)
                             route_group[route]=group_of[selected_host[route]];
-                    flyweight::v2::moe::align_blocks(
+                    flyweight::v2::moe::align_blocks_mixed(
                         route_group.data(),routed_route_weights.data(),
                         rows*top_k,static_cast<int>(stream_groups.size()),
-                        flyweight::v2::moe::kMmqBlockSize,aligned);
+                        flyweight::v2::moe::kMmqBlockSize,
+                        flyweight::v2::moe::kMmqWideBlockSize,
+                        routed_wide?flyweight::v2::moe::kMmqWideMinRoutes:0,
+                        aligned);
                 }
                 const int blocks=static_cast<int>(aligned.block_experts.size());
                 if(blocks){
@@ -3570,21 +3583,32 @@ void qwen_forward_rows(
                     // the streaming path needs disappears with it.
                     stream_quantize(normalized,stream_packed_q8,
                                     stream_packed_scales,hidden_size,rows);
-                    const int block_size=flyweight::v2::moe::kMmqBlockSize;
-                    // Tiles are sized so every per-slot buffer below is the
-                    // scratch the streaming path already owns.
-                    const int tile_blocks=
-                        std::max(1,static_cast<int>(stream_cap)/block_size);
                     int gate_scale_stride=(hidden_size/32)*2;
                     int down_scale_stride=(intermediate/32)*2;
                     // Mutable copies: the launch shim takes void* to each
                     // argument, so a const int cannot be handed over.
                     int slot_major=0,routed_top_k=top_k;
                     const double t_routed=moe_now();
-                    for(int begin=0;begin<blocks;begin+=tile_blocks){
-                        const int count=std::min(tile_blocks,blocks-begin);
+                    // Wide blocks first, then the 32-token ones; both walk the
+                    // same tables, the second pass offset by the first's slots.
+                    for(int pass=0;pass<2;++pass){
+                    const bool wide=pass==0;
+                    const int pass_begin=wide?0:aligned.wide_blocks;
+                    const int pass_end=wide?aligned.wide_blocks:blocks;
+                    const int pass_slots=wide?0:aligned.wide_slots;
+                    const int block_size=wide
+                        ?flyweight::v2::moe::kMmqWideBlockSize
+                        :flyweight::v2::moe::kMmqBlockSize;
+                    const std::string suffix=wide?"_w":"";
+                    // Tiles are sized so every per-slot buffer below is the
+                    // scratch the streaming path already owns.
+                    const int tile_blocks=
+                        std::max(1,static_cast<int>(stream_cap)/block_size);
+                    for(int begin=pass_begin;begin<pass_end;begin+=tile_blocks){
+                        const int count=std::min(tile_blocks,pass_end-begin);
                         int slots=count*block_size;
-                        const int slot_begin=begin*block_size;
+                        const int slot_begin=
+                            pass_slots+(begin-pass_begin)*block_size;
                         const auto tile_experts=routed_block_experts+
                             static_cast<std::uint64_t>(begin)*sizeof(std::int32_t);
                         const auto tile_sorted=routed_sorted+
@@ -3608,7 +3632,7 @@ void qwen_forward_rows(
                                 &in_size,&out_size,token_map,scale_stride,
                                 &tile_count};
                             const std::uint32_t row_tile=is_min?64u:128u;
-                            launch(name.c_str(),
+                            launch((name+suffix).c_str(),
                                    (static_cast<std::uint32_t>(out_size)+row_tile-1)
                                        /row_tile,
                                    static_cast<std::uint32_t>(count),
@@ -3651,6 +3675,7 @@ void qwen_forward_rows(
                         launch("qwen_slot_accumulate_rows",
                                (static_cast<std::uint32_t>(hidden_size)+255)/256,
                                static_cast<std::uint32_t>(rows),256,fold_args);
+                    }
                     }
                     if(moe_profile_enabled()){
                         auto&prof=qwen_moe_profile();

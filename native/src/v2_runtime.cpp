@@ -22183,12 +22183,13 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
             // The routed MMQ's index and pointer tables. Small -- ~200 KiB at
             // this model's shape -- but they ride the same walk, so the worst
             // case has to be sized here and taken in the same order there.
-            // Worst-case padding is one short block per expert.
+            // Worst-case padding is one short block per expert, at the wide
+            // tile's size since any expert may take it.
             const std::uint64_t stream_routes=stream_rows*stream_top_k;
             const std::uint64_t stream_experts=
                 runtime->model->config.expert_count;
             const std::uint64_t stream_padded=stream_routes+
-                stream_experts*(flyweight::v2::moe::kMmqBlockSize-1);
+                stream_experts*(flyweight::v2::moe::kMmqWideBlockSize-1);
             const std::uint64_t stream_blocks=
                 stream_padded/flyweight::v2::moe::kMmqBlockSize+1;
             for(int role=0;role<3;++role)

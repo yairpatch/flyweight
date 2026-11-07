@@ -236,6 +236,121 @@ class Q80FlatMmqTests(Q8KernelHarness, unittest.TestCase):
                 self._run(columns, seed)
 
 
+class RoutedWideMmqTests(Q8KernelHarness, unittest.TestCase):
+    """The 128-token routed MMQ tile (`_w`) against the 32-token one, over the
+    mixed block table prefill builds (flyweight_v2_moe_align.hpp,
+    align_blocks_mixed): an expert's routes fill whole 128-token blocks, one
+    more when at least 65 are left, the rest 32-token blocks. Q8_0 experts so
+    the exact product is the reference; the two tiles must agree bit for bit."""
+
+    TOKENS = 128
+    TOP_K = 4
+    COLUMNS = 256
+    OUTPUTS = 256
+    COUNTS = (5, 70, 160, 277)  # one expert per regime: narrow, wide, split, both
+
+    @staticmethod
+    def _table(experts_of, counts, wide_min):
+        """(block_experts, sorted_routes, wide_blocks) as align_blocks_mixed
+        lays them out."""
+        wide_count = [c - c % 128 + (c % 128 if wide_min and c % 128 >= wide_min else 0)
+                      if wide_min else 0 for c in counts]
+        by_expert = [[r for r, e in enumerate(experts_of) if e == x] for x in range(len(counts))]
+        block_experts, sorted_routes = [], []
+        for size, part in ((128, lambda x: by_expert[x][:wide_count[x]]),
+                           (32, lambda x: by_expert[x][wide_count[x]:])):
+            for expert in range(len(counts)):
+                routes = part(expert)
+                blocks = (len(routes) + size - 1) // size
+                block_experts += [expert] * blocks
+                sorted_routes += routes + [-1] * (blocks * size - len(routes))
+            if size == 128:
+                wide_blocks = len(block_experts)
+        return block_experts, sorted_routes, wide_blocks
+
+    def test_wide_tile_matches_narrow_and_exact(self) -> None:
+        rng = np.random.default_rng(7)
+        experts = len(self.COUNTS)
+        blocks = self.COLUMNS // 32
+        quants = rng.integers(-127, 128, size=(experts, self.OUTPUTS, blocks, 32)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.2, size=(experts, self.OUTPUTS, blocks)).astype(np.float16)
+        packed = np.zeros((experts, self.OUTPUTS, blocks, 34), dtype=np.uint8)
+        packed[..., :2] = scales.view(np.uint8).reshape(experts, self.OUTPUTS, blocks, 2)
+        packed[..., 2:] = quants.view(np.uint8)
+        activation = rng.integers(-126, 127, size=(self.TOKENS, self.COLUMNS)).astype(np.float32)
+        activation[:, ::32] = 127.0
+        weights_f = (quants.astype(np.float64) * scales.astype(np.float64)[..., None]).reshape(
+            experts, self.OUTPUTS, self.COLUMNS)
+        experts_of = rng.permutation(np.repeat(np.arange(experts), self.COUNTS)).tolist()
+        self.assertEqual(len(experts_of), self.TOKENS * self.TOP_K)
+
+        expert_bytes = packed[0].nbytes
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        pointers = np.array([weights + e * expert_bytes for e in range(experts)], dtype=np.uint64)
+        table = self._alloc(pointers.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            table, pointers.ctypes.data_as(ctypes.c_void_p), pointers.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = blocks * 2
+        q8 = self._alloc(self.TOKENS * self.COLUMNS)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        self._launch("quantize_q8_blocks_rows", (self.COLUMNS + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      ctypes.c_int32(self.COLUMNS), ctypes.c_int32(scale_stride)],
+                     grid_y=self.TOKENS)
+        allocated = [weights, table, source, q8, q8_scales]
+
+        def run(wide_min):
+            block_experts, sorted_routes, wide_blocks = self._table(
+                experts_of, self.COUNTS, wide_min)
+            be = np.array(block_experts, dtype=np.int32)
+            sr = np.array(sorted_routes, dtype=np.int32)
+            be_dev, sr_dev = self._alloc(be.nbytes), self._alloc(sr.nbytes)
+            out = self._alloc(sr.size * self.OUTPUTS * 4)
+            allocated.extend((be_dev, sr_dev, out))
+            for pointer, array in ((be_dev, be), (sr_dev, sr)):
+                self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+                    pointer, array.ctypes.data_as(ctypes.c_void_p), array.nbytes), 0)
+            wide_slots = wide_blocks * 128
+            for name, first, count, slot in (
+                    ("q80_q8_mmq_routed_w", 0, wide_blocks, 0),
+                    ("q80_q8_mmq_routed", wide_blocks, len(block_experts) - wide_blocks,
+                     wide_slots)):
+                if not count:
+                    continue
+                self._launch(name, self.OUTPUTS // 128, 256,
+                             [ctypes.c_uint64(table), ctypes.c_uint64(be_dev + 4 * first),
+                              ctypes.c_uint64(sr_dev + 4 * slot), ctypes.c_uint64(q8),
+                              ctypes.c_uint64(q8_scales), ctypes.c_uint64(out + 4 * slot * self.OUTPUTS),
+                              ctypes.c_int32(self.COLUMNS), ctypes.c_int32(self.OUTPUTS),
+                              ctypes.c_int32(self.TOP_K), ctypes.c_int32(scale_stride),
+                              ctypes.c_int32(count)],
+                             grid_y=count)
+            got = self._download(out, sr.size * self.OUTPUTS).reshape(sr.size, self.OUTPUTS)
+            by_route = {int(r): got[i] for i, r in enumerate(sorted_routes) if r >= 0}
+            return by_route, wide_blocks
+
+        narrow, none_wide = run(0)
+        mixed, wide_blocks = run(65)
+        self.assertEqual(none_wide, 0)
+        self.assertEqual(wide_blocks, 0 + 1 + 1 + 2)  # 70 -> 1, 160 -> 1 (+32s), 277 -> 2 (+21)
+        self.assertEqual(sorted(mixed), list(range(self.TOKENS * self.TOP_K)))
+        scale = 0.0
+        worst = 0.0
+        for route, expert in enumerate(experts_of):
+            expected = weights_f[expert] @ activation[route // self.TOP_K].astype(np.float64)
+            scale = max(scale, np.abs(expected).max())
+            worst = max(worst, np.abs(mixed[route] - expected).max())
+            np.testing.assert_array_equal(mixed[route], narrow[route])
+        self.assertLess(worst / scale, 1e-5)
+        for pointer in allocated:
+            self._lib.flyweight_gpu_free(pointer)
+
+
 class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
     """Each group-decode kernel must agree with its per-element reference."""
 
