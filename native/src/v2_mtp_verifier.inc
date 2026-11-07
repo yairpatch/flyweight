@@ -613,7 +613,17 @@ void qwen_forward_rows(
         // Flat 32-wide formats (IQ4_NL) take this block for any multiple of 32.
         // Super-block formats still need a multiple of 256: their Q8 kernels
         // address a tail as if it were eight independent groups.
-        const bool q8_width_ok=format&&qwen_q8_row_fits(type,input_size);
+        // Q8_0 rows a multiple of 32 but not 256 (qwen4exp's 320- and
+        // 640-wide hyper-connection projections) only take the Q8 path for a
+        // batch the flat-block MMQ runs; its other Q8 kernels tile by 256.
+        static const bool flat_q80_enabled=[]{
+            const char*setting=std::getenv("FLYWEIGHT_Q80_FLAT_MMQ");
+            return !setting||setting[0]!='0';
+        }();
+        const bool flat_q80=flat_q80_enabled&&type==8&&(input_size&255)!=0&&(input_size&31)==0&&
+            rows>kQ8RowBatch&&runtime.int8_tensor_cores&&
+            flyweight_gpu_kernel_available("q80_q8_mmq_k32")!=0;
+        const bool q8_width_ok=format&&(qwen_q8_row_fits(type,input_size)||flat_q80);
         if((experts>0?(rows<=8||batched_kernel):true)&&q8_width_ok&&
            format&&format->rows_q8_gate&&qwen_q8_head_enabled())
             q8_kernel=format->matvec_q8_warp;
@@ -696,8 +706,10 @@ void qwen_forward_rows(
                 return;
             }
             // MMQ tiles K in super-blocks, so a row that is only a multiple of
-            // 32 stays on the tiled or rows kernel below.
-            if((input_size&255)==0&&(rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&
+            // 32 stays on the tiled or rows kernel below -- except Q8_0, whose
+            // flat-block twin covers any multiple of 32 (flat_q80 above).
+            if(flat_q80){mmq_kernel="q80_q8_mmq_k32";small_narrow=nullptr;}
+            if(((input_size&255)==0||flat_q80)&&(rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&
                runtime.int8_tensor_cores){
                 const auto mmq_shape=qwen_mmq_shape();
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
@@ -925,9 +937,18 @@ void qwen_forward_rows(
             dense_trace("bf16_matmul_tiled64");
             return;
         }
+        static const bool f32_tiled=[]{const char*e=std::getenv("FLYWEIGHT_F32_TILED");return !e||e[0]!='0';}();
+        if(f32_tiled&&type==0&&rows>=16){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
+            launch("f32_matmul_tiled64",(output_size+63)/64,
+                   (static_cast<std::uint32_t>(rows)+63)/64,256,args);
+            dense_trace("f32_matmul_tiled64");
+            return;
+        }
         if(format&&format->matmul_rows){
             void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
             using Grid=flyweight::v2::RowsMatmulGrid;
+            dense_trace(format->matmul_rows);
             switch(format->matmul_rows_grid){
                 case Grid::per_token:
                     launch(format->matmul_rows,output_size,rows,256,args);return;

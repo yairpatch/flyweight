@@ -3701,6 +3701,12 @@ R"FLYWEIGHT_CUDA(
 // one int32 and the scale product is applied once per output. Results differ
 // from the two-scale kernel only in float rounding order.
 #define FLYWEIGHT_Q8_MMQ_ONE(name, decode_fn, stride)                            \
+    FLYWEIGHT_Q8_MMQ_ONE_SHAPED(name, decode_fn, stride, 8, 3)
+/* `block_shift` / `group_shift` as in FLYWEIGHT_Q8_MMQ_ROUTED: (8, 3) for a  */
+/* 256-element super-block of eight groups, (5, 0) for a flat 32-element     */
+/* block, which lets Q8_0 rows that are a multiple of 32 but not 256 (the    */
+/* qwen4exp hyper-connection 320- and 640-wide projections) use the MMQ.     */
+#define FLYWEIGHT_Q8_MMQ_ONE_SHAPED(name, decode_fn, stride, block_shift, group_shift)\
 extern "C" __global__                                                          \
 __launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32,        \
                   FLYWEIGHT_MMQ_MIN_BLOCKS)                                     \
@@ -3718,8 +3724,8 @@ void name(                                                                     \
     vectors += (long long)token_base * input_size;                             \
     vector_scales += (long long)token_base * scale_stride;                     \
     outputs += (long long)token_base * output_size;                            \
-    const int blocks_per_row = input_size >> 8;                                \
-    const int groups_per_row = blocks_per_row << 3;                            \
+    const int blocks_per_row = input_size >> (block_shift);                    \
+    const int groups_per_row = blocks_per_row << (group_shift);                \
     /* Two copies of the tile in dynamic shared memory (sized by the host   */\
     /* from the same shape: qwen_mmq_dynamic_shared). Staging step s+1 into */\
     /* one copy while the MMAs read the other needs one barrier per step    */\
@@ -9816,6 +9822,7 @@ FLYWEIGHT_Q8_MATVEC_ROWS(q80_q8_matvec_transposed_rows, q80_q8_decode, 272)
 FLYWEIGHT_Q8_LM_HEAD_ROWS(q80_q8_lm_head_argmax_warp, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MATMUL_TILED(q80_q8_matmul_tiled, q80_q8_decode, 272)
 FLYWEIGHT_Q8_MMQ_ONE(q80_q8_mmq, q80_q8_decode, 272)
+FLYWEIGHT_Q8_MMQ_ONE_SHAPED(q80_q8_mmq_k32, q80_q8_decode, 34, 5, 0)
 FLYWEIGHT_Q8_WMMA(q80_q8_mmq_wmma, q80_q8_decode, 272, true)
 // Flat 32-element blocks, same (5, 0) shape as IQ4_NL. Stride 34 is not a
 // multiple of 4; q80_q8_decode keys its word loads off the address so a row

@@ -303,6 +303,78 @@ void bf16_matmul_tiled64(
     }
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// bf16_matmul_tiled64 for fp32 weights: qwen4exp's routers (ffn_gate_inp,
+// 2560 x 512 a layer) are fp32, and qwen_f32_matmul_rows ran them as one
+// block per (output, token) dot -- 14% of the GPU time of a streamed prefill.
+// Same fp32 FMAs; only the summation order differs from it.
+extern "C" __global__
+void f32_matmul_tiled64(
+    const float* matrix, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    __shared__ float weights_tile[16][64 + 4];
+    __shared__ float inputs_tile[16][64 + 4];
+    const int thread = threadIdx.x;
+    const int out_base = blockIdx.x * 64;
+    const int token_base = blockIdx.y * 64;
+    const int tx = thread & 15;   // outputs tx*4 .. tx*4+3
+    const int ty = thread >> 4;   // tokens  ty*4 .. ty*4+3
+    // Loader mapping: 64 rows x 16 k, four consecutive k per thread.
+    const int load_row = thread >> 2;
+    const int load_k = (thread & 3) * 4;
+    float accumulator[4][4] = {};
+    for (int k_base = 0; k_base < input_size; k_base += 16) {
+        {
+            const int out = out_base + load_row;
+            const long long weight_start = (long long)out * input_size;
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int k = k_base + load_k + step;
+                float value = 0.0f;
+                if (out < output_size && k < input_size)
+                    value = matrix[weight_start + k];
+                weights_tile[load_k + step][load_row] = value;
+            }
+            const int token = token_base + load_row;
+            const long long input_start = (long long)token * input_size;
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int k = k_base + load_k + step;
+                inputs_tile[load_k + step][load_row] =
+                    token < rows && k < input_size ? input[input_start + k] : 0.0f;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = inputs_tile[k][ty * 4 + i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = weights_tile[k][tx * 4 + j];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    accumulator[i][j] = fmaf(a[i], b[j], accumulator[i][j]);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int token = token_base + ty * 4 + i;
+        if (token >= rows) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int out = out_base + tx * 4 + j;
+            if (out < output_size)
+                output[(long long)token * output_size + out] = accumulator[i][j];
+        }
+    }
+}
+
 extern "C" __global__
 void qwen_q8_matmul_rows(
     const unsigned char* packed, const float* input, float* output,

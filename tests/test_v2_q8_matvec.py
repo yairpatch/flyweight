@@ -171,6 +171,71 @@ class Q8KernelHarness:
         return vector
 
 
+class Q80FlatMmqTests(Q8KernelHarness, unittest.TestCase):
+    """q80_q8_mmq_k32: the tensor-core MMQ over flat 32-value Q8_0 blocks, for
+    rows a multiple of 32 but not of 256 (qwen4exp's 320- and 640-wide
+    hyper-connection projections). Against an exact product: the activations
+    quantize losslessly, so only fp32 accumulation order separates them."""
+
+    TOKENS = 128
+    OUTPUTS = 256
+    # The wide MMQ tile the GPU module is built with (qwen_mmq_shape): 128
+    # rows x 128 tokens, 512 threads, two staged copies in dynamic shared.
+    TILE_ROWS = 128
+    TILE_TOKENS = 128
+    THREADS = 512
+    SHARED = 2 * (TILE_ROWS + TILE_TOKENS) * 9 * 16 + 2 * (TILE_ROWS + TILE_TOKENS) * 4 * 4
+
+    def _run(self, columns: int, seed: int) -> None:
+        rng = np.random.default_rng(seed)
+        blocks = columns // 32
+        quants = rng.integers(-127, 128, size=(self.OUTPUTS, blocks, 32)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.2, size=(self.OUTPUTS, blocks)).astype(np.float16)
+        packed = np.zeros((self.OUTPUTS, blocks, 34), dtype=np.uint8)
+        packed[:, :, :2] = scales.view(np.uint8).reshape(self.OUTPUTS, blocks, 2)
+        packed[:, :, 2:] = quants.view(np.uint8)
+        activation = rng.integers(-126, 127, size=(self.TOKENS, columns)).astype(np.float32)
+        activation[:, ::32] = 127.0
+        weights_f = (quants.astype(np.float64) * scales.astype(np.float64)[:, :, None]).reshape(
+            self.OUTPUTS, columns)
+        expected = activation.astype(np.float64) @ weights_f.T
+
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = blocks * 2
+        q8 = self._alloc(self.TOKENS * columns)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        out = self._alloc(self.TOKENS * self.OUTPUTS * 4)
+        width = ctypes.c_int32(columns)
+        stride = ctypes.c_int32(scale_stride)
+        self._launch("quantize_q8_blocks_rows", (columns + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      width, stride], grid_y=self.TOKENS)
+        args = [ctypes.c_uint64(weights), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                ctypes.c_uint64(out), width, ctypes.c_int32(self.OUTPUTS),
+                ctypes.c_int32(self.TOKENS), stride]
+        array = (ctypes.c_void_p * len(args))(*[ctypes.addressof(value) for value in args])
+        self.assertEqual(self._lib.flyweight_gpu_launch_named(
+            b"q80_q8_mmq_k32", (self.OUTPUTS + self.TILE_ROWS - 1) // self.TILE_ROWS,
+            (self.TOKENS + self.TILE_TOKENS - 1) // self.TILE_TOKENS, self.THREADS,
+            self.SHARED, 0, array), 0)
+        got = self._download(out, self.TOKENS * self.OUTPUTS).reshape(self.TOKENS, self.OUTPUTS)
+        scale = np.abs(expected).max()
+        self.assertLess(np.abs(got - expected).max() / scale, 1e-5,
+                        f"q80_q8_mmq_k32 at {columns} columns")
+        for pointer in (weights, source, q8, q8_scales, out):
+            self._lib.flyweight_gpu_free(pointer)
+
+    def test_flat_widths_match_the_exact_product(self) -> None:
+        for columns, seed in ((320, 1), (640, 2), (96, 3)):
+            with self.subTest(columns=columns):
+                self._run(columns, seed)
+
+
 class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
     """Each group-decode kernel must agree with its per-element reference."""
 
