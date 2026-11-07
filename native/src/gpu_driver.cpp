@@ -306,6 +306,11 @@ struct Kernels {
 
 Kernels g_kernels;
 std::unordered_map<std::string, CUfunction> g_functions;
+// Whether g_functions holds the CPU backend's sentinel handles. A GPU compile
+// after a CPU one must drop them: it only re-registers the names on its lists,
+// and a kernel it would resolve lazily (flyweight_gpu_launch_named) otherwise
+// finds the stale CPU handle and runs on the host against device pointers.
+bool g_functions_hold_cpu = false;
 
 template <typename T>
 bool load_symbol(void* library, const char* name, T& target) {
@@ -1218,6 +1223,7 @@ extern "C" int flyweight_gpu_compile(
     // makes every wrapper below work unchanged.
     if (flyweight_backend_is_cpu()) {
         g_functions.clear();
+        g_functions_hold_cpu = true;
         const int total = flyweight_cpu_backend_kernel_count();
         for (int index = 0; index < total; ++index) {
             const char* name = flyweight_cpu_kernel_name(
@@ -1246,6 +1252,10 @@ extern "C" int flyweight_gpu_compile(
     }
     static std::mutex compile_mutex;
     std::lock_guard<std::mutex> compile_lock(compile_mutex);
+    if (g_functions_hold_cpu) {
+        g_functions.clear();
+        g_functions_hold_cpu = false;
+    }
     bool want_cubin = false;
     std::string arch_note;
     char arch[320];
