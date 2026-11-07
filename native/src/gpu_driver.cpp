@@ -1664,8 +1664,8 @@ extern "C" int flyweight_gpu_compile(
              "q80_q8_matvec_transposed_rows", "q80_q8_matmul_tiled", "q80_q8_mmq",
              // And the asymmetric ones, which carry a per-sub-block minimum.
              "q2k_q8_matvec_transposed_rows", "q2k_q8_mmq",
-             "q4k_q8_matvec_transposed_rows", "q4k_q8_mmq",
-             "q5k_q8_matvec_transposed_rows", "q5k_q8_mmq",
+             "q4k_q8_matvec_transposed_rows", "q4k_q8_mmq", "q4k_q8_mmq_one",
+             "q5k_q8_matvec_transposed_rows", "q5k_q8_mmq", "q5k_q8_mmq_one",
              // The IQ1 pair, symmetric once the delta is folded into the
              // weights; IQ1_M's sub-scales use the half-block split.
              "iq1s_q8_matvec_transposed_warp",

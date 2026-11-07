@@ -572,7 +572,7 @@ void qwen_forward_rows(
             if(seen.insert(key).second)std::fprintf(stderr,"[dense] %s\n",key);
         };
         const char* mmq_kernel=format?format->matmul_q8_mmq:nullptr;
-        const bool mmq_min=format&&format->mmq_min;
+        bool mmq_min=format&&format->mmq_min;
         const char* tiled_kernel=format?format->matmul_q8_tiled:nullptr;
         const char* q8_kernel=nullptr;
         // The RDNA3 twin of the MMQ kernel, when this device runs it and the
@@ -585,6 +585,20 @@ void qwen_forward_rows(
                 it=interned_wmma.emplace(mmq_kernel,std::string(mmq_kernel)+"_wmma").first;
             if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                 wmma_kernel=it->second.c_str();
+        }
+        // K-quants with one scale and minimum per group: the k32 tile with
+        // the minimum folded in, where tensor cores run it and RDNA3's WMMA
+        // twin does not take the projection instead.
+        static const bool kquant_one_mmq=[]{
+            const char*setting=std::getenv("FLYWEIGHT_KQUANT_ONE_MMQ");
+            return !(setting&&setting[0]=='0');
+        }();
+        bool mmq_offsets=false;
+        if(kquant_one_mmq&&format&&format->matmul_q8_mmq_one&&!wmma_kernel&&
+           runtime.int8_tensor_cores&&!flyweight_backend_is_cpu()){
+            mmq_kernel=format->matmul_q8_mmq_one;
+            mmq_min=false;
+            mmq_offsets=true;
         }
         // On MoE the *per-row* path below re-reads the whole weight matrix per
         // row, which only pays off against the reconstruct-in-float matmul when
@@ -762,8 +776,9 @@ void qwen_forward_rows(
                 if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d tiles=%u pos=%llu\n",
                     mmq_kernel,index,input_size,output_size,rows,token_tiles,
                     (unsigned long long)(runtime.position+span_begin));
-                const std::uint32_t mmq_shared=(format&&format->mmq_dynamic_shared&&!mmq_min)
-                    ?qwen_mmq_dynamic_shared(mmq_shape):0u;
+                const std::uint32_t mmq_shared=
+                    ((format&&format->mmq_dynamic_shared&&!mmq_min)||mmq_offsets)
+                        ?qwen_mmq_dynamic_shared(mmq_shape,mmq_offsets):0u;
                 if(full_rows>0)
                     launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
                 if(split_tail){

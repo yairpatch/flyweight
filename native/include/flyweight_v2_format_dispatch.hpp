@@ -52,6 +52,11 @@ struct QwenFormatKernels {
     const char* matmul_q8_tiled = nullptr;
     const char* matmul_q8_mmq = nullptr;
     bool mmq_min = false;
+    // The same family on the double-buffered 128x128 k32 tile with the
+    // minimum folded in (FLYWEIGHT_Q8_MMQ_ONE_MIN); preferred over
+    // matmul_q8_mmq where tensor cores run it. FLYWEIGHT_KQUANT_ONE_MMQ=0
+    // keeps the _MIN tile.
+    const char* matmul_q8_mmq_one = nullptr;
     // The MMQ kernel double-buffers its tile in dynamic shared memory (the
     // single-scale families); the host sizes the launch from the tile shape.
     bool mmq_dynamic_shared = false;
@@ -163,6 +168,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matvec_q8_warp = "q4k_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "q4k_q8_matvec_transposed_rows",
      .matmul_q8_mmq = "q4k_q8_mmq", .mmq_min = true,
+     .matmul_q8_mmq_one = "q4k_q8_mmq_one",
      .matmul_rows = "q4k_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "q4k_lm_head_argmax_warp",
@@ -173,6 +179,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matvec_q8_warp = "q5k_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "q5k_q8_matvec_transposed_rows",
      .matmul_q8_mmq = "q5k_q8_mmq", .mmq_min = true,
+     .matmul_q8_mmq_one = "q5k_q8_mmq_one",
      .matmul_rows = "q5k_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "q5k_lm_head_argmax_warp",

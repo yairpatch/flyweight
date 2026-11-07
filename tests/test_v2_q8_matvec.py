@@ -236,6 +236,70 @@ class Q80FlatMmqTests(Q8KernelHarness, unittest.TestCase):
                 self._run(columns, seed)
 
 
+class KQuantOneMmqTests(Q8KernelHarness, unittest.TestCase):
+    """q4k/q5k_q8_mmq_one: the single-scale k32 tile with the per-group
+    minimum folded in, against the _MIN tile it replaces. Same arithmetic up
+    to float rounding order (the k16 halves fold into one int32 first)."""
+
+    TOKENS = 200  # one full 128-token tile and a partial one
+    COLUMNS = 1024
+    OUTPUTS = 320
+    # qwen_mmq_shape's wide tile plus the two offset arrays
+    # (qwen_mmq_dynamic_shared with offsets).
+    TILE_ROWS = 128
+    TILE_TOKENS = 128
+    THREADS = 512
+    SHARED = 2 * (TILE_ROWS + TILE_TOKENS) * 9 * 16 + 2 * 2 * (TILE_ROWS + TILE_TOKENS) * 4 * 4
+    # The _MIN tile (kQ8MmqMinRows / kQ8MmqMinTokens / kQ8MmqMinThreads).
+    MIN_ROWS = 32
+    MIN_TOKENS = 64
+    MIN_THREADS = 512
+
+    def _run(self, label: str, seed: int) -> None:
+        superblock, _, prefix, _ = FORMATS[label]
+        packed = self._packed_weights(label, self.OUTPUTS * self.COLUMNS // 256 * superblock, seed)
+        rng = np.random.default_rng(seed)
+        activation = rng.uniform(-3.0, 3.0, size=(self.TOKENS, self.COLUMNS)).astype(np.float32)
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = self.COLUMNS // 32 * 2
+        q8 = self._alloc(self.TOKENS * self.COLUMNS)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        self._launch("quantize_q8_blocks_rows", (self.COLUMNS + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      ctypes.c_int32(self.COLUMNS), ctypes.c_int32(scale_stride)],
+                     grid_y=self.TOKENS)
+        results = {}
+        for name, rows, tokens, threads, shared in (
+                (f"{prefix}_q8_mmq", self.MIN_ROWS, self.MIN_TOKENS, self.MIN_THREADS, 0),
+                (f"{prefix}_q8_mmq_one", self.TILE_ROWS, self.TILE_TOKENS, self.THREADS, self.SHARED)):
+            out = self._alloc(self.TOKENS * self.OUTPUTS * 4)
+            args = [ctypes.c_uint64(weights), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                    ctypes.c_uint64(out), ctypes.c_int32(self.COLUMNS), ctypes.c_int32(self.OUTPUTS),
+                    ctypes.c_int32(self.TOKENS), ctypes.c_int32(scale_stride)]
+            array = (ctypes.c_void_p * len(args))(*[ctypes.addressof(value) for value in args])
+            self.assertEqual(self._lib.flyweight_gpu_launch_named(
+                name.encode(), (self.OUTPUTS + rows - 1) // rows,
+                (self.TOKENS + tokens - 1) // tokens, threads, shared, 0, array), 0, name)
+            results[name] = self._download(out, self.TOKENS * self.OUTPUTS)
+            self._lib.flyweight_gpu_free(out)
+        reference, got = results[f"{prefix}_q8_mmq"], results[f"{prefix}_q8_mmq_one"]
+        self.assertTrue(np.isfinite(reference).all())
+        self.assertLess(np.abs(got - reference).max() / np.abs(reference).max(), 1e-5,
+                        f"{prefix}_q8_mmq_one against the _MIN tile")
+        for pointer in (weights, source, q8, q8_scales):
+            self._lib.flyweight_gpu_free(pointer)
+
+    def test_matches_the_min_tile(self) -> None:
+        for label, seed in (("Q4_K", 11), ("Q5_K", 12)):
+            with self.subTest(label=label):
+                self._run(label, seed)
+
+
 class RoutedWideMmqTests(Q8KernelHarness, unittest.TestCase):
     """The 128-token routed MMQ tile (`_w`) against the 32-token one, over the
     mixed block table prefill builds (flyweight_v2_moe_align.hpp,

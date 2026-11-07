@@ -3860,6 +3860,200 @@ void name(                                                                     \
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
+// FLYWEIGHT_Q8_MMQ_ONE for the K-quants whose 32-group carries one scale and
+// one minimum (Q4_K, Q5_K): w = scale * q - offset, so a group's dot is
+// scale * (q . a) - offset * sum(a). The sums are staged beside the
+// activations, pre-multiplied by the activation scale, which turns the
+// minimum into one FMA per accumulator. FLYWEIGHT_Q8_MMQ_MIN computes the same
+// sum on a 32x64 k16 tile without ldmatrix or double buffering; this one is
+// the 128x128 k32 tile. Results differ only in float rounding order (the two
+// k16 halves fold into one int32 before scaling). The host adds the two extra
+// arrays to the dynamic shared size (qwen_mmq_dynamic_shared).
+#define FLYWEIGHT_Q8_MMQ_ONE_MIN(name, decode_fn, stride)                        \
+extern "C" __global__                                                          \
+__launch_bounds__(FLYWEIGHT_MMQ_ROW_WARPS * FLYWEIGHT_MMQ_TOKEN_WARPS * 32,        \
+                  FLYWEIGHT_MMQ_MIN_BLOCKS)                                     \
+void name(                                                                     \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, float* outputs,                               \
+    const int input_size, const int output_size,                               \
+    const int rows_total, const int scale_stride                               \
+) {                                                                            \
+    const int row_base = blockIdx.x * FLYWEIGHT_MMQ_ROWS;                        \
+    if (row_base >= output_size) return;                                       \
+    const int token_base = blockIdx.y * FLYWEIGHT_MMQ_TOKENS;                    \
+    if (token_base >= rows_total) return;                                      \
+    const int rows = min(FLYWEIGHT_MMQ_TOKENS, rows_total - token_base);         \
+    vectors += (long long)token_base * input_size;                             \
+    vector_scales += (long long)token_base * scale_stride;                     \
+    outputs += (long long)token_base * output_size;                            \
+    const int blocks_per_row = input_size >> 8;                               \
+    const int groups_per_row = blocks_per_row << 3;                            \
+    /* Two copies of the tile in dynamic shared memory (sized by the host   */\
+    /* from the same shape: qwen_mmq_dynamic_shared). Staging step s+1 into */\
+    /* one copy while the MMAs read the other needs one barrier per step    */\
+    /* instead of two, and lets a warp still waiting on its loads overlap   */\
+    /* a warp already on the tensor pipe. The layout: weight units, then    */\
+    /* activation units, then the two scale arrays, each [2][...].          */\
+    extern __shared__ int4 mmq_dynamic[];                                      \
+    typedef int4 WUnits[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_ROW_UNITS];             \
+    typedef int4 AUnits[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_ROW_UNITS];           \
+    typedef float WLow[FLYWEIGHT_MMQ_ROWS][FLYWEIGHT_MMQ_GROUPS];                 \
+    typedef float AScale[FLYWEIGHT_MMQ_TOKENS][FLYWEIGHT_MMQ_GROUPS];             \
+    WUnits* w_units = (WUnits*)mmq_dynamic;                                     \
+    AUnits* a_units = (AUnits*)(mmq_dynamic                                     \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_ROW_UNITS);                       \
+    WLow* w_low = (WLow*)(mmq_dynamic                                           \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_ROW_UNITS                         \
+        + 2 * FLYWEIGHT_MMQ_TOKENS * FLYWEIGHT_MMQ_ROW_UNITS);                     \
+    AScale* a_scale = (AScale*)((float*)w_low                                   \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_GROUPS);                          \
+    /* Past the plain tile: each (row, group)'s minimum offset and each     */\
+    /* (token, group)'s activation sum, already times its scale.            */\
+    WLow* w_off = (WLow*)((float*)a_scale                                       \
+        + 2 * FLYWEIGHT_MMQ_TOKENS * FLYWEIGHT_MMQ_GROUPS);                        \
+    AScale* a_sum = (AScale*)((float*)w_off                                     \
+        + 2 * FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_GROUPS);                          \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    const int warp_row =                                                  \
+        (warp / FLYWEIGHT_MMQ_TOKEN_WARPS) * (FLYWEIGHT_MMQ_ROW_FRAGS * 16);  \
+    const int warp_token =                                                \
+        (warp % FLYWEIGHT_MMQ_TOKEN_WARPS) * (FLYWEIGHT_MMQ_TOKEN_FRAGS * 8); \
+    const int quad = lane >> 2;                                           \
+    const int slot = lane & 3;                                            \
+    float acc[FLYWEIGHT_MMQ_ROW_FRAGS][FLYWEIGHT_MMQ_TOKEN_FRAGS][4];         \
+    _Pragma("unroll")                                                     \
+    for (int rf = 0; rf < FLYWEIGHT_MMQ_ROW_FRAGS; ++rf)                    \
+        _Pragma("unroll")                                                 \
+        for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf)              \
+            _Pragma("unroll")                                             \
+            for (int i = 0; i < 4; ++i) acc[rf][tf][i] = 0.0f;            \
+    auto stage = [&](const int base, const int buf) {                          \
+        for (int i = threadIdx.x;                                              \
+             i < FLYWEIGHT_MMQ_ROWS * FLYWEIGHT_MMQ_GROUPS; i += blockDim.x) {     \
+            const int r = i / FLYWEIGHT_MMQ_GROUPS;                              \
+            const int g = i - r * FLYWEIGHT_MMQ_GROUPS;                          \
+            float low = 0.0f, high = 0.0f, off_low = 0.0f, off_high = 0.0f;    \
+            int* const decoded = (int*)&w_units[buf][r][g * 2];                \
+            if (row_base + r < output_size && base + g < groups_per_row) {     \
+                decode_fn(packed + (long long)(row_base + r)                   \
+                              * blocks_per_row * stride,                       \
+                          base + g, decoded, &low, &high,                      \
+                          &off_low, &off_high);                                \
+            } else {                                                           \
+                _Pragma("unroll")                                              \
+                for (int k = 0; k < 8; ++k) decoded[k] = 0;                    \
+            }                                                                  \
+            w_low[buf][r][g] = low;                                            \
+            w_off[buf][r][g] = off_low;                                        \
+        }                                                                      \
+        for (int i = threadIdx.x;                                              \
+             i < FLYWEIGHT_MMQ_TOKENS * FLYWEIGHT_MMQ_GROUPS; i += blockDim.x) {   \
+            const int t = i / FLYWEIGHT_MMQ_GROUPS;                              \
+            const int g = i - t * FLYWEIGHT_MMQ_GROUPS;                          \
+            if (t < rows && base + g < groups_per_row) {                       \
+                const int4* source = (const int4*)(                            \
+                    vectors + (long long)t * input_size                        \
+                    + (long long)(base + g) * 32);                             \
+                const int4 first = source[0], second = source[1];              \
+                a_units[buf][t][g * 2] = first;                                \
+                a_units[buf][t][g * 2 + 1] = second;                           \
+                int sum = 0;                                                   \
+                sum = __dp4a(0x01010101, first.x, sum);                        \
+                sum = __dp4a(0x01010101, first.y, sum);                        \
+                sum = __dp4a(0x01010101, first.z, sum);                        \
+                sum = __dp4a(0x01010101, first.w, sum);                        \
+                sum = __dp4a(0x01010101, second.x, sum);                       \
+                sum = __dp4a(0x01010101, second.y, sum);                       \
+                sum = __dp4a(0x01010101, second.z, sum);                       \
+                sum = __dp4a(0x01010101, second.w, sum);                       \
+                const float scale = __half2float(                              \
+                    vector_scales[(long long)t * scale_stride + base + g]);    \
+                a_scale[buf][t][g] = scale;                                    \
+                a_sum[buf][t][g] = (float)sum * scale;                         \
+            } else {                                                           \
+                a_units[buf][t][g * 2] = make_int4(0, 0, 0, 0);                \
+                a_units[buf][t][g * 2 + 1] = make_int4(0, 0, 0, 0);            \
+                a_scale[buf][t][g] = 0.0f;                                     \
+                a_sum[buf][t][g] = 0.0f;                                       \
+            }                                                                  \
+        }                                                                      \
+    };                                                                         \
+    stage(0, 0);                                                               \
+    __syncthreads();                                                           \
+    int buf = 0;                                                               \
+    for (int base = 0; base < groups_per_row;                                  \
+         base += FLYWEIGHT_MMQ_GROUPS, buf ^= 1) {                               \
+        /* Next step's tile goes into the other copy while this one is read. */\
+        if (base + FLYWEIGHT_MMQ_GROUPS < groups_per_row)                      \
+            stage(base + FLYWEIGHT_MMQ_GROUPS, buf ^ 1);                       \
+        _Pragma("unroll")                                                 \
+        for (int g = 0; g < FLYWEIGHT_MMQ_GROUPS; ++g) {                    \
+            int a_low[FLYWEIGHT_MMQ_TOKEN_FRAGS];                           \
+            int a_high[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
+            float a_s0[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
+            float a_s1[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
+            float a_m0[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
+            float a_m1[FLYWEIGHT_MMQ_TOKEN_FRAGS];                          \
+            _Pragma("unroll")                                             \
+            for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf) {        \
+                const int tb = warp_token + tf * 8;                       \
+                a_low[tf] = ((const int*)&a_units[buf][tb + quad][g * 2])[slot];\
+                a_high[tf] =                                              \
+                    ((const int*)&a_units[buf][tb + quad][g * 2 + 1])[slot];\
+                a_s0[tf] = a_scale[buf][tb + slot * 2][g];                \
+                a_s1[tf] = a_scale[buf][tb + slot * 2 + 1][g];            \
+                a_m0[tf] = a_sum[buf][tb + slot * 2][g];                  \
+                a_m1[tf] = a_sum[buf][tb + slot * 2 + 1][g];              \
+            }                                                             \
+            _Pragma("unroll")                                             \
+            for (int rf = 0; rf < FLYWEIGHT_MMQ_ROW_FRAGS; ++rf) {          \
+                const int rb = warp_row + rf * 16;                        \
+                int frag_low[2], frag_high[2];                            \
+                ldmatrix_x2_b16(                                          \
+                    frag_low, &w_units[buf][rb + (lane & 15)][g * 2]);    \
+                ldmatrix_x2_b16(                                          \
+                    frag_high, &w_units[buf][rb + (lane & 15)][g * 2 + 1]);\
+                const float wl0 = w_low[buf][rb + quad][g];               \
+                const float wl1 = w_low[buf][rb + quad + 8][g];           \
+                const float wo0 = w_off[buf][rb + quad][g];               \
+                const float wo1 = w_off[buf][rb + quad + 8][g];           \
+                _Pragma("unroll")                                         \
+                for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf) {    \
+                    int dot[4] = {0, 0, 0, 0};                            \
+                    mma_m16n8k32_s8(dot, frag_low, frag_high,             \
+                                    a_low[tf], a_high[tf]);               \
+                    acc[rf][tf][0] += (float)dot[0] * (wl0 * a_s0[tf])    \
+                        - wo0 * a_m0[tf];                                 \
+                    acc[rf][tf][1] += (float)dot[1] * (wl0 * a_s1[tf])    \
+                        - wo0 * a_m1[tf];                                 \
+                    acc[rf][tf][2] += (float)dot[2] * (wl1 * a_s0[tf])    \
+                        - wo1 * a_m0[tf];                                 \
+                    acc[rf][tf][3] += (float)dot[3] * (wl1 * a_s1[tf])    \
+                        - wo1 * a_m1[tf];                                 \
+                }                                                         \
+            }                                                             \
+        }                                                                 \
+        __syncthreads();                                                       \
+    }                                                                          \
+    _Pragma("unroll")                                                     \
+    for (int rf = 0; rf < FLYWEIGHT_MMQ_ROW_FRAGS; ++rf)                    \
+        _Pragma("unroll")                                                 \
+        for (int tf = 0; tf < FLYWEIGHT_MMQ_TOKEN_FRAGS; ++tf)              \
+            _Pragma("unroll")                                             \
+            for (int item = 0; item < 4; ++item) {                        \
+                const int r = row_base + warp_row + rf * 16               \
+                    + ((item < 2) ? quad : quad + 8);                     \
+                const int t = warp_token + tf * 8 + slot * 2 + (item & 1);\
+                if (r < output_size && t < rows)                          \
+                    outputs[(long long)t * output_size + r] =             \
+                        acc[rf][tf][item];                                \
+            }                                                             \
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 // The same kernel with a per-block shared copy of the decoder's codebook.
 #define FLYWEIGHT_Q8_MMQ_ONE_T(name, decode_fn, stride, table_fn, table_bytes)                            \
 extern "C" __global__                                                          \
@@ -5070,6 +5264,8 @@ __device__ __forceinline__ void q5k_q8_decode(
 FLYWEIGHT_Q8_MATVEC_ROWS_MIN(q5k_q8_matvec_transposed_rows, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(q5k_q8_lm_head_argmax_warp, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_MMQ_MIN(q5k_q8_mmq, q5k_q8_decode, 176)
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(FLYWEIGHT_Q8_MMQ_ONE_MIN(q5k_q8_mmq_one, q5k_q8_decode, 176)
 FLYWEIGHT_Q8_WMMA_MIN(q5k_q8_mmq_wmma, q5k_q8_decode, 176, true)
 FLYWEIGHT_Q8_MMQ_MIN_ROUTED(q5k_q8_mmq_routed, q5k_q8_decode, 176)
 
@@ -5799,6 +5995,8 @@ __device__ __forceinline__ void q4k_q8_decode(
 FLYWEIGHT_Q8_MATVEC_ROWS_MIN(q4k_q8_matvec_transposed_rows, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_LM_HEAD_ROWS_MIN(q4k_q8_lm_head_argmax_warp, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_MMQ_MIN(q4k_q8_mmq, q4k_q8_decode, 144)
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(FLYWEIGHT_Q8_MMQ_ONE_MIN(q4k_q8_mmq_one, q4k_q8_decode, 144)
 FLYWEIGHT_Q8_WMMA_MIN(q4k_q8_mmq_wmma, q4k_q8_decode, 144, true)
 FLYWEIGHT_Q8_MMQ_MIN_ROUTED(q4k_q8_mmq_routed, q4k_q8_decode, 144)
 
