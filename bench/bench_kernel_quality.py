@@ -91,6 +91,9 @@ ARMS: dict[str, dict[str, str]] = {
     # K-quant routed experts on the float grouped kernels, which the
     # Q8-activation q*k_q8_grouped_swiglu / _down kernels replaced.
     "experts-float": {"FLYWEIGHT_Q8_EXPERTS": "0"},
+    # Q8_0 projections whose width is a multiple of 32 but not 256 on the
+    # float tiled kernel, which the flat-block MMQ (q80_q8_mmq_k32) replaced.
+    "q80-flat-float": {"FLYWEIGHT_Q80_FLAT_MMQ": "0"},
     # Qwen IQ2_XXS / IQ2_S CPU gate/up on the float dot, which the
     # multi-token Q8_K VNNI dots replaced.
     "iq2-float": {"FLYWEIGHT_IQ2_Q8": "0"},

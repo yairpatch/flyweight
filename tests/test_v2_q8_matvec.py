@@ -171,6 +171,250 @@ class Q8KernelHarness:
         return vector
 
 
+class Q80FlatMmqTests(Q8KernelHarness, unittest.TestCase):
+    """q80_q8_mmq_k32: the tensor-core MMQ over flat 32-value Q8_0 blocks, for
+    rows a multiple of 32 but not of 256 (qwen4exp's 320- and 640-wide
+    hyper-connection projections). Against an exact product: the activations
+    quantize losslessly, so only fp32 accumulation order separates them."""
+
+    TOKENS = 128
+    OUTPUTS = 256
+    # The wide MMQ tile the GPU module is built with (qwen_mmq_shape): 128
+    # rows x 128 tokens, 512 threads, two staged copies in dynamic shared.
+    TILE_ROWS = 128
+    TILE_TOKENS = 128
+    THREADS = 512
+    SHARED = 2 * (TILE_ROWS + TILE_TOKENS) * 9 * 16 + 2 * (TILE_ROWS + TILE_TOKENS) * 4 * 4
+
+    def _run(self, columns: int, seed: int) -> None:
+        rng = np.random.default_rng(seed)
+        blocks = columns // 32
+        quants = rng.integers(-127, 128, size=(self.OUTPUTS, blocks, 32)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.2, size=(self.OUTPUTS, blocks)).astype(np.float16)
+        packed = np.zeros((self.OUTPUTS, blocks, 34), dtype=np.uint8)
+        packed[:, :, :2] = scales.view(np.uint8).reshape(self.OUTPUTS, blocks, 2)
+        packed[:, :, 2:] = quants.view(np.uint8)
+        activation = rng.integers(-126, 127, size=(self.TOKENS, columns)).astype(np.float32)
+        activation[:, ::32] = 127.0
+        weights_f = (quants.astype(np.float64) * scales.astype(np.float64)[:, :, None]).reshape(
+            self.OUTPUTS, columns)
+        expected = activation.astype(np.float64) @ weights_f.T
+
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = blocks * 2
+        q8 = self._alloc(self.TOKENS * columns)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        out = self._alloc(self.TOKENS * self.OUTPUTS * 4)
+        width = ctypes.c_int32(columns)
+        stride = ctypes.c_int32(scale_stride)
+        self._launch("quantize_q8_blocks_rows", (columns + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      width, stride], grid_y=self.TOKENS)
+        args = [ctypes.c_uint64(weights), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                ctypes.c_uint64(out), width, ctypes.c_int32(self.OUTPUTS),
+                ctypes.c_int32(self.TOKENS), stride]
+        array = (ctypes.c_void_p * len(args))(*[ctypes.addressof(value) for value in args])
+        self.assertEqual(self._lib.flyweight_gpu_launch_named(
+            b"q80_q8_mmq_k32", (self.OUTPUTS + self.TILE_ROWS - 1) // self.TILE_ROWS,
+            (self.TOKENS + self.TILE_TOKENS - 1) // self.TILE_TOKENS, self.THREADS,
+            self.SHARED, 0, array), 0)
+        got = self._download(out, self.TOKENS * self.OUTPUTS).reshape(self.TOKENS, self.OUTPUTS)
+        scale = np.abs(expected).max()
+        self.assertLess(np.abs(got - expected).max() / scale, 1e-5,
+                        f"q80_q8_mmq_k32 at {columns} columns")
+        for pointer in (weights, source, q8, q8_scales, out):
+            self._lib.flyweight_gpu_free(pointer)
+
+    def test_flat_widths_match_the_exact_product(self) -> None:
+        for columns, seed in ((320, 1), (640, 2), (96, 3)):
+            with self.subTest(columns=columns):
+                self._run(columns, seed)
+
+
+class KQuantOneMmqTests(Q8KernelHarness, unittest.TestCase):
+    """q4k/q5k_q8_mmq_one: the single-scale k32 tile with the per-group
+    minimum folded in, against the _MIN tile it replaces. Same arithmetic up
+    to float rounding order (the k16 halves fold into one int32 first)."""
+
+    TOKENS = 200  # one full 128-token tile and a partial one
+    COLUMNS = 1024
+    OUTPUTS = 320
+    # qwen_mmq_shape's wide tile plus the two offset arrays
+    # (qwen_mmq_dynamic_shared with offsets).
+    TILE_ROWS = 128
+    TILE_TOKENS = 128
+    THREADS = 512
+    SHARED = 2 * (TILE_ROWS + TILE_TOKENS) * 9 * 16 + 2 * 2 * (TILE_ROWS + TILE_TOKENS) * 4 * 4
+    # The _MIN tile (kQ8MmqMinRows / kQ8MmqMinTokens / kQ8MmqMinThreads).
+    MIN_ROWS = 32
+    MIN_TOKENS = 64
+    MIN_THREADS = 512
+
+    def _run(self, label: str, seed: int) -> None:
+        superblock, _, prefix, _ = FORMATS[label]
+        packed = self._packed_weights(label, self.OUTPUTS * self.COLUMNS // 256 * superblock, seed)
+        rng = np.random.default_rng(seed)
+        activation = rng.uniform(-3.0, 3.0, size=(self.TOKENS, self.COLUMNS)).astype(np.float32)
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = self.COLUMNS // 32 * 2
+        q8 = self._alloc(self.TOKENS * self.COLUMNS)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        self._launch("quantize_q8_blocks_rows", (self.COLUMNS + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      ctypes.c_int32(self.COLUMNS), ctypes.c_int32(scale_stride)],
+                     grid_y=self.TOKENS)
+        results = {}
+        for name, rows, tokens, threads, shared in (
+                (f"{prefix}_q8_mmq", self.MIN_ROWS, self.MIN_TOKENS, self.MIN_THREADS, 0),
+                (f"{prefix}_q8_mmq_one", self.TILE_ROWS, self.TILE_TOKENS, self.THREADS, self.SHARED)):
+            out = self._alloc(self.TOKENS * self.OUTPUTS * 4)
+            args = [ctypes.c_uint64(weights), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                    ctypes.c_uint64(out), ctypes.c_int32(self.COLUMNS), ctypes.c_int32(self.OUTPUTS),
+                    ctypes.c_int32(self.TOKENS), ctypes.c_int32(scale_stride)]
+            array = (ctypes.c_void_p * len(args))(*[ctypes.addressof(value) for value in args])
+            self.assertEqual(self._lib.flyweight_gpu_launch_named(
+                name.encode(), (self.OUTPUTS + rows - 1) // rows,
+                (self.TOKENS + tokens - 1) // tokens, threads, shared, 0, array), 0, name)
+            results[name] = self._download(out, self.TOKENS * self.OUTPUTS)
+            self._lib.flyweight_gpu_free(out)
+        reference, got = results[f"{prefix}_q8_mmq"], results[f"{prefix}_q8_mmq_one"]
+        self.assertTrue(np.isfinite(reference).all())
+        self.assertLess(np.abs(got - reference).max() / np.abs(reference).max(), 1e-5,
+                        f"{prefix}_q8_mmq_one against the _MIN tile")
+        for pointer in (weights, source, q8, q8_scales):
+            self._lib.flyweight_gpu_free(pointer)
+
+    def test_matches_the_min_tile(self) -> None:
+        for label, seed in (("Q4_K", 11), ("Q5_K", 12)):
+            with self.subTest(label=label):
+                self._run(label, seed)
+
+
+class RoutedWideMmqTests(Q8KernelHarness, unittest.TestCase):
+    """The 128-token routed MMQ tile (`_w`) against the 32-token one, over the
+    mixed block table prefill builds (flyweight_v2_moe_align.hpp,
+    align_blocks_mixed): an expert's routes fill whole 128-token blocks, one
+    more when at least 65 are left, the rest 32-token blocks. Q8_0 experts so
+    the exact product is the reference; the two tiles must agree bit for bit."""
+
+    TOKENS = 128
+    TOP_K = 4
+    COLUMNS = 256
+    OUTPUTS = 256
+    COUNTS = (5, 70, 160, 277)  # one expert per regime: narrow, wide, split, both
+
+    @staticmethod
+    def _table(experts_of, counts, wide_min):
+        """(block_experts, sorted_routes, wide_blocks) as align_blocks_mixed
+        lays them out."""
+        wide_count = [c - c % 128 + (c % 128 if wide_min and c % 128 >= wide_min else 0)
+                      if wide_min else 0 for c in counts]
+        by_expert = [[r for r, e in enumerate(experts_of) if e == x] for x in range(len(counts))]
+        block_experts, sorted_routes = [], []
+        for size, part in ((128, lambda x: by_expert[x][:wide_count[x]]),
+                           (32, lambda x: by_expert[x][wide_count[x]:])):
+            for expert in range(len(counts)):
+                routes = part(expert)
+                blocks = (len(routes) + size - 1) // size
+                block_experts += [expert] * blocks
+                sorted_routes += routes + [-1] * (blocks * size - len(routes))
+            if size == 128:
+                wide_blocks = len(block_experts)
+        return block_experts, sorted_routes, wide_blocks
+
+    def test_wide_tile_matches_narrow_and_exact(self) -> None:
+        rng = np.random.default_rng(7)
+        experts = len(self.COUNTS)
+        blocks = self.COLUMNS // 32
+        quants = rng.integers(-127, 128, size=(experts, self.OUTPUTS, blocks, 32)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.2, size=(experts, self.OUTPUTS, blocks)).astype(np.float16)
+        packed = np.zeros((experts, self.OUTPUTS, blocks, 34), dtype=np.uint8)
+        packed[..., :2] = scales.view(np.uint8).reshape(experts, self.OUTPUTS, blocks, 2)
+        packed[..., 2:] = quants.view(np.uint8)
+        activation = rng.integers(-126, 127, size=(self.TOKENS, self.COLUMNS)).astype(np.float32)
+        activation[:, ::32] = 127.0
+        weights_f = (quants.astype(np.float64) * scales.astype(np.float64)[..., None]).reshape(
+            experts, self.OUTPUTS, self.COLUMNS)
+        experts_of = rng.permutation(np.repeat(np.arange(experts), self.COUNTS)).tolist()
+        self.assertEqual(len(experts_of), self.TOKENS * self.TOP_K)
+
+        expert_bytes = packed[0].nbytes
+        weights = self._alloc(packed.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), packed.nbytes), 0)
+        pointers = np.array([weights + e * expert_bytes for e in range(experts)], dtype=np.uint64)
+        table = self._alloc(pointers.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            table, pointers.ctypes.data_as(ctypes.c_void_p), pointers.nbytes), 0)
+        source = self._alloc(activation.nbytes)
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+            source, activation.ctypes.data_as(ctypes.c_void_p), activation.nbytes), 0)
+        scale_stride = blocks * 2
+        q8 = self._alloc(self.TOKENS * self.COLUMNS)
+        q8_scales = self._alloc(self.TOKENS * scale_stride * 2)
+        self._launch("quantize_q8_blocks_rows", (self.COLUMNS + 255) // 256, 256,
+                     [ctypes.c_uint64(source), ctypes.c_uint64(q8), ctypes.c_uint64(q8_scales),
+                      ctypes.c_int32(self.COLUMNS), ctypes.c_int32(scale_stride)],
+                     grid_y=self.TOKENS)
+        allocated = [weights, table, source, q8, q8_scales]
+
+        def run(wide_min):
+            block_experts, sorted_routes, wide_blocks = self._table(
+                experts_of, self.COUNTS, wide_min)
+            be = np.array(block_experts, dtype=np.int32)
+            sr = np.array(sorted_routes, dtype=np.int32)
+            be_dev, sr_dev = self._alloc(be.nbytes), self._alloc(sr.nbytes)
+            out = self._alloc(sr.size * self.OUTPUTS * 4)
+            allocated.extend((be_dev, sr_dev, out))
+            for pointer, array in ((be_dev, be), (sr_dev, sr)):
+                self.assertEqual(self._lib.flyweight_gpu_upload_sync(
+                    pointer, array.ctypes.data_as(ctypes.c_void_p), array.nbytes), 0)
+            wide_slots = wide_blocks * 128
+            for name, first, count, slot in (
+                    ("q80_q8_mmq_routed_w", 0, wide_blocks, 0),
+                    ("q80_q8_mmq_routed", wide_blocks, len(block_experts) - wide_blocks,
+                     wide_slots)):
+                if not count:
+                    continue
+                self._launch(name, self.OUTPUTS // 128, 256,
+                             [ctypes.c_uint64(table), ctypes.c_uint64(be_dev + 4 * first),
+                              ctypes.c_uint64(sr_dev + 4 * slot), ctypes.c_uint64(q8),
+                              ctypes.c_uint64(q8_scales), ctypes.c_uint64(out + 4 * slot * self.OUTPUTS),
+                              ctypes.c_int32(self.COLUMNS), ctypes.c_int32(self.OUTPUTS),
+                              ctypes.c_int32(self.TOP_K), ctypes.c_int32(scale_stride),
+                              ctypes.c_int32(count)],
+                             grid_y=count)
+            got = self._download(out, sr.size * self.OUTPUTS).reshape(sr.size, self.OUTPUTS)
+            by_route = {int(r): got[i] for i, r in enumerate(sorted_routes) if r >= 0}
+            return by_route, wide_blocks
+
+        narrow, none_wide = run(0)
+        mixed, wide_blocks = run(65)
+        self.assertEqual(none_wide, 0)
+        self.assertEqual(wide_blocks, 0 + 1 + 1 + 2)  # 70 -> 1, 160 -> 1 (+32s), 277 -> 2 (+21)
+        self.assertEqual(sorted(mixed), list(range(self.TOKENS * self.TOP_K)))
+        scale = 0.0
+        worst = 0.0
+        for route, expert in enumerate(experts_of):
+            expected = weights_f[expert] @ activation[route // self.TOP_K].astype(np.float64)
+            scale = max(scale, np.abs(expected).max())
+            worst = max(worst, np.abs(mixed[route] - expected).max())
+            np.testing.assert_array_equal(mixed[route], narrow[route])
+        self.assertLess(worst / scale, 1e-5)
+        for pointer in allocated:
+            self._lib.flyweight_gpu_free(pointer)
+
+
 class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
     """Each group-decode kernel must agree with its per-element reference."""
 

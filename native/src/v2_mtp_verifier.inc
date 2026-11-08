@@ -572,7 +572,7 @@ void qwen_forward_rows(
             if(seen.insert(key).second)std::fprintf(stderr,"[dense] %s\n",key);
         };
         const char* mmq_kernel=format?format->matmul_q8_mmq:nullptr;
-        const bool mmq_min=format&&format->mmq_min;
+        bool mmq_min=format&&format->mmq_min;
         const char* tiled_kernel=format?format->matmul_q8_tiled:nullptr;
         const char* q8_kernel=nullptr;
         // The RDNA3 twin of the MMQ kernel, when this device runs it and the
@@ -585,6 +585,20 @@ void qwen_forward_rows(
                 it=interned_wmma.emplace(mmq_kernel,std::string(mmq_kernel)+"_wmma").first;
             if(flyweight_gpu_kernel_available(it->second.c_str())!=0)
                 wmma_kernel=it->second.c_str();
+        }
+        // K-quants with one scale and minimum per group: the k32 tile with
+        // the minimum folded in, where tensor cores run it and RDNA3's WMMA
+        // twin does not take the projection instead.
+        static const bool kquant_one_mmq=[]{
+            const char*setting=std::getenv("FLYWEIGHT_KQUANT_ONE_MMQ");
+            return !(setting&&setting[0]=='0');
+        }();
+        bool mmq_offsets=false;
+        if(kquant_one_mmq&&format&&format->matmul_q8_mmq_one&&!wmma_kernel&&
+           runtime.int8_tensor_cores&&!flyweight_backend_is_cpu()){
+            mmq_kernel=format->matmul_q8_mmq_one;
+            mmq_min=false;
+            mmq_offsets=true;
         }
         // On MoE the *per-row* path below re-reads the whole weight matrix per
         // row, which only pays off against the reconstruct-in-float matmul when
@@ -613,7 +627,17 @@ void qwen_forward_rows(
         // Flat 32-wide formats (IQ4_NL) take this block for any multiple of 32.
         // Super-block formats still need a multiple of 256: their Q8 kernels
         // address a tail as if it were eight independent groups.
-        const bool q8_width_ok=format&&qwen_q8_row_fits(type,input_size);
+        // Q8_0 rows a multiple of 32 but not 256 (qwen4exp's 320- and
+        // 640-wide hyper-connection projections) only take the Q8 path for a
+        // batch the flat-block MMQ runs; its other Q8 kernels tile by 256.
+        static const bool flat_q80_enabled=[]{
+            const char*setting=std::getenv("FLYWEIGHT_Q80_FLAT_MMQ");
+            return !setting||setting[0]!='0';
+        }();
+        const bool flat_q80=flat_q80_enabled&&type==8&&(input_size&255)!=0&&(input_size&31)==0&&
+            rows>kQ8RowBatch&&runtime.int8_tensor_cores&&
+            flyweight_gpu_kernel_available("q80_q8_mmq_k32")!=0;
+        const bool q8_width_ok=format&&(qwen_q8_row_fits(type,input_size)||flat_q80);
         if((experts>0?(rows<=8||batched_kernel):true)&&q8_width_ok&&
            format&&format->rows_q8_gate&&qwen_q8_head_enabled())
             q8_kernel=format->matvec_q8_warp;
@@ -696,8 +720,10 @@ void qwen_forward_rows(
                 return;
             }
             // MMQ tiles K in super-blocks, so a row that is only a multiple of
-            // 32 stays on the tiled or rows kernel below.
-            if((input_size&255)==0&&(rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&
+            // 32 stays on the tiled or rows kernel below -- except Q8_0, whose
+            // flat-block twin covers any multiple of 32 (flat_q80 above).
+            if(flat_q80){mmq_kernel="q80_q8_mmq_k32";small_narrow=nullptr;}
+            if(((input_size&255)==0||flat_q80)&&(rows>kQ8RowBatch||small_narrow)&&mmq_kernel&&
                runtime.int8_tensor_cores){
                 const auto mmq_shape=qwen_mmq_shape();
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:mmq_shape.rows();
@@ -750,8 +776,9 @@ void qwen_forward_rows(
                 if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d tiles=%u pos=%llu\n",
                     mmq_kernel,index,input_size,output_size,rows,token_tiles,
                     (unsigned long long)(runtime.position+span_begin));
-                const std::uint32_t mmq_shared=(format&&format->mmq_dynamic_shared&&!mmq_min)
-                    ?qwen_mmq_dynamic_shared(mmq_shape):0u;
+                const std::uint32_t mmq_shared=
+                    ((format&&format->mmq_dynamic_shared&&!mmq_min)||mmq_offsets)
+                        ?qwen_mmq_dynamic_shared(mmq_shape,mmq_offsets):0u;
                 if(full_rows>0)
                     launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,token_tiles,mmq_threads,mmq_args,mmq_shared);
                 if(split_tail){
@@ -925,9 +952,18 @@ void qwen_forward_rows(
             dense_trace("bf16_matmul_tiled64");
             return;
         }
+        static const bool f32_tiled=[]{const char*e=std::getenv("FLYWEIGHT_F32_TILED");return !e||e[0]!='0';}();
+        if(f32_tiled&&type==0&&rows>=16){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
+            launch("f32_matmul_tiled64",(output_size+63)/64,
+                   (static_cast<std::uint32_t>(rows)+63)/64,256,args);
+            dense_trace("f32_matmul_tiled64");
+            return;
+        }
         if(format&&format->matmul_rows){
             void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
             using Grid=flyweight::v2::RowsMatmulGrid;
+            dense_trace(format->matmul_rows);
             switch(format->matmul_rows_grid){
                 case Grid::per_token:
                     launch(format->matmul_rows,output_size,rows,256,args);return;
@@ -2866,7 +2902,7 @@ void qwen_forward_rows(
         const std::uint64_t routed_routes=stream_cap*top_k;
         const std::uint64_t routed_padded=
             routed_routes+static_cast<std::uint64_t>(experts)*
-                (flyweight::v2::moe::kMmqBlockSize-1);
+                (flyweight::v2::moe::kMmqWideBlockSize-1);
         const std::uint64_t routed_blocks=
             routed_padded/flyweight::v2::moe::kMmqBlockSize+1;
         std::uint64_t routed_role_ptrs[3];
@@ -3485,6 +3521,16 @@ void qwen_forward_rows(
             const bool routed_moe=!runtime.nemotron&&routed_setting&&runtime.int8_tensor_cores&&
                 !routed_gate.empty()&&!routed_up.empty()&&!routed_down.empty()&&
                 !routed_route_weights.empty();
+            // Experts with enough routes take the 128-token tile, which decodes
+            // their weights a quarter as often. The _MIN shape has no wide
+            // variant, and a wide block must fit the per-tile scratch.
+            // FLYWEIGHT_ROUTED_WIDE=0 keeps every expert on the 32-token tile.
+            static const char*wide_env=std::getenv("FLYWEIGHT_ROUTED_WIDE");
+            const bool routed_wide=routed_moe&&!(wide_env&&wide_env[0]=='0')&&
+                !routed_is_min(gate_type)&&!routed_is_min(up_type)&&
+                !routed_is_min(down_type)&&
+                stream_cap>=static_cast<std::uint64_t>(
+                    flyweight::v2::moe::kMmqWideBlockSize);
             if(routed_moe){
                 flyweight::v2::moe::AlignedRoutes aligned;
                 {
@@ -3496,10 +3542,13 @@ void qwen_forward_rows(
                     for(int route=0;route<rows*top_k;++route)
                         if(routed_route_weights[route]!=0.0f)
                             route_group[route]=group_of[selected_host[route]];
-                    flyweight::v2::moe::align_blocks(
+                    flyweight::v2::moe::align_blocks_mixed(
                         route_group.data(),routed_route_weights.data(),
                         rows*top_k,static_cast<int>(stream_groups.size()),
-                        flyweight::v2::moe::kMmqBlockSize,aligned);
+                        flyweight::v2::moe::kMmqBlockSize,
+                        flyweight::v2::moe::kMmqWideBlockSize,
+                        routed_wide?flyweight::v2::moe::kMmqWideMinRoutes:0,
+                        aligned);
                 }
                 const int blocks=static_cast<int>(aligned.block_experts.size());
                 if(blocks){
@@ -3549,21 +3598,32 @@ void qwen_forward_rows(
                     // the streaming path needs disappears with it.
                     stream_quantize(normalized,stream_packed_q8,
                                     stream_packed_scales,hidden_size,rows);
-                    const int block_size=flyweight::v2::moe::kMmqBlockSize;
-                    // Tiles are sized so every per-slot buffer below is the
-                    // scratch the streaming path already owns.
-                    const int tile_blocks=
-                        std::max(1,static_cast<int>(stream_cap)/block_size);
                     int gate_scale_stride=(hidden_size/32)*2;
                     int down_scale_stride=(intermediate/32)*2;
                     // Mutable copies: the launch shim takes void* to each
                     // argument, so a const int cannot be handed over.
                     int slot_major=0,routed_top_k=top_k;
                     const double t_routed=moe_now();
-                    for(int begin=0;begin<blocks;begin+=tile_blocks){
-                        const int count=std::min(tile_blocks,blocks-begin);
+                    // Wide blocks first, then the 32-token ones; both walk the
+                    // same tables, the second pass offset by the first's slots.
+                    for(int pass=0;pass<2;++pass){
+                    const bool wide=pass==0;
+                    const int pass_begin=wide?0:aligned.wide_blocks;
+                    const int pass_end=wide?aligned.wide_blocks:blocks;
+                    const int pass_slots=wide?0:aligned.wide_slots;
+                    const int block_size=wide
+                        ?flyweight::v2::moe::kMmqWideBlockSize
+                        :flyweight::v2::moe::kMmqBlockSize;
+                    const std::string suffix=wide?"_w":"";
+                    // Tiles are sized so every per-slot buffer below is the
+                    // scratch the streaming path already owns.
+                    const int tile_blocks=
+                        std::max(1,static_cast<int>(stream_cap)/block_size);
+                    for(int begin=pass_begin;begin<pass_end;begin+=tile_blocks){
+                        const int count=std::min(tile_blocks,pass_end-begin);
                         int slots=count*block_size;
-                        const int slot_begin=begin*block_size;
+                        const int slot_begin=
+                            pass_slots+(begin-pass_begin)*block_size;
                         const auto tile_experts=routed_block_experts+
                             static_cast<std::uint64_t>(begin)*sizeof(std::int32_t);
                         const auto tile_sorted=routed_sorted+
@@ -3587,7 +3647,7 @@ void qwen_forward_rows(
                                 &in_size,&out_size,token_map,scale_stride,
                                 &tile_count};
                             const std::uint32_t row_tile=is_min?64u:128u;
-                            launch(name.c_str(),
+                            launch((name+suffix).c_str(),
                                    (static_cast<std::uint32_t>(out_size)+row_tile-1)
                                        /row_tile,
                                    static_cast<std::uint32_t>(count),
@@ -3630,6 +3690,7 @@ void qwen_forward_rows(
                         launch("qwen_slot_accumulate_rows",
                                (static_cast<std::uint32_t>(hidden_size)+255)/256,
                                static_cast<std::uint32_t>(rows),256,fold_args);
+                    }
                     }
                     if(moe_profile_enabled()){
                         auto&prof=qwen_moe_profile();

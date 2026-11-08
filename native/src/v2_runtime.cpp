@@ -20554,12 +20554,14 @@ static QwenMmqShape qwen_mmq_shape(){
 }
 // Dynamic shared bytes of the double-buffered MMQ tile for this shape: two
 // copies each of the weight units, activation units, weight scales and
-// activation scales. Must match the carve-up in FLYWEIGHT_Q8_MMQ_ONE.
-static std::uint32_t qwen_mmq_dynamic_shared(const QwenMmqShape& shape){
+// activation scales. Must match the carve-up in FLYWEIGHT_Q8_MMQ_ONE;
+// `offsets` adds FLYWEIGHT_Q8_MMQ_ONE_MIN's minimum offsets and sums.
+static std::uint32_t qwen_mmq_dynamic_shared(const QwenMmqShape& shape,bool offsets=false){
     const std::uint32_t units=9u*16u;   // FLYWEIGHT_MMQ_ROW_UNITS int4 per row
     const std::uint32_t rows=static_cast<std::uint32_t>(shape.rows());
     const std::uint32_t tokens=static_cast<std::uint32_t>(shape.tokens());
-    return 2u*(rows+tokens)*units+2u*(rows+tokens)*4u*sizeof(float);
+    const std::uint32_t scale_arrays=offsets?2u:1u;
+    return 2u*(rows+tokens)*units+scale_arrays*2u*(rows+tokens)*4u*sizeof(float);
 }
 static std::string qwen_cuda_corpus(){
     const auto shape=qwen_mmq_shape();
@@ -22183,12 +22185,13 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
             // The routed MMQ's index and pointer tables. Small -- ~200 KiB at
             // this model's shape -- but they ride the same walk, so the worst
             // case has to be sized here and taken in the same order there.
-            // Worst-case padding is one short block per expert.
+            // Worst-case padding is one short block per expert, at the wide
+            // tile's size since any expert may take it.
             const std::uint64_t stream_routes=stream_rows*stream_top_k;
             const std::uint64_t stream_experts=
                 runtime->model->config.expert_count;
             const std::uint64_t stream_padded=stream_routes+
-                stream_experts*(flyweight::v2::moe::kMmqBlockSize-1);
+                stream_experts*(flyweight::v2::moe::kMmqWideBlockSize-1);
             const std::uint64_t stream_blocks=
                 stream_padded/flyweight::v2::moe::kMmqBlockSize+1;
             for(int role=0;role<3;++role)

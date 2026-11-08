@@ -52,10 +52,21 @@ inline constexpr int kBlockSize = 8;
 // of once for 8 -- 2.9x fewer decodes at this model's ~20 routes per expert.
 inline constexpr int kMmqBlockSize = 32;
 
+// The wide routed MMQ tile ("_w" kernels). MUST match the tokens of
+// FLYWEIGHT_MOE_MMQ_WIDE_TOKEN_FRAGS. A 128-token block costs ~2.3x a 32-token
+// one (fwbench routed_mmq_wide_bench.py, IQ2_S / IQ2_XXS), so a wide block
+// pays once it holds more than 64 routes and loses below.
+inline constexpr int kMmqWideBlockSize = 128;
+inline constexpr int kMmqWideMinRoutes = 65;
+
 struct AlignedRoutes {
     std::vector<std::int32_t> sorted_routes;
     std::vector<std::int32_t> block_experts;
     std::int32_t padded_total = 0;
+    // align_blocks_mixed only: the first `wide_blocks` entries of
+    // block_experts are wide blocks covering sorted_routes[0, wide_slots).
+    std::int32_t wide_blocks = 0;
+    std::int32_t wide_slots = 0;
 };
 
 // Routes whose weight is exactly zero are skipped: the rows path uses a zero
@@ -106,6 +117,76 @@ inline void align_blocks(
         if (expert < 0 || expert >= experts) continue;
         const auto slot = offsets[static_cast<std::size_t>(expert)] +
             filled[static_cast<std::size_t>(expert)]++;
+        out.sorted_routes[static_cast<std::size_t>(slot)] = route;
+    }
+}
+
+// align_blocks with two tiles. An expert's routes fill whole `wide_size`
+// blocks, plus one more wide block when what is left reaches `wide_min`; the
+// rest go to `block_size` blocks. Wide blocks are laid out first. Same
+// determinism as align_blocks; `wide_min` of 0 means no wide blocks.
+inline void align_blocks_mixed(
+    const std::int32_t* selected, const float* weights, int routes,
+    int experts, int block_size, int wide_size, int wide_min,
+    AlignedRoutes& out
+) {
+    out.sorted_routes.clear();
+    out.block_experts.clear();
+    out.padded_total = 0;
+    out.wide_blocks = 0;
+    out.wide_slots = 0;
+    if (!selected || routes <= 0 || experts <= 0 || block_size <= 0) return;
+
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(experts), 0);
+    for (int route = 0; route < routes; ++route) {
+        if (weights && weights[route] == 0.0f) continue;
+        const auto expert = selected[route];
+        if (expert < 0 || expert >= experts) continue;
+        ++counts[static_cast<std::size_t>(expert)];
+    }
+    const bool any_wide = wide_min > 0 && wide_size > 0;
+    std::vector<std::int32_t> wide_count(static_cast<std::size_t>(experts), 0);
+    if (any_wide)
+        for (int expert = 0; expert < experts; ++expert) {
+            const auto count = counts[static_cast<std::size_t>(expert)];
+            const auto rest = count % wide_size;
+            wide_count[static_cast<std::size_t>(expert)] =
+                count - rest + (rest >= wide_min ? rest : 0);
+        }
+    std::vector<std::int32_t> wide_offsets(static_cast<std::size_t>(experts), 0);
+    std::vector<std::int32_t> offsets(static_cast<std::size_t>(experts), 0);
+    std::int32_t cursor = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int expert = 0; expert < experts; ++expert) {
+            const auto wide = wide_count[static_cast<std::size_t>(expert)];
+            const auto count = pass == 0
+                ? wide : counts[static_cast<std::size_t>(expert)] - wide;
+            if (!count) continue;
+            const int size = pass == 0 ? wide_size : block_size;
+            (pass == 0 ? wide_offsets : offsets)[static_cast<std::size_t>(expert)] =
+                cursor;
+            const auto blocks = (count + size - 1) / size;
+            for (int block = 0; block < blocks; ++block)
+                out.block_experts.push_back(expert);
+            cursor += blocks * size;
+        }
+        if (pass == 0) {
+            out.wide_blocks = static_cast<std::int32_t>(out.block_experts.size());
+            out.wide_slots = cursor;
+        }
+    }
+    out.padded_total = cursor;
+    out.sorted_routes.assign(static_cast<std::size_t>(cursor), kEmpty);
+
+    std::vector<std::int32_t> filled(static_cast<std::size_t>(experts), 0);
+    for (int route = 0; route < routes; ++route) {
+        if (weights && weights[route] == 0.0f) continue;
+        const auto expert = selected[route];
+        if (expert < 0 || expert >= experts) continue;
+        const auto e = static_cast<std::size_t>(expert);
+        const auto index = filled[e]++;
+        const auto slot = index < wide_count[e]
+            ? wide_offsets[e] + index : offsets[e] + index - wide_count[e];
         out.sorted_routes[static_cast<std::size_t>(slot)] = route;
     }
 }
