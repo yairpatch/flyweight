@@ -15,11 +15,13 @@
 #include <flyweight_cpu_native.hpp>
 #include <flyweight_cpu_shim_geometry.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <random>
 #include <string>
 #include <vector>
@@ -223,6 +225,42 @@ void add_cases() {
             }
         },
         1e-5f,
+    });
+
+    cases().push_back(Case{
+        "f32_matmul_tiled64",
+        [](std::vector<std::vector<float>>& outputs) {
+            // On and off the 64x64 tile in both directions, and an input
+            // width off the 16-wide K step.
+            const int shapes[][3] = {
+                {256, 64, 1}, {512, 130, 7}, {250, 33, 70}, {2048, 64, 64},
+            };
+            for (const auto& shape : shapes) {
+                int input_size = shape[0];
+                int output_size = shape[1];
+                int rows = shape[2];
+                auto matrix = random_vector(
+                    static_cast<std::size_t>(input_size) * output_size, -1.0f, 1.0f);
+                auto input = random_vector(
+                    static_cast<std::size_t>(input_size) * rows, -1.0f, 1.0f);
+                std::vector<float> output(
+                    static_cast<std::size_t>(output_size) * rows, -7.0f);
+                const float* matrix_pointer = matrix.data();
+                const float* input_pointer = input.data();
+                float* output_pointer = output.data();
+                void* arguments[] = {&matrix_pointer, &input_pointer,
+                                     &output_pointer, &input_size,
+                                     &output_size, &rows};
+                flyweight_cpu_launch_named("f32_matmul_tiled64",
+                                           (output_size + 63) / 64,
+                                           (rows + 63) / 64, 256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        // The corpus accumulates each dot sequentially along K with fmaf, so
+        // its own error grows with input_size; the host's split accumulators
+        // sit closer to exact. Same reasoning as q8_matmul_tiled below.
+        1e-4f,
     });
 
     // Q8_0 blocks: fp16 scale + 32 int8, 34 bytes. Built here rather than
@@ -1123,11 +1161,346 @@ void add_cases() {
     });
 }
 
+// --- Q8-activation matvec families (cpu_q8_family.inc) ----------------------
+//
+// One case per registered kernel name, generated from the same format table
+// the registrations come from. The packed weights are random bytes drawn from
+// [0x00, 0x3b] and [0x80, 0xbb]: every byte pair then reads as a finite fp16
+// below 1.0, so the per-format d / dmin fields stay finite whatever the layout
+// puts where, while the quant nibbles, sign bits and codebook indices still
+// cover a wide range.
+struct Q8Format {
+    const char* prefix;
+    int stride;          // bytes per 256 values
+    bool lm_head;
+    bool minimum;        // FLYWEIGHT_Q8_MATVEC_ROWS_MIN rather than _ROWS
+    bool tiled;
+    bool flat;           // 32-wide blocks: input_size need not divide 256
+};
+
+const Q8Format kQ8Formats[] = {
+    {"iq1m", 56, false, false, true, false},
+    {"iq1s", 50, true, false, true, false},
+    {"iq2s", 82, false, false, true, false},
+    {"iq2xs", 74, false, false, true, false},
+    {"iq2xxs", 66, true, false, true, false},
+    {"iq3s", 110, true, false, true, false},
+    {"iq3xxs", 98, true, false, true, false},
+    {"iq4nl", 144, true, false, true, true},
+    {"iq4xs", 136, false, false, true, false},
+    {"q2k", 84, true, true, false, false},
+    {"q3k", 110, true, false, true, false},
+    {"q4k", 144, true, true, false, false},
+    {"q5k", 176, true, true, false, false},
+    {"q6k", 210, true, false, true, false},
+    {"q80", 272, true, false, true, true},
+};
+
+std::vector<unsigned char> random_q8_weights(int input_size, int output_size,
+                                             int stride) {
+    const int groups = input_size / 32;
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(groups / 8) * stride
+        + static_cast<std::size_t>(groups % 8) * (stride / 8);
+    std::uniform_int_distribution<int> byte(0, 2 * 0x3c - 1);
+    std::vector<unsigned char> packed(row_bytes * output_size);
+    for (auto& value : packed) {
+        const int pick = byte(rng());
+        value = static_cast<unsigned char>(pick < 0x3c ? pick : 0x80 + pick - 0x3c);
+    }
+    return packed;
+}
+
+struct Q8Activations {
+    std::vector<signed char> values;
+    std::vector<std::uint16_t> scales;
+    int scale_stride;
+};
+
+Q8Activations random_q8_activations(int input_size, int rows) {
+    Q8Activations out;
+    const int groups = input_size / 32;
+    out.scale_stride = groups + 2;  // the runtime pads scale rows the same way
+    std::uniform_int_distribution<int> value(-127, 127);
+    out.values.resize(static_cast<std::size_t>(input_size) * rows);
+    for (auto& v : out.values) v = static_cast<signed char>(value(rng()));
+    auto scales = random_vector(static_cast<std::size_t>(out.scale_stride) * rows,
+                                0.002f, 0.02f);
+    out.scales.resize(scales.size());
+    for (std::size_t index = 0; index < scales.size(); ++index)
+        out.scales[index] = flyweight::cpu::float_to_half_bits(scales[index]);
+    return out;
+}
+
+// These kernels compare against an emulated reference whose own fp32 error is
+// the larger term (the single-row ones also group the same sum differently:
+// the corpus's fused *_q8_group against the decode form the host runs): random signed weights against random signed
+// activations make every output a heavily cancelling sum, and the corpus
+// reduces it in a different order (per-thread strides then a shuffle tree, or
+// tile-sequential lanes for the tiled kernel). Replacing the native
+// accumulation with an exact double sum leaves the gap where it was -- 1e-5 to
+// 1e-4 relative across the formats -- so that gap is the reference's noise. A
+// real defect in decode or addressing shows up as O(1) relative error.
+constexpr float kQ8BatchTolerance = 2.5e-4f;
+
+std::vector<int> q8_input_sizes(const Q8Format& format) {
+    if (format.flat) return {256, 288, 768};
+    return {256, 768};
+}
+
+void add_q8_family_cases() {
+    for (const Q8Format& format : kQ8Formats) {
+        const std::string prefix = format.prefix;
+
+        cases().push_back(Case{
+            prefix + "_q8_matvec_transposed_warp",
+            [format](std::vector<std::vector<float>>& outputs) {
+                for (int input_size : q8_input_sizes(format)) {
+                    int output_size = 19;
+                    auto packed = random_q8_weights(input_size, output_size, format.stride);
+                    auto act = random_q8_activations(input_size, 1);
+                    std::vector<float> output(output_size, 0.0f);
+                    const unsigned char* packed_p = packed.data();
+                    const signed char* vector_p = act.values.data();
+                    const std::uint16_t* scales_p = act.scales.data();
+                    float* output_p = output.data();
+                    void* arguments[] = {&packed_p, &vector_p, &scales_p, &output_p,
+                                         &input_size, &output_size};
+                    flyweight_cpu_launch_named(
+                        (std::string(format.prefix) + "_q8_matvec_transposed_warp").c_str(),
+                        output_size, 1, 128, 0, 0, arguments);
+                    outputs.push_back(std::move(output));
+                }
+            },
+            kQ8BatchTolerance,
+        });
+
+        if (format.lm_head) {
+            cases().push_back(Case{
+                prefix + "_q8_lm_head_argmax_warp",
+                [format](std::vector<std::vector<float>>& outputs) {
+                    for (int input_size : q8_input_sizes(format)) {
+                        int output_size = 61;
+                        auto packed = random_q8_weights(input_size, output_size, format.stride);
+                        auto act = random_q8_activations(input_size, 1);
+                        unsigned long long winner = 0ull;
+                        const unsigned char* packed_p = packed.data();
+                        const signed char* vector_p = act.values.data();
+                        const std::uint16_t* scales_p = act.scales.data();
+                        unsigned long long* winner_p = &winner;
+                        void* arguments[] = {&packed_p, &vector_p, &scales_p, &winner_p,
+                                             &input_size, &output_size};
+                        flyweight_cpu_launch_named(
+                            (std::string(format.prefix) + "_q8_lm_head_argmax_warp").c_str(),
+                            (output_size + 7) / 8, 1, 256, 0, 0, arguments);
+                        // The row must match exactly; the logit to tolerance.
+                        const unsigned int row = 0xffffffffu - static_cast<unsigned int>(winner);
+                        unsigned int ordered = static_cast<unsigned int>(winner >> 32);
+                        const unsigned int bits = (ordered & 0x80000000u)
+                            ? (ordered ^ 0x80000000u) : ~ordered;
+                        float logit;
+                        std::memcpy(&logit, &bits, sizeof(logit));
+                        outputs.push_back({static_cast<float>(row) * 1000.0f, logit});
+                    }
+                },
+                kQ8BatchTolerance,
+            });
+        }
+
+        // The batched rows family: the full-cap name plus its _r2.._r7 twins.
+        const int caps[] = {8, 2, 3, 4, 5, 6, 7};
+        for (int cap : caps) {
+            const std::string name = prefix + "_q8_matvec_transposed_rows"
+                + (cap == 8 ? std::string() : "_r" + std::to_string(cap));
+            cases().push_back(Case{
+                name,
+                [format, cap, name](std::vector<std::vector<float>>& outputs) {
+                    const std::vector<int> sizes = format.minimum
+                        ? std::vector<int>{256, 768} : q8_input_sizes(format);
+                    for (int input_size : sizes) {
+                        // A full batch and a short one: rows < cap leaves
+                        // accumulators the kernel must not write.
+                        for (int rows : {cap, cap > 2 ? cap - 2 : 1}) {
+                            int output_size = 13;
+                            auto packed = random_q8_weights(input_size, output_size, format.stride);
+                            auto act = random_q8_activations(input_size, rows);
+                            std::vector<float> output(
+                                static_cast<std::size_t>(output_size) * cap, -7.0f);
+                            const unsigned char* packed_p = packed.data();
+                            const signed char* vectors_p = act.values.data();
+                            const std::uint16_t* scales_p = act.scales.data();
+                            float* output_p = output.data();
+                            int scale_stride = act.scale_stride;
+                            void* arguments[] = {&packed_p, &vectors_p, &scales_p, &output_p,
+                                                 &input_size, &output_size, &rows,
+                                                 &scale_stride};
+                            flyweight_cpu_launch_named(name.c_str(), output_size, 1, 128,
+                                                       0, 0, arguments);
+                            outputs.push_back(std::move(output));
+                        }
+                    }
+                },
+                kQ8BatchTolerance,
+            });
+        }
+
+        if (format.tiled) {
+            cases().push_back(Case{
+                prefix + "_q8_matmul_tiled",
+                [format](std::vector<std::vector<float>>& outputs) {
+                    for (int input_size : q8_input_sizes(format)) {
+                        // Rows off the 16-row tile and tokens off the 8-warp
+                        // split, plus a full 32-token batch.
+                        for (int rows : {32, 5}) {
+                            int output_size = 21;
+                            auto packed = random_q8_weights(input_size, output_size, format.stride);
+                            auto act = random_q8_activations(input_size, rows);
+                            std::vector<float> output(
+                                static_cast<std::size_t>(output_size) * rows, -7.0f);
+                            const unsigned char* packed_p = packed.data();
+                            const signed char* vectors_p = act.values.data();
+                            const std::uint16_t* scales_p = act.scales.data();
+                            float* output_p = output.data();
+                            int scale_stride = act.scale_stride;
+                            void* arguments[] = {&packed_p, &vectors_p, &scales_p, &output_p,
+                                                 &input_size, &output_size, &rows,
+                                                 &scale_stride};
+                            flyweight_cpu_launch_named(
+                                (std::string(format.prefix) + "_q8_matmul_tiled").c_str(),
+                                (output_size + 15) / 16, 1, 256, 0, 0, arguments);
+                            outputs.push_back(std::move(output));
+                        }
+                    }
+                },
+                kQ8BatchTolerance,
+            });
+        }
+    }
+
+    // Quantizers: bytes and scales must match exactly, so tolerance is zero.
+    cases().push_back(Case{
+        "quantize_q8_blocks",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (int elements : {32, 1000, 2560}) {
+                auto input = random_vector(elements, -3.0f, 3.0f);
+                // An all-zero block takes the scale = 1 branch.
+                for (int index = 0; index < std::min(elements, 32); ++index)
+                    input[index] = 0.0f;
+                const int blocks = (elements + 31) / 32;
+                std::vector<signed char> output(elements, 0);
+                std::vector<std::uint16_t> scales(blocks, 0);
+                const float* input_p = input.data();
+                signed char* output_p = output.data();
+                std::uint16_t* scales_p = scales.data();
+                void* arguments[] = {&input_p, &output_p, &scales_p, &elements};
+                flyweight_cpu_launch_named("quantize_q8_blocks", blocks, 1, 32, 0, 0,
+                                           arguments);
+                outputs.emplace_back(output.begin(), output.end());
+                std::vector<float> scale_values(blocks);
+                for (int b = 0; b < blocks; ++b)
+                    scale_values[b] = flyweight::cpu::half_bits_to_float(scales[b]);
+                outputs.push_back(std::move(scale_values));
+            }
+        },
+        0.0f,
+    });
+
+    cases().push_back(Case{
+        "quantize_q8_blocks_rows",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (int elements : {64, 1000, 2560}) {
+                int rows = 3;
+                int scale_stride = (elements + 31) / 32 + 2;
+                auto input = random_vector(static_cast<std::size_t>(elements) * rows,
+                                           -3.0f, 3.0f);
+                std::vector<signed char> output(static_cast<std::size_t>(elements) * rows, 0);
+                std::vector<std::uint16_t> scales(
+                    static_cast<std::size_t>(scale_stride) * rows, 0);
+                const float* input_p = input.data();
+                signed char* output_p = output.data();
+                std::uint16_t* scales_p = scales.data();
+                void* arguments[] = {&input_p, &output_p, &scales_p, &elements,
+                                     &scale_stride};
+                const int warps = 256 / 32;
+                const int blocks32 = (elements + 31) / 32;
+                flyweight_cpu_launch_named("quantize_q8_blocks_rows",
+                                           (blocks32 + warps - 1) / warps, rows, 256,
+                                           0, 0, arguments);
+                outputs.emplace_back(output.begin(), output.end());
+                std::vector<float> scale_values(scales.size());
+                for (std::size_t b = 0; b < scales.size(); ++b)
+                    scale_values[b] = flyweight::cpu::half_bits_to_float(scales[b]);
+                outputs.push_back(std::move(scale_values));
+            }
+        },
+        0.0f,
+    });
+}
+
+// --- M-RoPE query / key ---------------------------------------------------
+void add_mrope_cases() {
+    struct Shape { int heads, head_dim, rotary_dim, t, h, w, e; };
+    // Qwen 3.5's real split is [11, 11, 10] over 64 pairs; the small shape
+    // has an extra section and a non-rotated tail.
+    const Shape shapes[] = {{4, 256, 64, 11, 11, 10, 0}, {3, 64, 32, 6, 5, 4, 1}};
+
+    for (bool key : {false, true}) {
+        for (bool batched : {false, true}) {
+            const std::string name = std::string(key ? "qwen_attention_key_mrope"
+                                                     : "qwen_attention_query_mrope")
+                + (batched ? "_rows" : "");
+            cases().push_back(Case{
+                name,
+                [=](std::vector<std::vector<float>>& outputs) {
+                    for (const Shape& shape : shapes) {
+                        int heads = shape.heads, head_dim = shape.head_dim;
+                        int rotary_dim = shape.rotary_dim;
+                        int position = 37, position_h = 5, position_w = 9;
+                        int st = shape.t, sh = shape.h, sw = shape.w, se = shape.e;
+                        float theta = 10000000.0f, epsilon = 1e-6f;
+                        const int rows = batched ? 3 : 1;
+                        const int per_head = key ? head_dim : 2 * head_dim;
+                        int projected_stride = heads * per_head + 8;
+                        int out_stride = heads * head_dim + 4;
+                        auto projected = random_vector(
+                            static_cast<std::size_t>(projected_stride) * rows, -2.0f, 2.0f);
+                        auto norm = random_vector(head_dim, 0.5f, 1.5f);
+                        std::vector<float> first(static_cast<std::size_t>(out_stride) * rows, 0.0f);
+                        std::vector<float> second(static_cast<std::size_t>(out_stride) * rows, 0.0f);
+                        const float* projected_p = projected.data();
+                        const float* norm_p = norm.data();
+                        float* first_p = first.data();
+                        float* second_p = second.data();
+                        std::vector<void*> arguments = {&projected_p, &norm_p, &first_p};
+                        if (!key) arguments.push_back(&second_p);
+                        for (void* a : std::initializer_list<void*>{
+                                 &heads, &head_dim, &rotary_dim, &position, &theta,
+                                 &epsilon, &position_h, &position_w, &st, &sh, &sw, &se})
+                            arguments.push_back(a);
+                        if (batched) {
+                            arguments.push_back(&projected_stride);
+                            arguments.push_back(&out_stride);
+                            if (!key) arguments.push_back(&out_stride);
+                        }
+                        flyweight_cpu_launch_named(name.c_str(), heads, rows, 256, 0, 0,
+                                                   arguments.data());
+                        outputs.push_back(std::move(first));
+                        if (!key) outputs.push_back(std::move(second));
+                    }
+                },
+                1e-5f,
+            });
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
     flyweight_backend_select(kFlyweightBackendCpu);
     add_cases();
+    add_q8_family_cases();
+    add_mrope_cases();
 
     std::printf("CPU kernel parity (native vs emulated corpus)\n");
     int failures = 0;

@@ -3,13 +3,22 @@
 // The kernel bodies here are the generated copy of the same text NVRTC compiles
 // for the GPU backend (native/tools/generate_cpu_kernels.py). Nothing in this
 // file should hand-implement a kernel: if the numerics need to change, they
-// change in the CUDA headers and both backends follow.
+// change in the CUDA headers and both backends follow. The one exception is
+// cpu_q8_family.inc, which drives the corpus's own per-group functions from a
+// host loop instead of a fiber block.
 
 #include <flyweight_cpu_shim.hpp>
 #include <flyweight_cpu_kernels_api.hpp>
+#include <flyweight_cpu_native.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
+#include <vector>
+
+// Host ISA probe (cpu_backend.cpp); cpu_q8_family.inc picks its loops from it.
+extern "C" std::uint32_t flyweight_cpu_features();
 
 // ---------------------------------------------------------------------------
 // cub::BlockRadixSort
@@ -102,6 +111,12 @@ struct FlyweightCpuKernelEntry {
 };
 
 #include "flyweight_cpu_kernel_table.inc"
+
+// Host drivers for the Q8-activation matvec families. They reuse the corpus's
+// per-group decode and arithmetic above and replace only the fiber-per-thread
+// decomposition around it; see the file for why that one family is the
+// exception to "nothing here is hand-implemented".
+#include "cpu_q8_family.inc"
 
 }  // namespace
 

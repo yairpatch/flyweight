@@ -20622,6 +20622,12 @@ static int qwen_runtime_prepare_once(FlyweightV2QwenRuntime*runtime){return guar
         runtime->cuda_graphs=false;
     runtime->prefill_profile=std::getenv("FLYWEIGHT_PREFILL_PROFILE")&&
         std::getenv("FLYWEIGHT_PREFILL_PROFILE")[0]=='1';
+    // The fused split-KV attention kernels are shaped for a GPU (a block per
+    // KV head and tile, reductions through warp shuffles) and have no host
+    // implementation, so on the CPU backend they run emulated on fibers: ~54 ms
+    // a layer at a 50-token context on a 4B model, against well under a
+    // millisecond for the serial ring path, whose kernels are native.
+    if(flyweight_backend_is_cpu())runtime->fused_attention=false;
     if(const char*fused=std::getenv("FLYWEIGHT_FUSED_ATTENTION"))
         runtime->fused_attention=fused[0]!='0';
     else if(const char*fused=std::getenv("FLYWEIGHT_FUSED_Q8_ATTENTION"))
