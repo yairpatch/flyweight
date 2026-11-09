@@ -174,15 +174,11 @@ void qwen_f32_matvec_warp(const Launch&, void** arguments) {
 // with the token loop inside, so each weight row is fetched once and reused
 // across all tokens -- the arithmetic intensity the GPU version does not need
 // and the CPU version lives on.
-void qwen_f32_matmul_rows(const Launch&, void** arguments) {
-    const float* matrix = *reinterpret_cast<const float**>(arguments[0]);
-    const float* input = *reinterpret_cast<const float**>(arguments[1]);
-    float* output = *reinterpret_cast<float**>(arguments[2]);
-    const int input_size = *reinterpret_cast<const int*>(arguments[3]);
-    const int output_size = *reinterpret_cast<const int*>(arguments[4]);
-    const int rows = *reinterpret_cast<const int*>(arguments[5]);
-
-    parallel_chunks(static_cast<std::uint64_t>(output_size),
+// `outputs` and `rows` bound what is computed; the output row stride is always
+// the launch's output_size.
+void f32_matmul(const float* matrix, const float* input, float* output,
+                int input_size, int output_size, int outputs, int rows) {
+    parallel_chunks(static_cast<std::uint64_t>(std::max(outputs, 0)),
                     [&](std::uint64_t output_row) {
         const float* row_matrix =
             matrix + static_cast<std::int64_t>(output_row) * input_size;
@@ -192,6 +188,37 @@ void qwen_f32_matmul_rows(const Launch&, void** arguments) {
                         input_size);
         }
     });
+}
+
+void qwen_f32_matmul_rows(const Launch&, void** arguments) {
+    const float* matrix = *reinterpret_cast<const float**>(arguments[0]);
+    const float* input = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int input_size = *reinterpret_cast<const int*>(arguments[3]);
+    const int output_size = *reinterpret_cast<const int*>(arguments[4]);
+    const int rows = *reinterpret_cast<const int*>(arguments[5]);
+    f32_matmul(matrix, input, output, input_size, output_size, output_size, rows);
+}
+
+// --- f32_matmul_tiled64 ---------------------------------------------------
+//
+// Corpus signature: identical to qwen_f32_matmul_rows; the GPU version tiles
+// 64 outputs x 64 tokens per block through shared memory (the fp32 MoE router
+// GEMM in prefill). On the host the tiling buys nothing, and emulated it cost
+// ~50 ms a launch -- most of a 35B-A3B CPU prefill. The grid bounds what the
+// corpus computes, so they bound it here too.
+void f32_matmul_tiled64(const Launch& launch, void** arguments) {
+    const float* matrix = *reinterpret_cast<const float**>(arguments[0]);
+    const float* input = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int input_size = *reinterpret_cast<const int*>(arguments[3]);
+    const int output_size = *reinterpret_cast<const int*>(arguments[4]);
+    const int rows = *reinterpret_cast<const int*>(arguments[5]);
+    const int outputs = static_cast<int>(std::min<std::int64_t>(
+        output_size, static_cast<std::int64_t>(launch.grid_x) * 64));
+    const int tokens = static_cast<int>(std::min<std::int64_t>(
+        rows, static_cast<std::int64_t>(launch.grid_y) * 64));
+    f32_matmul(matrix, input, output, input_size, output_size, outputs, tokens);
 }
 
 // --- Q8_0 ------------------------------------------------------------------
@@ -558,10 +585,30 @@ void qwen_shared_scale_rows(const Launch&, void** arguments) {
 // The rotation reads the *pre-rotation* normalized partner, which is why the
 // normalized values are staged before any of them are written back -- rotating
 // in place would feed already-rotated values into later pairs.
+// M-RoPE (Qwen-VL style) splits the rotary pairs into time / height / width
+// sections, each rotated by its own position. Null means plain RoPE: every pair
+// uses `position`. Mirrors the corpus's qwen_mrope_position.
+struct MropeSections {
+    int position_h, position_w;
+    int sections_t, sections_h, sections_w, sections_e;
+};
+
+inline float mrope_position(const MropeSections& m, int pair, int position_t) {
+    const int total = m.sections_t + m.sections_h + m.sections_w + m.sections_e;
+    const int sector = total > 0 ? pair % total : pair;
+    const int which = sector % 3;
+    if (which == 1 && sector < 3 * m.sections_h)
+        return static_cast<float>(m.position_h);
+    if (which == 2 && sector < 3 * m.sections_w)
+        return static_cast<float>(m.position_w);
+    return static_cast<float>(position_t);
+}
+
 inline void attention_head_norm_rope(const float* source, const float* norm_weights,
                                      float* destination, int head_dim,
                                      int rotary_dim, int position, float theta,
-                                     float epsilon) {
+                                     float epsilon,
+                                     const MropeSections* mrope = nullptr) {
     // rotary_dim flows from GGUF metadata (rope.dimension_count). The partner
     // lookup below reads up to normalized[rotary_dim - 1] out of a buffer
     // sized head_dim, so a checkpoint claiming a wider rotary span than the
@@ -590,7 +637,10 @@ inline void attention_head_norm_rope(const float* source, const float* norm_weig
             const int pair = index < half ? index : index - half;
             const float other =
                 normalized[index < half ? index + half : index - half];
-            const float angle = static_cast<float>(position) /
+            const float rotation = mrope != nullptr
+                ? mrope_position(*mrope, pair, position)
+                : static_cast<float>(position);
+            const float angle = rotation /
                 std::pow(theta, 2.0f * static_cast<float>(pair) /
                                     static_cast<float>(rotary_dim));
             value = index < half
@@ -645,6 +695,132 @@ void qwen_attention_key(const Launch&, void** arguments) {
         attention_head_norm_rope(source, norm_weights, destination, head_dim,
                                  rotary_dim, position, theta, epsilon);
     });
+}
+
+// --- M-RoPE query/key, per token and batched -------------------------------
+//
+// Corpus signatures (flyweight_v2_native_kernels.hpp):
+//   void qwen_attention_query_mrope(projected, norm_weights, queries, gates,
+//       heads, head_dim, rotary_dim, position, theta, epsilon,
+//       position_h, position_w, sections_t, sections_h, sections_w, sections_e)
+//   void qwen_attention_query_mrope_rows(... same ...,
+//       projected_stride, query_stride, gate_stride)          blockIdx.y = row
+//   void qwen_attention_key_mrope(projected, norm_weights, keys, heads,
+//       head_dim, rotary_dim, position, theta, epsilon,
+//       position_h, position_w, sections_t, sections_h, sections_w, sections_e)
+//   void qwen_attention_key_mrope_rows(... same ..., projected_stride,
+//       key_stride)                                           blockIdx.y = row
+//
+// The same head norm + rotation as qwen_attention_query/key, with the rotation
+// position chosen per pair. The batched twins are text prompts, where all
+// three positions are `position + row`. Every Qwen 3.5+ full-attention layer
+// goes through these; emulated they cost 3-4 ms a call, ~50 ms a decoded token
+// on a 4B model.
+struct MropeArguments {
+    int heads, head_dim, rotary_dim, position;
+    float theta, epsilon;
+    MropeSections sections;
+};
+
+inline MropeArguments mrope_arguments(void** arguments, int first) {
+    auto integer = [&](int index) {
+        return *reinterpret_cast<const int*>(arguments[first + index]);
+    };
+    auto real = [&](int index) {
+        return *reinterpret_cast<const float*>(arguments[first + index]);
+    };
+    return MropeArguments{
+        integer(0), integer(1), integer(2), integer(3), real(4), real(5),
+        MropeSections{integer(6), integer(7), integer(8), integer(9),
+                      integer(10), integer(11)},
+    };
+}
+
+// rows == 1 with zero strides is the per-token kernel.
+void attention_query_mrope(const float* projected, const float* norm_weights,
+                           float* queries, float* gates, const MropeArguments& a,
+                           int rows, bool batched, std::int64_t projected_stride,
+                           std::int64_t query_stride, std::int64_t gate_stride) {
+    const std::uint64_t heads = static_cast<std::uint64_t>(std::max(a.heads, 0));
+    parallel_chunks(static_cast<std::uint64_t>(rows) * heads, [&](std::uint64_t item) {
+        const std::int64_t row = static_cast<std::int64_t>(item / heads);
+        const std::int64_t head = static_cast<std::int64_t>(item % heads);
+        MropeSections sections = a.sections;
+        int position = a.position;
+        if (batched) {
+            position += static_cast<int>(row);
+            sections.position_h = sections.position_w = position;
+        }
+        const float* source =
+            projected + row * projected_stride + head * 2 * a.head_dim;
+        attention_head_norm_rope(source, norm_weights,
+                                 queries + row * query_stride + head * a.head_dim,
+                                 a.head_dim, a.rotary_dim, position, a.theta,
+                                 a.epsilon, &sections);
+        float* gate_out = gates + row * gate_stride + head * a.head_dim;
+        for (int index = 0; index < a.head_dim; ++index)
+            gate_out[index] = source[a.head_dim + index];
+    });
+}
+
+void attention_key_mrope(const float* projected, const float* norm_weights,
+                         float* keys, const MropeArguments& a, int rows,
+                         bool batched, std::int64_t projected_stride,
+                         std::int64_t key_stride) {
+    const std::uint64_t heads = static_cast<std::uint64_t>(std::max(a.heads, 0));
+    parallel_chunks(static_cast<std::uint64_t>(rows) * heads, [&](std::uint64_t item) {
+        const std::int64_t row = static_cast<std::int64_t>(item / heads);
+        const std::int64_t head = static_cast<std::int64_t>(item % heads);
+        MropeSections sections = a.sections;
+        int position = a.position;
+        if (batched) {
+            position += static_cast<int>(row);
+            sections.position_h = sections.position_w = position;
+        }
+        attention_head_norm_rope(
+            projected + row * projected_stride + head * a.head_dim, norm_weights,
+            keys + row * key_stride + head * a.head_dim, a.head_dim,
+            a.rotary_dim, position, a.theta, a.epsilon, &sections);
+    });
+}
+
+void qwen_attention_query_mrope(const Launch&, void** arguments) {
+    attention_query_mrope(
+        *reinterpret_cast<const float**>(arguments[0]),
+        *reinterpret_cast<const float**>(arguments[1]),
+        *reinterpret_cast<float**>(arguments[2]),
+        *reinterpret_cast<float**>(arguments[3]),
+        mrope_arguments(arguments, 4), 1, false, 0, 0, 0);
+}
+
+void qwen_attention_query_mrope_rows(const Launch& launch, void** arguments) {
+    attention_query_mrope(
+        *reinterpret_cast<const float**>(arguments[0]),
+        *reinterpret_cast<const float**>(arguments[1]),
+        *reinterpret_cast<float**>(arguments[2]),
+        *reinterpret_cast<float**>(arguments[3]),
+        mrope_arguments(arguments, 4), static_cast<int>(launch.grid_y), true,
+        *reinterpret_cast<const int*>(arguments[16]),
+        *reinterpret_cast<const int*>(arguments[17]),
+        *reinterpret_cast<const int*>(arguments[18]));
+}
+
+void qwen_attention_key_mrope(const Launch&, void** arguments) {
+    attention_key_mrope(
+        *reinterpret_cast<const float**>(arguments[0]),
+        *reinterpret_cast<const float**>(arguments[1]),
+        *reinterpret_cast<float**>(arguments[2]),
+        mrope_arguments(arguments, 3), 1, false, 0, 0);
+}
+
+void qwen_attention_key_mrope_rows(const Launch& launch, void** arguments) {
+    attention_key_mrope(
+        *reinterpret_cast<const float**>(arguments[0]),
+        *reinterpret_cast<const float**>(arguments[1]),
+        *reinterpret_cast<float**>(arguments[2]),
+        mrope_arguments(arguments, 3), static_cast<int>(launch.grid_y), true,
+        *reinterpret_cast<const int*>(arguments[15]),
+        *reinterpret_cast<const int*>(arguments[16]));
 }
 
 // --- qwen_delta_recurrent_split -------------------------------------------
@@ -1165,6 +1341,10 @@ FLYWEIGHT_CPU_NATIVE_KERNEL("route_topk_rows", route_topk_rows);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_shared_scale_rows", qwen_shared_scale_rows);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_query", qwen_attention_query);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_key", qwen_attention_key);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_query_mrope", qwen_attention_query_mrope);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_query_mrope_rows", qwen_attention_query_mrope_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_key_mrope", qwen_attention_key_mrope);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_key_mrope_rows", qwen_attention_key_mrope_rows);
 // --- qwen_imatrix_accumulate ----------------------------------------------
 //
 // Corpus signature:
@@ -1281,6 +1461,7 @@ FLYWEIGHT_CPU_NATIVE_KERNEL("qwen4_group_rms_rows", qwen4_group_rms_rows);
 FLYWEIGHT_CPU_NATIVE_KERNEL("k2_half_split_rope", k2_half_split_rope);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("f32_matmul_tiled64", f32_matmul_tiled64);
 
 // --- qwen_attention_gate --------------------------------------------------
 //
