@@ -200,6 +200,23 @@ void qwen_f32_matmul_rows(const Launch&, void** arguments) {
     f32_matmul(matrix, input, output, input_size, output_size, output_size, rows);
 }
 
+// --- qwen_f32_matvec -------------------------------------------------------
+//
+// Corpus signature: (matrix, input, output, input_size, output_size), one
+// block per output row. The warp variant below has been native for a while;
+// this block-per-row twin is what the runtime picks for some shapes (Qwen3.5
+// 2B's), and emulated it cost ~12 ms a launch, ~36 launches a decoded token.
+void qwen_f32_matvec(const Launch& launch, void** arguments) {
+    const float* matrix = *reinterpret_cast<const float**>(arguments[0]);
+    const float* input = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int input_size = *reinterpret_cast<const int*>(arguments[3]);
+    const int output_size = *reinterpret_cast<const int*>(arguments[4]);
+    const int outputs = static_cast<int>(
+        std::min<std::int64_t>(output_size, launch.grid_x));
+    f32_matmul(matrix, input, output, input_size, output_size, outputs, 1);
+}
+
 // --- f32_matmul_tiled64 ---------------------------------------------------
 //
 // Corpus signature: identical to qwen_f32_matmul_rows; the GPU version tiles
@@ -1462,6 +1479,7 @@ FLYWEIGHT_CPU_NATIVE_KERNEL("k2_half_split_rope", k2_half_split_rope);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
 FLYWEIGHT_CPU_NATIVE_KERNEL("f32_matmul_tiled64", f32_matmul_tiled64);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec", qwen_f32_matvec);
 
 // --- qwen_attention_gate --------------------------------------------------
 //

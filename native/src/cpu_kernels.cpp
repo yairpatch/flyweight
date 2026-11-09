@@ -118,6 +118,18 @@ struct FlyweightCpuKernelEntry {
 // exception to "nothing here is hand-implemented".
 #include "cpu_q8_family.inc"
 
+// Host driver for the chunked-prefill attention (KV_PREFILL), same approach.
+#include "cpu_kv_prefill.inc"
+
+// Host driver for the block top-k sampling sort.
+#include "cpu_sampling.inc"
+
+// Host drivers for the split scores/values decode attention.
+#include "cpu_kv_ring.inc"
+
+// Host drivers for a few small elementwise kernels.
+#include "cpu_elementwise.inc"
+
 }  // namespace
 
 namespace flyweight::cpu {
