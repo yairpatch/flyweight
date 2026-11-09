@@ -1437,6 +1437,400 @@ void add_q8_family_cases() {
     });
 }
 
+
+// A KV cache built from random floats in a storage format. kind: 0 f32,
+// 1 f16, 2 bf16, 3 q8_0 (fp16 scale + 32 int8 per 34-byte block).
+std::vector<unsigned char> encode_cache(int kind, const std::vector<float>& raw) {
+    std::vector<unsigned char> bytes;
+    if (kind == 0) {
+        bytes.resize(raw.size() * 4);
+        std::memcpy(bytes.data(), raw.data(), bytes.size());
+    } else if (kind == 1 || kind == 2) {
+        bytes.resize(raw.size() * 2);
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+            std::uint16_t bits;
+            if (kind == 1) {
+                bits = flyweight::cpu::float_to_half_bits(raw[i]);
+            } else {
+                std::uint32_t full;
+                std::memcpy(&full, &raw[i], 4);
+                bits = static_cast<std::uint16_t>(full >> 16);
+            }
+            std::memcpy(bytes.data() + 2 * i, &bits, 2);
+        }
+    } else {
+        bytes.resize(raw.size() / 32 * 34);
+        for (std::size_t block = 0; block < raw.size() / 32; ++block) {
+            const float* slice = raw.data() + block * 32;
+            float absmax = 0.0f;
+            for (int i = 0; i < 32; ++i) absmax = std::fmax(absmax, std::fabs(slice[i]));
+            const float scale = absmax / 127.0f;
+            const std::uint16_t bits = flyweight::cpu::float_to_half_bits(scale);
+            unsigned char* out = bytes.data() + block * 34;
+            std::memcpy(out, &bits, 2);
+            for (int i = 0; i < 32; ++i)
+                out[2 + i] = static_cast<unsigned char>(static_cast<signed char>(
+                    std::lround(scale > 0 ? slice[i] / scale : 0.0f)));
+        }
+    }
+    return bytes;
+}
+
+// --- split decode attention and the turbo cache (cpu_kv_ring.inc) ---------
+
+// A turbo3/turbo4 cache of random rows: per 32 values an fp16 scale and the
+// packed codebook indices. Bytes come from [0x00, 0x3b] u [0x80, 0xbb] so every
+// scale is a finite fp16 below 1; the indices still take every value.
+std::vector<unsigned char> random_turbo_cache(int bits, std::size_t values) {
+    const int bytes = bits == 3 ? 14 : 18;
+    std::uniform_int_distribution<int> byte(0, 2 * 0x3c - 1);
+    std::vector<unsigned char> out(values / 32 * bytes);
+    for (auto& value : out) {
+        const int pick = byte(rng());
+        value = static_cast<unsigned char>(pick < 0x3c ? pick : 0x80 + pick - 0x3c);
+    }
+    return out;
+}
+
+void add_kv_split_cases() {
+    // kind: 0 f32, 1 f16, 2 bf16, 3 q8_0, 4 turbo3, 5 turbo4.
+    // mode: 0 linear, 1 ring, 2 indexed.
+    struct Kernel { std::string name; int kind; int mode; bool values; };
+    std::vector<Kernel> kernels;
+    const char* suffixes[] = {"", "_f16", "_bf16", "_q8", "_turbo3", "_turbo4"};
+    const char* modes[] = {"", "_ring", "_indexed"};
+    for (int kind = 0; kind < 6; ++kind) {
+        for (int mode = 0; mode < 3; ++mode) {
+            kernels.push_back({std::string("kv_attention_scores") + suffixes[kind] + modes[mode],
+                               kind, mode, false});
+            // f32 / f16 ring values have long-standing cases of their own.
+            if (mode == 1 && kind <= 1) continue;
+            kernels.push_back({std::string("kv_attention_values") + suffixes[kind] + modes[mode],
+                               kind, mode, true});
+        }
+    }
+    for (const Kernel& kernel : kernels) {
+        cases().push_back(Case{
+            kernel.name,
+            [kernel](std::vector<std::vector<float>>& outputs) {
+                struct Shape { int heads, kv_heads, head_dim, tokens, capacity, first; };
+                // A ring window that wraps, a full one, a single token, and
+                // more tokens than one 256-thread score block covers.
+                const Shape shapes[] = {{4, 2, 64, 37, 48, 20},
+                                        {8, 8, 32, 64, 64, 0},
+                                        {2, 1, 128, 1, 16, 15},
+                                        {4, 1, 64, 300, 320, 100}};
+                for (const Shape& shape : shapes) {
+                    int heads = shape.heads, kv_heads = shape.kv_heads;
+                    int head_dim = shape.head_dim, tokens = shape.tokens;
+                    int capacity = shape.capacity;
+                    int first = kernel.mode == 1 ? shape.first : 0;
+                    const std::size_t cache_values =
+                        static_cast<std::size_t>(kv_heads) * capacity * head_dim;
+                    auto cache = kernel.kind >= 4
+                        ? random_turbo_cache(kernel.kind == 4 ? 3 : 4, cache_values)
+                        : encode_cache(kernel.kind, random_vector(cache_values, -1.5f, 1.5f));
+                    // QSA picks arbitrary rows, repeats included.
+                    std::vector<int> slots(tokens);
+                    std::uniform_int_distribution<int> pick(0, capacity - 1);
+                    for (auto& slot : slots) slot = pick(rng());
+                    const unsigned char* cache_p = cache.data();
+                    const int* slots_p = slots.data();
+                    if (!kernel.values) {
+                        auto query = random_vector(
+                            static_cast<std::size_t>(heads) * head_dim, -1.0f, 1.0f);
+                        std::vector<float> scores(static_cast<std::size_t>(heads) * tokens, -7.0f);
+                        const float* query_p = query.data();
+                        float* scores_p = scores.data();
+                        float scale = 0.125f;
+                        std::vector<void*> arguments = {&query_p, &cache_p};
+                        if (kernel.mode == 2) arguments.push_back(&slots_p);
+                        for (void* a : std::initializer_list<void*>{
+                                 &scores_p, &heads, &kv_heads, &head_dim, &tokens, &capacity})
+                            arguments.push_back(a);
+                        if (kernel.mode == 1) arguments.push_back(&first);
+                        arguments.push_back(&scale);
+                        flyweight_cpu_launch_named(kernel.name.c_str(), heads,
+                                                   (tokens + 255) / 256, 256, 0, 0,
+                                                   arguments.data());
+                        outputs.push_back(std::move(scores));
+                    } else {
+                        auto scores = random_vector(
+                            static_cast<std::size_t>(heads) * tokens, -6.0f, 6.0f);
+                        std::vector<float> output(static_cast<std::size_t>(heads) * head_dim, -7.0f);
+                        float* scores_p = scores.data();
+                        float* output_p = output.data();
+                        std::vector<void*> arguments = {&scores_p, &cache_p};
+                        if (kernel.mode == 2) arguments.push_back(&slots_p);
+                        for (void* a : std::initializer_list<void*>{
+                                 &output_p, &heads, &kv_heads, &head_dim, &tokens, &capacity})
+                            arguments.push_back(a);
+                        if (kernel.mode == 1) arguments.push_back(&first);
+                        flyweight_cpu_launch_named(kernel.name.c_str(), heads, 1, 256, 0, 0,
+                                                   arguments.data());
+                        outputs.push_back(std::move(output));
+                        // Normalized in place by every variant but linear q8.
+                        outputs.push_back(std::move(scores));
+                    }
+                }
+            },
+            1e-5f,
+        });
+    }
+
+    // Turbo stores: the coded bytes must match exactly.
+    for (int bits : {3, 4}) {
+        for (const char* side : {"k", "v"}) {
+            for (bool rows_variant : {false, true}) {
+                const std::string name = "kv_store_turbo" + std::to_string(bits) + "_" + side
+                    + (rows_variant ? "_rows" : "");
+                cases().push_back(Case{
+                    name,
+                    [=](std::vector<std::vector<float>>& outputs) {
+                        for (int head_dim : {64, 256}) {
+                            int kv_heads = 3, capacity = 10, position = 8;
+                            int row_stride = kv_heads * head_dim + 5;
+                            const int rows = rows_variant ? 4 : 1;  // wraps the ring
+                            const int bytes = bits == 3 ? 14 : 18;
+                            auto current = random_vector(
+                                static_cast<std::size_t>(row_stride) * rows, -2.0f, 2.0f);
+                            std::vector<unsigned char> cache(
+                                static_cast<std::size_t>(kv_heads) * capacity * (head_dim / 32)
+                                    * bytes, 0x5a);
+                            const float* current_p = current.data();
+                            unsigned char* cache_p = cache.data();
+                            std::vector<void*> arguments = {&current_p, &cache_p, &kv_heads,
+                                                            &head_dim, &position, &capacity};
+                            if (rows_variant) arguments.push_back(&row_stride);
+                            flyweight_cpu_launch_named(name.c_str(), kv_heads, rows, 256, 0, 0,
+                                                       arguments.data());
+                            outputs.emplace_back(cache.begin(), cache.end());
+                        }
+                    },
+                    0.0f,
+                });
+            }
+        }
+    }
+
+    // Rotation: the transform is order-identical, so exact.
+    for (const char* name : {"turbo_rotate_rows", "turbo_unrotate_rows"}) {
+        cases().push_back(Case{
+            name,
+            [name](std::vector<std::vector<float>>& outputs) {
+                for (int dim : {32, 128, 512}) {
+                    int rows = 5, stream = 1;
+                    auto data = random_vector(static_cast<std::size_t>(rows) * dim, -3.0f, 3.0f);
+                    float* data_p = data.data();
+                    void* arguments[] = {&data_p, &rows, &dim, &stream};
+                    flyweight_cpu_launch_named(name, rows, 1, 256, 0, 0, arguments);
+                    outputs.push_back(std::move(data));
+                }
+            },
+            0.0f,
+        });
+    }
+}
+
+// --- chunked-prefill attention (cpu_kv_prefill.inc) -----------------------
+void add_kv_prefill_cases() {
+    // kind: 0 f32, 1 f16, 2 bf16, 3 q8_0. The cache is built from random floats
+    // in the storage format, so both paths read identical bits.
+    struct Kernel { const char* name; int kind; };
+    const Kernel kernels[] = {{"kv_attention_prefill", 0},
+                              {"kv_attention_prefill_f16", 1},
+                              {"kv_attention_prefill_bf16", 2},
+                              {"kv_attention_prefill_q8", 3}};
+    for (const Kernel& kernel : kernels) {
+        cases().push_back(Case{
+            kernel.name,
+            [kernel](std::vector<std::vector<float>>& outputs) {
+                struct Shape { int heads, kv_heads, head_dim, base, rows, window; };
+                // GQA and MHA, a chunk starting mid-context, a ragged final
+                // warp tile, and a sliding window (the q8 kernel has none).
+                const Shape shapes[] = {{4, 2, 64, 0, 37, 0},
+                                        {2, 2, 128, 21, 9, 0},
+                                        {8, 2, 32, 5, 70, 11}};
+                for (const Shape& shape : shapes) {
+                    int heads = shape.heads, kv_heads = shape.kv_heads;
+                    int head_dim = shape.head_dim, base = shape.base, rows = shape.rows;
+                    int window = kernel.kind == 3 ? 0 : shape.window;
+                    int capacity = base + rows + 3;
+                    const std::size_t cache_values =
+                        static_cast<std::size_t>(kv_heads) * capacity * head_dim;
+                    auto raw_keys = random_vector(cache_values, -1.5f, 1.5f);
+                    auto raw_values = random_vector(cache_values, -1.5f, 1.5f);
+                    auto encode = [&](const std::vector<float>& raw) {
+                        return encode_cache(kernel.kind, raw);
+                    };
+                    auto keys = encode(raw_keys);
+                    auto values = encode(raw_values);
+                    auto queries = random_vector(
+                        static_cast<std::size_t>(rows) * heads * head_dim, -1.0f, 1.0f);
+                    std::vector<float> output(queries.size(), -7.0f);
+                    const float* queries_p = queries.data();
+                    const unsigned char* keys_p = keys.data();
+                    const unsigned char* values_p = values.data();
+                    float* output_p = output.data();
+                    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                    void* arguments[] = {&queries_p, &keys_p, &values_p, &output_p,
+                                         &heads, &kv_heads, &head_dim, &base, &rows,
+                                         &capacity, &scale, &window};
+                    // The runtime's geometry: a block per head, eight warps of
+                    // four rows each per block.
+                    flyweight_cpu_launch_named(kernel.name, heads, (rows + 31) / 32, 256,
+                                               0, 0, arguments);
+                    outputs.push_back(std::move(output));
+                }
+            },
+            1e-5f,
+        });
+    }
+}
+
+
+// --- sampling top-k and the block-per-row f32 matvec ----------------------
+void add_sampling_cases() {
+    // Duplicate logits and NaNs exercise the tie order; a count off the
+    // 1,024-item block exercises the padded tail.
+    auto make_logits = [](int count) {
+        auto logits = random_vector(count, -8.0f, 8.0f);
+        for (int i = 0; i < count; i += 97) logits[i] = 3.25f;
+        for (int i = 13; i < count; i += 501) logits[i] = std::nanf("");
+        return logits;
+    };
+    cases().push_back(Case{
+        "sampling_block_topk_logits",
+        [make_logits](std::vector<std::vector<float>>& outputs) {
+            for (int count : {1024, 5000, 3}) {
+                for (int top_k : {40, 1024}) {
+                    auto logits = make_logits(count);
+                    const int blocks = (count + 1023) / 1024;
+                    std::vector<int> indices(static_cast<std::size_t>(blocks) * top_k, -7);
+                    std::vector<float> values(indices.size(), -7.0f);
+                    const float* logits_p = logits.data();
+                    int* indices_p = indices.data();
+                    float* values_p = values.data();
+                    void* arguments[] = {&logits_p, &indices_p, &values_p, &count, &top_k};
+                    flyweight_cpu_launch_named("sampling_block_topk_logits", blocks, 1,
+                                               256, 0, 0, arguments);
+                    outputs.emplace_back(indices.begin(), indices.end());
+                    outputs.push_back(std::move(values));
+                }
+            }
+        },
+        0.0f,
+    });
+    cases().push_back(Case{
+        "sampling_block_topk_pairs",
+        [make_logits](std::vector<std::vector<float>>& outputs) {
+            for (int count : {1024, 2600}) {
+                int top_k = 64;
+                auto values_in = make_logits(count);
+                std::vector<int> indices_in(count);
+                for (int i = 0; i < count; ++i) indices_in[i] = (i * 7919) % 250000;
+                const int blocks = (count + 1023) / 1024;
+                std::vector<int> indices(static_cast<std::size_t>(blocks) * top_k, -7);
+                std::vector<float> values(indices.size(), -7.0f);
+                const int* in_indices_p = indices_in.data();
+                const float* in_values_p = values_in.data();
+                int* indices_p = indices.data();
+                float* values_p = values.data();
+                void* arguments[] = {&in_indices_p, &in_values_p, &indices_p, &values_p,
+                                     &count, &top_k};
+                flyweight_cpu_launch_named("sampling_block_topk_pairs", blocks, 1, 256,
+                                           0, 0, arguments);
+                outputs.emplace_back(indices.begin(), indices.end());
+                outputs.push_back(std::move(values));
+            }
+        },
+        0.0f,
+    });
+    cases().push_back(Case{
+        "qwen_f32_matvec",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (const auto& shape : {std::pair<int, int>{2048, 32}, {256, 65}, {100, 7}}) {
+                int input_size = shape.first, output_size = shape.second;
+                auto matrix = random_vector(
+                    static_cast<std::size_t>(input_size) * output_size, -1.0f, 1.0f);
+                auto input = random_vector(input_size, -1.0f, 1.0f);
+                std::vector<float> output(output_size, -7.0f);
+                const float* matrix_p = matrix.data();
+                const float* input_p = input.data();
+                float* output_p = output.data();
+                void* arguments[] = {&matrix_p, &input_p, &output_p, &input_size,
+                                     &output_size};
+                flyweight_cpu_launch_named("qwen_f32_matvec", output_size, 1, 256, 0, 0,
+                                           arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        1e-5f,
+    });
+}
+
+
+// --- small elementwise kernels (cpu_elementwise.inc) ----------------------
+void add_elementwise_cases() {
+    cases().push_back(Case{
+        "qwen_copy_vector",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (int elements : {1, 1000, 4096}) {
+                auto input = random_vector(elements, -2.0f, 2.0f);
+                std::vector<float> output(elements + 3, -7.0f);
+                const float* input_p = input.data();
+                float* output_p = output.data();
+                void* arguments[] = {&input_p, &output_p, &elements};
+                flyweight_cpu_launch_named("qwen_copy_vector", (elements + 255) / 256, 1,
+                                           256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        0.0f,
+    });
+    cases().push_back(Case{
+        "silu_mul",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (int elements : {1, 1000, 9216}) {
+                auto gate_up = random_vector(static_cast<std::size_t>(elements) * 2, -9.0f, 9.0f);
+                std::vector<float> output(elements, -7.0f);
+                const float* gate_up_p = gate_up.data();
+                float* output_p = output.data();
+                void* arguments[] = {&gate_up_p, &output_p, &elements};
+                flyweight_cpu_launch_named("silu_mul", (elements + 255) / 256, 1, 256, 0, 0,
+                                           arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        0.0f,
+    });
+    cases().push_back(Case{
+        "delta_conv_chunk",
+        [](std::vector<std::vector<float>>& outputs) {
+            for (int tokens : {1, 17}) {
+                int channels = 300, kernel_size = 4;
+                auto mixed = random_vector(static_cast<std::size_t>(tokens) * channels, -2.0f, 2.0f);
+                auto weights = random_vector(static_cast<std::size_t>(channels) * kernel_size,
+                                             -1.0f, 1.0f);
+                auto state = random_vector(static_cast<std::size_t>(channels) * kernel_size,
+                                           -1.0f, 1.0f);
+                std::vector<float> output(mixed.size(), -7.0f);
+                const float* mixed_p = mixed.data();
+                const float* weights_p = weights.data();
+                float* state_p = state.data();
+                float* output_p = output.data();
+                void* arguments[] = {&mixed_p, &weights_p, &state_p, &output_p, &tokens,
+                                     &channels, &kernel_size};
+                flyweight_cpu_launch_named("delta_conv_chunk", (channels + 127) / 128, 1, 128,
+                                           0, 0, arguments);
+                outputs.push_back(std::move(output));
+                outputs.push_back(std::move(state));
+            }
+        },
+        0.0f,
+    });
+}
+
 // --- M-RoPE query / key ---------------------------------------------------
 void add_mrope_cases() {
     struct Shape { int heads, head_dim, rotary_dim, t, h, w, e; };
@@ -1501,6 +1895,10 @@ int main() {
     add_cases();
     add_q8_family_cases();
     add_mrope_cases();
+    add_kv_prefill_cases();
+    add_sampling_cases();
+    add_kv_split_cases();
+    add_elementwise_cases();
 
     std::printf("CPU kernel parity (native vs emulated corpus)\n");
     int failures = 0;
