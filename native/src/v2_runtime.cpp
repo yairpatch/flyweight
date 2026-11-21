@@ -13187,7 +13187,7 @@ extern "C" __global__ void raon_rda_recurrence(
         const float beta = 1.0f / (1.0f + expf(-b));
         const float sp1 = -b > 20.0f ? -b : log1pf(expf(-b));
         const float sp2 = -(b + d) > 20.0f ? -(b + d) : log1pf(expf(-(b + d)));
-        const float ratio = expf(sp1 - sp2);
+)" R"(        const float ratio = expf(sp1 - sp2);
         float pred = 0.0f;
         for (int j = 0; j < D; ++j) {
             const float value = S[j * D + i] * decay[j];
@@ -13360,7 +13360,7 @@ extern "C" __global__ void raon_mla_attention(
     for (int j = 0; j < 64; ++j) ctx[(long long)my_row * 512 + lane + 8 * j] = acc[j] * inverse;
 }
 
-// Decode attention: one token's 40 query rows [heads][576] against
+)" R"(// Decode attention: one token's 40 query rows [heads][576] against
 // positions [0, positions). grid = (heads / 4, splits), 256 threads: a block
 // takes four heads and one run of keys_per_split keys, each warp every eighth
 // key. Lane j of a warp loads dims j, j+32, ... of the key row once -- 16
@@ -13510,7 +13510,7 @@ extern "C" __global__ void raon_mhc_pre(
             for (int c = 0; c < 4; ++c) {
                 const float identity = r == c ? 1.0f : 0.0f;
                 const float phi = (r == c ? 0.625f : 0.125f) + E[r][c] / rho;
-                coefficients[4 + r * 4 + c] = identity + gamma * (phi - identity);
+)" R"(                coefficients[4 + r * 4 + c] = identity + gamma * (phi - identity);
             }
     }
     __syncthreads();
@@ -13659,7 +13659,7 @@ extern "C" __global__ void __launch_bounds__(256) raon_mla_attention_mma(
             }
         } else {
             for (int i = threadIdx.x; i < 32 * 576; i += blockDim.x) {
-                const int kk = i / 576, d = i % 576, key = key0 + kk;
+)" R"(                const int kk = i / 576, d = i % 576, key = key0 + kk;
                 __half value = __float2half(0.0f);
                 if (key < key_end)
                     value = d < 512 ? raon_cache_half(latents, (long long)key * 512 + d, cache_type)

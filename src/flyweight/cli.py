@@ -2374,8 +2374,11 @@ def _doctor() -> int:
     )
     if checkout is not None and package != checkout / "src" / "flyweight":
         report("package", None, f"imported from {package}, not {checkout}",
+               # The distribution is flyweight-llm, not the import name; telling
+               # someone to uninstall `flyweight` just warns "not installed" and
+               # leaves the shadowing copy in place.
                "an installed copy is shadowing the checkout you are standing "
-               "in: pip uninstall flyweight && pip install -e .")
+               "in: pip uninstall flyweight-llm && pip install -e .")
     else:
         report("package", True, str(package))
 
@@ -2518,8 +2521,17 @@ def _doctor() -> int:
                            "and the headers, no toolkit needed), install the CUDA "
                            "toolkit, or serve with --backend cpu")
                 else:
-                    report("nvidia gpu", None, "no usable device",
-                           "serve with --backend cpu, or install an NVIDIA driver")
+                    # Both libraries load, so a driver IS installed; what failed
+                    # is CUDA's own device enumeration (cuInit returning
+                    # CUDA_ERROR_NO_DEVICE is common with a disabled/Optimus GPU
+                    # or a session without GPU access). Telling someone to
+                    # install a driver they already have sends them nowhere.
+                    report("nvidia gpu", None,
+                           "driver and NVRTC found, but CUDA sees no device",
+                           "the driver is installed; check the GPU is enabled "
+                           "and available to this session (a remote or virtual "
+                           "session may not expose it), or serve with "
+                           "--backend cpu")
         except Exception as error:  # noqa: BLE001 - no driver is not a failure
             report("nvidia gpu", None, f"unavailable ({error})",
                    "serve with --backend cpu, or install an NVIDIA driver")

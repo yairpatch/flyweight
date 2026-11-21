@@ -191,7 +191,7 @@ void ds4_q8_grouped_matvec(
     const int warp = threadIdx.x >> 5;
     const int row = blockIdx.x * (blockDim.x >> 5) + warp;
     if (row >= output_size) return;
-    const float* source = vector + (long long)(row / group_rows) * input_size;
+)FLYWEIGHT_CUDA" R"FLYWEIGHT_CUDA(    const float* source = vector + (long long)(row / group_rows) * input_size;
     const int blocks = input_size >> 5;
     const unsigned char* base = packed + (unsigned long long)row * blocks * 34;
     float partial = 0.0f;

@@ -66,7 +66,9 @@ KERNEL_HEAD = re.compile(
 # MSVC truncates a single string literal past 16384 bytes (C2026), which is why
 # the corpus is split into adjacent literals rather than written as one. The
 # concatenation is unbounded, so only the individual pieces matter. Checked here
-# because the headers are edited on Linux, where nothing else would notice.
+# for the three corpus headers, and for every other native raw string by
+# tests/test_install_paths.py::test_raw_string_literals_fit_the_msvc_limit, so an
+# edit made on Linux cannot silently break the Windows source build.
 MAX_SEGMENT_BYTES = 16384
 
 
