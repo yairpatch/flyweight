@@ -10,6 +10,7 @@ cannot work from an installed copy, because there is no `native/` beside it.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -25,7 +26,37 @@ from flyweight.cli import main
 real_which = shutil.which
 
 
+# MSVC rejects a single raw string literal past 16384 bytes with C2026, even
+# though GCC and Clang accept it. The CUDA corpus is split into adjacent
+# literals for exactly this reason; `generate_cpu_kernels.py` enforces the limit
+# on the three corpus headers, but the deepseek4 header and v2_runtime.cpp carry
+# raw strings too and one oversized literal there breaks `pip install .` on
+# Windows while every POSIX compiler stays happy. Keep the limit here for all of
+# them, on every platform CI runs, so a Linux edit cannot silently break Windows.
+MSVC_RAW_STRING_LIMIT = 16384
+RAW_STRING = re.compile(r'R"([A-Za-z0-9_]*)\((.*?)\)\1"', re.DOTALL)
+
+
 class NativeBuildTests(unittest.TestCase):
+    def test_raw_string_literals_fit_the_msvc_limit(self) -> None:
+        native = Path(__file__).resolve().parents[1] / "native"
+        offenders: list[str] = []
+        for source in sorted(native.rglob("*")):
+            if source.suffix not in (".hpp", ".cpp", ".h", ".inc"):
+                continue
+            text = source.read_text(encoding="utf-8")
+            for match in RAW_STRING.finditer(text):
+                size = len(match.group(2).encode("utf-8"))
+                if size >= MSVC_RAW_STRING_LIMIT:
+                    line = text.count("\n", 0, match.start()) + 1
+                    offenders.append(
+                        f"{source.relative_to(native)}:{line} ({size} bytes)"
+                    )
+        self.assertEqual(
+            offenders, [],
+            "raw string literals over MSVC's 16384-byte limit: " + ", ".join(offenders),
+        )
+
     def test_the_checkout_finds_its_own_sources(self) -> None:
         source = native_build.source_root()
         self.assertIsNotNone(source)
@@ -164,6 +195,24 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("python -m flyweight.native_build", output)
         self.assertIn("wheel", output)
 
+    def test_a_present_driver_with_no_cuda_device_does_not_blame_the_driver(self) -> None:
+        # nvcuda.dll loads but cuInit returns CUDA_ERROR_NO_DEVICE -- common
+        # with an Optimus/disabled GPU or a session without GPU access.
+        # Telling someone with a working driver to install one is no help.
+        with tempfile.TemporaryDirectory() as directory:
+            native = Path(directory)
+            (native / "flyweight_v2.dll").write_bytes(b"")
+            with (
+                patch.object(native_build, "default_output", return_value=native),
+                patch("flyweight.v2._library", return_value=object()),
+                patch("flyweight.v2.V2Model.gpu_info", return_value={"available": 0}),
+                patch("flyweight.cli._cuda_libraries_present", return_value=(True, True)),
+            ):
+                _, output = self._run()
+        self.assertIn("CUDA sees no device", output)
+        self.assertNotIn("install an NVIDIA driver", output)
+        self.assertIn("the driver is installed", output)
+
     def test_an_installed_copy_shadowing_the_checkout_is_reported(self) -> None:
         # Installing a built wheel into the same environment as a checkout
         # makes every import resolve to site-packages: edits look inert, and
@@ -178,6 +227,11 @@ class DoctorTests(unittest.TestCase):
         # path, which on Windows starts with a drive letter and failed here.
         self.assertIn(f"not {Path(__file__).resolve().parents[1]}", output)
         self.assertIn("shadowing the checkout", output)
+        # The fix has to name the distribution, not the import package:
+        # `pip uninstall flyweight` would warn "not installed" and leave the
+        # shadowing copy exactly where it is.
+        self.assertIn("pip uninstall flyweight-llm", output)
+        self.assertNotIn("pip uninstall flyweight &&", output)
 
     def test_a_console_script_off_path_is_a_warning_naming_the_module_form(self) -> None:
         # The exact end state of a successful Microsoft Store `pip install`:
