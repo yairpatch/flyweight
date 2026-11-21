@@ -27,6 +27,7 @@ toolkit needed. **[Download it](#the-easy-way-download-the-app)**, or run
 | Muse Glimmer | GGUF | Channel-tagged reasoning; native ATEM tool calls; no speculative decoding |
 | LFM2 / LFM2-MoE (LFM2.5) | GGUF | Gated short-conv + GQA hybrid; native pythonic tool calls; no speculative decoding |
 | Nemotron 3.5 Bolt (`nemotron_h_moe`) | GGUF | Mamba-2 + GQA + latent-MoE hybrid; routed experts on the CPU; no speculative decoding |
+| Inkling 2 Mini (`inkling2`) | GGUF | Loopable MoE transformer with SiTU experts, relative-position attention and short convolutions. Runs on its own CPU runtime; prefill is one token at a time |
 
 Image generation with [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
 or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) (RGBA out)

@@ -65,6 +65,17 @@
       "description": "The largest dense Qwen3. Excellent answers, but needs a 24 GB graphics card to be fast.",
       "tags": ["Thinking", "Tools", "Code"],
       "rank": 6
+    },
+    {
+      "id": "inkling-2-mini",
+      "name": "Inkling 2 Mini",
+      "repo": "unsloth/Inkling-2-Mini-GGUF",
+      "quants": ["UD-Q4_K_XL", "UD-IQ2_XXS"],
+      "description": "Thinking Machines Lab's 26B looped mixture-of-experts model, with vision and a million-token context. The middle layers run three times, so it behaves like a much larger model on a modest computer.",
+      "tags": ["Mixture of experts", "Thinking", "Tools", "Vision"],
+      "moe": true,
+      "vision": true,
+      "rank": 4
     }
   ]
 }

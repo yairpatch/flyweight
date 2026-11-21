@@ -50,6 +50,7 @@ from .v2 import (
     V2Error,
     BailingRuntime,
     RaonRuntime,
+    Inkling2Runtime,
     raon_cache_type,
     V2Model,
     V2QwenRuntime,
@@ -707,6 +708,10 @@ class NativeV2Tokenizer:
         Used when resuming a cached conversation whose last generation stopped
         short of an EOS token, so the reused prefix stays well formed.
         """
+        if self.architecture == "inkling2":
+            # The embedded template closes each message (including an assistant
+            # one) with <|end_message|> and runs the next role token straight on.
+            return "<|end_message|>"
         if self.architecture == "laguna":
             return "</assistant>\n"
         if self.architecture == "deepseek4":
@@ -743,7 +748,7 @@ class NativeV2Tokenizer:
         # BailingMoE3 is the same: its template emits <role>HUMAN</role>
         # immediately after <|role_end|>, with nothing between them.
         return "" if self.architecture in (
-            "deepseek4", "muse-glimmer", "bailingmoe3"
+            "deepseek4", "muse-glimmer", "bailingmoe3", "inkling2"
         ) else "\n"
 
     @property
@@ -2808,6 +2813,20 @@ class RaonGenerator(ChatGenerator):
         return self.engine.cache_stats()
 
 
+class Inkling2Generator(ChatGenerator):
+    """Streaming generator backed by the Inkling 2 runtime."""
+
+    def __init__(self, model: V2Model, runtime: "Inkling2Runtime",
+                 tokenizer: NativeV2Tokenizer,
+                 snapshot_budget_bytes: int | None = None):
+        super().__init__(model, BailingEngine(runtime, snapshot_budget_bytes),
+                         tokenizer)
+        self.runtime = runtime
+
+    def prefix_cache_stats(self) -> dict[str, int]:
+        return self.engine.cache_stats()
+
+
 def _report_placement(runtime: V2QwenRuntime) -> None:
     # A report, never a reason to fail a load that already succeeded.
     from .placement import format_placement
@@ -2930,6 +2949,7 @@ class NativeV2InferenceService(InferenceService):
         self.architecture = str(self.v2_model.info["architecture"])
         self.bailing_runtime: BailingRuntime | None = None
         self.raon_runtime: RaonRuntime | None = None
+        self.inkling2_runtime: Inkling2Runtime | None = None
         if self.architecture == "bailingmoe3":
             try:
                 self._init_bailing(
@@ -2954,6 +2974,35 @@ class NativeV2InferenceService(InferenceService):
                 if runtime is not None:
                     runtime.close()
                     self.bailing_runtime = None
+                self.v2_model.close()
+                raise
+            self.generation_defaults_source = generation_defaults_source
+            self.gpu_cache_mib = gpu_cache_mib
+            self.mtp_drafts = 0
+            return
+        elif self.architecture == "inkling2":
+            try:
+                self._init_inkling2(
+                    model_name=model_name or Path(model_path).stem,
+                    max_new_tokens=max_new_tokens,
+                    context_window=context_window,
+                    api_key=api_key,
+                    cors_origin=cors_origin,
+                    strict_model=strict_model,
+                    max_concurrent_requests=max_concurrent_requests,
+                    request_timeout_seconds=request_timeout_seconds,
+                    sse_keepalive_seconds=sse_keepalive_seconds,
+                    max_tool_call_tokens=max_tool_call_tokens,
+                    generation_defaults=generation_defaults,
+                    default_thinking_budget=default_thinking_budget,
+                    reasoning_effort=reasoning_effort,
+                    prompt_cache_mib=prompt_cache_mib,
+                )
+            except BaseException:
+                runtime = getattr(self, "inkling2_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                    self.inkling2_runtime = None
                 self.v2_model.close()
                 raise
             self.generation_defaults_source = generation_defaults_source
@@ -3147,6 +3196,44 @@ class NativeV2InferenceService(InferenceService):
         # One sequence of caches, so requests must not overlap.
         self._serialize_generation = True
 
+    def _init_inkling2(self, *, model_name, max_new_tokens, context_window, api_key,
+                       cors_origin, strict_model, max_concurrent_requests,
+                       request_timeout_seconds, sse_keepalive_seconds,
+                       max_tool_call_tokens, generation_defaults,
+                       default_thinking_budget=None,
+                       reasoning_effort=None, prompt_cache_mib=0) -> None:
+        self.v2_runtime = None
+        tokenizer = NativeV2Tokenizer(
+            self.v2_model, image_max_tokens=self.image_max_tokens)
+        self.inkling2_runtime = Inkling2Runtime(
+            self.v2_model, capacity=context_window)
+        snapshot_budget = (
+            None if prompt_cache_mib >= AUTO_PROMPT_CACHE_MIB
+            else prompt_cache_mib * 1024**2
+        )
+        super().__init__(
+            model_name,
+            Inkling2Generator(self.v2_model, self.inkling2_runtime, tokenizer,
+                              snapshot_budget),
+            max_new_tokens=max_new_tokens,
+            context_window=context_window,
+            api_key=api_key,
+            cors_origin=cors_origin,
+            strict_model=strict_model,
+            max_concurrent_requests=max_concurrent_requests,
+            request_timeout_seconds=request_timeout_seconds,
+            sse_keepalive_seconds=sse_keepalive_seconds,
+            max_tool_call_tokens=max_tool_call_tokens,
+            default_thinking_budget=default_thinking_budget,
+            reasoning_effort=reasoning_effort,
+            generation_defaults=generation_defaults,
+        )
+        self.requested_expert_mode = "n/a"
+        self.expert_mode = "n/a"
+        self.expert_fallback_reason = ""
+        self.moe_device = "n/a"
+        self._serialize_generation = True
+
     def _init_raon(self, *, model_name, max_new_tokens, context_window, api_key,
                    cors_origin, strict_model, max_concurrent_requests,
                    request_timeout_seconds, sse_keepalive_seconds,
@@ -3276,6 +3363,10 @@ class NativeV2InferenceService(InferenceService):
         if raon is not None:
             raon.close()
             self.raon_runtime = None
+        inkling2 = getattr(self, "inkling2_runtime", None)
+        if inkling2 is not None:
+            inkling2.close()
+            self.inkling2_runtime = None
         if self.v2_runtime is not None:
             self.v2_runtime.close()
             self.v2_runtime = None

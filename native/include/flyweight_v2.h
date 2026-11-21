@@ -81,10 +81,30 @@ typedef struct FlyweightV2ModelConfig {
     uint32_t expert_group_count, expert_group_used;
     uint32_t norm_groups;
     uint32_t value_expert_count, value_expert_used_count;
+    /* Inkling 2 (inkling2). Zero on every other architecture. `layer_count`
+       above is the number of layer applications; the core repeats `num_loops`
+       times. The embedding/output rows are padded past `vocab_size_unpadded`. */
+    uint32_t num_loops, loop_core_start, loop_core_end, loop_gate_rank;
+    uint32_t attn_res_block_size;
+    uint32_t relative_length, relative_extent, log_scale_floor;
+    float qk_clip, relative_clip, log_scale_alpha;
+    uint32_t vocab_size_unpadded;
+    uint32_t conv_kernel;
+    float situ_beta, situ_linear_beta, expert_weights_scale;
 } FlyweightV2ModelConfig;
 
 typedef struct FlyweightV2BailingRuntime FlyweightV2BailingRuntime;
 typedef struct FlyweightV2RaonRuntime FlyweightV2RaonRuntime;
+typedef struct FlyweightV2Inkling2Runtime FlyweightV2Inkling2Runtime;
+
+/* Inkling 2: a looped MoE transformer. The runtime owns its recurrent
+   convolution state and KV cache; eval processes the tokens in order and
+   returns the logits of the last one. */
+FLYWEIGHT_V2_API int flyweight_v2_inkling2_create(const FlyweightV2Model* model, uint32_t context_limit, FlyweightV2Inkling2Runtime** out);
+FLYWEIGHT_V2_API void flyweight_v2_inkling2_destroy(FlyweightV2Inkling2Runtime* runtime);
+FLYWEIGHT_V2_API int flyweight_v2_inkling2_reset(FlyweightV2Inkling2Runtime* runtime);
+FLYWEIGHT_V2_API int flyweight_v2_inkling2_position(FlyweightV2Inkling2Runtime* runtime, uint32_t* out);
+FLYWEIGHT_V2_API int flyweight_v2_inkling2_eval(FlyweightV2Inkling2Runtime* runtime, const uint32_t* tokens, uint32_t count, float* logits);
 
 typedef struct FlyweightV2GpuInfo {
     int32_t available;
