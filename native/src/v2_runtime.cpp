@@ -390,7 +390,6 @@ struct FlyweightV2Model : flyweight::v2::WeightProvider { const uint8_t* data=nu
 const uint8_t* tensor_data(const FlyweightV2Model& model, const Tensor& tensor) {
     return (tensor.source ? tensor.source : model.data) + tensor.offset;
 }
-#include "v2_inkling2.inc"
 struct FlyweightV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_heads, head_dim, position=0; };
 
 struct QwenLayerPlan {
@@ -34067,3 +34066,5 @@ int flyweight_v2_qwen_engine_idle_maintenance(FlyweightV2QwenRuntime*runtime){re
 });}
 
 }
+
+#include "v2_inkling2.inc"

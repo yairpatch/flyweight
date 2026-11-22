@@ -105,6 +105,7 @@ FLYWEIGHT_V2_API void flyweight_v2_inkling2_destroy(FlyweightV2Inkling2Runtime* 
 FLYWEIGHT_V2_API int flyweight_v2_inkling2_reset(FlyweightV2Inkling2Runtime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_inkling2_position(FlyweightV2Inkling2Runtime* runtime, uint32_t* out);
 FLYWEIGHT_V2_API int flyweight_v2_inkling2_eval(FlyweightV2Inkling2Runtime* runtime, const uint32_t* tokens, uint32_t count, float* logits);
+FLYWEIGHT_V2_API int flyweight_v2_inkling2_uses_gpu(const FlyweightV2Inkling2Runtime* runtime);
 
 typedef struct FlyweightV2GpuInfo {
     int32_t available;

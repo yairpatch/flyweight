@@ -1,8 +1,6 @@
 # Inkling 2 (`inkling2`)
 
-Status: **load/config/tokenizer and a CPU execution path are implemented.**
-Prefill runs as a sequence of single-token steps, so it is correct but much
-slower than a fused batched kernel; there is no GPU path yet.
+Status: **load/config/tokenizer, CPU execution, hybrid/paged GPU decode, and batched GPU prefill are implemented.**
 
 `Inkling-2-Mini-UD-IQ2_XXS.gguf` (`general.architecture = inkling2`) is
 Thinking Machines Lab's 26.4B-parameter looped MoE transformer. llama.cpp's

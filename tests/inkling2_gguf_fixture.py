@@ -8,6 +8,7 @@ downloading anything.
 """
 from __future__ import annotations
 
+import math
 import struct
 from pathlib import Path
 
@@ -87,7 +88,12 @@ class Inkling2Spec:
                      for index in range(self.applications))
 
 
-def build_inkling2_gguf(path: Path | str, spec: Inkling2Spec | None = None) -> Inkling2Spec:
+def build_inkling2_gguf(
+    path: Path | str,
+    spec: Inkling2Spec | None = None,
+    *,
+    seed: int | None = None,
+) -> Inkling2Spec:
     spec = spec or Inkling2Spec()
 
     # The vocabulary is deliberately tiny, but its tokens include a control
@@ -161,7 +167,18 @@ def build_inkling2_gguf(path: Path | str, spec: Inkling2Spec | None = None) -> I
         count = 1
         for dim in shape:
             count *= dim
-        tensors.append((name, tuple(shape), b"\0" * (count * 4)))
+        if seed is None:
+            raw = b"\0" * (count * 4)
+        else:
+            # Deterministic small non-zero weights so GPU and CPU parity tests
+            # exercise real matmuls, routing, SiTU activations, and softcap.
+            offset = (seed * 1315423911 + sum(ord(ch) * (idx + 1) for idx, ch in enumerate(name))) & 0xFFFF
+            if name.endswith("_norm.weight") or name.endswith("_clip.weight"):
+                values = [1.0 + 0.05 * math.sin(offset + i * 0.37) for i in range(count)]
+            else:
+                values = [0.05 * math.sin(offset + i * 0.13) for i in range(count)]
+            raw = struct.pack(f"<{count}f", *values)
+        tensors.append((name, tuple(shape), raw))
 
     add("token_embd.weight", spec.hidden, spec.vocabulary)
     add("token_embd_norm.weight", spec.hidden)

@@ -1965,6 +1965,8 @@ class Inkling2Runtime:
             ctypes.POINTER(ctypes.c_float),
         ]
         self._lib.flyweight_v2_inkling2_reset.argtypes = [ctypes.c_void_p]
+        self._lib.flyweight_v2_inkling2_uses_gpu.argtypes = [ctypes.c_void_p]
+        self._lib.flyweight_v2_inkling2_uses_gpu.restype = ctypes.c_int
         self._check(
             self._lib.flyweight_v2_inkling2_create(
                 model._handle, ctypes.c_uint32(capacity), ctypes.byref(self._handle)
@@ -1973,7 +1975,17 @@ class Inkling2Runtime:
         self._logits = (ctypes.c_float * self._vocabulary)()
         self._tokens: list[int] = []
         self._generator: Any = None
+        self._progress: Any = None
         self.slot_count = 1
+
+    @property
+    def uses_gpu(self) -> bool:
+        if not self._handle:
+            return False
+        return bool(self._lib.flyweight_v2_inkling2_uses_gpu(self._handle))
+
+    def set_progress(self, callback: Any) -> None:
+        self._progress = callback
 
     def _check(self, status: int) -> None:
         if status:
@@ -1983,13 +1995,32 @@ class Inkling2Runtime:
     def eval_into(self, tokens: Sequence[int], slot: int = 0) -> None:
         if not tokens:
             raise ValueError("eval needs at least one token")
-        buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
-        self._check(
-            self._lib.flyweight_v2_inkling2_eval(
-                self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+        if self._progress is None or len(tokens) == 1:
+            buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
+            self._check(
+                self._lib.flyweight_v2_inkling2_eval(
+                    self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+                )
             )
-        )
-        self._tokens.extend(int(token) for token in tokens)
+            self._tokens.extend(int(token) for token in tokens)
+            return
+        total = len(tokens)
+        chunk_size = 64
+        for offset in range(0, total, chunk_size):
+            piece = tokens[offset : offset + chunk_size]
+            buffer = (ctypes.c_uint32 * len(piece))(*piece)
+            is_last = offset + len(piece) == total
+            self._check(
+                self._lib.flyweight_v2_inkling2_eval(
+                    self._handle,
+                    buffer,
+                    ctypes.c_uint32(len(piece)),
+                    self._logits if is_last else None,
+                )
+            )
+            self._tokens.extend(int(token) for token in piece)
+            if self._progress(offset + len(piece), total) is False:
+                raise V2Error("prefill cancelled")
 
     def eval(self, tokens: Sequence[int], slot: int = 0) -> Any:
         self.eval_into(tokens, slot)

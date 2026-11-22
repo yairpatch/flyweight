@@ -3228,10 +3228,10 @@ class NativeV2InferenceService(InferenceService):
             reasoning_effort=reasoning_effort,
             generation_defaults=generation_defaults,
         )
-        self.requested_expert_mode = "n/a"
-        self.expert_mode = "n/a"
+        self.requested_expert_mode = "auto"
+        self.expert_mode = "gpu" if self.inkling2_runtime.uses_gpu else "cpu"
         self.expert_fallback_reason = ""
-        self.moe_device = "n/a"
+        self.moe_device = "gpu" if self.inkling2_runtime.uses_gpu else "cpu"
         self._serialize_generation = True
 
     def _init_raon(self, *, model_name, max_new_tokens, context_window, api_key,
@@ -3401,6 +3401,22 @@ class NativeV2InferenceService(InferenceService):
                 "gpu_layers": getattr(self, "gpu_layers", None),
                 "parallel_sequences": int(
                     getattr(raon, "slot_count", 1)
+                ),
+            }
+            return value
+        inkling2 = getattr(self, "inkling2_runtime", None)
+        if inkling2 is not None:
+            value = super().health()
+            value["execution"] = {
+                "backend": "native-v2-inkling2",
+                "architecture": self.architecture,
+                "device": "gpu" if inkling2.uses_gpu else "cpu",
+                "expert_mode": self.expert_mode,
+                "requested_expert_mode": self.requested_expert_mode,
+                "moe_device": self.moe_device,
+                "expert_fallback_reason": self.expert_fallback_reason,
+                "parallel_sequences": int(
+                    getattr(inkling2, "slot_count", 1)
                 ),
             }
             return value

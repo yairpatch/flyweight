@@ -8,7 +8,7 @@ from pathlib import Path
 
 from flyweight import models
 from flyweight.v2 import Inkling2Runtime, V2Model, V2Error
-from flyweight.v2_server import NativeV2Tokenizer
+from flyweight.v2_server import NativeV2InferenceService, NativeV2Tokenizer
 
 from tests.inkling2_gguf_fixture import Inkling2Spec, build_inkling2_gguf
 
@@ -72,13 +72,64 @@ class Inkling2ConfigTests(unittest.TestCase):
     def test_dedicated_runtime_runs_a_token(self):
         model, spec = _model()
         runtime = Inkling2Runtime(model, capacity=32)
-        _MODELS.append(model)
         try:
             logits = runtime.eval([0])
             self.assertEqual(len(logits), spec.vocabulary)
             self.assertTrue(all((not isinstance(v, float)) or v == v for v in logits))
         finally:
             runtime.close()
+
+    def test_gpu_decode_matches_cpu_on_nonzero_weights(self):
+        model, spec = _model(seed=42)
+        previous = V2Model.active_backend()
+        try:
+            V2Model.select_backend("cpu")
+            with Inkling2Runtime(model, capacity=32) as cpu_rt:
+                self.assertFalse(cpu_rt.uses_gpu)
+                cpu_prefill = list(cpu_rt.eval([1, 2, 3, 4, 5, 6]))
+                cpu_decode = list(cpu_rt.eval([7]))
+            self.assertEqual(len(cpu_prefill), spec.vocabulary)
+            self.assertTrue(any(abs(v) > 1e-6 for v in cpu_prefill))
+
+            selected = V2Model.select_backend("auto")
+            if selected == "cpu":
+                self.skipTest("no GPU backend available in this session")
+            with Inkling2Runtime(model, capacity=32) as gpu_rt:
+                self.assertTrue(gpu_rt.uses_gpu)
+                gpu_prefill = list(gpu_rt.eval([1, 2, 3, 4, 5, 6]))
+                gpu_decode = list(gpu_rt.eval([7]))
+            prefill_diff = max(abs(a - b) for a, b in zip(cpu_prefill, gpu_prefill))
+            decode_diff = max(abs(a - b) for a, b in zip(cpu_decode, gpu_decode))
+            self.assertLess(prefill_diff, 1e-3, f"GPU prefill vs CPU max diff {prefill_diff}")
+            self.assertLess(decode_diff, 1e-3, f"GPU decode-after-prefill vs CPU max diff {decode_diff}")
+        finally:
+            V2Model.select_backend(previous)
+
+    def test_service_health_and_streaming_chat(self):
+        holder = tempfile.TemporaryDirectory(prefix="flyweight-inkling2-srv-")
+        _WORKSPACES.append(holder)
+        path = Path(holder.name) / "inkling2.gguf"
+        build_inkling2_gguf(path, seed=7)
+        previous = V2Model.active_backend()
+        try:
+            V2Model.select_backend("cpu")
+            service = NativeV2InferenceService(path, context_window=32, max_new_tokens=4)
+            try:
+                health = service.health()
+                self.assertEqual(health["execution"]["backend"], "native-v2-inkling2")
+                self.assertEqual(health["execution"]["architecture"], "inkling2")
+                chunks = list(service.stream_chat_completion({
+                    "model": service.model_name,
+                    "messages": [{"role": "user", "content": "Hello world!"}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "stream": True,
+                }))
+                self.assertTrue(chunks)
+            finally:
+                service.close()
+        finally:
+            V2Model.select_backend(previous)
 
     def test_qwen_runtime_refuses_inkling2(self):
         # The layer loop for Qwen has no loop controllers or relative bias,
