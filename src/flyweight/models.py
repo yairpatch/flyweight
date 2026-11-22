@@ -44,7 +44,7 @@ USER_AGENT = "flyweight-desktop"
 # "qwen" and are not chat models.
 SUPPORTED_ARCHITECTURES = {
     "gemma4", "laguna", "muse-glimmer", "k2-horizon", "lfm2", "lfm2moe",
-    "nemotron_h_moe", "bailingmoe3", "deepseek4",
+    "nemotron_h_moe", "bailingmoe3", "deepseek4", "inkling2",
 }
 _NOT_CHAT = re.compile(r"(image|dit|vae|clip|mmproj)", re.IGNORECASE)
 _SPLIT = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)

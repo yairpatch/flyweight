@@ -12,6 +12,7 @@ import dataclasses
 import json
 import os
 import re
+import struct
 import sys
 from pathlib import Path
 from typing import Any, ClassVar, Iterator, Mapping, Sequence
@@ -201,6 +202,23 @@ class _ModelConfig(ctypes.Structure):
         ("norm_groups", ctypes.c_uint32),
         ("value_expert_count", ctypes.c_uint32),
         ("value_expert_used_count", ctypes.c_uint32),
+        # Inkling 2 (inkling2); zero on every other architecture.
+        ("num_loops", ctypes.c_uint32),
+        ("loop_core_start", ctypes.c_uint32),
+        ("loop_core_end", ctypes.c_uint32),
+        ("loop_gate_rank", ctypes.c_uint32),
+        ("attn_res_block_size", ctypes.c_uint32),
+        ("relative_length", ctypes.c_uint32),
+        ("relative_extent", ctypes.c_uint32),
+        ("log_scale_floor", ctypes.c_uint32),
+        ("qk_clip", ctypes.c_float),
+        ("relative_clip", ctypes.c_float),
+        ("log_scale_alpha", ctypes.c_float),
+        ("vocab_size_unpadded", ctypes.c_uint32),
+        ("conv_kernel", ctypes.c_uint32),
+        ("situ_beta", ctypes.c_float),
+        ("situ_linear_beta", ctypes.c_float),
+        ("expert_weights_scale", ctypes.c_float),
     ]
 
 
@@ -1925,6 +1943,132 @@ _RAON_PROGRESS = ctypes.CFUNCTYPE(
 RAON_CACHE_TYPES = ("f32", "f16", "bf16")
 
 
+class Inkling2Runtime:
+    """Execution for Inkling 2 (inkling2) checkpoints.
+
+    Native execution owns the KV cache, the looped-layer convolution state and
+    the block/message banks. Prefill is a sequence of single-token steps, so a
+    long prompt costs one forward per token. The interface mirrors
+    ``BailingRuntime`` so the shared streaming engine can drive it.
+    """
+
+    def __init__(self, model: "V2Model", capacity: int = 4096, slots: int = 1):
+        self._model = model
+        self._lib = model._lib
+        self._handle = ctypes.c_void_p()
+        self._vocabulary = int(str(model.config["vocab_size_unpadded"]))
+        self._lib.flyweight_v2_inkling2_create.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+        ]
+        self._lib.flyweight_v2_inkling2_eval.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self._lib.flyweight_v2_inkling2_reset.argtypes = [ctypes.c_void_p]
+        self._lib.flyweight_v2_inkling2_uses_gpu.argtypes = [ctypes.c_void_p]
+        self._lib.flyweight_v2_inkling2_uses_gpu.restype = ctypes.c_int
+        self._check(
+            self._lib.flyweight_v2_inkling2_create(
+                model._handle, ctypes.c_uint32(capacity), ctypes.byref(self._handle)
+            )
+        )
+        self._logits = (ctypes.c_float * self._vocabulary)()
+        self._tokens: list[int] = []
+        self._generator: Any = None
+        self._progress: Any = None
+        self.slot_count = 1
+
+    @property
+    def uses_gpu(self) -> bool:
+        if not self._handle:
+            return False
+        return bool(self._lib.flyweight_v2_inkling2_uses_gpu(self._handle))
+
+    def set_progress(self, callback: Any) -> None:
+        self._progress = callback
+
+    def _check(self, status: int) -> None:
+        if status:
+            message = self._lib.flyweight_v2_last_error() or b"native inkling2 error"
+            raise V2Error(message.decode(errors="replace"))
+
+    def eval_into(self, tokens: Sequence[int], slot: int = 0) -> None:
+        if not tokens:
+            raise ValueError("eval needs at least one token")
+        if self._progress is None or len(tokens) == 1:
+            buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
+            self._check(
+                self._lib.flyweight_v2_inkling2_eval(
+                    self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+                )
+            )
+            self._tokens.extend(int(token) for token in tokens)
+            return
+        total = len(tokens)
+        chunk_size = 64
+        for offset in range(0, total, chunk_size):
+            piece = tokens[offset : offset + chunk_size]
+            buffer = (ctypes.c_uint32 * len(piece))(*piece)
+            is_last = offset + len(piece) == total
+            self._check(
+                self._lib.flyweight_v2_inkling2_eval(
+                    self._handle,
+                    buffer,
+                    ctypes.c_uint32(len(piece)),
+                    self._logits if is_last else None,
+                )
+            )
+            self._tokens.extend(int(token) for token in piece)
+            if self._progress(offset + len(piece), total) is False:
+                raise V2Error("prefill cancelled")
+
+    def eval(self, tokens: Sequence[int], slot: int = 0) -> Any:
+        self.eval_into(tokens, slot)
+        if _numpy is not None:
+            return _numpy.frombuffer(self._logits, dtype=_numpy.float32).copy()
+        return list(self._logits)
+
+    def sample(
+        self, config: Any = None, generated: Sequence[int] | None = None
+    ) -> int:
+        token, self._generator = _sample_from_logits_buffer(
+            self._logits,
+            self._vocabulary,
+            config,
+            generated=generated,
+            generator=self._generator,
+        )
+        return token
+
+    def reset(self, slot: int = 0) -> None:
+        self._check(self._lib.flyweight_v2_inkling2_reset(self._handle))
+        self._tokens.clear()
+
+    def save_state(self, slot: int = 0) -> bytes:
+        # No native snapshot yet: record the tokens and replay them on restore.
+        return b"".join(struct.pack("<I", token) for token in self._tokens)
+
+    def load_state(self, snapshot: bytes, slot: int = 0) -> None:
+        tokens = [
+            struct.unpack_from("<I", snapshot, offset)[0]
+            for offset in range(0, len(snapshot), 4)
+        ]
+        self.reset()
+        if tokens:
+            self.eval_into(tokens)
+
+    def close(self) -> None:
+        if self._handle:
+            self._lib.flyweight_v2_inkling2_destroy(self._handle)
+            self._handle = ctypes.c_void_p()
+
+    def __enter__(self) -> "Inkling2Runtime":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 def raon_cache_type(cache_type_k: str | None = "f16", cache_type_v: str | None = None) -> str:
     """The one cache type a Raon-1 runtime takes, from the --cache-type-k/v pair."""
     key = cache_type_k or "f16"
@@ -2393,6 +2537,12 @@ class V2Model:
             "final_logit_softcap",
             "expert_group_count",
             "expert_group_used",
+            "qk_clip",
+            "relative_clip",
+            "log_scale_alpha",
+            "situ_beta",
+            "situ_linear_beta",
+            "expert_weights_scale",
         }
         config = {
             field: (

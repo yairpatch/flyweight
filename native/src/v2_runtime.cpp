@@ -2915,7 +2915,24 @@ int parse(FlyweightV2Model& m) {
         else if(suffix(".ple.eos_token_id"))target=&m.config.ple_eos_token_id;
         else if(suffix(".expert_shared_count"))target=&m.config.expert_shared_count;
         else if(suffix(".hash_layer_count"))target=&m.config.hash_layer_count;
+        // Inkling 2. The loop geometry drives both tensor loading and the
+        // effective-to-physical layer mapping, so it has to survive parsing.
+        // `.attn_res.block_size` must precede the generic `.block_size`, which
+        // would otherwise swallow it and store it as an MTP draft size.
+        else if(suffix(".attn_res.block_size"))target=&m.config.attn_res_block_size;
         else if(suffix(".block_size"))target=&m.config.draft_block_size;
+        // `.vocab_size_unpadded` must be tested before `.vocab_size`: suffix
+        // matching compares whole tails, but the shorter key is a prefix of
+        // the longer one and a future reader could reorder these branches.
+        else if(suffix(".vocab_size_unpadded"))target=&m.config.vocab_size_unpadded;
+        else if(suffix(".vocab_size"))target=&m.config.vocabulary_size;
+        else if(suffix(".num_loops"))target=&m.config.num_loops;
+        else if(suffix(".loop.core_start"))target=&m.config.loop_core_start;
+        else if(suffix(".loop.core_end"))target=&m.config.loop_core_end;
+        else if(suffix(".loop.gate_rank"))target=&m.config.loop_gate_rank;
+        else if(suffix(".attention.relative_length"))target=&m.config.relative_length;
+        else if(suffix(".attention.relative_extent"))target=&m.config.relative_extent;
+        else if(suffix(".attention.log_scale_floor"))target=&m.config.log_scale_floor;
         else if(suffix(".embedding_length"))target=&m.config.hidden_size;
         else if(suffix(".embedding_length_per_layer_input"))target=&m.config.per_layer_embedding_size;
         else if(suffix(".block_count"))target=&m.config.layer_count;
@@ -3031,6 +3048,11 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=28 && key.compare(key.size()-28,28,".rope.scaling.yarn_beta_slow")==0 && (type==6 || type==12)) m.config.yarn_beta_slow=read_float(type);
         else if (key.size()>=18 && key.compare(key.size()-18,18,".rope.scaling.type")==0 && type==8) m.config.rope_scaling_yarn=r.str()=="yarn";
         else if (key.size()>=21 && key.compare(key.size()-21,21,".expert_weights_scale")==0 && (type==6 || type==12)) m.config.expert_weights_scale=read_float(type);
+        // Inkling 2's relative-position attention and QK clipping. None of
+        // these tails collide with another family's keys.
+        else if (key.size()>=18 && key.compare(key.size()-18,18,".attention.qk_clip")==0 && (type==6 || type==12)) m.config.qk_clip=read_float(type);
+        else if (key.size()>=24 && key.compare(key.size()-24,24,".attention.relative_clip")==0 && (type==6 || type==12)) m.config.relative_clip=read_float(type);
+        else if (key.size()>=26 && key.compare(key.size()-26,26,".attention.log_scale_alpha")==0 && (type==6 || type==12)) m.config.log_scale_alpha=read_float(type);
         else if (key.size()>=20 && key.compare(key.size()-20,20,".expert_weights_norm")==0 && type==7) m.config.expert_weights_norm=r.get<std::uint8_t>()!=0;
         else if (key.size()>=26 && key.compare(key.size()-26,26,".attention.compress_ratios")==0 && type==9) m.config.compress_ratios=read_uint_array(type);
         else if (key.size()>=14 && key.compare(key.size()-14,14,".target_layers")==0 && type==9) m.config.target_layers=read_uint_array(type);
@@ -3230,6 +3252,35 @@ int parse(FlyweightV2Model& m) {
             for(const auto used:m.config.expert_used_by_layer)
                 m.config.expert_used_count=std::max(m.config.expert_used_count,used);
         }
+    }
+    // Inkling 2: a looped MoE transformer with no RoPE. The GGUF prefix is
+    // `inkling2`, but llama.cpp selects its looped graph whenever num_loops > 1;
+    // normalize the geometry the same way here. `block_count` is the number of
+    // layer applications (48 on Mini = 24 stored layers with the 12-layer core
+    // repeated twice more), so the per-layer arrays must cover it.
+    if(m.architecture=="inkling2"){
+        if(!m.config.attention_head_dim)m.config.attention_head_dim=m.config.key_length;
+        if(!m.config.num_loops)m.config.num_loops=1;
+        if(!m.config.attn_res_block_size)
+            throw std::runtime_error("inkling2 GGUF is missing attn_res.block_size");
+        if(!m.config.relative_length||!m.config.relative_extent||!m.config.log_scale_floor)
+            throw std::runtime_error("inkling2 GGUF is missing its relative-position keys");
+        if(!m.config.vocab_size_unpadded||m.config.vocab_size_unpadded>m.config.vocabulary_size)
+            throw std::runtime_error("inkling2 GGUF has an invalid unpadded vocabulary size");
+        if(m.config.sliding_window_pattern.size()<m.config.layer_count)
+            throw std::runtime_error("inkling2 sliding-window pattern is shorter than block_count");
+        if(m.config.attention_kv_heads_by_layer.size()<m.config.layer_count)
+            throw std::runtime_error("inkling2 attention.head_count_kv is shorter than block_count");
+        if(m.config.attention_heads_by_layer.size()<m.config.layer_count)
+            throw std::runtime_error("inkling2 attention.head_count is shorter than block_count");
+        if(!m.config.attention_kv_heads)
+            m.config.attention_kv_heads=*std::max_element(
+                m.config.attention_kv_heads_by_layer.begin(),
+                m.config.attention_kv_heads_by_layer.end());
+        if(!m.config.attention_heads)
+            m.config.attention_heads=*std::max_element(
+                m.config.attention_heads_by_layer.begin(),
+                m.config.attention_heads_by_layer.end());
     }
     if(m.architecture=="qwen_image"||m.architecture=="qwenimage21-dit"){
         m.architecture="qwenimage21-dit";
@@ -15978,7 +16029,11 @@ out->draft_block_size=m->config.draft_block_size;
 out->target_layers_length=static_cast<std::uint32_t>(m->config.target_layers.size());
 out->mask_token_id=m->config.mask_token_id;
 out->logit_scale=m->config.logit_scale;
-out->final_logit_softcap=m->config.final_logit_softcap;out->norm_groups=m->config.norm_groups;out->value_expert_count=m->config.value_expert_count;out->value_expert_used_count=m->config.value_expert_used_count;return 0;});}
+out->final_logit_softcap=m->config.final_logit_softcap;out->norm_groups=m->config.norm_groups;out->value_expert_count=m->config.value_expert_count;out->value_expert_used_count=m->config.value_expert_used_count;
+out->num_loops=m->config.num_loops;out->loop_core_start=m->config.loop_core_start;out->loop_core_end=m->config.loop_core_end;out->loop_gate_rank=m->config.loop_gate_rank;
+out->attn_res_block_size=m->config.attn_res_block_size;out->relative_length=m->config.relative_length;out->relative_extent=m->config.relative_extent;out->log_scale_floor=m->config.log_scale_floor;
+out->qk_clip=m->config.qk_clip;out->relative_clip=m->config.relative_clip;out->log_scale_alpha=m->config.log_scale_alpha;out->vocab_size_unpadded=m->config.vocab_size_unpadded;
+out->conv_kernel=m->config.conv_kernel;out->situ_beta=m->config.situ_beta;out->situ_linear_beta=m->config.situ_linear_beta;out->expert_weights_scale=m->config.expert_weights_scale;return 0;});}
 
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
@@ -19708,6 +19763,9 @@ std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
     if(m.tokenizer_pre=="laguna")return laguna_pretokenize(text);
     if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    // llama.cpp maps inkling2's `pre` to the GPT-4o regex with clean_spaces
+    // off (see llama-vocab.cpp's tokenizer_pre == "inkling2" branch).
+    if(m.tokenizer_pre=="inkling2")return gpt4o_pretokenize(text,3);
     // llama.cpp gives `pixtral` (Nemotron H's vocabulary) the same llama3
     // pattern as lfm2: digit runs of up to three.
     if(m.tokenizer_pre=="lfm2"||m.tokenizer_pre=="pixtral")return lfm2_pretokenize(text);
@@ -19746,7 +19804,8 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
        m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
        m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
        m->tokenizer_pre=="bailingmoe3"||m->tokenizer_pre=="lfm2"||
-       m->tokenizer_pre=="pixtral"||m->tokenizer_pre=="raon"){
+       m->tokenizer_pre=="pixtral"||m->tokenizer_pre=="raon"||
+        m->tokenizer_pre=="inkling2"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -19911,6 +19970,12 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
+    // Inkling 2 has its own runtime: the Qwen layer loop has no short
+    // convolutions, loop controllers or relative bias table. Point callers at
+    // it rather than letting them fail on a missing Qwen-shaped tensor.
+    if(m->config.architecture=="inkling2")throw std::runtime_error(
+        "inkling2 checkpoints need the dedicated inkling2 runtime (flyweight_v2_inkling2_create), "
+        "not the Qwen runtime");
     if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon&&!lfm2&&!nemotron)
         throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer, K2-Horizon, LFM2 and Nemotron H models");
     // Dense checkpoints report no experts at all, so only require a routing
@@ -34001,3 +34066,5 @@ int flyweight_v2_qwen_engine_idle_maintenance(FlyweightV2QwenRuntime*runtime){re
 });}
 
 }
+
+#include "v2_inkling2.inc"

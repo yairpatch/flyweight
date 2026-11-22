@@ -164,5 +164,18 @@ struct ModelConfig {
     float situ_linear_beta=25.0f;
     float kda_gate_lower_bound=-5.0f;
     float latent_norm_rms_epsilon=1e-6f;
+    // Inkling 2 (inkling2): a looped MoE transformer. `layer_count` is the
+    // number of layer applications (48 on Inkling-2-Mini); the physical layers
+    // stored in the file are `loop_core_end` plus the tail after it. The core
+    // [loop_core_start, loop_core_end) runs `num_loops` times, the first pass
+    // from the file's weights and later passes through the shared loop
+    // controllers. There is no RoPE: positions enter through a relative bias
+    // table (`relative_*`) and a log-scaled tau on the full-attention layers.
+    std::uint32_t num_loops=1, loop_core_start=0, loop_core_end=0, loop_gate_rank=0;
+    std::uint32_t attn_res_block_size=0;
+    std::uint32_t relative_length=0, relative_extent=0, log_scale_floor=0;
+    float qk_clip=0.0f, relative_clip=0.0f, log_scale_alpha=0.0f;
+    // The embedding/output rows are padded past the tokenizer's vocabulary.
+    std::uint32_t vocab_size_unpadded=0;
 };
 }
